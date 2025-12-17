@@ -282,6 +282,14 @@ def _condition_checks_nunique_le_one(test_node: ast.AST) -> bool:
     ]
     if not comparator_consts:
         return False
+    for op, comp in zip(test_node.ops, comparator_consts):
+        if isinstance(op, ast.Eq) and comp.value == 1:
+            return True
+        if isinstance(op, ast.LtE) and comp.value <= 1:
+            return True
+        if isinstance(op, ast.Lt) and comp.value <= 2:
+            return True
+    # Fallback: accept any <=1 threshold
     threshold_match = any(const.value <= 1 for const in comparator_consts)
     return valid_op and threshold_match
 

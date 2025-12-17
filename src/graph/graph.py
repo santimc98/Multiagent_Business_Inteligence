@@ -866,7 +866,7 @@ def run_engineer(state: AgentState) -> AgentState:
     strategy = state.get('selected_strategy')
     
     # Pass input context
-    data_path = "data/cleaned_data.csv"
+    data_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
     feedback_history = state.get('feedback_history', [])
     leakage_summary = state.get("leakage_audit_summary", "")
     data_audit_context = state.get('data_summary', '')
@@ -1091,6 +1091,8 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         }
 
 def check_qa_review(state: AgentState):
+    if state.get("error_message") or state.get("review_abort_reason"):
+        return "failed"
     if state.get('review_verdict') == "REJECTED":
         return "rejected"
     # APPROVED or APPROVE_WITH_WARNINGS -> proceeds
@@ -1121,7 +1123,7 @@ def execute_code(state: AgentState) -> AgentState:
     # 0b. Undefined name preflight (avoid sandbox NameError)
     undefined = detect_undefined_names(code)
     if undefined:
-        msg = f"EXECUTION ERROR: Undefined names detected preflight: {', '.join(undefined)}"
+        msg = f"STATIC_PRECHECK_UNDEFINED: Undefined names detected preflight: {', '.join(undefined)}"
         fh = list(state.get("feedback_history", []))
         fh.append(f"STATIC_PRECHECK_UNDEFINED: {msg}")
         return {"error_message": msg, "execution_output": msg, "feedback_history": fh}
@@ -1405,10 +1407,14 @@ def check_execution_status(state: AgentState):
     # Traceback check (Runtime Error)
     has_error = "Traceback (most recent call last)" in output or "EXECUTION ERROR" in output
     determinism_error = "DETERMINISTIC_TARGET_RELATION" in output
+    undefined_precheck = "STATIC_PRECHECK_UNDEFINED" in output
 
     if determinism_error or skipped_reason == "DETERMINISTIC_TARGET_RELATION":
         return "evaluate"
     
+    if undefined_precheck:
+        return "retry_fix"
+
     if has_error:
         print(f"Runtime Error detected (Attempt {attempt}). Delegating to Postmortem.")
         return "failed"
@@ -1693,7 +1699,8 @@ workflow.add_conditional_edges(
     check_qa_review,
     {
         "approved": "execute_code", # Pass QA -> Execute
-        "rejected": "retry_handler" # Back to engineer
+        "rejected": "retry_handler", # Back to engineer
+        "failed": "postmortem"
     }
 )
 

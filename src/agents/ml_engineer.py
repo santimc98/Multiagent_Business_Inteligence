@@ -122,7 +122,7 @@ class MLEngineerAgent:
         *** TARGET & DATA GUARDRAILS (MANDATORY) ***
         - If df.empty after loading with output_dialect -> raise ValueError with dialect info.
         - If df.shape[1] == 1 AND the sole column name contains ',', ';', or '\\t' with length > 20 -> raise ValueError("Delimiter/Dialect mismatch: ...") with dialect info; DO NOT fabricate/split columns.
-        - Before training, if target.nunique() <= 1 -> raise ValueError("Target has no variance; cannot train meaningful model."). NEVER add noise/jitter or randomization to force variance.
+        - If a target exists, add EXACTLY one guard: `if y.nunique() <= 1: raise ValueError("Target has no variance; cannot train meaningful model.")` (or `< 2`) before training/optimization. NEVER add noise/jitter or randomization to force variance.
         - Before regression/correlation, print non-null counts per numeric feature; drop features with very low non-null counts (e.g., < 20 rows) and report them as dropped_due_to_missingness.
 
         *** OUTLIER DETECTION (ROBUSTNESS) ***
