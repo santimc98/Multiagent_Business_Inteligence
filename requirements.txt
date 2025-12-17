@@ -1,0 +1,43 @@
+# --- Core & Data ---
+python-dotenv
+pandas
+numpy
+scipy
+openpyxl
+
+# --- Agentes & LLMs ---
+langchain
+langgraph
+langchain-google-genai
+google-generativeai
+openai
+e2b-code-interpreter
+
+# --- Machine Learning (Classic & Boosting) ---
+scikit-learn
+xgboost
+lightgbm
+catboost
+category_encoders
+imbalanced-learn
+statsmodels
+
+# --- Deep Learning ---
+torch
+torchvision
+tensorflow
+
+# --- Explainability (XAI) ---
+shap
+
+# --- Visualization & UI ---
+streamlit
+matplotlib
+seaborn
+plotly
+altair
+
+# --- Utils & Reporting ---
+fpdf
+reportlab
+tabulate

@@ -1,0 +1,43 @@
+{
+  "summary": {
+    "RIIM10_Norm": {
+      "matched": "riim10_norm",
+      "method": "exact_ci",
+      "score": 1.0,
+      "synthetic": false
+    },
+    "Score_FEC": {
+      "matched": "score_fec",
+      "method": "exact_ci",
+      "score": 1.0,
+      "synthetic": false
+    },
+    "%plazoConsumido": {
+      "matched": "plazo_consumido",
+      "method": "exact_norm",
+      "score": 1.0,
+      "synthetic": false
+    },
+    "Importe_Norm": {
+      "matched": "importe_norm",
+      "method": "exact_ci",
+      "score": 1.0,
+      "synthetic": false
+    },
+    "Impacto": {
+      "matched": "impacto",
+      "method": "exact_ci",
+      "score": 1.0,
+      "synthetic": false
+    }
+  },
+  "rename_mapping": {
+    "riim10_norm": "RIIM10_Norm",
+    "score_fec": "Score_FEC",
+    "plazo_consumido": "%plazoConsumido",
+    "importe_norm": "Importe_Norm",
+    "impacto": "Impacto"
+  },
+  "missing": [],
+  "synthetic": []
+}

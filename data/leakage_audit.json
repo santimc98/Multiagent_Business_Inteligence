@@ -1,0 +1,55 @@
+{
+  "relations": [
+    {
+      "type": "sum",
+      "columns": [
+        "vidafactura",
+        "daystodue",
+        "plazofactura"
+      ],
+      "support": 20096,
+      "support_frac": 1.0
+    },
+    {
+      "type": "diff",
+      "columns": [
+        "plazofactura",
+        "daystodue",
+        "vidafactura"
+      ],
+      "support": 20096,
+      "support_frac": 1.0
+    },
+    {
+      "type": "diff",
+      "columns": [
+        "plazofactura",
+        "vidafactura",
+        "daystodue"
+      ],
+      "support": 20096,
+      "support_frac": 1.0
+    }
+  ],
+  "scanned_columns": [
+    "entityid",
+    "codpartidaabierta",
+    "plazofactura",
+    "vidafactura",
+    "daystodue",
+    "plazoconsumido",
+    "lgd",
+    "pdriim",
+    "riim10",
+    "pdriim_norm",
+    "importe",
+    "log_importe",
+    "Impacto",
+    "Importe_Norm",
+    "RIIM10_Norm",
+    "score",
+    "plazoconsumido_capped",
+    "tiposegmento"
+  ],
+  "rows": 20096
+}

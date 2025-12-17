@@ -1,0 +1,111 @@
+{
+  "contract_version": "1.0",
+  "strategy_title": "Linear Weight Optimization via Correlation Analysis",
+  "business_objective": "Ajustar pesos no negativos (suman 1) para Score_nuevo = 100*(w1*ImporteNorm + w2*RIIM10_Norm + w3*PlazoConsumido_adj + w4*ScoreFEC + w5*Impacto), donde PlazoConsumido_adj = PlazoConsumido si 0<=x<=1, si x>1 tratar como 0. Asignar caso por fila seg\u00fan reglas dadas. Verificar Score_actual vs f\u00f3rmula. Producir tabla por caso con conteo, estad\u00edsticas y ordenamiento vs RefScore ordinal. Entregar pesos propuestos y explicaci\u00f3n de negocio.",
+  "required_outputs": [
+    "data/cleaned_data.csv",
+    "data/weights.json",
+    "data/case_summary.csv",
+    "static/plots/score_comparison_by_case.png"
+  ],
+  "data_requirements": [
+    {
+      "name": "EntityId",
+      "role": "categorical",
+      "expected_range": null,
+      "allowed_null_frac": 0.0,
+      "source": "input"
+    },
+    {
+      "name": "Importe Norm",
+      "role": "feature",
+      "expected_range": null,
+      "allowed_null_frac": 0.0,
+      "source": "input"
+    },
+    {
+      "name": "RIIM10 Norm",
+      "role": "feature",
+      "expected_range": null,
+      "allowed_null_frac": 0.0,
+      "source": "input"
+    },
+    {
+      "name": "%plazoConsumido",
+      "role": "percentage",
+      "expected_range": [
+        0,
+        100
+      ],
+      "allowed_null_frac": 0.05,
+      "source": "input"
+    },
+    {
+      "name": "Score FEC",
+      "role": "feature",
+      "expected_range": null,
+      "allowed_null_frac": 0.0,
+      "source": "input"
+    },
+    {
+      "name": "Impacto",
+      "role": "feature",
+      "expected_range": [
+        0,
+        1
+      ],
+      "allowed_null_frac": 0.0,
+      "source": "input"
+    },
+    {
+      "name": "RIIM10",
+      "role": "risk_score",
+      "expected_range": [
+        1,
+        10
+      ],
+      "allowed_null_frac": 0.0,
+      "source": "input"
+    },
+    {
+      "name": "FEC",
+      "role": "feature",
+      "expected_range": null,
+      "allowed_null_frac": 0.0,
+      "source": "input"
+    },
+    {
+      "name": "Score",
+      "role": "feature",
+      "expected_range": null,
+      "allowed_null_frac": 0.0,
+      "source": "input"
+    },
+    {
+      "name": "PlazoConsumido_adj",
+      "role": "percentage",
+      "expected_range": [
+        0,
+        1
+      ],
+      "allowed_null_frac": 0.0,
+      "source": "derived"
+    },
+    {
+      "name": "RefScore",
+      "role": "target",
+      "expected_range": [
+        -1.0,
+        1.0
+      ],
+      "allowed_null_frac": 0.0,
+      "source": "derived"
+    }
+  ],
+  "validations": [
+    "ranking_coherence_spearman",
+    "out_of_range",
+    "non_negative_weights_sum_to_one"
+  ],
+  "notes_for_engineers": "1. Convertir '%plazoConsumido' de string (ej. '33,33%') a float decimal (ej. 0.3333). 2. Crear 'PlazoConsumido_adj' aplicando la regla: si 0 <= valor <= 1, usar valor; si > 1, usar 0. 3. Crear columna 'RefScore' asignando el valor correspondiente basado en la definici\u00f3n exacta de casos (sin solapamiento) usando RIIM10, FEC, PlazoConsumido_adj e Impacto. 4. 'RefScore' es un objetivo ordinal para optimizaci\u00f3n de ranking; no es un target predictivo. El 'leakage' entre variables de caso y RefScore es intencional y parte del dise\u00f1o. 5. La optimizaci\u00f3n debe producir pesos no negativos que sumen 1 para la f\u00f3rmula de Score_nuevo. 6. La salida 'case_summary.csv' debe incluir por cada caso: count, media y percentiles (ej. 25, 50, 75) de 'Score' (actual) y 'Score_nuevo', y una bandera que indique si el orden de la media de Score_nuevo respeta el orden de RefScore. 7. El plot debe comparar Score_nuevo vs Score_actual o mostrar la distribuci\u00f3n de Score_nuevo por caso/RefScore."
+}

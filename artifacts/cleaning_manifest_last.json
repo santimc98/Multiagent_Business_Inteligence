@@ -1,0 +1,391 @@
+{
+  "input_dialect": {
+    "sep": ",",
+    "decimal": ",",
+    "encoding": "utf-8"
+  },
+  "output_dialect": {
+    "sep": ",",
+    "decimal": ".",
+    "encoding": "utf-8"
+  },
+  "original_columns": [
+    "EntityId",
+    "CodPartidaAbierta",
+    "FE",
+    "FV",
+    "FechaObs",
+    "PlazoFactura",
+    "VidaFactura",
+    "DaysToDue",
+    "%plazoConsumido",
+    "FEC",
+    "FEC desde FObs",
+    "Rango FEC",
+    "LGD",
+    "PdRIIM",
+    "RIIM10",
+    "PdRIIM Norm",
+    "Sector",
+    "TipoSegmento",
+    "Importe",
+    "Log Importe",
+    "Impacto",
+    "Importe Norm",
+    "RIIM10 Norm",
+    "Score FEC",
+    "Score",
+    "Escala"
+  ],
+  "column_mapping": {
+    "EntityId": "entityid",
+    "CodPartidaAbierta": "codpartidaabierta",
+    "FE": "fe",
+    "FV": "fv",
+    "FechaObs": "fechaobs",
+    "PlazoFactura": "plazofactura",
+    "VidaFactura": "vidafactura",
+    "DaysToDue": "daystodue",
+    "%plazoConsumido": "plazoconsumido",
+    "FEC": "fec",
+    "FEC desde FObs": "fec_desde_fobs",
+    "Rango FEC": "rango_fec",
+    "LGD": "lgd",
+    "PdRIIM": "pdriim",
+    "RIIM10": "riim10",
+    "PdRIIM Norm": "pdriim_norm",
+    "Sector": "sector",
+    "TipoSegmento": "tiposegmento",
+    "Importe": "importe",
+    "Log Importe": "log_importe",
+    "Impacto": "impacto",
+    "Importe Norm": "importe_norm",
+    "RIIM10 Norm": "riim10_norm",
+    "Score FEC": "score_fec",
+    "Score": "score",
+    "Escala": "escala"
+  },
+  "dropped_columns": [
+    {
+      "name": "fechaobs",
+      "reason": "constant (nunique=1)"
+    }
+  ],
+  "conversions": {
+    "entityid": "numeric",
+    "codpartidaabierta": "numeric",
+    "fe": "date",
+    "fv": "date",
+    "plazofactura": "numeric",
+    "vidafactura": "numeric",
+    "daystodue": "numeric",
+    "plazoconsumido": "percentage_decimal",
+    "fec": "numeric",
+    "fec_desde_fobs": "numeric",
+    "rango_fec": "text (numeric parse failed)",
+    "lgd": "text (numeric parse failed)",
+    "pdriim": "text (numeric parse failed)",
+    "riim10": "numeric",
+    "pdriim_norm": "text (numeric parse failed)",
+    "tiposegmento": "numeric",
+    "importe": "text (numeric parse failed)",
+    "log_importe": "text (numeric parse failed)",
+    "impacto": "boolean",
+    "importe_norm": "text (numeric parse failed)",
+    "riim10_norm": "text (numeric parse failed)",
+    "score_fec": "text (numeric parse failed)",
+    "score": "text (numeric parse failed)",
+    "plazo_consumido_adj": "derived"
+  },
+  "conversions_meta": {
+    "entityid": {
+      "parse_success_rate": 1.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": false,
+      "reason": "parse_success_rate=1.000"
+    },
+    "codpartidaabierta": {
+      "parse_success_rate": 1.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": false,
+      "reason": "parse_success_rate=1.000"
+    },
+    "fe": {
+      "parse_success_rate": 1.0,
+      "dtype_before": "object",
+      "dtype_after": "datetime64[ns]"
+    },
+    "fv": {
+      "parse_success_rate": 0.07792595541401273,
+      "dtype_before": "object",
+      "dtype_after": "datetime64[ns]"
+    },
+    "plazofactura": {
+      "parse_success_rate": 1.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": false,
+      "reason": "parse_success_rate=1.000"
+    },
+    "vidafactura": {
+      "parse_success_rate": 1.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": false,
+      "reason": "parse_success_rate=1.000"
+    },
+    "daystodue": {
+      "parse_success_rate": 1.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": false,
+      "reason": "parse_success_rate=1.000"
+    },
+    "plazoconsumido": {
+      "parse_success_rate": 1.0,
+      "dtype_before": "object",
+      "dtype_after": "float64"
+    },
+    "fec": {
+      "parse_success_rate": 1.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": false,
+      "reason": "parse_success_rate=1.000"
+    },
+    "fec_desde_fobs": {
+      "parse_success_rate": 1.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": false,
+      "reason": "parse_success_rate=1.000"
+    },
+    "rango_fec": {
+      "parse_success_rate": 0.065,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.065"
+    },
+    "lgd": {
+      "parse_success_rate": 0.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.000"
+    },
+    "pdriim": {
+      "parse_success_rate": 0.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.000"
+    },
+    "riim10": {
+      "parse_success_rate": 1.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": false,
+      "reason": "parse_success_rate=1.000"
+    },
+    "pdriim_norm": {
+      "parse_success_rate": 0.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.000"
+    },
+    "tiposegmento": {
+      "parse_success_rate": 1.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": false,
+      "reason": "parse_success_rate=1.000"
+    },
+    "importe": {
+      "parse_success_rate": 0.045,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.045"
+    },
+    "log_importe": {
+      "parse_success_rate": 0.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.000"
+    },
+    "impacto": {
+      "parse_success_rate": 1.0,
+      "dtype_before": "object",
+      "dtype_after": "bool"
+    },
+    "importe_norm": {
+      "parse_success_rate": 0.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.000"
+    },
+    "riim10_norm": {
+      "parse_success_rate": 0.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.000"
+    },
+    "score_fec": {
+      "parse_success_rate": 0.08,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.080"
+    },
+    "score": {
+      "parse_success_rate": 0.0,
+      "digits_ratio": 1.0,
+      "decimal_hint": ".",
+      "thousands_hint": "",
+      "sample_size": 200,
+      "reverted": true,
+      "reason": "parse_success_rate=0.000"
+    },
+    "plazo_consumido_adj": {
+      "source": "plazoconsumido",
+      "transformation": "x if 0<=x<=1 else 0 if x>1 else NaN"
+    }
+  },
+  "rows_before": 20096,
+  "rows_after": 20096,
+  "validation_results": [
+    {
+      "column": "ImporteNorm",
+      "actual_column": "importe_norm",
+      "null_fraction": 0.0,
+      "null_check": "PASS",
+      "range_check": "SKIPPED",
+      "range_message": "",
+      "dtype": "object"
+    },
+    {
+      "column": "RIIM10_Norm",
+      "actual_column": "riim10_norm",
+      "null_fraction": 0.0,
+      "null_check": "PASS",
+      "range_check": "SKIPPED",
+      "range_message": "",
+      "dtype": "object"
+    },
+    {
+      "column": "%plazoConsumido",
+      "actual_column": "plazoconsumido",
+      "null_fraction": 0.0,
+      "null_check": "PASS",
+      "range_check": "FAIL",
+      "range_message": "Range [0.014, 355.000] outside expected [0, 100]",
+      "dtype": "float64"
+    },
+    {
+      "column": "PlazoConsumido_adj",
+      "actual_column": "plazo_consumido_adj",
+      "null_fraction": 0.0,
+      "null_check": "PASS",
+      "range_check": "PASS",
+      "range_message": "Range [0.000, 1.000] within expected [0, 1]",
+      "dtype": "float64"
+    },
+    {
+      "column": "ScoreFEC",
+      "actual_column": "score_fec",
+      "null_fraction": 0.0,
+      "null_check": "PASS",
+      "range_check": "SKIPPED",
+      "range_message": "",
+      "dtype": "object"
+    },
+    {
+      "column": "Impacto",
+      "actual_column": "impacto",
+      "null_fraction": 0.0,
+      "null_check": "PASS",
+      "range_check": "PASS",
+      "range_message": "Range [0.000, 1.000] within expected [0, 1]",
+      "dtype": "int64"
+    },
+    {
+      "column": "RIIM10",
+      "actual_column": "riim10",
+      "null_fraction": 0.0,
+      "null_check": "PASS",
+      "range_check": "PASS",
+      "range_message": "Range [1.000, 10.000] within expected [1, 10]",
+      "dtype": "float64"
+    },
+    {
+      "column": "FEC",
+      "actual_column": "fec",
+      "null_fraction": 0.0,
+      "null_check": "PASS",
+      "range_check": "SKIPPED",
+      "range_message": "",
+      "dtype": "float64"
+    },
+    {
+      "column": "RefScore",
+      "actual_column": null,
+      "null_fraction": null,
+      "null_check": "MISSING",
+      "range_check": "SKIPPED",
+      "range_message": "Required column RefScore not found",
+      "dtype": ""
+    },
+    {
+      "column": "Score",
+      "actual_column": "score",
+      "null_fraction": 0.0,
+      "null_check": "PASS",
+      "range_check": "SKIPPED",
+      "range_message": "",
+      "dtype": "object"
+    }
+  ]
+}
