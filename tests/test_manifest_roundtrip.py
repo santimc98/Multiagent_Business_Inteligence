@@ -52,7 +52,7 @@ def test_manifest_roundtrip_upload():
         
 def test_manifest_patching_logic():
     state = {
-        "generated_code": "md = json.load(open('data/cleaning_manifest.json'))\ndf = pd.read_csv('./data/cleaned_data.csv')",
+        "generated_code": "import json\nimport pandas as pd\nmd = json.load(open('data/cleaning_manifest.json'))\ndf = pd.read_csv('./data/cleaned_data.csv')",
         "execution_output": "",
         "execution_attempt": 1,
         "csv_path": "data/dummy.csv" # Required by checks? No, but maybe.
@@ -66,6 +66,10 @@ def test_manifest_patching_logic():
          
         mock_instance = MockSandbox.create.return_value.__enter__.return_value
         mock_instance.commands.run.return_value.exit_code = 0
+        mock_instance.commands.run.return_value.stdout = ""
+        mock_instance.run_code.return_value.logs.stdout = ["ok"]
+        mock_instance.run_code.return_value.logs.stderr = []
+        mock_instance.run_code.return_value.error = None
         
         # Capture executed code
         result = execute_code(state)
