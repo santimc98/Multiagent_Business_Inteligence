@@ -59,6 +59,67 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
             return [r.get("name") for r in contract_reqs if isinstance(r, dict) and r.get("source", "input") == "input" and r.get("name")]
     return strategy.get("required_columns", []) if strategy else []
 
+def detect_undefined_names(code: str) -> List[str]:
+    """
+    AST-based preflight to detect names that are used but never defined/imported.
+    Avoids wasting sandbox runs on obvious NameError.
+    """
+    import ast
+    import builtins as _builtins
+
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+
+    defined: set[str] = set(dir(_builtins)) | {"__name__", "__file__", "__package__", "__spec__", "__doc__", "__cached__"}
+
+    def add_target(target):
+        if isinstance(target, ast.Name):
+            defined.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                add_target(elt)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.asname:
+                    defined.add(alias.asname)
+                else:
+                    # top-level module name
+                    defined.add(alias.name.split(".")[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+            for arg in node.args.args + node.args.kwonlyargs:
+                defined.add(arg.arg)
+            if node.args.vararg:
+                defined.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                defined.add(node.args.kwarg.arg)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            add_target(node.target if hasattr(node, "target") else None)
+            if hasattr(node, "targets"):
+                for tgt in node.targets:
+                    add_target(tgt)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            add_target(node.target)
+        elif isinstance(node, ast.With):
+            for item in node.items:
+                if item.optional_vars:
+                    add_target(item.optional_vars)
+        elif isinstance(node, ast.comprehension):
+            add_target(node.target)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            defined.add(node.name)
+
+    undefined: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id not in defined:
+                undefined.add(node.id)
+    return sorted(undefined)
+
 def manifest_dump_missing_default(code: str) -> bool:
     """
     Detects json.dump calls without default= to guard manifest serialization.
@@ -1056,6 +1117,14 @@ def execute_code(state: AgentState) -> AgentState:
         failure_reason = "CRITICAL: Security Violations:\n" + "\n".join(violations)
         print(f"🚫 Security Block: {failure_reason}")
         return {"error_message": failure_reason, "execution_output": failure_reason}
+
+    # 0b. Undefined name preflight (avoid sandbox NameError)
+    undefined = detect_undefined_names(code)
+    if undefined:
+        msg = f"EXECUTION ERROR: Undefined names detected preflight: {', '.join(undefined)}"
+        fh = list(state.get("feedback_history", []))
+        fh.append(f"STATIC_PRECHECK_UNDEFINED: {msg}")
+        return {"error_message": msg, "execution_output": msg, "feedback_history": fh}
 
     # Secure execution using E2B
     try:

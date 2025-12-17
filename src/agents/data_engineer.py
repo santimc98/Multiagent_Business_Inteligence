@@ -91,6 +91,10 @@ class DataEngineerAgent:
            - Booleans: Map {yes, y, true, 1} -> True.
            - Missing semantics: Use `is_effectively_missing` (None/NaN/''/whitespace) when deciding emptiness; NEVER treat 0 or "0" as missing.
            - Numeric/Currency parsing: prefer shared helper `safe_convert_numeric_currency` from `src.utils.type_inference` to ensure consistent audit signals.
+           - Parsing hygiene (MANDATORY):
+             * Do NOT blindly strip '.' characters; infer decimal/thousands from patterns (only '.' present -> decimal='.'; only ',' -> decimal=','; if both, decide by rightmost separator).
+             * For percentages: always strip '%' and parse using the detected decimal separator.
+             * If a conversion is reverted, restore exactly the original series (no downstream overwrites or partial coercion).
         
         4. MANIFEST ARTIFACT (AUDITABILITY):
            - In addition to 'data/cleaned_data.csv', you MUST save 'data/cleaning_manifest.json'.
