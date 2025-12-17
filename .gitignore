@@ -1,0 +1,43 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.dmypy.json
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+
+# Runtime artifacts
+artifacts/
+static/plots/*.png
+final_report_*.pdf
+changes.patch
+
+# Data artifacts (keep raw fixtures and other CSVs)
+data/cleaned_data.csv
+data/cleaned_full.csv
+data/cleaning_manifest.json
+data/column_mapping_summary.json
+data/execution_contract.json
+data/integrity_audit_report.json
+data/output_contract_report.json
+data/postmortem_decision.json
+data/leakage_audit.json
+data/steward_llm_trace.json
+data/feature_integrity_report.json
+data/weights.json
+data/metrics.json
+data/case_summary.csv
