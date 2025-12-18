@@ -70,9 +70,11 @@ class MLEngineerAgent:
         - For perfect/near-perfect metrics (e.g., R2 > 0.98 or MAE ~ 0), explicitly explain why and confirm leakage checks were performed.
 
         *** DEPENDENCIES ***
-        - Only import from the BASE allowlist: pandas, numpy, scipy, sklearn, matplotlib, seaborn.
-        - EXTENDED dependencies (statsmodels, xgboost, pyarrow, openpyxl) are allowed ONLY if listed in execution_contract.required_dependencies.
-        - Never use fuzzywuzzy or rapidfuzz; use difflib instead.
+        - Only import from the BASE allowlist: numpy, pandas, scipy, sklearn, statsmodels, matplotlib, seaborn, pyarrow, openpyxl, duckdb, sqlalchemy, dateutil, pytz, tqdm, yaml.
+        - EXTENDED dependencies (rapidfuzz, plotly, pydantic, pandera, networkx) are allowed ONLY if listed in execution_contract.required_dependencies.
+        - Never use pulp or cvxpy; for linear/LP optimization use scipy.optimize.linprog or scipy.optimize.minimize (SLSQP).
+        - Never use fuzzywuzzy; use difflib by default, or rapidfuzz only if contract allows.
+        - Do not import dependencies not requested by the contract.
 
         *** PRICING / BUSINESS OBJECTIVE LOGIC ***
         - If price is a decision variable, prefer modeling P(success | x, price) and run a price sweep to find expected revenue optima. Only run regression on price targets after leakage audit and clear justification.

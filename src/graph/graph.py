@@ -1065,6 +1065,13 @@ def run_engineer(state: AgentState) -> AgentState:
         if "execution_contract" in sig.parameters:
             kwargs["execution_contract"] = execution_contract
         code = ml_engineer.generate_code(**kwargs)
+        try:
+            os.makedirs("artifacts", exist_ok=True)
+            with open(os.path.join("artifacts", "ml_engineer_last.py"), "w", encoding="utf-8") as f_art:
+                f_art.write(code)
+        except Exception as artifact_err:
+            print(f"Warning: failed to persist ml_engineer_last.py: {artifact_err}")
+
         return {
             "selected_strategy": strategy,
             "generated_code": code,
@@ -1254,6 +1261,42 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
 def run_ml_preflight(state: AgentState) -> AgentState:
     print("--- ML PREFLIGHT ---")
     code = state.get("generated_code", "")
+    contract = state.get("execution_contract", {}) or {}
+    required_deps = contract.get("required_dependencies", []) or []
+    dep_result = check_dependency_precheck(code, required_deps)
+    if dep_result.get("banned") or dep_result.get("blocked"):
+        blocked = dep_result.get("blocked", [])
+        banned = dep_result.get("banned", [])
+        suggestions = dep_result.get("suggestions", {})
+        parts = []
+        if banned:
+            parts.append(f"banned={', '.join(banned)}")
+        if blocked:
+            parts.append(f"blocked={', '.join(blocked)}")
+        hint_parts = []
+        for key in banned + blocked:
+            hint = suggestions.get(key)
+            if hint:
+                hint_parts.append(f"{key}: {hint}")
+        hint_text = f" Suggestions: {' | '.join(hint_parts)}" if hint_parts else ""
+        feedback = f"DEPENDENCY_BLOCKED: {'; '.join(parts)}.{hint_text}"
+        history = list(state.get("feedback_history", []))
+        history.append(feedback)
+        gate_context = {
+            "source": "ml_preflight",
+            "status": "REJECTED",
+            "feedback": feedback,
+            "failed_gates": ["DEPENDENCY_BLOCKED"],
+            "required_fixes": ["DEPENDENCY_BLOCKED"],
+        }
+        return {
+            "ml_preflight_failed": True,
+            "feedback_history": history,
+            "last_gate_context": gate_context,
+            "review_verdict": "REJECTED",
+            "review_feedback": feedback,
+        }
+
     issues = ml_quality_preflight(code)
     if issues:
         feedback = f"ML_PREFLIGHT_MISSING: {', '.join(issues)}"

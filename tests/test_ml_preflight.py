@@ -1,4 +1,5 @@
 from src.graph.graph import ml_quality_preflight
+from src.graph.graph import run_ml_preflight
 
 
 def test_ml_preflight_fails_missing_variance_guard():
@@ -38,3 +39,16 @@ if y.nunique() < 2:
 """
     issues = ml_quality_preflight(code)
     assert issues == []
+
+
+def test_ml_preflight_blocks_dependency_with_suggestion():
+    state = {
+        "generated_code": "import pulp\n",
+        "execution_contract": {"required_dependencies": []},
+        "feedback_history": [],
+    }
+    result = run_ml_preflight(state)
+    assert result.get("ml_preflight_failed") is True
+    history = result.get("feedback_history", [])
+    assert any("DEPENDENCY_BLOCKED" in h for h in history)
+    assert any("linprog" in h.lower() for h in history)
