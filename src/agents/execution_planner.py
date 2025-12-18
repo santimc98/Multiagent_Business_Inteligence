@@ -54,6 +54,59 @@ class ExecutionPlannerAgent:
         def _norm(name: str) -> str:
             return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
 
+        def _parse_summary_kinds(summary_text: str) -> Dict[str, str]:
+            kind_map: Dict[str, str] = {}
+            if not summary_text:
+                return kind_map
+            for raw_line in summary_text.splitlines():
+                line = raw_line.strip()
+                if not line.startswith("-"):
+                    continue
+                content = line.lstrip("-").strip()
+                if ":" not in content:
+                    continue
+                label, cols = content.split(":", 1)
+                label_lower = label.strip().lower()
+                cols_list = [c.strip() for c in re.split(r"[;,]", cols) if c.strip()]
+                kind = None
+                if "date" in label_lower:
+                    kind = "datetime"
+                elif "numerical" in label_lower or "numeric" in label_lower:
+                    kind = "numeric"
+                elif "categor" in label_lower or "boolean" in label_lower or "identifier" in label_lower:
+                    kind = "categorical"
+                if kind:
+                    for col in cols_list:
+                        kind_map[_norm(col)] = kind
+            return kind_map
+
+        def _apply_expected_kind(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return {}
+            kind_map = _parse_summary_kinds(data_summary)
+            reqs = contract.get("data_requirements", []) or []
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                if req.get("expected_kind"):
+                    continue
+                name = req.get("name")
+                norm_name = _norm(name) if name else ""
+                if norm_name in kind_map:
+                    req["expected_kind"] = kind_map[norm_name]
+                    continue
+                role = (req.get("role") or "").lower()
+                if role in {"percentage", "feature", "risk_score", "probability", "ratio"}:
+                    req["expected_kind"] = "numeric"
+                elif role == "categorical":
+                    req["expected_kind"] = "categorical"
+                elif role == "date":
+                    req["expected_kind"] = "datetime"
+                else:
+                    req["expected_kind"] = "unknown"
+            contract["data_requirements"] = reqs
+            return contract
+
         def _apply_inventory_source(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return {}
@@ -135,7 +188,7 @@ class ExecutionPlannerAgent:
                     "Align cleaning/modeling with this contract; avoid hardcoded business rules.",
                 ],
             }
-            return contract
+            return enforce_percentage_ranges(_apply_expected_kind(_apply_inventory_source(contract)))
 
         if not self.client:
             return _fallback()
@@ -147,7 +200,7 @@ You are a senior execution planner. Produce a JSON contract to guide data cleani
 Requirements:
 - Output JSON ONLY (no markdown/code fences).
 - Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations, notes_for_engineers, required_dependencies.
-        - data_requirements: list of {name, role, expected_range, allowed_null_frac, source}. Roles: target|feature|percentage|probability|categorical|date|risk_score. source: "input" | "derived".
+        - data_requirements: list of {name, role, expected_range, allowed_null_frac, source, expected_kind}. expected_kind in {numeric, datetime, categorical, unknown}.
 - Each data_requirement may include source: "input" | "derived" (default input). If role==target and the name is not present in the column inventory from data_summary, mark source="derived" if reasonable.
 - expected_range e.g. [0,1] for probabilities/scores/percentages if implied by the column description.
 - validations: generic checks (e.g., ranking_coherence spearman, out_of_range).
@@ -197,6 +250,6 @@ Return the contract JSON.
                 return _fallback()
             if "required_dependencies" not in contract:
                 contract["required_dependencies"] = []
-            return enforce_percentage_ranges(_apply_inventory_source(contract))
+            return enforce_percentage_ranges(_apply_expected_kind(_apply_inventory_source(contract)))
         except Exception:
             return _fallback()

@@ -90,6 +90,7 @@ class DataEngineerAgent:
            - Money/Percentage: Clean regex -> Float.
            - Dates: `pd.to_datetime(..., errors='coerce')`.
              * If a column has few unique values and patterns like "0-7", "-7-0", "-15--7", treat it as categorical string, NOT as a date.
+             * Do NOT use short substrings like "fe"/"fv" for date detection; if used, require exact normalized match or clear patterns ("fecha", "date", "venc", "emision", "obs").
            - Categories: `str.strip().str.title()`.
            - Booleans: Map {yes, y, true, 1} -> True.
            - Missing semantics: Use `is_effectively_missing` (None/NaN/''/whitespace) when deciding emptiness; NEVER treat 0 or "0" as missing.
@@ -101,6 +102,10 @@ class DataEngineerAgent:
            - Percentage role handling (MANDATORY):
              * If role==percentage in the contract, parse with the detected decimal separator and normalize to 0-1 when most values are in [1,100] or p50 > 1.
              * Keep both raw and normalized versions only if explicitly required by the contract; otherwise overwrite with normalized values.
+           - Contract type enforcement (MANDATORY):
+             * For each required column, respect expected_kind from the contract: numeric -> pd.to_numeric, datetime -> pd.to_datetime, categorical -> keep as string/categorical.
+             * If coercion produces too many NaN (e.g., >80%), try the next candidate mapping; if none, raise a clear ValueError.
+             * Ensure required columns with expected_kind==numeric do NOT end up as datetime dtype.
         
         4. MANIFEST ARTIFACT (AUDITABILITY):
            - In addition to 'data/cleaned_data.csv', you MUST save 'data/cleaning_manifest.json'.
@@ -114,6 +119,7 @@ class DataEngineerAgent:
                "dropped_columns": [{"name": "col_x", "reason": "empty"}],
                "conversions": {"price": "clean_currency"},
                "conversions_meta": {"price": {"parse_success_rate": 0.97, "reverted": false, "reason": ""}},
+               "type_checks": [{"column": "col", "expected_kind": "numeric", "observed_dtype": "float64", "coercion_applied": "to_numeric", "na_frac_after": 0.01}],
                "rows_before": 1000,
             "rows_after": 950
            }
