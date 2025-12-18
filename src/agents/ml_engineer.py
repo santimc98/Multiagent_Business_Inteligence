@@ -91,6 +91,7 @@ class MLEngineerAgent:
         - Hypothesis: $hypothesis
         - Required Features: $required_columns
         - Execution Contract (json): $execution_contract_json
+        - ROLE RUNBOOK (ML Engineer): $ml_engineer_runbook (adhere to goals/must/must_not/safe_idioms)
         
         *** FEASIBILITY & CAUSALITY CHECK (CRITICAL) ***
         - Before modeling, CHECK CAUSALITY TRAPS:
@@ -187,6 +188,10 @@ class MLEngineerAgent:
         - Save plots to `static/plots/`.
         """
         
+        ml_runbook_json = json.dumps(
+            (execution_contract or {}).get("role_runbooks", {}).get("ml_engineer", {}),
+            indent=2,
+        )
         # Safe Rendering for System Prompt
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
@@ -200,7 +205,8 @@ class MLEngineerAgent:
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
-            execution_contract_json=json.dumps(execution_contract or {}, indent=2)
+            execution_contract_json=json.dumps(execution_contract or {}, indent=2),
+            ml_engineer_runbook=ml_runbook_json,
         )
         
         # USER TEMPLATES (Static)

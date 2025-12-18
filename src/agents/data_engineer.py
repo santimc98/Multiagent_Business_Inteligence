@@ -44,6 +44,10 @@ class DataEngineerAgent:
         import json
 
         contract_json = json.dumps(execution_contract or {}, indent=2)
+        de_runbook_json = json.dumps(
+            (execution_contract or {}).get("role_runbooks", {}).get("data_engineer", {}),
+            indent=2,
+        )
         
         # SYSTEM TEMPLATE (Static, Safe, No F-Strings)
         SYSTEM_TEMPLATE = """
@@ -61,7 +65,8 @@ class DataEngineerAgent:
         - Business Objective: "$business_objective"
         - Required Columns (Strategy): $required_columns
         - Execution Contract (json): $execution_contract_json
-        
+        - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (you MUST adhere to these goals/must/must_not/safe_idioms)
+
         *** DATA AUDIT ***
         $data_audit
         
@@ -204,7 +209,8 @@ class DataEngineerAgent:
             business_objective=business_objective,
             required_columns=str(strategy.get('required_columns', [])),
             data_audit=data_audit,
-            execution_contract_json=contract_json
+            execution_contract_json=contract_json,
+            data_engineer_runbook=de_runbook_json,
         )
 
         from src.utils.retries import call_with_retries

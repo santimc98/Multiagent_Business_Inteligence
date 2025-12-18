@@ -46,6 +46,8 @@ from src.utils.sandbox_deps import (
     get_sandbox_install_packages,
 )
 from src.utils.case_alignment import build_case_alignment_report
+from src.utils.contract_validation import ensure_role_runbooks
+from src.utils.data_engineer_preflight import data_engineer_preflight
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -591,7 +593,14 @@ def run_execution_planner(state: AgentState) -> AgentState:
         )
     except Exception as e:
         print(f"Warning: execution planner failed ({e}); using fallback contract.")
-        contract = {"contract_version": 1, "data_requirements": [], "validations": [], "required_outputs": ["cleaned_data.csv"], "notes_for_engineers": ["Planner failed; use strategy + data_summary."]}
+        contract = {
+            "contract_version": 1,
+            "data_requirements": [],
+            "validations": [],
+            "required_outputs": ["cleaned_data.csv"],
+            "notes_for_engineers": ["Planner failed; use strategy + data_summary."],
+        }
+    contract = ensure_role_runbooks(contract)
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/execution_contract.json", "w", encoding="utf-8") as f:
@@ -645,6 +654,30 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "cleaning_code": code,
             "cleaned_data_preview": "Error: Generation Failed",
             "error_message": code
+        }
+
+    preflight_issues = data_engineer_preflight(code)
+    if preflight_issues:
+        msg = "DATA_ENGINEER_PREFLIGHT: " + "; ".join(preflight_issues)
+        fh = list(state.get("feedback_history", []))
+        fh.append(msg)
+        lgc = {
+            "source": "data_engineer_preflight",
+            "status": "REJECTED",
+            "feedback": msg,
+            "required_fixes": preflight_issues,
+            "failed_gates": preflight_issues,
+        }
+        try:
+            print(msg)
+        except Exception:
+            pass
+        return {
+            "cleaning_code": code,
+            "cleaned_data_preview": "Preflight Failed",
+            "error_message": msg,
+            "feedback_history": fh,
+            "last_gate_context": lgc,
         }
 
     # Manifest serialization guard: ensure json.dump uses default=

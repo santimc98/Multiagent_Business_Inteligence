@@ -7,6 +7,11 @@ import difflib
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from src.utils.contract_validation import (
+    ensure_role_runbooks,
+    DEFAULT_DATA_ENGINEER_RUNBOOK,
+    DEFAULT_ML_ENGINEER_RUNBOOK,
+)
 
 load_dotenv()
 
@@ -200,8 +205,12 @@ class ExecutionPlannerAgent:
                     "Refine roles/ranges using data_summary evidence; adjust in Patch Mode if needed.",
                     "Align cleaning/modeling with this contract; avoid hardcoded business rules.",
                 ],
+                "role_runbooks": {
+                    "data_engineer": DEFAULT_DATA_ENGINEER_RUNBOOK,
+                    "ml_engineer": DEFAULT_ML_ENGINEER_RUNBOOK,
+                },
             }
-            return enforce_percentage_ranges(_apply_expected_kind(_apply_inventory_source(contract)))
+            return ensure_role_runbooks(enforce_percentage_ranges(_apply_expected_kind(_apply_inventory_source(contract))))
 
         if not self.client:
             return _fallback()
@@ -217,13 +226,15 @@ Requirements:
 - Each data_requirement may include source: "input" | "derived" (default input). If role==target and the name is not present in the column inventory from data_summary, mark source="derived" if reasonable.
 - expected_range e.g. [0,1] for probabilities/scores/percentages if implied by the column description.
 - validations: generic checks (e.g., ranking_coherence spearman, out_of_range).
-- Do NOT invent columns; base everything on the provided strategy and data_summary.
-- required_outputs should always include data/cleaned_data.csv. For scoring/weights/ranking strategies, also include data/weights.json, data/case_summary.csv, and at least one plot like static/plots/*.png. For standard classification/regression, include data/metrics.json and one plot.
-- If role == "date", use expected_range=null. Do not mix numeric ranges with null (avoid [0, null]); either null or a full numeric range when appropriate.
-        - COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
-        - required_dependencies is optional; include only if strongly implied by the strategy title or data_summary. Use module names (e.g., "xgboost", "statsmodels", "pyarrow", "openpyxl"). Otherwise use [].
+  - Do NOT invent columns; base everything on the provided strategy and data_summary.
+  - required_outputs should always include data/cleaned_data.csv. For scoring/weights/ranking strategies, also include data/weights.json, data/case_summary.csv, and at least one plot like static/plots/*.png. For standard classification/regression, include data/metrics.json and one plot.
+  - Include role_runbooks for data_engineer and ml_engineer with: goals, must, must_not, safe_idioms, validation_checklist, and (for DE) manifest_requirements; (for ML) methodology and outputs.
+  - If role == "date", use expected_range=null. Do not mix numeric ranges with null (avoid [0, null]); either null or a full numeric range when appropriate.
+          - COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
+          - required_dependencies is optional; include only if strongly implied by the strategy title or data_summary. Use module names (e.g., "xgboost", "statsmodels", "pyarrow", "openpyxl"). Otherwise use [].
         - Include quality_gates (spearman_min, violations_max, inactive_share_max, max_weight_max, hhi_max, near_zero_max) and optimization_preferences (regularization + ranking_loss).
-"""
+        - Include role_runbooks as above to guide engineers with run-time safe idioms (e.g., use mask.mean() for boolean ratios; avoid sum(mask.sum())).
+  """
         ).substitute(column_inventory=column_inventory_json)
         user_prompt_template = Template(
             """
@@ -278,6 +289,7 @@ Return the contract JSON.
                     "regularization": {"l2": 0.05, "concentration_penalty": 0.1},
                     "ranking_loss": "hinge_pairwise",
                 }
-            return enforce_percentage_ranges(_apply_expected_kind(_apply_inventory_source(contract)))
+            contract = enforce_percentage_ranges(_apply_expected_kind(_apply_inventory_source(contract)))
+            return ensure_role_runbooks(contract)
         except Exception:
             return _fallback()
