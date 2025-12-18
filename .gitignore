@@ -43,3 +43,8 @@ data/feature_integrity_report.json
 data/weights.json
 data/metrics.json
 data/case_summary.csv
+
+# local artifacts
+/data/case_alignment_report.json
+/tatic/
+
