@@ -15,6 +15,20 @@ def _safe_load_json(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _load_output_dialect(manifest_path: str = "data/cleaning_manifest.json") -> Dict[str, str]:
+    defaults = {"sep": ",", "decimal": ".", "encoding": "utf-8"}
+    manifest = _safe_load_json(manifest_path) or {}
+    if isinstance(manifest, dict):
+        output_dialect = manifest.get("output_dialect") or {}
+        if isinstance(output_dialect, dict):
+            return {
+                "sep": output_dialect.get("sep", defaults["sep"]),
+                "decimal": output_dialect.get("decimal", defaults["decimal"]),
+                "encoding": output_dialect.get("encoding", defaults["encoding"]),
+            }
+    return defaults
+
+
 def _normalize(name: str) -> str:
     return "".join(ch for ch in str(name).lower() if ch.isalnum())
 
@@ -185,13 +199,20 @@ def build_case_alignment_report(
     ref_series = None
     score_series = None
 
+    dialect = _load_output_dialect()
+
     # Try row_level if data available and weights exist
     if weights and data_paths:
         weight_variants = {key: _weight_key_variants(key) for key in weights.keys()}
         for path in data_paths:
             if os.path.exists(path):
                 try:
-                    df = pd.read_csv(path)
+                    df = pd.read_csv(
+                        path,
+                        sep=dialect["sep"],
+                        decimal=dialect["decimal"],
+                        encoding=dialect["encoding"],
+                    )
                 except Exception:
                     continue
                 target_col = _pick_column(df, target_name, "target")
@@ -220,7 +241,12 @@ def build_case_alignment_report(
     if ref_series is None or score_series is None:
         if os.path.exists(case_summary_path):
             try:
-                cs = pd.read_csv(case_summary_path)
+                cs = pd.read_csv(
+                    case_summary_path,
+                    sep=dialect["sep"],
+                    decimal=dialect["decimal"],
+                    encoding=dialect["encoding"],
+                )
                 ref_col = _pick_column(cs, target_name, "target")
                 score_col = _pick_column(cs, None, "score_mean")
                 if ref_col and score_col:

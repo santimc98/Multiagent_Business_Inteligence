@@ -20,7 +20,7 @@ class DomainExpertAgent:
         # Initialize OpenAI Client for DeepSeek
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url="https://api.deepseek.com"
+            base_url="https://api.deepseek.com/v1"
         )
         self.model_name = "deepseek-reasoner"
 

@@ -597,7 +597,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
             "contract_version": 1,
             "data_requirements": [],
             "validations": [],
-            "required_outputs": ["cleaned_data.csv"],
+            "required_outputs": ["data/cleaned_data.csv"],
             "notes_for_engineers": ["Planner failed; use strategy + data_summary."],
         }
     contract = ensure_role_runbooks(contract)
@@ -1156,11 +1156,12 @@ def run_reviewer(state: AgentState) -> AgentState:
     
     # Context Construction
     strategy = state.get('selected_strategy', {})
+    analysis_type = strategy.get('analysis_type', 'predictive')
     strategy_context = f"Strategy: {strategy.get('title')}\nType: {strategy.get('analysis_type')}\nRules: {strategy.get('reasoning')}"
     business_objective = state.get('business_objective', 'Analyze data.')
     
     try:
-        review = reviewer.review_code(code, strategy_context, business_objective)
+        review = reviewer.review_code(code, analysis_type, business_objective, strategy_context)
         print(f"Verdict: {review['status']}")
         
         # Update Streak
@@ -1679,7 +1680,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
              "feedback_history": state.get("feedback_history", []) # Maintain history
          }
 
-    strategy_context = state['selected_strategy'].get('analysis_type', 'predictive')
+    strategy = state.get('selected_strategy', {}) or {}
+    strategy_context = f"Strategy: {strategy.get('title')}\nType: {strategy.get('analysis_type')}\nRules: {strategy.get('reasoning')}"
     business_objective = state.get('business_objective', '')
     
     eval_result = reviewer.evaluate_results(execution_output, business_objective, strategy_context)
@@ -1744,13 +1746,18 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "required_fixes": case_report.get("failures", []) if case_report.get("status") == "FAIL" else [],
     }
 
-    return {
-        "review_verdict": status, 
+    review_feedback = feedback or state.get("review_feedback", "")
+    result_state = {
+        "review_verdict": status,
+        "review_feedback": review_feedback,
         "execution_feedback": feedback,
         "feedback_history": new_history,
         "output_contract_report": oc_report,
         "last_gate_context": gate_context,
     }
+    if status == "NEEDS_IMPROVEMENT":
+        result_state["iteration_count"] = state.get("iteration_count", 0) + 1
+    return result_state
 
 def check_execution_status(state: AgentState):
     # Check for critical failures first

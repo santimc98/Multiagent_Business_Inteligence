@@ -31,7 +31,7 @@ class BusinessTranslatorAgent:
         # Initialize OpenAI Client for DeepSeek
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url="https://api.deepseek.com"
+            base_url="https://api.deepseek.com/v1"
         )
         self.model_name = "deepseek-reasoner"
 
@@ -48,12 +48,16 @@ class BusinessTranslatorAgent:
         analysis_type = str(strategy.get('analysis_type', 'N/A'))
         
         # Review content
-        review = state.get('review_feedback', {})
-        if isinstance(review, dict):
-            compliance = review.get('status', 'PENDING')
+        review_verdict = state.get("review_verdict")
+        if review_verdict:
+            compliance = review_verdict
         else:
-            # If it's a string (e.g. just the feedback text from older legacy flows or simple strings)
-            compliance = "REVIEWED" if review else "PENDING"
+            review = state.get('review_feedback', {})
+            if isinstance(review, dict):
+                compliance = review.get('status', 'PENDING')
+            else:
+                # If it's a string (e.g. just the feedback text from older legacy flows or simple strings)
+                compliance = "REVIEWED" if review else "PENDING"
         
         # Construct JSON Context for Visuals safely using json library
         visuals_context_data = {

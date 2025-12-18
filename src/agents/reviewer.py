@@ -19,11 +19,17 @@ class ReviewerAgent:
         # Initialize OpenAI Client for DeepSeek
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url="https://api.deepseek.com"
+            base_url="https://api.deepseek.com/v1"
         )
         self.model_name = "deepseek-reasoner"
 
-    def review_code(self, code: str, analysis_type: str = "predictive", business_objective: str = "") -> Dict[str, Any]:
+    def review_code(
+        self,
+        code: str,
+        analysis_type: str = "predictive",
+        business_objective: str = "",
+        strategy_context: str = "",
+    ) -> Dict[str, Any]:
         
         output_format_instructions = """
         Return a raw JSON object:
@@ -43,6 +49,7 @@ class ReviewerAgent:
         CONTEXT: 
         - Analysis Type: "$analysis_type"
         - Business Objective: "$business_objective"
+        - Strategy Context: "$strategy_context"
         
         ### CRITERIA FOR APPROVAL (QUALITY FIRST PRINCIPLES)
 
@@ -83,7 +90,8 @@ class ReviewerAgent:
             SYSTEM_PROMPT_TEMPLATE,
             analysis_type=analysis_type.upper(),
             business_objective=business_objective,
-            output_format_instructions=output_format_instructions
+            strategy_context=strategy_context,
+            output_format_instructions=output_format_instructions,
         )
         
         USER_PROMPT_TEMPLATE = "REVIEW THIS CODE:\n\n$code"
