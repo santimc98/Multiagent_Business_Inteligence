@@ -148,6 +148,65 @@ class ExecutionPlannerAgent:
             risks: List[str] = []
             summary_text = data_summary or ""
             summary_lower = summary_text.lower()
+            numeric_name_tokens = {
+                "pct",
+                "percent",
+                "ratio",
+                "rate",
+                "prob",
+                "probability",
+                "score",
+                "norm",
+                "amount",
+                "value",
+                "price",
+                "cost",
+                "revenue",
+                "income",
+                "importe",
+                "monto",
+                "saldo",
+                "age",
+                "days",
+                "term",
+            }
+
+            def _looks_numeric_name(col_name: str) -> bool:
+                if "%" in col_name:
+                    return True
+                norm_name = _norm(col_name)
+                return any(tok in norm_name for tok in numeric_name_tokens)
+
+            def _parse_column_dtypes(text: str) -> List[tuple[str, str]]:
+                cols: List[tuple[str, str]] = []
+                in_section = False
+                for raw_line in text.splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    lower = line.lower()
+                    if lower.startswith("key columns"):
+                        in_section = True
+                        continue
+                    if in_section and lower.startswith("potential "):
+                        break
+                    if in_section and lower.startswith("example rows"):
+                        break
+                    if not in_section:
+                        continue
+                    if not line.startswith("-"):
+                        continue
+                    match = re.match(r"-\s*(.+?):\s*([^,]+),", line)
+                    if match:
+                        col = match.group(1).strip()
+                        dtype = match.group(2).strip()
+                        cols.append((col, dtype))
+                return cols
+
+            def _has_numeric_conversion_risk(risk_items: List[str]) -> bool:
+                marker = "Ensure numeric conversion before comparisons/normalization"
+                return any(marker in risk for risk in risk_items)
+
             # Surface explicit alert/critical lines from steward summary
             for raw_line in summary_text.splitlines():
                 line = raw_line.strip()
@@ -165,6 +224,16 @@ class ExecutionPlannerAgent:
             # Variance/constant hints
             if "no variation" in summary_lower or "no variance" in summary_lower or "constant" in summary_lower:
                 risks.append("Potential low-variance/constant columns; guard for target/feature variance.")
+
+            # Object dtypes on numeric-looking columns (type conversion risks)
+            for col, dtype in _parse_column_dtypes(summary_text):
+                dtype_lower = dtype.lower()
+                if "object" in dtype_lower or "string" in dtype_lower:
+                    if _looks_numeric_name(col):
+                        risks.append(
+                            f"Column '{col}' appears numeric/percentage but dtype is '{dtype}'. "
+                            "Ensure numeric conversion before comparisons/normalization to avoid type errors."
+                        )
 
             inv_norm = {_norm(c) for c in (column_inventory or []) if c is not None}
             missing_inputs: List[str] = []
@@ -219,6 +288,17 @@ class ExecutionPlannerAgent:
                     if note not in notes:
                         notes.append(note)
                 contract["notes_for_engineers"] = notes
+                if _has_numeric_conversion_risk(risks):
+                    planner_self_check = contract.get("planner_self_check")
+                    if not isinstance(planner_self_check, list):
+                        planner_self_check = []
+                    msg = (
+                        "Flagged numeric-looking object columns; warn DE to convert to numeric before "
+                        "comparisons/normalization."
+                    )
+                    if msg not in planner_self_check:
+                        planner_self_check.append(msg)
+                    contract["planner_self_check"] = planner_self_check
             return contract
 
         def _ensure_spec_extraction(contract: Dict[str, Any]) -> Dict[str, Any]:
