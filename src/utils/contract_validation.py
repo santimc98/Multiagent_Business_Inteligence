@@ -43,9 +43,11 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Train/evaluate models aligned to the strategy and execution contract.",
         "Produce interpretable outputs and required artifacts without leakage.",
     ],
+    "spec_extraction": {},
     "must": [
         "Use dialect/output_dialect from manifest when loading data.",
         "Honor allowlist dependencies; do not import banned packages (pulp/cvxpy/fuzzywuzzy/torch/tensorflow/etc.).",
+        "If contract.spec_extraction is present, treat it as source-of-truth for formulas, constraints, cases, and deliverables.",
         "Include variance guard: if y.nunique() <= 1 raise ValueError.",
         "Print Mapping Summary and build X only from contract feature columns.",
         "Ensure output dirs exist (data/, static/plots/) before saving artifacts.",
@@ -101,6 +103,9 @@ def ensure_role_runbooks(contract: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(rb, dict):
             return out
         out["version"] = str(rb.get("version", default.get("version", "1")))
+        if "spec_extraction" in default:
+            spec = rb.get("spec_extraction", default.get("spec_extraction", {}))
+            out["spec_extraction"] = spec if isinstance(spec, dict) else copy.deepcopy(default.get("spec_extraction", {}))
         out["goals"] = _ensure_list_of_str(rb.get("goals"), default.get("goals", []))
         out["must"] = _ensure_list_of_str(rb.get("must"), default.get("must", []))
         out["must_not"] = _ensure_list_of_str(rb.get("must_not"), default.get("must_not", []))
@@ -118,3 +123,42 @@ def ensure_role_runbooks(contract: Dict[str, Any]) -> Dict[str, Any]:
     runbooks["ml_engineer"] = _normalize(runbooks.get("ml_engineer", {}), DEFAULT_ML_ENGINEER_RUNBOOK)
     contract["role_runbooks"] = runbooks
     return contract
+
+
+def validate_spec_extraction_structure(contract: Dict[str, Any]) -> List[str]:
+    """
+    Deterministic, structure-only validation for spec_extraction.
+    Returns a list of issues; empty list means structure is acceptable.
+    """
+    issues: List[str] = []
+    if not isinstance(contract, dict):
+        return ["contract_not_dict"]
+    spec = contract.get("spec_extraction")
+    if not isinstance(spec, dict):
+        return ["spec_extraction_missing_or_not_dict"]
+
+    list_fields = ["derived_columns", "case_taxonomy", "constraints", "deliverables"]
+    for field in list_fields:
+        val = spec.get(field)
+        if val is None:
+            continue
+        if not isinstance(val, list):
+            issues.append(f"spec_extraction.{field}_not_list")
+            continue
+        if field in {"derived_columns", "case_taxonomy"}:
+            for idx, item in enumerate(val):
+                if not isinstance(item, dict):
+                    issues.append(f"spec_extraction.{field}[{idx}]_not_object")
+        else:
+            for idx, item in enumerate(val):
+                if not isinstance(item, (str, dict)):
+                    issues.append(f"spec_extraction.{field}[{idx}]_invalid_type")
+
+    for field in ["scoring_formula", "target_type", "leakage_policy"]:
+        val = spec.get(field)
+        if val is None:
+            continue
+        if not isinstance(val, str):
+            issues.append(f"spec_extraction.{field}_not_string")
+
+    return issues

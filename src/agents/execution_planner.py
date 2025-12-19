@@ -11,6 +11,7 @@ from src.utils.contract_validation import (
     ensure_role_runbooks,
     DEFAULT_DATA_ENGINEER_RUNBOOK,
     DEFAULT_ML_ENGINEER_RUNBOOK,
+    validate_spec_extraction_structure,
 )
 
 load_dotenv()
@@ -220,6 +221,59 @@ class ExecutionPlannerAgent:
                 contract["notes_for_engineers"] = notes
             return contract
 
+        def _ensure_spec_extraction(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return {}
+            spec = contract.get("spec_extraction")
+            if not isinstance(spec, dict):
+                spec = {}
+            spec["derived_columns"] = spec.get("derived_columns") if isinstance(spec.get("derived_columns"), list) else []
+            spec["case_taxonomy"] = spec.get("case_taxonomy") if isinstance(spec.get("case_taxonomy"), list) else []
+            spec["constraints"] = spec.get("constraints") if isinstance(spec.get("constraints"), list) else []
+            spec["deliverables"] = spec.get("deliverables") if isinstance(spec.get("deliverables"), list) else []
+            spec["scoring_formula"] = spec.get("scoring_formula") if isinstance(spec.get("scoring_formula"), str) else None
+            spec["target_type"] = spec.get("target_type") if isinstance(spec.get("target_type"), str) else None
+            spec["leakage_policy"] = spec.get("leakage_policy") if isinstance(spec.get("leakage_policy"), str) else None
+            contract["spec_extraction"] = spec
+            planner_self_check = contract.get("planner_self_check")
+            if not isinstance(planner_self_check, list):
+                contract["planner_self_check"] = []
+            return contract
+
+        def _attach_spec_extraction_issues(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            issues = validate_spec_extraction_structure(contract)
+            if not issues:
+                return contract
+            contract["spec_extraction_issues"] = issues
+            notes = contract.get("notes_for_engineers")
+            if not isinstance(notes, list):
+                notes = []
+            for issue in issues:
+                note = f"SPEC_EXTRACTION_ISSUE: {issue}"
+                if note not in notes:
+                    notes.append(note)
+            contract["notes_for_engineers"] = notes
+            return contract
+
+        def _attach_spec_extraction_to_runbook(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            spec = contract.get("spec_extraction")
+            if not isinstance(spec, dict):
+                return contract
+            runbooks = contract.get("role_runbooks")
+            if not isinstance(runbooks, dict):
+                return contract
+            ml_runbook = runbooks.get("ml_engineer")
+            if not isinstance(ml_runbook, dict):
+                return contract
+            ml_runbook["spec_extraction"] = spec
+            runbooks["ml_engineer"] = ml_runbook
+            contract["role_runbooks"] = runbooks
+            return contract
+
         def _fallback() -> Dict[str, Any]:
             required_cols = strategy.get("required_columns", []) or []
             data_requirements: List[Dict[str, Any]] = []
@@ -281,17 +335,31 @@ class ExecutionPlannerAgent:
                 "notes_for_engineers": [
                     "Refine roles/ranges using data_summary evidence; adjust in Patch Mode if needed.",
                     "Align cleaning/modeling with this contract; avoid hardcoded business rules.",
+                    "Planner fallback used; spec_extraction may be empty.",
                 ],
                 "role_runbooks": {
                     "data_engineer": DEFAULT_DATA_ENGINEER_RUNBOOK,
                     "ml_engineer": DEFAULT_ML_ENGINEER_RUNBOOK,
                 },
+                "spec_extraction": {
+                    "derived_columns": [],
+                    "case_taxonomy": [],
+                    "constraints": [],
+                    "deliverables": [],
+                    "scoring_formula": None,
+                    "target_type": None,
+                    "leakage_policy": None,
+                },
+                "planner_self_check": [],
             }
             contract = _apply_inventory_source(contract)
             contract = _apply_expected_kind(contract)
             contract = enforce_percentage_ranges(contract)
             contract = ensure_role_runbooks(contract)
-            return _attach_data_risks(contract)
+            contract = _attach_data_risks(contract)
+            contract = _attach_spec_extraction_issues(contract)
+            contract = _ensure_spec_extraction(contract)
+            return _attach_spec_extraction_to_runbook(contract)
 
         if not self.client:
             return _fallback()
@@ -302,7 +370,7 @@ class ExecutionPlannerAgent:
 You are a senior execution planner. Produce a JSON contract to guide data cleaning and modeling.
 Requirements:
 - Output JSON ONLY (no markdown/code fences).
-- Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations, notes_for_engineers, required_dependencies, data_risks.
+- Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations, notes_for_engineers, required_dependencies, data_risks, spec_extraction, planner_self_check.
         - data_requirements: list of {name, role, expected_range, allowed_null_frac, source, expected_kind}. expected_kind in {numeric, datetime, categorical, unknown}.
 - Each data_requirement may include source: "input" | "derived" (default input). If role==target and the name is not present in the column inventory from data_summary, mark source="derived" if reasonable.
 - expected_range e.g. [0,1] for probabilities/scores/percentages if implied by the column description.
@@ -317,6 +385,20 @@ Requirements:
           - required_dependencies is optional; include only if strongly implied by the strategy title or data_summary. Use module names (e.g., "xgboost", "statsmodels", "pyarrow", "openpyxl"). Otherwise use [].
         - Include quality_gates (spearman_min, violations_max, inactive_share_max, max_weight_max, hhi_max, near_zero_max) and optimization_preferences (regularization + ranking_loss).
         - Include role_runbooks as above to guide engineers with run-time safe idioms (e.g., use mask.mean() for boolean ratios; avoid sum(mask.sum())).
+  - SPEC EXTRACTION (from business_objective + strategy): include a spec_extraction object with:
+    - scoring_formula: a string formula if explicitly stated, else null.
+    - derived_columns: list of {name, formula, depends_on, constraints} for any explicitly described derived fields.
+    - case_taxonomy: list of {case_id_or_name, conditions, ref_score, precedence} if the objective defines cases or tables.
+    - constraints: list of explicit constraints (e.g., weight non-negativity, sum-to-one) if stated.
+    - deliverables: list of explicitly requested outputs (tables, checks, comparisons) if stated.
+    - target_type: "ranking" or "ordinal" if the objective says ordinal/ranking, else null.
+    - leakage_policy: "allow_deterministic_for_design" if the target/case is defined using input variables; else null.
+    - If a spec element is not stated, leave it empty/null. Do NOT invent.
+  - SELF CHECK: include planner_self_check list with short statements verifying:
+    - If scoring_formula is not null, it appears in spec_extraction.
+    - If case_taxonomy is non-empty, deliverables include a case-level table.
+    - If constraints are stated, they appear in constraints.
+    - If target_type is ordinal/ranking, include a ranking validation in validations.
   """
         ).substitute(column_inventory=column_inventory_json)
         user_prompt_template = Template(
@@ -376,6 +458,9 @@ Return the contract JSON.
             contract = _apply_expected_kind(contract)
             contract = enforce_percentage_ranges(contract)
             contract = ensure_role_runbooks(contract)
-            return _attach_data_risks(contract)
+            contract = _attach_data_risks(contract)
+            contract = _attach_spec_extraction_issues(contract)
+            contract = _ensure_spec_extraction(contract)
+            return _attach_spec_extraction_to_runbook(contract)
         except Exception:
             return _fallback()

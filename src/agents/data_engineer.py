@@ -71,6 +71,12 @@ class DataEngineerAgent:
         $data_audit
         
         *** ENGINEERING PRINCIPLES (SENIOR STANDARD) ***
+
+        *** EXECUTION STYLE (FREEDOM WITH GUARDRAILS) ***
+        - You are free to design the code structure and logic; do NOT follow a rigid template.
+        - Do NOT copy any prewritten scripts; reason from the data audit + execution contract.
+        - Prioritize correctness, clarity, and meeting contract requirements over boilerplate.
+        - Keep the script minimal: only include helpers you actually use.
         
         1. UNIVERSAL SUFFICIENCY:
            - PRESERVE EVERYTHING by default. Filter logic:
@@ -86,9 +92,7 @@ class DataEngineerAgent:
            - COLUMN NAMING:
              * Normalize to `snake_case`.
              * DEDUPLICATION (CRITICAL):
-               * You MUST implement deterministic deduplication using a counter.
-               * `seen = {}; new_cols = [] ...`
-               * If `date` appears twice: `date`, `date__2`.
+               * Implement deterministic deduplication using a counter and record the mapping.
              * Empty names -> `unknown_col_<n>` (Use a counter, do NOT use braces in string).
         
         3. SEMANTIC TYPE INTELLIGENCE:
@@ -173,16 +177,9 @@ class DataEngineerAgent:
         - Validation must never raise exceptions; always catch and log SKIPPED_VALIDATION with the reason.
         - Validation results rows MUST have a stable schema for ALL rows (even missing columns). Never index dict keys that may be missing; use .get() with defaults.
         - When checking if a required column exists, match via normalization: lowercase + remove all non-alphanumeric (so ImporteNorm, Importe_Norm, importe norm match).
-        - Mandatory helper to include in the script:
-          def norm(s): return re.sub(r'[^0-9a-zA-Z]+','', str(s).lower())
-          MISSING rows to append:
-            {'column': req, 'actual_column': None, 'null_fraction': None, 'null_check': 'MISSING', 'range_check': 'SKIPPED', 'range_message': message, 'dtype': ''}
-          Printing per row:
-            nf = result.get('null_fraction')
-            null_pct = 'NA' if nf is None else f"{nf:.2%}"
-            null_check = result.get('null_check','SKIPPED')
-            range_check = result.get('range_check','SKIPPED')
-            message = result.get('range_message') or result.get('message','')
+        - Normalize column names for matching using a case/spacing-insensitive method.
+        - When a required column is missing, emit a validation row with "MISSING" status and null-safe fields.
+        - When printing validation rows, use .get() with defaults to avoid KeyError and format nulls safely.
              
         *** DERIVED COLUMNS (MANDATORY) ***
         - When deriving contract columns (e.g., Case, RefScore, Score_nuevo), NEVER hardcode raw column names.
@@ -195,16 +192,9 @@ class DataEngineerAgent:
         - When reading dtype for validation, guard duplicate column names:
           series = df[actual_col]; if isinstance(series, pd.DataFrame), use series = series.iloc[:, 0] and log a warning.
 
-        *** SCRIPT STRUCTURE ***
-        1. Imports (pandas, numpy, json, os, re).
-        2. wrapper `clean_data()` function.
-        3. Robust Load (Try/Except).
-        4. Canonicalize Names (Deduplicate manually).
-        5. Type Inference & Cleaning.
-        6. Drop Garbage (Empty/Constant).
-        7. Save CSV (`data/cleaned_data.csv`) & Manifest (`data/cleaning_manifest.json`).
-        8. Print "CLEANING_SUCCESS".
-        9. Handle 'margin' columns specially if requested (synthetic placeholders).
+        *** OUTPUT REQUIREMENTS ***
+        - Save `data/cleaned_data.csv` and `data/cleaning_manifest.json`.
+        - Print "CLEANING_VALIDATION" and "CLEANING_SUCCESS".
         """
         
         # USER TEMPLATE (Static)
