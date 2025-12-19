@@ -1262,16 +1262,16 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 
             except Exception as e:
                 print(f"Column Mapping Failed: {e}")
-                    return {
-                         "cleaning_code": code,
-                         "cleaned_data_preview": f"Error: Mapping Failed {e}",
-                         "error_message": f"Host-side Column Mapping Failed: {str(e)}",
-                         "csv_sep": csv_sep,
-                         "csv_decimal": csv_decimal,
-                         "csv_encoding": csv_encoding,
-                         "leakage_audit_summary": leakage_audit_summary,
-                         "budget_counters": counters,
-                    }
+                return {
+                    "cleaning_code": code,
+                    "cleaned_data_preview": f"Error: Mapping Failed {e}",
+                    "error_message": f"Host-side Column Mapping Failed: {str(e)}",
+                    "csv_sep": csv_sep,
+                    "csv_decimal": csv_decimal,
+                    "csv_encoding": csv_encoding,
+                    "leakage_audit_summary": leakage_audit_summary,
+                    "budget_counters": counters,
+                }
 
             if run_id:
                 log_run_event(
