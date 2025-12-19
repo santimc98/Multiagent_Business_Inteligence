@@ -144,6 +144,10 @@ class ExecutionPlannerAgent:
             contract["data_requirements"] = updated_reqs
             return contract
 
+        def _has_numeric_conversion_risk(risk_items: List[str]) -> bool:
+            marker = "Ensure numeric conversion before comparisons/normalization"
+            return any(marker in risk for risk in risk_items)
+
         def _extract_data_risks(contract: Dict[str, Any]) -> List[str]:
             risks: List[str] = []
             summary_text = data_summary or ""
@@ -202,10 +206,6 @@ class ExecutionPlannerAgent:
                         dtype = match.group(2).strip()
                         cols.append((col, dtype))
                 return cols
-
-            def _has_numeric_conversion_risk(risk_items: List[str]) -> bool:
-                marker = "Ensure numeric conversion before comparisons/normalization"
-                return any(marker in risk for risk in risk_items)
 
             # Surface explicit alert/critical lines from steward summary
             for raw_line in summary_text.splitlines():
