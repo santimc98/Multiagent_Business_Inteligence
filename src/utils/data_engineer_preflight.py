@@ -34,4 +34,11 @@ def data_engineer_preflight(code: str) -> List[str]:
                     ):
                         issues.append("Avoid sum(x.sum()); use mask.mean() or mask.sum()/len(mask) for ratios.")
                         break
+    # Guard against slicing None for actual_column in validation summaries
+    if "actual_column" in code:
+        import re
+        if re.search(r"actual_column[^\\n]{0,120}\\[:", code):
+            issues.append(
+                "Guard actual_column when printing: use actual = str(res.get('actual_column') or 'MISSING') before slicing."
+            )
     return issues

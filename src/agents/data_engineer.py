@@ -190,6 +190,8 @@ class DataEngineerAgent:
         - If a required source column is missing, raise a clear ValueError instead of defaulting all rows.
         - Do NOT validate required column presence before canonicalization; check after normalization mapping.
         - Only enforce existence for source="input" columns. For source="derived", derive after mapping.
+        - When printing validation summaries, guard None values:
+          actual = str(result.get('actual_column') or 'MISSING') before slicing/formatting.
 
         *** SCRIPT STRUCTURE ***
         1. Imports (pandas, numpy, json, os, re).

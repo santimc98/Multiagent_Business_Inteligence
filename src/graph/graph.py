@@ -794,6 +794,37 @@ def run_data_engineer(state: AgentState) -> AgentState:
             if execution.error:
                 error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
                 print(f"Cleaning Failed in Sandbox: {error_details}")
+                contract = state.get("execution_contract", {}) or {}
+                derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
+                if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
+                    new_state = dict(state)
+                    new_state["de_missing_derived_retry_done"] = True
+                    override = state.get("data_summary", "")
+                    try:
+                        override += (
+                            "\n\nDERIVED_COLUMN_MISSING_GUARD: "
+                            f"{derived_cols} are derived. Do not treat them as required input columns. "
+                            "Only enforce source='input' columns after canonicalization; derive the rest."
+                        )
+                    except Exception:
+                        pass
+                    new_state["data_engineer_audit_override"] = override
+                    print("Derived column missing guard: retrying Data Engineer with derived-column guidance.")
+                    return run_data_engineer(new_state)
+                if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
+                    new_state = dict(state)
+                    new_state["de_actual_column_guard_retry_done"] = True
+                    override = state.get("data_summary", "")
+                    try:
+                        override += (
+                            "\n\nVALIDATION_PRINT_GUARD: Use actual = str(result.get('actual_column') or 'MISSING') "
+                            "before slicing; do not subscript None."
+                        )
+                    except Exception:
+                        pass
+                    new_state["data_engineer_audit_override"] = override
+                    print("Validation print guard: retrying Data Engineer with None-safe formatting.")
+                    return run_data_engineer(new_state)
                 return {
                     "cleaning_code": code,
                     "cleaned_data_preview": "Error: Cleaning Failed",
