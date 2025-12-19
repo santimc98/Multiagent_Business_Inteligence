@@ -30,6 +30,7 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Use canonical_name (if provided) for consistent references across mapping, validation, and derivations.",
         "Verify required columns after normalization/mapping; do not treat pre-mapped absence as missing.",
         "If a numeric-looking column is typed as object/string, treat conversion as a risk before comparisons/normalization.",
+        "If data_risks mention canonicalization collisions, ensure column selection remains unambiguous.",
         "If normalization causes name collisions, choose deterministically and log a warning for traceability.",
         "If conversion yields too many NaN, revert and log instead of dropping required columns.",
         "If derived columns are required, confirm source inputs exist and document any NA handling assumptions.",

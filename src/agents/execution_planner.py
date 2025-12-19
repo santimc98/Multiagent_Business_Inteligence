@@ -60,6 +60,10 @@ class ExecutionPlannerAgent:
         def _norm(name: str) -> str:
             return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
 
+        def _canonicalize_name(name: str) -> str:
+            cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
+            return re.sub(r"_+", "_", cleaned)
+
         def _parse_summary_kinds(summary_text: str) -> Dict[str, str]:
             kind_map: Dict[str, str] = {}
             if not summary_text:
@@ -144,10 +148,6 @@ class ExecutionPlannerAgent:
             contract["data_requirements"] = updated_reqs
             return contract
 
-        def _canonicalize_name(name: str) -> str:
-            cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
-            return re.sub(r"_+", "_", cleaned)
-
         def _attach_canonical_names(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return {}
@@ -176,8 +176,22 @@ class ExecutionPlannerAgent:
                 contract["notes_for_engineers"] = notes
             return contract
 
+        def _detect_canonical_collisions() -> List[tuple[str, List[str]]]:
+            names = [c for c in (column_inventory or []) if c is not None]
+            buckets: Dict[str, List[str]] = {}
+            for name in names:
+                canon = _canonicalize_name(name)
+                if not canon:
+                    continue
+                buckets.setdefault(canon, []).append(str(name))
+            return [(canon, vals) for canon, vals in buckets.items() if len(vals) > 1]
+
         def _has_numeric_conversion_risk(risk_items: List[str]) -> bool:
             marker = "Ensure numeric conversion before comparisons/normalization"
+            return any(marker in risk for risk in risk_items)
+
+        def _has_canonical_collision_risk(risk_items: List[str]) -> bool:
+            marker = "Potential normalization collisions in column names"
             return any(marker in risk for risk in risk_items)
 
         def _extract_data_risks(contract: Dict[str, Any]) -> List[str]:
@@ -267,6 +281,18 @@ class ExecutionPlannerAgent:
                             "Ensure numeric conversion before comparisons/normalization to avoid type errors."
                         )
 
+            collisions = _detect_canonical_collisions()
+            if collisions:
+                examples = []
+                for canon, originals in collisions[:3]:
+                    sample = ", ".join(originals[:3])
+                    examples.append(f"{canon}: {sample}")
+                suffix = "; ".join(examples)
+                risks.append(
+                    "Potential normalization collisions in column names; ensure column selection is unambiguous "
+                    f"after canonicalization (examples: {suffix})."
+                )
+
             inv_norm = {_norm(c) for c in (column_inventory or []) if c is not None}
             missing_inputs: List[str] = []
             derived_needed: List[str] = []
@@ -327,6 +353,17 @@ class ExecutionPlannerAgent:
                     msg = (
                         "Flagged numeric-looking object columns; warn DE to convert to numeric before "
                         "comparisons/normalization."
+                    )
+                    if msg not in planner_self_check:
+                        planner_self_check.append(msg)
+                    contract["planner_self_check"] = planner_self_check
+                if _has_canonical_collision_risk(risks):
+                    planner_self_check = contract.get("planner_self_check")
+                    if not isinstance(planner_self_check, list):
+                        planner_self_check = []
+                    msg = (
+                        "Detected potential column-name collisions after canonicalization; ensure unambiguous "
+                        "selection before validation."
                     )
                     if msg not in planner_self_check:
                         planner_self_check.append(msg)
