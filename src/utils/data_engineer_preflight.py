@@ -36,9 +36,10 @@ def data_engineer_preflight(code: str) -> List[str]:
                         break
     # Guard against slicing None for actual_column in validation summaries
     if "actual_column" in code:
-        import re
-        if re.search(r"actual_column[^\\n]{0,120}\\[:", code):
-            issues.append(
-                "Guard actual_column when printing: use actual = str(res.get('actual_column') or 'MISSING') before slicing."
-            )
+        for line in code.splitlines():
+            if "actual_column" in line and "[:" in line:
+                issues.append(
+                    "Guard actual_column when printing: use actual = str(res.get('actual_column') or 'MISSING') before slicing."
+                )
+                break
     return issues
