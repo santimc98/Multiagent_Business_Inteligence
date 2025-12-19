@@ -1473,28 +1473,28 @@ def run_reviewer(state: AgentState) -> AgentState:
             # Check Fail-Safe Condition (Streak Based)
             # 1. Critical API Error
             if "Reviewer unavailable" in review['feedback']:
-                 msg = f"CRITICAL SYSTEM FAILURE: {review['feedback']}"
-                  return {
-                      "review_verdict": "REJECTED",
-                      "review_feedback": review['feedback'],
-                      "feedback_history": new_history,
-                      "reviewer_iteration": current_iter + 1,
-                      "review_abort_reason": msg,
-                      "budget_counters": counters,
-                  }
+                msg = f"CRITICAL SYSTEM FAILURE: {review['feedback']}"
+                return {
+                    "review_verdict": "REJECTED",
+                    "review_feedback": review['feedback'],
+                    "feedback_history": new_history,
+                    "reviewer_iteration": current_iter + 1,
+                    "review_abort_reason": msg,
+                    "budget_counters": counters,
+                }
 
             # 2. Reject Streak Exceeded (Avoid infinite loop on bad code)
             if streak >= 3:
-                 msg = f"CRITICAL: Code review failed {streak} times in a row. Aborting to avoid loops."
-                 print(msg)
-                  return {
-                      "review_verdict": "REJECTED",
-                      "review_feedback": review['feedback'],
-                      "feedback_history": new_history,
-                      "reviewer_iteration": current_iter + 1,
-                      "review_abort_reason": msg,
-                      "budget_counters": counters,
-                  }
+                msg = f"CRITICAL: Code review failed {streak} times in a row. Aborting to avoid loops."
+                print(msg)
+                return {
+                    "review_verdict": "REJECTED",
+                    "review_feedback": review['feedback'],
+                    "feedback_history": new_history,
+                    "reviewer_iteration": current_iter + 1,
+                    "review_abort_reason": msg,
+                    "budget_counters": counters,
+                }
 
         if run_id:
             log_run_event(run_id, "reviewer_complete", {"status": review.get("status")})
@@ -1586,16 +1586,16 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             
             # QA Fail Safe
             if streak >= 5:
-                 msg = f"CRITICAL: QA Rejected code {streak} times consecutively. Quality Standard not met."
-                  return {
-                      "review_verdict": "REJECTED",
-                      "review_feedback": feedback,
-                      "feedback_history": current_history,
-                      "error_message": msg,
-                      "last_gate_context": gate_context,
-                      "qa_reject_streak": streak,
-                      "budget_counters": counters,
-                  }
+                msg = f"CRITICAL: QA Rejected code {streak} times consecutively. Quality Standard not met."
+                return {
+                    "review_verdict": "REJECTED",
+                    "review_feedback": feedback,
+                    "feedback_history": current_history,
+                    "error_message": msg,
+                    "last_gate_context": gate_context,
+                    "qa_reject_streak": streak,
+                    "budget_counters": counters,
+                }
             
             return {
                 "review_verdict": "REJECTED", # Mark as rejected to trigger retry
