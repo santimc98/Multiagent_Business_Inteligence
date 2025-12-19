@@ -973,6 +973,42 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             derived_rename[match] = req_name
                     if derived_rename:
                         df_mapped = df_mapped.rename(columns=derived_rename)
+
+                # Guard: derived columns should not be constant if present
+                derived_issues = []
+                if contract_derived_cols:
+                    col_by_norm = {_norm_name(c): c for c in df_mapped.columns}
+                    for derived_name in contract_derived_cols:
+                        norm_name = _norm_name(derived_name)
+                        actual_name = col_by_norm.get(norm_name)
+                        if not actual_name:
+                            continue
+                        nunique = df_mapped[actual_name].nunique(dropna=False)
+                        if nunique <= 1:
+                            derived_issues.append(f"{derived_name} has no variance (nunique={nunique})")
+                if derived_issues:
+                    if not state.get("de_derived_guard_retry_done"):
+                        new_state = dict(state)
+                        new_state["de_derived_guard_retry_done"] = True
+                        override = state.get("data_summary", "")
+                        try:
+                            override += (
+                                "\n\nDERIVED_COLUMN_GUARD: "
+                                + "; ".join(derived_issues)
+                                + ". Ensure derived columns use normalized column mapping "
+                                "to access source columns and do not default all rows."
+                            )
+                        except Exception:
+                            pass
+                        new_state["data_engineer_audit_override"] = override
+                        print("Derived column guard: retrying Data Engineer with mapping guidance.")
+                        return run_data_engineer(new_state)
+                    else:
+                        return {
+                            "cleaning_code": code,
+                            "cleaned_data_preview": "Error: Derived Columns Constant",
+                            "error_message": "CRITICAL: Derived columns present but constant; verify mapping and derivation.",
+                        }
                 
                 # Create Synthetic Columns if needed
                 for synth in mapping_result['synthetic']:

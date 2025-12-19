@@ -13,6 +13,8 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Respect expected_kind: numeric -> pd.to_numeric; datetime -> pd.to_datetime; categorical -> keep as string.",
         "Do not import sys.",
         "Do not drop required/derived columns solely for being constant; record as constant in manifest.",
+        "When deriving contract columns, use normalized column mappings instead of hardcoding raw names.",
+        "If a required source column for derivations is missing, raise a clear ValueError (do not default all rows).",
     ],
     "must_not": [
         "Do not blindly strip '.'; infer thousands/decimal from patterns.",

@@ -184,6 +184,11 @@ class DataEngineerAgent:
             range_check = result.get('range_check','SKIPPED')
             message = result.get('range_message') or result.get('message','')
              
+        *** DERIVED COLUMNS (MANDATORY) ***
+        - When deriving contract columns (e.g., Case, RefScore, Score_nuevo), NEVER hardcode raw column names.
+        - Build a map of normalized names -> actual column names after canonicalization and use it to access source columns.
+        - If a required source column is missing, raise a clear ValueError instead of defaulting all rows.
+
         *** SCRIPT STRUCTURE ***
         1. Imports (pandas, numpy, json, os, re).
         2. wrapper `clean_data()` function.
