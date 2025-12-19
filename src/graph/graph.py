@@ -75,7 +75,16 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
     if contract and isinstance(contract, dict):
         contract_reqs = contract.get("data_requirements", []) or []
         if contract_reqs:
-            return [r.get("name") for r in contract_reqs if isinstance(r, dict) and r.get("source", "input") == "input" and r.get("name")]
+            resolved = []
+            for req in contract_reqs:
+                if not isinstance(req, dict):
+                    continue
+                if req.get("source", "input") != "input":
+                    continue
+                name = req.get("canonical_name") or req.get("name")
+                if name:
+                    resolved.append(name)
+            return resolved
     return strategy.get("required_columns", []) if strategy else []
 
 def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
@@ -86,7 +95,7 @@ def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None
     for req in reqs:
         if not isinstance(req, dict):
             continue
-        name = req.get("name")
+        name = req.get("canonical_name") or req.get("name")
         if not name:
             continue
         source = req.get("source", "input") or "input"

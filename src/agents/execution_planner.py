@@ -144,6 +144,38 @@ class ExecutionPlannerAgent:
             contract["data_requirements"] = updated_reqs
             return contract
 
+        def _canonicalize_name(name: str) -> str:
+            cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
+            return re.sub(r"_+", "_", cleaned)
+
+        def _attach_canonical_names(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return {}
+            reqs = contract.get("data_requirements", []) or []
+            canonical_cols: List[str] = []
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                name = req.get("name")
+                if not name:
+                    continue
+                canonical = req.get("canonical_name")
+                if not canonical:
+                    canonical = _canonicalize_name(name)
+                    req["canonical_name"] = canonical
+                canonical_cols.append(canonical)
+            contract["data_requirements"] = reqs
+            if canonical_cols:
+                contract["canonical_columns"] = canonical_cols
+                notes = contract.get("notes_for_engineers")
+                if not isinstance(notes, list):
+                    notes = []
+                note = "Use data_requirements.canonical_name for consistent column references across agents."
+                if note not in notes:
+                    notes.append(note)
+                contract["notes_for_engineers"] = notes
+            return contract
+
         def _has_numeric_conversion_risk(risk_items: List[str]) -> bool:
             marker = "Ensure numeric conversion before comparisons/normalization"
             return any(marker in risk for risk in risk_items)
@@ -434,6 +466,7 @@ class ExecutionPlannerAgent:
             }
             contract = _apply_inventory_source(contract)
             contract = _apply_expected_kind(contract)
+            contract = _attach_canonical_names(contract)
             contract = enforce_percentage_ranges(contract)
             contract = ensure_role_runbooks(contract)
             contract = _attach_data_risks(contract)
@@ -536,6 +569,7 @@ Return the contract JSON.
                 }
             contract = _apply_inventory_source(contract)
             contract = _apply_expected_kind(contract)
+            contract = _attach_canonical_names(contract)
             contract = enforce_percentage_ranges(contract)
             contract = ensure_role_runbooks(contract)
             contract = _attach_data_risks(contract)

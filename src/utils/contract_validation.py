@@ -27,6 +27,7 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Avoid double sum: never call sum(x.sum()) on a scalar; aggregate with .mean() or divide by len(mask).",
     ],
     "reasoning_checklist": [
+        "Use canonical_name (if provided) for consistent references across mapping, validation, and derivations.",
         "Verify required columns after normalization/mapping; do not treat pre-mapped absence as missing.",
         "If a numeric-looking column is typed as object/string, treat conversion as a risk before comparisons/normalization.",
         "If normalization causes name collisions, choose deterministically and log a warning for traceability.",
@@ -73,6 +74,7 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "For fuzzy matching prefer difflib; use rapidfuzz only if contract requests dependency.",
     ],
     "reasoning_checklist": [
+        "Use canonical_name (if provided) for consistent references across agents.",
         "Treat spec_extraction as source-of-truth; do not invent formulas, cases, or constraints.",
         "If target_type is ordinal/ranking, avoid predictive regression as the primary objective.",
         "Validate weight constraints and explain any regularization choices.",
