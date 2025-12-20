@@ -835,6 +835,35 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "budget_counters": counters,
         }
 
+    # 0a. Undefined name preflight for Data Engineer code
+    undefined = detect_undefined_names(code)
+    if undefined:
+        msg = f"STATIC_PRECHECK_UNDEFINED: Undefined names detected preflight: {', '.join(undefined)}"
+        if not state.get("de_undefined_retry_done"):
+            new_state = dict(state)
+            new_state["de_undefined_retry_done"] = True
+            override = state.get("data_summary", "")
+            try:
+                override += (
+                    "\n\nUNDEFINED_NAME_GUARD: Ensure every referenced name is defined in the same scope. "
+                    "Avoid using variables created inside helper functions in outer scopes. "
+                    "Do not inline JSON literals (null/true/false) into Python code."
+                )
+            except Exception:
+                pass
+            new_state["data_engineer_audit_override"] = override
+            print("Undefined name guard triggered: retrying Data Engineer with safety instructions.")
+            return run_data_engineer(new_state)
+        fh = list(state.get("feedback_history", []))
+        fh.append(msg)
+        return {
+            "cleaning_code": code,
+            "cleaned_data_preview": "Preflight Failed",
+            "error_message": msg,
+            "feedback_history": fh,
+            "budget_counters": counters,
+        }
+
     if contains_json_null_literal(code):
         if not state.get("de_json_literal_retry_done"):
             new_state = dict(state)
