@@ -138,6 +138,37 @@ def _parse_manifest_warning_list(warning: str) -> List[str]:
         return [str(item) for item in parsed]
     return []
 
+def _find_empty_required_columns(df, required_cols: List[str], threshold: float = 0.98) -> List[Dict[str, Any]]:
+    issues = []
+    if df is None or not required_cols:
+        return issues
+    for col in required_cols:
+        if col not in df.columns:
+            continue
+        series = df[col]
+        if series.empty:
+            continue
+        try:
+            if series.dtype == object:
+                stripped = series.astype(str).str.strip()
+                null_like = series.isna() | (stripped == "")
+            else:
+                null_like = series.isna()
+            null_frac = float(null_like.mean()) if len(series) else 0.0
+            non_null_count = int((~null_like).sum())
+        except Exception:
+            null_frac = 0.0
+            non_null_count = 0
+        if null_frac >= threshold or non_null_count == 0:
+            issues.append(
+                {
+                    "column": col,
+                    "null_frac": null_frac,
+                    "non_null_count": non_null_count,
+                }
+            )
+    return issues
+
 def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     """Return a shallow copy of contract with data_requirements limited to source=='input'."""
     if not isinstance(contract, dict):
@@ -1286,6 +1317,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 output_log = ""
                 if execution.logs.stdout: output_log += "\n".join(execution.logs.stdout)
                 if execution.logs.stderr: output_log += "\n".join(execution.logs.stderr)
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(os.path.join("artifacts", "data_engineer_sandbox_last.log"), "w", encoding="utf-8") as f_log:
+                        f_log.write(output_log or "")
+                except Exception as log_err:
+                    print(f"Warning: failed to persist data_engineer_sandbox_last.log: {log_err}")
                 
                 if execution.error:
                     error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
@@ -1575,6 +1612,25 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         derived_rename[match] = req_name
                 if derived_rename:
                     df_mapped = df_mapped.rename(columns=derived_rename)
+
+            empty_required = _find_empty_required_columns(df_mapped, required_cols)
+            if empty_required:
+                if not state.get("de_empty_required_retry_done"):
+                    new_state = dict(state)
+                    new_state["de_empty_required_retry_done"] = True
+                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                    payload = "EMPTY_REQUIRED_COLUMNS:\n" + "\n".join(
+                        f"- {item['column']}: null_frac={item['null_frac']:.2%}, non_null_count={item['non_null_count']}"
+                        for item in empty_required
+                    )
+                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                    print("Empty required columns guard: retrying Data Engineer with evidence.")
+                    return run_data_engineer(new_state)
+                return {
+                    "cleaning_code": code,
+                    "cleaned_data_preview": "Error: Empty Required Columns",
+                    "error_message": "CRITICAL: Required input columns are empty after cleaning.",
+                }
 
             # Guard: derived columns should not be constant if present
             derived_issues = []
