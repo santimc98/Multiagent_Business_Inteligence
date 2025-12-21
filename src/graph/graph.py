@@ -169,6 +169,55 @@ def _find_empty_required_columns(df, required_cols: List[str], threshold: float 
             )
     return issues
 
+def _build_required_sample_context(
+    csv_path: str,
+    dialect: Dict[str, Any],
+    required_cols: List[str],
+    norm_map: Dict[str, str],
+    max_rows: int = 50,
+    max_examples: int = 6,
+) -> str:
+    if not csv_path or not required_cols:
+        return ""
+    raw_cols = []
+    canon_to_raw: Dict[str, str] = {}
+    for col in required_cols:
+        normed = _norm_name(col)
+        raw = norm_map.get(normed)
+        if raw:
+            canon_to_raw[col] = raw
+            raw_cols.append(raw)
+    if not raw_cols:
+        return ""
+    sample_df = sample_raw_columns(csv_path, dialect, raw_cols, nrows=max_rows)
+    if sample_df is None or getattr(sample_df, "empty", False):
+        return ""
+
+    samples: Dict[str, Dict[str, Any]] = {}
+    for canon, raw in canon_to_raw.items():
+        if raw not in sample_df.columns:
+            continue
+        series = sample_df[raw]
+        try:
+            if series.dtype == object:
+                series = series.astype(str).str.strip()
+            values = [v for v in series.dropna().tolist() if str(v).strip() != ""]
+        except Exception:
+            values = []
+        uniq: List[str] = []
+        for val in values:
+            sval = str(val)
+            if sval not in uniq:
+                uniq.append(sval)
+            if len(uniq) >= max_examples:
+                break
+        samples[canon] = {"raw_column": raw, "examples": uniq}
+
+    if not samples:
+        return ""
+    payload = {"sample_rows": int(len(sample_df)), "columns": samples}
+    return "RAW_REQUIRED_COLUMN_SAMPLES:\n" + json.dumps(payload, ensure_ascii=True)
+
 def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     """Return a shallow copy of contract with data_requirements limited to source=='input'."""
     if not isinstance(contract, dict):
@@ -1032,6 +1081,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
             + json.dumps(norm_map, ensure_ascii=False)
         )
         data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, header_context)
+        required_cols = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+        sample_context = _build_required_sample_context(csv_path, input_dialect, required_cols, norm_map)
+        if sample_context:
+            data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, sample_context)
     state["data_engineer_audit_override"] = data_engineer_audit_override
     try:
         os.makedirs("artifacts", exist_ok=True)
@@ -1043,6 +1096,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "header_cols": header_cols,
             "required_input_columns": _resolve_required_input_columns(state.get("execution_contract", {}), selected),
             "required_all_columns": _resolve_contract_columns(state.get("execution_contract", {})),
+            "raw_required_sample_context": sample_context,
             "data_engineer_audit_override": data_engineer_audit_override,
         }
         with open(os.path.join("artifacts", "data_engineer_context.json"), "w", encoding="utf-8") as f_ctx:
@@ -1107,6 +1161,22 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "cleaning_code": code,
             "cleaned_data_preview": "Error: Generation Failed",
             "error_message": code,
+            "budget_counters": counters,
+        }
+
+    if "GENERATED CODE BLOCKED BY STATIC SCAN" in code:
+        if not state.get("de_static_guard_retry_done"):
+            new_state = dict(state)
+            new_state["de_static_guard_retry_done"] = True
+            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+            payload = "SECURITY_VIOLATION_CONTEXT:\n" + code.strip()
+            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+            print("Static scan guard: retrying Data Engineer with violation context.")
+            return run_data_engineer(new_state)
+        return {
+            "cleaning_code": code,
+            "cleaned_data_preview": "Error: Security Blocked",
+            "error_message": "CRITICAL: cleaning code blocked by static scan.",
             "budget_counters": counters,
         }
 
