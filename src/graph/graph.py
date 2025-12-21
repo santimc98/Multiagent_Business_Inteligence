@@ -63,6 +63,81 @@ from src.utils.governance import write_governance_report, build_run_summary
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
 
+def _extract_manifest_alerts(manifest: Dict[str, Any], derived_columns: List[str]) -> List[str]:
+    if not isinstance(manifest, dict):
+        return []
+
+    row_counts = manifest.get("row_counts") or {}
+    summary_stats = manifest.get("summary_statistics") or {}
+    warnings = manifest.get("warnings") or []
+    if not isinstance(warnings, list):
+        warnings = [warnings]
+
+    cleaned_shape = summary_stats.get("cleaned_shape")
+    cleaned_rows = None
+    if isinstance(cleaned_shape, (list, tuple)) and cleaned_shape:
+        try:
+            cleaned_rows = int(cleaned_shape[0])
+        except Exception:
+            cleaned_rows = None
+
+    def _is_zero(val: Any) -> bool:
+        return isinstance(val, (int, float)) and val == 0
+
+    row_candidates = [
+        row_counts.get("final"),
+        row_counts.get("rows_after"),
+        row_counts.get("after"),
+        summary_stats.get("rows_processed"),
+        cleaned_rows,
+    ]
+
+    alerts: List[str] = []
+    if any(_is_zero(val) for val in row_candidates):
+        alerts.append(f"EMPTY_OUTPUT: row_counts={row_counts} summary_statistics={summary_stats}")
+
+    missing_derived: List[str] = []
+    if derived_columns and warnings:
+        derived_norm = {_norm_name(col) for col in derived_columns if col}
+        for warning in warnings:
+            if not isinstance(warning, str):
+                continue
+            warning_text = warning
+            if "Missing columns in raw data" in warning_text or "Missing required columns" in warning_text:
+                parsed_cols = _parse_manifest_warning_list(warning_text)
+                if parsed_cols:
+                    for col in parsed_cols:
+                        if _norm_name(col) in derived_norm:
+                            missing_derived.append(col)
+                else:
+                    warning_norm = _norm_name(warning_text)
+                    for col in derived_columns:
+                        col_norm = _norm_name(col)
+                        if col_norm and col_norm in warning_norm:
+                            missing_derived.append(col)
+
+    if missing_derived:
+        alerts.append(f"MISSING_DERIVED_IN_WARNINGS: {sorted(set(missing_derived))}")
+
+    if alerts and warnings:
+        preview = warnings if len(warnings) <= 3 else warnings[:3] + ["..."]
+        alerts.append(f"WARNINGS_PREVIEW: {preview}")
+
+    return alerts
+
+def _parse_manifest_warning_list(warning: str) -> List[str]:
+    import ast
+    if ":" not in warning:
+        return []
+    list_text = warning.split(":", 1)[1].strip()
+    try:
+        parsed = ast.literal_eval(list_text)
+    except Exception:
+        return []
+    if isinstance(parsed, (list, tuple)):
+        return [str(item) for item in parsed]
+    return []
+
 def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     """Return a shallow copy of contract with data_requirements limited to source=='input'."""
     if not isinstance(contract, dict):
@@ -174,7 +249,7 @@ def detect_undefined_names(code: str) -> List[str]:
                 else:
                     # top-level module name
                     defined.add(alias.name.split(".")[0])
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             defined.add(node.name)
             for arg in node.args.args + node.args.kwonlyargs:
                 defined.add(arg.arg)
@@ -182,6 +257,8 @@ def detect_undefined_names(code: str) -> List[str]:
                 defined.add(node.args.vararg.arg)
             if node.args.kwarg:
                 defined.add(node.args.kwarg.arg)
+        elif isinstance(node, ast.ClassDef):
+            defined.add(node.name)
         elif isinstance(node, ast.Lambda):
             for arg in node.args.args + node.args.kwonlyargs:
                 defined.add(arg.arg)
@@ -1359,7 +1436,26 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             f_copy.write(f_src.read())
                 except Exception as copy_err:
                     print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
-    
+
+                manifest_data = {}
+                try:
+                    with open(local_manifest_path, "r", encoding="utf-8") as f_manifest:
+                        manifest_data = json.load(f_manifest)
+                except Exception:
+                    manifest_data = {}
+                manifest_alerts = _extract_manifest_alerts(
+                    manifest_data,
+                    _resolve_contract_columns(state.get("execution_contract", {}), sources={"derived", "output"})
+                )
+                if manifest_alerts and not state.get("de_manifest_guard_retry_done"):
+                    new_state = dict(state)
+                    new_state["de_manifest_guard_retry_done"] = True
+                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                    payload = "MANIFEST_ALERTS:\n" + "\n".join(f"- {alert}" for alert in manifest_alerts)
+                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                    print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
+                    return run_data_engineer(new_state)
+
                 print("Cleaning Success (Artifacts Downloaded).")
     
                 # Apply output_dialect for downstream reads
