@@ -298,7 +298,35 @@ class StewardAgent:
                 other_cols.append(col)
                 
         sorted_cols = (priority_cols + other_cols)[:50]
-        
+
+        def _norm_header(name: str) -> str:
+            cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
+            return re.sub(r"_+", "_", cleaned)
+
+        name_collisions = {}
+        for col in all_cols:
+            normed = _norm_header(col)
+            if normed:
+                name_collisions.setdefault(normed, []).append(str(col))
+
+        spaced_cols = [c for c in all_cols if " " in str(c) or "\t" in str(c)]
+        trimmed_cols = [c for c in all_cols if str(c) != str(c).strip()]
+        punct_cols = [c for c in all_cols if re.search(r"[^0-9A-Za-z_ ]", str(c))]
+        collision_examples = [f"{k}: {v}" for k, v in name_collisions.items() if len(v) > 1]
+
+        if trimmed_cols:
+            sample = trimmed_cols[:5]
+            ambiguities += f"- Column names have leading/trailing whitespace (e.g., {sample}); strip before matching.\n"
+        if spaced_cols:
+            sample = spaced_cols[:5]
+            ambiguities += f"- Column names contain spaces (e.g., {sample}); normalize to underscores for canonical_name mapping.\n"
+        if punct_cols:
+            sample = punct_cols[:5]
+            ambiguities += f"- Column names contain punctuation/special chars (e.g., {sample}); normalize before matching.\n"
+        if collision_examples:
+            sample = collision_examples[:3]
+            ambiguities += f"- Canonicalization collisions after normalization (examples: {sample}); disambiguate in mapping.\n"
+
         for col in sorted_cols:
             dtype = str(df[col].dtype)
             n_unique = df[col].nunique()

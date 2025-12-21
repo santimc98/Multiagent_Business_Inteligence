@@ -40,6 +40,8 @@ data/output_contract_report.json
 data/postmortem_decision.json
 data/leakage_audit.json
 data/steward_llm_trace.json
+data/steward_summary.txt
+data/steward_summary.json
 data/feature_integrity_report.json
 data/weights.json
 data/metrics.json

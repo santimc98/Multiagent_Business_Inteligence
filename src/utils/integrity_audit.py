@@ -85,19 +85,27 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
     used_actuals: Dict[str, List[Tuple[str, bool]]] = {}
     for req in data_requirements:
         name = req.get("name")
-        if not name:
+        canonical = req.get("canonical_name")
+        req_label = canonical or name
+        if not req_label:
             continue
-        actual, is_exact = _find_column(df, name)
+        actual, is_exact = _find_column(df, req_label)
+        if not actual and canonical and name:
+            actual, is_exact = _find_column(df, name)
         if actual:
-            requirement_to_actual[name] = (actual, is_exact)
-            used_actuals.setdefault(actual, []).append((name, is_exact))
+            requirement_to_actual[req_label] = (actual, is_exact)
+            used_actuals.setdefault(actual, []).append((req_label, is_exact))
         else:
+            missing_label = req_label
+            detail_suffix = ""
+            if canonical and name and canonical != name:
+                detail_suffix = f" (canonical_name={canonical}, name={name})"
             issues.append(
                 {
                     "type": "MISSING_COLUMN",
                     "severity": "critical",
-                    "column": name,
-                    "detail": "Column required by contract not found in cleaned dataset.",
+                    "column": missing_label,
+                    "detail": "Column required by contract not found in cleaned dataset." + detail_suffix,
                 }
             )
 
@@ -117,9 +125,11 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
     # Checks per requirement
     for req in data_requirements:
         name = req.get("name")
-        if not name:
+        canonical = req.get("canonical_name")
+        req_label = canonical or name
+        if not req_label:
             continue
-        actual_entry = requirement_to_actual.get(name)
+        actual_entry = requirement_to_actual.get(req_label)
         if not actual_entry:
             continue
         actual, is_exact = actual_entry

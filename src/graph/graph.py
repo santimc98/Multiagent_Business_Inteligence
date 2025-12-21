@@ -512,6 +512,10 @@ def _build_de_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]
         why = f"Gate required fixes: {required_fixes}"
     else:
         why = _infer_de_failure_cause(gate_feedback or err_msg or exec_out)
+    if not reason:
+        reason = err_msg or gate_feedback or "Data Engineer failure."
+    if not why:
+        why = "Unknown root cause. Inspect header mapping, canonicalization, and required input checks."
     lines = ["POSTMORTEM_CONTEXT_FOR_DE:"]
     if reason:
         lines.append(f"FAILURE_SUMMARY: {reason}")
@@ -536,6 +540,15 @@ def _merge_de_audit_override(base: str, payload: str) -> str:
     if base:
         return f"{base}\n\n{payload}"
     return payload
+
+def _read_csv_header(csv_path: str, encoding: str, sep: str) -> List[str]:
+    try:
+        import csv
+        with open(csv_path, "r", encoding=encoding, errors="replace") as f:
+            reader = csv.reader(f, delimiter=sep)
+            return next(reader, [])
+    except Exception:
+        return []
 # 1. Define State
 class AgentState(TypedDict):
     csv_path: str
@@ -648,6 +661,27 @@ def run_steward(state: AgentState) -> AgentState:
     encoding = result.get('encoding', 'utf-8')
     sep = result.get('sep', ',')
     decimal = result.get('decimal', '.')
+
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open("data/steward_summary.txt", "w", encoding="utf-8") as f_summary:
+            f_summary.write(summary or "")
+        with open("data/steward_summary.json", "w", encoding="utf-8") as f_summary_json:
+            json.dump(
+                {
+                    "run_id": run_id,
+                    "csv_path": csv_path,
+                    "encoding": encoding,
+                    "sep": sep,
+                    "decimal": decimal,
+                    "summary": summary,
+                },
+                f_summary_json,
+                indent=2,
+                ensure_ascii=False,
+            )
+    except Exception as summary_err:
+        print(f"Warning: failed to persist steward summary: {summary_err}")
     
     print(f"Steward Detected: Encoding={encoding}, Sep='{sep}', Decimal='{decimal}'")
     
@@ -846,6 +880,37 @@ def run_data_engineer(state: AgentState) -> AgentState:
     input_dialect = {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal}
     leakage_audit_summary = state.get("leakage_audit_summary", "")
     data_engineer_audit_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
+    header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+    if header_cols:
+        norm_map = {}
+        for col in header_cols:
+            normed = _norm_name(col)
+            if normed and normed not in norm_map:
+                norm_map[normed] = col
+        header_context = (
+            "COLUMN_INVENTORY_RAW: "
+            + json.dumps(header_cols, ensure_ascii=False)
+            + "\nNORMALIZED_HEADER_MAP: "
+            + json.dumps(norm_map, ensure_ascii=False)
+        )
+        data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, header_context)
+    state["data_engineer_audit_override"] = data_engineer_audit_override
+    try:
+        os.makedirs("artifacts", exist_ok=True)
+        context_payload = {
+            "csv_path": csv_path,
+            "csv_encoding": csv_encoding,
+            "csv_sep": csv_sep,
+            "csv_decimal": csv_decimal,
+            "header_cols": header_cols,
+            "required_input_columns": _resolve_required_input_columns(state.get("execution_contract", {}), selected),
+            "required_all_columns": _resolve_contract_columns(state.get("execution_contract", {})),
+            "data_engineer_audit_override": data_engineer_audit_override,
+        }
+        with open(os.path.join("artifacts", "data_engineer_context.json"), "w", encoding="utf-8") as f_ctx:
+            json.dump(context_payload, f_ctx, indent=2, ensure_ascii=False)
+    except Exception as ctx_err:
+        print(f"Warning: failed to persist data_engineer_context.json: {ctx_err}")
 
     # Generate cleaning script (targeting REMOTE path)
     code = data_engineer.generate_cleaning_script(
@@ -1171,6 +1236,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                         try:
                             override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
+                            failure_cause = _infer_de_failure_cause(error_details)
+                            if failure_cause:
+                                override += "\nWHY_IT_HAPPENED: " + failure_cause
                         except Exception:
                             pass
                         new_state["data_engineer_audit_override"] = override

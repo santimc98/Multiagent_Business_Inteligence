@@ -67,6 +67,10 @@ class PostmortemAgent:
             why = f"Gate required fixes: {required_fixes}"
         else:
             why = self._infer_failure_cause(gate_feedback or err_msg or exec_out)
+        if not reason:
+            reason = err_msg or gate_feedback or "Data Engineer failure."
+        if not why:
+            why = "Unknown root cause. Inspect header mapping, canonicalization, and required input checks."
         lines = ["POSTMORTEM_CONTEXT_FOR_DE:"]
         if reason:
             lines.append(f"FAILURE_SUMMARY: {reason}")
