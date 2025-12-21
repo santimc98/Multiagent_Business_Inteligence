@@ -120,7 +120,7 @@ def _ensure_scored_rows_output(contract: Dict[str, Any]) -> Dict[str, Any]:
     return contract
 
 DEFAULT_RUN_BUDGET = {
-    "max_de_calls": 3,
+    "max_de_calls": 4,
     "max_ml_calls": 5,
     "max_reviewer_calls": 5,
     "max_qa_calls": 5,
@@ -475,6 +475,67 @@ def dialect_guard_violations(code: str, csv_sep: str, csv_decimal: str, csv_enco
             seen.add(v)
             unique.append(v)
     return unique
+
+def _infer_de_failure_cause(text: str) -> str:
+    if not text:
+        return ""
+    lower = text.lower()
+    if "missing required columns" in lower or "mapping failed" in lower:
+        return "Required columns not found after canonicalization or alias mapping."
+    if "cleaning_plan_not_allowed" in lower or "plan output" in lower:
+        return "Model returned a JSON plan instead of executable Python code."
+    if "dialect" in lower or "read_csv" in lower:
+        return "CSV dialect mismatch (sep/decimal/encoding) or missing dialect params."
+    if "parsererror" in lower or "tokenizing data" in lower:
+        return "CSV dialect/quoting mismatch; enforce detected sep/decimal/encoding."
+    if "nameerror" in lower:
+        return "Undefined name referenced in the generated code."
+    if "keyerror" in lower and "not in index" in lower:
+        return "Column name mismatch after normalization; mapping resolution failed."
+    if "typeerror" in lower or "ufunc" in lower:
+        return "Type conversion missing; numeric ops executed on string/object data."
+    if "json" in lower and "default" in lower:
+        return "Manifest json.dump missing default for numpy/pandas types."
+    if "syntaxerror" in lower:
+        return "Generated code is not valid Python syntax."
+    return ""
+
+def _build_de_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]) -> str:
+    last_gate = state.get("last_gate_context") or {}
+    required_fixes = last_gate.get("required_fixes", [])
+    gate_feedback = last_gate.get("feedback", "")
+    err_msg = state.get("error_message", "") or ""
+    exec_out = state.get("execution_output", "") or ""
+    reason = decision.get("reason", "") or ""
+    why = ""
+    if required_fixes:
+        why = f"Gate required fixes: {required_fixes}"
+    else:
+        why = _infer_de_failure_cause(gate_feedback or err_msg or exec_out)
+    lines = ["POSTMORTEM_CONTEXT_FOR_DE:"]
+    if reason:
+        lines.append(f"FAILURE_SUMMARY: {reason}")
+    if why:
+        lines.append(f"WHY_IT_HAPPENED: {why}")
+    if gate_feedback:
+        lines.append(f"LAST_GATE_FEEDBACK: {gate_feedback}")
+    if err_msg:
+        lines.append(f"ERROR_MESSAGE: {err_msg}")
+    if exec_out:
+        lines.append(f"EXECUTION_OUTPUT_TAIL: {exec_out[-1200:]}")
+    lines.append("FIX_GUIDANCE: Fix the root cause and regenerate the full cleaning script.")
+    return "\n".join(lines)
+
+def _merge_de_audit_override(base: str, payload: str) -> str:
+    base = base or ""
+    payload = payload or ""
+    if not payload:
+        return base
+    if payload in base:
+        return base
+    if base:
+        return f"{base}\n\n{payload}"
+    return payload
 # 1. Define State
 class AgentState(TypedDict):
     csv_path: str
@@ -880,7 +941,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             if not state.get("de_undefined_retry_done"):
                 new_state = dict(state)
                 new_state["de_undefined_retry_done"] = True
-                override = state.get("data_summary", "")
+                override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                 try:
                     override += (
                         "\n\nUNDEFINED_NAME_GUARD: Ensure every referenced name is defined in the same scope. "
@@ -906,7 +967,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if not state.get("de_json_literal_retry_done"):
             new_state = dict(state)
             new_state["de_json_literal_retry_done"] = True
-            override = state.get("data_summary", "")
+            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
             try:
                 override += (
                     "\n\nCONTRACT_LITERAL_GUARD: Do not inline raw JSON into Python code. "
@@ -931,7 +992,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if not state.get("de_manifest_retry_done"):
             new_state = dict(state)
             new_state["de_manifest_retry_done"] = True
-            override = state.get("data_summary", "")
+            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
             try:
                 override += "\n\nMANIFEST_JSON_SAFETY: ensure json.dump(manifest, ..., default=_json_default) to handle numpy/pandas types."
             except Exception:
@@ -955,7 +1016,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if not state.get("de_dialect_retry_done"):
             new_state = dict(state)
             new_state["de_dialect_retry_done"] = True
-            override = state.get("data_summary", "")
+            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
             try:
                 override += "\n\nDIALECT_GUARD:\n" + "\n".join(dialect_issues)
             except Exception:
@@ -1062,7 +1123,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
                         new_state = dict(state)
                         new_state["de_missing_derived_retry_done"] = True
-                        override = state.get("data_summary", "")
+                        override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                         try:
                             override += (
                                 "\n\nDERIVED_COLUMN_MISSING_GUARD: "
@@ -1077,7 +1138,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
                         new_state = dict(state)
                         new_state["de_actual_column_guard_retry_done"] = True
-                        override = state.get("data_summary", "")
+                        override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                         try:
                             override += (
                                 "\n\nVALIDATION_PRINT_GUARD: Use actual = str(result.get('actual_column') or 'MISSING') "
@@ -1092,7 +1153,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         if not state.get("de_dtype_guard_retry_done"):
                             new_state = dict(state)
                             new_state["de_dtype_guard_retry_done"] = True
-                            override = state.get("data_summary", "")
+                            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                             try:
                                 override += (
                                     "\n\nDUPLICATE_COLUMN_GUARD: When reading dtype, handle duplicate column labels. "
@@ -1107,7 +1168,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     if not state.get("de_runtime_retry_done"):
                         new_state = dict(state)
                         new_state["de_runtime_retry_done"] = True
-                        override = state.get("data_summary", "")
+                        override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                         try:
                             override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
                         except Exception:
@@ -1283,7 +1344,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         patch = format_patch_instructions(issues)
                         new_state = dict(state)
                         new_state["de_destructive_retry_done"] = True
-                        new_state["data_engineer_audit_override"] = state.get("data_summary", "") + "\n\n" + patch
+                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, patch)
                         print("⚠️ DESTRUCTIVE_CONVERSION_GUARD: retrying Data Engineer once with patch instructions.")
                         return run_data_engineer(new_state)
                     conflict_msg = f" Alias conflicts: {alias_conflicts}" if alias_conflicts else ""
@@ -1336,7 +1398,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 if not state.get("de_derived_guard_retry_done"):
                     new_state = dict(state)
                     new_state["de_derived_guard_retry_done"] = True
-                    override = state.get("data_summary", "")
+                    override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                     try:
                         override += (
                             "\n\nDERIVED_COLUMN_GUARD: "
@@ -1380,7 +1442,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         issue_text = json.dumps(issues, indent=2)
                     except Exception:
                         issue_text = str(issues)
-                    new_state["data_engineer_audit_override"] = state.get("data_summary", "") + "\n\nINTEGRITY_AUDIT_ISSUES:\n" + issue_text
+                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                    payload = "INTEGRITY_AUDIT_ISSUES:\n" + issue_text
+                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
                     print("⚠️ INTEGRITY_AUDIT: triggering Data Engineer retry with issues context.")
                     return run_data_engineer(new_state)
             except Exception as audit_err:
@@ -2646,13 +2710,21 @@ def run_postmortem(state: AgentState) -> AgentState:
         target = context_patch.get("target")
         payload = context_patch.get("payload", "")
         if target == "data_engineer_audit_override":
-            new_state["data_engineer_audit_override"] = payload
+            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, str(payload))
         elif target == "feedback_history":
             fh = list(new_state.get("feedback_history", state.get("feedback_history", [])))
             fh.append(payload)
             new_state["feedback_history"] = fh
         elif target == "strategist_context_override":
             new_state["strategist_context_override"] = payload
+
+    if action == "retry_data_engineer":
+        base_override = new_state.get("data_engineer_audit_override")
+        if not base_override:
+            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+        auto_payload = _build_de_postmortem_context(state, decision)
+        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, auto_payload)
 
     sr_raw = decision.get("should_reset")
     should_reset = sr_raw if isinstance(sr_raw, dict) else {}

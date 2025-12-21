@@ -27,6 +27,7 @@ artifacts/
 static/plots/*.png
 final_report_*.pdf
 changes.patch
+logs/
 
 # Data artifacts (keep raw fixtures and other CSVs)
 data/cleaned_data.csv
