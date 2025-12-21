@@ -17,6 +17,29 @@ def _canonicalize_name(name: str) -> str:
     return cleaned
 
 
+def _resolve_column_name(df: pd.DataFrame, name: str | None) -> str | None:
+    if not name:
+        return None
+    if name in df.columns:
+        return name
+    target = _canonicalize_name(name)
+    if not target:
+        return None
+    for col in df.columns:
+        if _canonicalize_name(col) == target:
+            return col
+    suffixes = ("_cleaned", "_raw", "_orig", "_original", "_normalized", "_norm")
+    lower_name = str(name).lower()
+    for suffix in suffixes:
+        if lower_name.endswith(suffix):
+            base = name[: -len(suffix)]
+            base_norm = _canonicalize_name(base)
+            for col in df.columns:
+                if _canonicalize_name(col) == base_norm:
+                    return col
+    return None
+
+
 def _dedup_columns(cols: List[str]) -> Tuple[List[str], Dict[str, int]]:
     seen: Dict[str, int] = {}
     out: List[str] = []
@@ -73,14 +96,38 @@ def _eval_condition(df: pd.DataFrame, cond: Dict[str, Any]) -> pd.Series:
     col = cond.get("col")
     op = cond.get("op")
     value = cond.get("value")
-    if col not in df.columns:
+    resolved = _resolve_column_name(df, col)
+    if resolved is None:
         return pd.Series([False] * len(df), index=df.index)
-    series = df[col]
+    series = df[resolved]
+    op_norm = str(op).strip().lower().replace(" ", "_")
+    symbol_map = {
+        "<": "lt",
+        "<=": "lte",
+        ">": "gt",
+        ">=": "gte",
+        "==": "eq",
+        "=": "eq",
+        "!=": "neq",
+    }
+    if op_norm in symbol_map:
+        op = symbol_map[op_norm]
+    else:
+        op = op_norm
+    if op == "notin":
+        op = "not_in"
     if op in {"is_null", "isna"}:
         return series.isna()
     if op in {"not_null", "notna"}:
         return series.notna()
     series_cmp = _series_for_compare(series, value)
+    if value is None and op in {"eq", "=="}:
+        return series.isna()
+    if value is None and op in {"neq", "!="}:
+        return series.notna()
+    if op in {"in", "not_in", "between", "not_between"} and isinstance(value, list):
+        if all(isinstance(v, (int, float)) for v in value):
+            series_cmp = pd.to_numeric(series, errors="coerce")
     if op == "eq":
         return series_cmp == value
     if op == "neq":
@@ -111,17 +158,55 @@ def _eval_condition(df: pd.DataFrame, cond: Dict[str, Any]) -> pd.Series:
 def _apply_case_when(df: pd.DataFrame, spec: Dict[str, Any]) -> pd.Series:
     cases = spec.get("cases", [])
     default = spec.get("default")
+    if default is None and "else" in spec:
+        default = spec.get("else")
     result = pd.Series([default] * len(df), index=df.index)
     for case in cases:
         when = case.get("when", [])
         value = case.get("value")
-        if not isinstance(when, list) or not when:
-            continue
-        mask = pd.Series([True] * len(df), index=df.index)
-        for cond in when:
-            if not isinstance(cond, dict):
+        if value is None and "then" in case:
+            value = case.get("then")
+        if value is None and "result" in case:
+            value = case.get("result")
+        if isinstance(value, dict) and "col" in value:
+            ref_col = _resolve_column_name(df, value.get("col"))
+            if ref_col:
+                value = df[ref_col]
+            else:
                 continue
-            mask &= _eval_condition(df, cond)
+        operator = str(case.get("operator", "AND")).upper()
+        if isinstance(when, bool):
+            mask = pd.Series([when] * len(df), index=df.index)
+            result = result.mask(mask, value)
+            continue
+        if isinstance(when, dict):
+            when = [when]
+        if not isinstance(when, list):
+            continue
+        if not when:
+            if default is None:
+                mask = result.isna()
+            else:
+                mask = result == default
+            result = result.mask(mask, value)
+            continue
+        mask = None
+        for cond in when:
+            if isinstance(cond, bool):
+                cond_mask = pd.Series([cond] * len(df), index=df.index)
+            elif isinstance(cond, dict):
+                cond_mask = _eval_condition(df, cond)
+            else:
+                continue
+            if mask is None:
+                mask = cond_mask
+            else:
+                if operator == "OR":
+                    mask = mask | cond_mask
+                else:
+                    mask = mask & cond_mask
+        if mask is None:
+            continue
         result = result.mask(mask, value)
     return result
 
@@ -130,9 +215,13 @@ def _apply_clip_rule(series: pd.Series, rule: Dict[str, Any]) -> pd.Series:
     min_val = rule.get("min")
     max_val = rule.get("max")
     overflow_to = rule.get("overflow_to")
+    if overflow_to is None:
+        overflow_to = rule.get("clip_above_max_to")
+    underflow_to = rule.get("clip_below_min_to")
     numeric = pd.to_numeric(series, errors="coerce")
     if min_val is not None:
-        numeric = numeric.mask(numeric < min_val, overflow_to if overflow_to is not None else min_val)
+        replacement = underflow_to if underflow_to is not None else (overflow_to if overflow_to is not None else min_val)
+        numeric = numeric.mask(numeric < min_val, replacement)
     if max_val is not None:
         numeric = numeric.mask(numeric > max_val, overflow_to if overflow_to is not None else max_val)
     return numeric
@@ -235,21 +324,50 @@ def execute_cleaning_plan(plan: Dict[str, Any], contract: Dict[str, Any]) -> Dic
         if not isinstance(deriv, dict):
             continue
         name = deriv.get("name")
-        op = deriv.get("op")
+        op = str(deriv.get("op") or "").strip().lower()
         if not name:
             continue
+        source = deriv.get("source") or deriv.get("source_column")
+        if op in {"clip_transform", "cliprule"}:
+            op = "clip"
         if op == "copy":
-            source = deriv.get("source")
-            if source in df.columns:
-                df[name] = df[source]
+            resolved = _resolve_column_name(df, source)
+            if resolved:
+                df[name] = df[resolved]
             continue
         if op == "clip":
-            source = deriv.get("source")
-            if source in df.columns:
-                df[name] = _apply_clip_rule(df[source], deriv)
+            resolved = _resolve_column_name(df, source)
+            if resolved:
+                df[name] = _apply_clip_rule(df[resolved], deriv)
             continue
         if op == "case_when":
+            if "cases" not in deriv and "conditions" in deriv:
+                deriv = dict(deriv)
+                deriv["cases"] = deriv.get("conditions", [])
+            cases = deriv.get("cases") or []
+            normalized_cases = []
+            for case in cases:
+                if not isinstance(case, dict):
+                    continue
+                case_norm = dict(case)
+                if "when" not in case_norm and "if" in case_norm:
+                    case_norm["when"] = case_norm.get("if")
+                if "value" not in case_norm and "then" in case_norm:
+                    case_norm["value"] = case_norm.get("then")
+                if case_norm.get("value") == "value":
+                    resolved = _resolve_column_name(df, source)
+                    if resolved:
+                        case_norm["value"] = {"col": resolved}
+                normalized_cases.append(case_norm)
+            deriv["cases"] = normalized_cases
             df[name] = _apply_case_when(df, deriv)
+            continue
+        if op == "clip_transform":
+            resolved = _resolve_column_name(df, source)
+            if resolved:
+                deriv = dict(deriv)
+                deriv["source"] = resolved
+                df[name] = _apply_clip_rule(df[resolved], deriv)
             continue
 
     # Case assignment

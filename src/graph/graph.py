@@ -807,8 +807,17 @@ def run_data_engineer(state: AgentState) -> AgentState:
     plan_payload = None
     is_plan = False
     plan_issues: List[str] = []
+    force_code_mode = state.get("force_code_mode", True)
     plan, _ = parse_cleaning_plan(code)
     if plan:
+        if force_code_mode:
+            msg = "CLEANING_PLAN_NOT_ALLOWED: expected Python cleaning code."
+            return {
+                "cleaning_code": code,
+                "cleaned_data_preview": "Error: Plan Output",
+                "error_message": msg,
+                "budget_counters": counters,
+            }
         is_plan = True
         plan_payload = plan
         plan_issues = validate_cleaning_plan(plan)
@@ -1095,6 +1104,17 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             new_state["data_engineer_audit_override"] = override
                             print("Duplicate column dtype guard: retrying Data Engineer.")
                             return run_data_engineer(new_state)
+                    if not state.get("de_runtime_retry_done"):
+                        new_state = dict(state)
+                        new_state["de_runtime_retry_done"] = True
+                        override = state.get("data_summary", "")
+                        try:
+                            override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
+                        except Exception:
+                            pass
+                        new_state["data_engineer_audit_override"] = override
+                        print("Runtime error guard: retrying Data Engineer with error context.")
+                        return run_data_engineer(new_state)
                     return {
                         "cleaning_code": code,
                         "cleaned_data_preview": "Error: Cleaning Failed",
@@ -1166,7 +1186,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     else:
                         print("Warning: Manifest download failed (not found?). Creating default.")
                         # Create default manifest if missing
-                        import json
                         default_manifest = {
                             "input_dialect": {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal},
                             "output_dialect": {"encoding": "utf-8", "sep": ",", "decimal": "."},
@@ -1216,7 +1235,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
             print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
         # --- HOST-SIDE COLUMN MAPPING PROTOCOL v2 ---
         import pandas as pd
-        import json
         from src.utils.column_mapping import build_mapping
         from src.utils.cleaning_validation import (
             normalize_manifest,

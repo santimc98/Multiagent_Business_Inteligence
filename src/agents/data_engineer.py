@@ -37,10 +37,9 @@ class DataEngineerAgent:
         execution_contract: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Generates a JSON cleaning plan to clean and standardize the dataset.
+        Generates a Python script to clean and standardize the dataset.
         """
         from src.utils.prompting import render_prompt
-        from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
         from src.utils.static_safety_scan import scan_code_safety
         import json
 
@@ -52,11 +51,11 @@ class DataEngineerAgent:
         
         # SYSTEM TEMPLATE (Static, Safe, No F-Strings)
         SYSTEM_TEMPLATE = """
-        You are a Senior Data Engineer. Produce a robust cleaning PLAN for downstream ML.
+        You are a Senior Data Engineer. Produce a robust cleaning SCRIPT for downstream ML.
         
         *** HARD CONSTRAINTS (VIOLATION = FAILURE) ***
-        1. OUTPUT JSON ONLY (no markdown/code fences).
-        2. Do NOT output Python code.
+        1. OUTPUT VALID PYTHON CODE ONLY (no markdown/code fences).
+        2. Do NOT output JSON plans or pseudo-code.
         3. NO NETWORK/FS OPS: Do NOT use requests/subprocess/os.system and do not access filesystem outside declared input/output paths.
         4. BAN pandas private APIs: do not use pandas.io.* or pd.io.parsers.*.
         
@@ -71,39 +70,16 @@ class DataEngineerAgent:
         *** DATA AUDIT ***
         $data_audit
         
-        *** CLEANING PLAN OUTPUT (JSON) ***
-        Output a JSON object with plan_type="cleaning_plan_v1".
-        Required keys:
-          {
-            "plan_type": "cleaning_plan_v1",
-            "input": {"path": "$input_path"},
-            "dialect": {"sep": "$csv_sep", "decimal": "$csv_decimal", "encoding": "$csv_encoding"},
-            "output": {"cleaned_path": "data/cleaned_data.csv", "manifest_path": "data/cleaning_manifest.json"},
-            "normalize": {"method": "snake_case_dedup"},
-            "column_mapping": {"use_canonical_names": true, "required": [<canonical names>]},
-            "type_conversions": [
-              {"column": "...", "kind": "numeric|categorical|datetime", "role": "...", "normalize_0_1": true|false}
-            ],
-            "derived_columns": [
-              {"name": "...", "op": "copy|clip|case_when", ...}
-            ],
-            "case_assignment": {
-              "case_id_col": "...",
-              "refscore_col": "...",
-              "rules": [
-                {"case_id": 1, "ref_score": 1.0, "when": [ {"col":"...", "op":"<", "value": 3}, ... ] }
-              ],
-              "default": {"case_id": 9, "ref_score": -1.0}
-            },
-            "warnings": []
-          }
+        *** CLEANING OUTPUT REQUIREMENTS ***
+        - Read input using the provided dialect (sep/decimal/encoding).
+        - Save cleaned CSV to data/cleaned_data.csv.
+        - Save manifest to data/cleaning_manifest.json (json.dump(..., default=_json_default)).
         - Use canonical_name from the contract for all column references.
-        - Use structured conditions only (no free-text rules).
-        - If a column is numeric/percentage, include a conversion entry with normalize_0_1 when needed.
+        - Derive required columns using clear, deterministic logic.
         """
         
         # USER TEMPLATE (Static)
-        USER_TEMPLATE = "Generate the cleaning plan following Principles."
+        USER_TEMPLATE = "Generate the cleaning script following Principles."
         
         # Rendering
         system_prompt = render_prompt(
@@ -180,15 +156,8 @@ class DataEngineerAgent:
             content = call_with_retries(_call_model, max_retries=3)
             print("DEBUG: DeepSeek response received.")
             
-            plan, _ = parse_cleaning_plan(content)
-            if plan:
-                issues = validate_cleaning_plan(plan)
-                if issues:
-                    return f"# Error: CLEANING_PLAN_INVALID: {', '.join(issues)}"
-                return json.dumps(plan, indent=2, ensure_ascii=False)
-
             code = self._clean_code(content)
-
+            
             # STATIC SAFETY SCAN
             is_safe, violations = scan_code_safety(code)
             if not is_safe:

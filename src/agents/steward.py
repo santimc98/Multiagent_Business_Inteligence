@@ -94,6 +94,12 @@ class StewardAgent:
             KEY COLUMNS (Top 50 Importance):
             {profile['column_details']}
             
+            AMBIGUITY REPORT:
+            {profile['ambiguities']}
+            
+            COLUMN GLOSSARY (Heuristic Hints):
+            {profile['glossary']}
+            
             {profile['alerts']}
             
             Potential IDs: {profile['ids']}
@@ -118,10 +124,11 @@ class StewardAgent:
             1. Start strictly with "DATA SUMMARY:".
             2. Infer the Business Domain (e.g., Retail, CRM, Manufacturing) based on column names.
             3. Explain the *meaning* of key variables relative to the Objective: "$business_objective".
-            4. Highlight Data Quality Blockers (e.g., "Target variable 'churn' has 90% nulls").
-            5. Mention which columns seem to be Identifiers vs Dates vs Numerical Features.
-            6. IF "Sampled: True" is in the profile, YOU MUST EXPLICITLY STATE: "Note: Analysis based on a sample of the first 5000 rows."
-            7. Be concise. NO markdown tables. Plain text only.
+            4. Highlight Data Quality Blockers and Ambiguities (e.g., numeric-looking strings with commas, percent signs, mixed types).
+            5. Mention which columns seem to be Identifiers vs Dates vs Numerical Features, and why they matter to the objective.
+            6. Explicitly call out any columns whose meaning is unclear or overloaded.
+            7. IF "Sampled: True" is in the profile, YOU MUST EXPLICITLY STATE: "Note: Analysis based on a sample of the first 5000 rows."
+            8. Be concise. NO markdown tables. Plain text only.
             """
             
             system_prompt = render_prompt(
@@ -263,6 +270,8 @@ class StewardAgent:
         """
         alerts = ""
         col_details = ""
+        ambiguities = ""
+        glossary = ""
         ids = []
         dates = []
         targets = []
@@ -321,6 +330,42 @@ class StewardAgent:
                     pass
             
             col_details += f"- {col}: {dtype}, Unique={n_unique} {card_tag}, Nulls={null_pct:.1%}\n"
+
+            if dtype == "object":
+                series = df[col].dropna().astype(str)
+                if not series.empty:
+                    sample = series.sample(min(len(series), 50), random_state=42)
+                    percent_like = sample.str.contains("%").mean()
+                    comma_decimal = sample.str.contains(r"\d+,\d+").mean()
+                    dot_decimal = sample.str.contains(r"\d+\.\d+").mean()
+                    numeric_like = sample.str.contains(r"^[\s\-\+]*[\d,.\s%]+$").mean()
+                    whitespace = sample.str.contains(r"^\s+|\s+$").mean()
+                    if numeric_like > 0.6:
+                        ambiguities += f"- {col}: numeric-looking strings (~{numeric_like:.0%}); may need numeric conversion.\n"
+                    if percent_like > 0.1:
+                        ambiguities += f"- {col}: percent sign present (~{percent_like:.0%}); may need percent normalization.\n"
+                    if comma_decimal > 0.1 and dot_decimal < 0.1:
+                        ambiguities += f"- {col}: comma decimal pattern (~{comma_decimal:.0%}); likely decimal=','.\n"
+                    if whitespace > 0.1:
+                        ambiguities += f"- {col}: leading/trailing spaces (~{whitespace:.0%}); strip whitespace.\n"
+
+            tokens = [t for t in col.lower().split("_") if t]
+            role_hints = []
+            if any(t in {"id", "uuid", "key"} for t in tokens):
+                role_hints.append("identifier")
+            if any(t in {"date", "fecha", "fec", "time"} for t in tokens):
+                role_hints.append("date/time")
+            if any(t in {"score", "risk", "rating"} for t in tokens):
+                role_hints.append("score")
+            if any(t in {"amount", "importe", "price", "cost", "monto"} for t in tokens):
+                role_hints.append("monetary")
+            if any(t in {"pct", "percent", "ratio", "rate"} for t in tokens):
+                role_hints.append("percentage/ratio")
+            if any(t in {"flag", "is", "has", "impacto", "status"} for t in tokens):
+                role_hints.append("binary/flag")
+            if role_hints:
+                sample_vals = df[col].dropna().astype(str).head(3).tolist()
+                glossary += f"- {col}: dtype={dtype}, hints={role_hints}, sample={sample_vals}\n"
             
         # Target Validation
         if targets:
@@ -337,6 +382,8 @@ class StewardAgent:
         return {
             "column_details": col_details,
             "alerts": alerts,
+            "ambiguities": ambiguities or "None detected.",
+            "glossary": glossary or "None.",
             "ids": ids,
             "dates": dates,
             "targets": targets,
