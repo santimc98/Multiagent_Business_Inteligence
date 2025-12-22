@@ -2896,10 +2896,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
     
-    print(f"Reviewer Verdict: {status}")
-    if status == "NEEDS_IMPROVEMENT":
-        print(f"Advice: {feedback}")
-    
     new_history = list(state.get('feedback_history', []))
     if status == "NEEDS_IMPROVEMENT":
         new_history.append(f"RESULT EVALUATION FEEDBACK: {feedback}")
@@ -2952,6 +2948,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "failed_gates": case_report.get("failures", []) if case_report.get("status") == "FAIL" else [],
         "required_fixes": case_report.get("failures", []) if case_report.get("status") == "FAIL" else [],
     }
+
+    print(f"Reviewer Verdict: {status}")
+    if status == "NEEDS_IMPROVEMENT":
+        print(f"Advice: {feedback}")
 
     review_feedback = feedback or state.get("review_feedback", "")
     result_state = {
