@@ -6,6 +6,7 @@ import sys
 import time
 import glob
 import signal
+import threading
 from datetime import datetime
 
 # Ensure src is in path
@@ -22,6 +23,8 @@ def _handle_shutdown(signum, frame):
 def _install_signal_handlers():
     global _SIGNAL_HANDLER_INSTALLED
     if _SIGNAL_HANDLER_INSTALLED:
+        return
+    if threading.current_thread() is not threading.main_thread():
         return
     signal.signal(signal.SIGINT, _handle_shutdown)
     signal.signal(signal.SIGTERM, _handle_shutdown)
