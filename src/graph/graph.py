@@ -710,13 +710,36 @@ def _infer_de_failure_cause(text: str) -> str:
         return "Undefined name referenced in the generated code."
     if "keyerror" in lower and "not in index" in lower:
         return "Column name mismatch after normalization; mapping resolution failed."
+    if "list of cases must be same length as list of conditions" in lower:
+        return "np.select called with mismatched conditions/choices list lengths."
     if "typeerror" in lower or "ufunc" in lower:
         return "Type conversion missing; numeric ops executed on string/object data."
+    if "numpy.bool_" in lower and "not serializable" in lower:
+        return "JSON serialization failed due to numpy.bool_ values not handled in _json_default."
     if "json" in lower and "default" in lower:
         return "Manifest json.dump missing default for numpy/pandas types."
     if "syntaxerror" in lower:
         return "Generated code is not valid Python syntax."
     return ""
+
+def _build_de_runtime_diagnosis(error_details: str) -> List[str]:
+    if not error_details:
+        return []
+    lower = error_details.lower()
+    lines: List[str] = []
+    if "list of cases must be same length as list of conditions" in lower:
+        lines.append(
+            "np.select raised a length mismatch: number of conditions does not match number of choices (see assign_fec_window)."
+        )
+    if "numpy.bool_" in lower and "not serializable" in lower:
+        lines.append(
+            "json.dumps failed because validation_results contains numpy.bool_, which _json_default does not handle."
+        )
+    if "keyerror" in lower and "not in index" in lower:
+        lines.append(
+            "KeyError indicates a column name mismatch after renaming/normalization; selection list includes a missing column."
+        )
+    return lines
 
 def _build_de_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]) -> str:
     last_gate = state.get("last_gate_context") or {}
@@ -1536,6 +1559,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             failure_cause = _infer_de_failure_cause(error_details)
                             if failure_cause:
                                 override += "\nWHY_IT_HAPPENED: " + failure_cause
+                            diagnosis_lines = _build_de_runtime_diagnosis(error_details)
+                            if diagnosis_lines:
+                                override += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
                         except Exception:
                             pass
                         new_state["data_engineer_audit_override"] = override
