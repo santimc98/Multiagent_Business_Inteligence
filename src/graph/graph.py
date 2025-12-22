@@ -25,6 +25,7 @@ from src.agents.qa_reviewer import QAReviewerAgent # New QA Gate
 from src.agents.execution_planner import ExecutionPlannerAgent
 from src.agents.postmortem import PostmortemAgent
 from src.agents.failure_explainer import FailureExplainerAgent
+from src.agents.results_advisor import ResultsAdvisorAgent
 from src.utils.pdf_generator import convert_report_to_pdf
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.visuals import generate_fallback_plots
@@ -834,6 +835,47 @@ def _read_csv_header(csv_path: str, encoding: str, sep: str) -> List[str]:
             return next(reader, [])
     except Exception:
         return []
+
+def _load_json_safe(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _summarize_case_summary(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        import pandas as pd
+        df = pd.read_csv(path)
+    except Exception:
+        return {}
+    case_col = "Case" if "Case" in df.columns else ("Caso" if "Caso" in df.columns else None)
+    if not case_col:
+        return {"rows": int(len(df))}
+    try:
+        cases = [int(x) for x in df[case_col].dropna().unique().tolist()]
+    except Exception:
+        cases = []
+    missing_cases = [c for c in range(1, 21) if c not in cases] if cases else []
+    respects_col = "respects_order" if "respects_order" in df.columns else None
+    false_count = 0
+    if respects_col:
+        try:
+            false_count = int((df[respects_col] == False).sum())
+        except Exception:
+            false_count = 0
+    return {
+        "rows": int(len(df)),
+        "case_count": int(len(cases)),
+        "missing_cases": missing_cases,
+        "respects_order_false": false_count,
+        "case_col": case_col,
+    }
 # 1. Define State
 class AgentState(TypedDict):
     csv_path: str
@@ -905,6 +947,7 @@ qa_reviewer = QAReviewerAgent()
 execution_planner = ExecutionPlannerAgent()
 postmortem_agent = PostmortemAgent()
 failure_explainer = FailureExplainerAgent()
+results_advisor = ResultsAdvisorAgent()
 
 
 # 2. Define Nodes
@@ -3005,6 +3048,33 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "output_contract_report": oc_report,
         "last_gate_context": gate_context,
     }
+    if status == "NEEDS_IMPROVEMENT":
+        try:
+            advisor_ctx = {
+                "case_alignment_report": case_report,
+                "output_contract_report": oc_report,
+                "case_summary_stats": _summarize_case_summary("data/case_summary.csv"),
+                "weights": _load_json_safe("data/weights.json"),
+                "metrics": _load_json_safe("data/metrics.json"),
+                "business_alignment": contract.get("business_alignment", {}),
+                "spec_extraction": contract.get("spec_extraction", {}),
+            }
+            advice = results_advisor.generate_ml_advice(advisor_ctx)
+            if advice:
+                base_override = state.get("ml_engineer_audit_override") or state.get("data_summary", "")
+                result_state["ml_engineer_audit_override"] = _merge_de_audit_override(
+                    base_override,
+                    "RESULTS_ADVISOR:\n" + advice.strip(),
+                )
+                result_state["ml_results_advice"] = advice.strip()
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(os.path.join("artifacts", "ml_results_advisor.txt"), "w", encoding="utf-8") as f_adv:
+                        f_adv.write(advice.strip())
+                except Exception as adv_err:
+                    print(f"Warning: failed to persist ml_results_advisor.txt: {adv_err}")
+        except Exception as adv_err:
+            print(f"Warning: results advisor failed: {adv_err}")
     if status == "NEEDS_IMPROVEMENT":
         result_state["iteration_count"] = state.get("iteration_count", 0) + 1
     if run_id:
