@@ -779,6 +779,7 @@ def _build_ml_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]
     err_msg = state.get("error_message", "") or ""
     exec_out = state.get("execution_output", "") or ""
     reason = decision.get("reason", "") or ""
+    ml_expl = (state.get("ml_failure_explanation") or "").strip()
     why = ""
     if required_fixes:
         why = f"Gate required fixes: {required_fixes}"
@@ -786,6 +787,8 @@ def _build_ml_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]
         why = _infer_de_failure_cause(gate_feedback or err_msg or exec_out)
     if not reason:
         reason = err_msg or gate_feedback or "ML Engineer failure."
+    if ml_expl:
+        why = ml_expl
     if not why:
         why = "Unknown root cause. Inspect feature mapping, target variance, and dialect usage."
     lines = ["POSTMORTEM_CONTEXT_FOR_ML:"]
@@ -793,6 +796,8 @@ def _build_ml_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]
         lines.append(f"FAILURE_SUMMARY: {reason}")
     if why:
         lines.append(f"WHY_IT_HAPPENED: {why}")
+    if ml_expl:
+        lines.append(f"FAILURE_EXPLANATION: {ml_expl}")
     if gate_feedback:
         lines.append(f"LAST_GATE_FEEDBACK: {gate_feedback}")
     if err_msg:
@@ -2980,6 +2985,10 @@ def check_execution_status(state: AgentState):
         return "retry_fix"
 
     if has_error:
+        max_runtime_fixes = state.get("max_runtime_fix_attempts", 2)
+        if attempt <= max_runtime_fixes:
+            print(f"Runtime Error detected (Attempt {attempt}). Preparing runtime fix.")
+            return "retry_fix"
         print(f"Runtime Error detected (Attempt {attempt}). Delegating to Postmortem.")
         return "failed"
             
@@ -2996,11 +3005,35 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
         "failed_gates": ["Runtime Stability"],
         "required_fixes": ["Fix the exception."]
     }
+
+    ml_override = state.get("ml_engineer_audit_override", "")
+    try:
+        error_details = state.get("last_runtime_error_tail") or output
+        code = state.get("generated_code") or state.get("last_generated_code") or ""
+        expl_ctx = state.get("ml_context_snapshot") or {}
+        expl_text = failure_explainer.explain_ml_failure(
+            code=code,
+            error_details=str(error_details),
+            context=expl_ctx,
+        )
+        if expl_text:
+            payload = "ML_FAILURE_EXPLANATION:\n" + expl_text.strip()
+            payload += "\nRUNTIME_ERROR_TAIL:\n" + str(error_details)[-2000:]
+            ml_override = _merge_de_audit_override(ml_override, payload)
+            try:
+                os.makedirs("artifacts", exist_ok=True)
+                with open(os.path.join("artifacts", "ml_engineer_failure_explainer.txt"), "w", encoding="utf-8") as f_exp:
+                    f_exp.write(expl_text.strip())
+            except Exception as exp_err:
+                print(f"Warning: failed to persist ml_engineer_failure_explainer.txt: {exp_err}")
+    except Exception as expl_err:
+        print(f"Warning: ML failure explainer failed during runtime fix: {expl_err}")
     
     return {
         "last_gate_context": error_context,
          # We add error to history so it persists
-        "feedback_history": state.get("feedback_history", []) + [f"RUNTIME ERROR (Attempt {state.get('execution_attempt')}):\n{output[-500:]}"]
+        "feedback_history": state.get("feedback_history", []) + [f"RUNTIME ERROR (Attempt {state.get('execution_attempt')}):\n{output[-500:]}"],
+        "ml_engineer_audit_override": ml_override,
     }
 
 def check_evaluation(state: AgentState):
@@ -3189,8 +3222,7 @@ def run_postmortem(state: AgentState) -> AgentState:
         base_override = new_state.get("ml_engineer_audit_override")
         if not base_override:
             base_override = state.get("ml_engineer_audit_override") or state.get("data_summary", "")
-        auto_payload = _build_ml_postmortem_context(state, decision)
-        extra_payload = ""
+        expl_text = ""
         try:
             error_details = state.get("last_runtime_error_tail") or state.get("execution_output") or state.get("error_message", "")
             code = state.get("generated_code") or state.get("last_generated_code") or ""
@@ -3201,7 +3233,6 @@ def run_postmortem(state: AgentState) -> AgentState:
                 context=expl_ctx,
             )
             if expl_text:
-                extra_payload = "ML_FAILURE_EXPLANATION:\n" + expl_text.strip()
                 try:
                     os.makedirs("artifacts", exist_ok=True)
                     with open(os.path.join("artifacts", "ml_engineer_failure_explainer.txt"), "w", encoding="utf-8") as f_exp:
@@ -3210,8 +3241,11 @@ def run_postmortem(state: AgentState) -> AgentState:
                     print(f"Warning: failed to persist ml_engineer_failure_explainer.txt: {exp_err}")
         except Exception as expl_err:
             print(f"Warning: ML failure explainer failed: {expl_err}")
-        if extra_payload:
-            auto_payload = _merge_de_audit_override(auto_payload, extra_payload)
+        state_with_expl = dict(state)
+        if expl_text:
+            state_with_expl["ml_failure_explanation"] = expl_text.strip()
+            new_state["ml_failure_explanation"] = expl_text.strip()
+        auto_payload = _build_ml_postmortem_context(state_with_expl, decision)
         new_state["ml_engineer_audit_override"] = _merge_de_audit_override(base_override, auto_payload)
 
     sr_raw = decision.get("should_reset")
