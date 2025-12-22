@@ -744,6 +744,10 @@ def _build_de_runtime_diagnosis(error_details: str) -> List[str]:
         lines.append(
             "Type comparison on object/string data: convert %plazoConsumido (or any percentage string) to numeric before >/< checks; use pd.to_numeric/clean_plazo_consumido and compare the numeric series."
         )
+    if "keyerror" in lower and "'score'" in lower:
+        lines.append(
+            "KeyError on 'Score' suggests conversion metadata was updated before creating a 'Score' entry or the column mapping for Score did not run."
+        )
     return lines
 
 def _build_de_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]) -> str:
@@ -1873,8 +1877,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
             # Guard: derived columns should not be constant if present
             derived_issues = []
+            derived_evidence = {}
             if contract_derived_cols:
                 col_by_norm = {_norm_name(c): c for c in df_mapped.columns}
+                spec = contract.get("spec_extraction", {}) if isinstance(contract, dict) else {}
+                spec_derived = spec.get("derived_columns", []) if isinstance(spec, dict) else []
                 for derived_name in contract_derived_cols:
                     norm_name = _norm_name(derived_name)
                     actual_name = col_by_norm.get(norm_name)
@@ -1883,6 +1890,37 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     nunique = df_mapped[actual_name].nunique(dropna=False)
                     if nunique <= 1:
                         derived_issues.append(f"{derived_name} has no variance (nunique={nunique})")
+                    deps = []
+                    for entry in spec_derived:
+                        if not isinstance(entry, dict):
+                            continue
+                        entry_name = entry.get("name")
+                        if entry_name and _norm_name(entry_name) == norm_name:
+                            deps = entry.get("depends_on", []) or []
+                            break
+                    if deps:
+                        dep_stats = {}
+                        for dep in deps:
+                            dep_norm = _norm_name(dep)
+                            dep_actual = col_by_norm.get(dep_norm)
+                            if not dep_actual:
+                                dep_stats[dep] = {"status": "missing"}
+                                continue
+                            series = df_mapped[dep_actual]
+                            non_null = int(series.notna().sum())
+                            sample_vals = []
+                            try:
+                                for val in series.dropna().astype(str).head(3).tolist():
+                                    if val not in sample_vals:
+                                        sample_vals.append(val)
+                            except Exception:
+                                sample_vals = []
+                            dep_stats[dep] = {
+                                "actual": dep_actual,
+                                "non_null": non_null,
+                                "sample": sample_vals,
+                            }
+                        derived_evidence[derived_name] = dep_stats
             if derived_issues:
                 if not state.get("de_derived_guard_retry_done"):
                     new_state = dict(state)
@@ -1895,6 +1933,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             + ". Ensure derived columns use normalized column mapping "
                             "to access source columns and do not default all rows."
                         )
+                        if derived_evidence:
+                            override += "\nDERIVED_SOURCE_EVIDENCE:\n" + json.dumps(
+                                derived_evidence,
+                                ensure_ascii=True,
+                            )
                     except Exception:
                         pass
                     new_state["data_engineer_audit_override"] = override
