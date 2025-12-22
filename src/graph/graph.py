@@ -3529,7 +3529,7 @@ workflow.add_conditional_edges(
     "evaluate_results",
     check_evaluation,
     {
-        "retry": "postmortem",
+        "retry": "retry_handler",
         "approved": "translator"
     }
 )
