@@ -61,8 +61,30 @@ class ExecutionPlannerAgent:
             return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
 
         def _canonicalize_name(name: str) -> str:
-            cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
-            return re.sub(r"_+", "_", cleaned)
+            return str(name)
+
+        def _resolve_exact_header(name: str) -> str | None:
+            if not name or not column_inventory:
+                return None
+            norm_name = _norm(name)
+            if not norm_name:
+                return None
+            best_match = None
+            best_score = 0.0
+            for raw in column_inventory:
+                if raw is None:
+                    continue
+                raw_str = str(raw)
+                raw_norm = _norm(raw_str)
+                if raw_norm == norm_name:
+                    return raw_str
+                score = difflib.SequenceMatcher(None, norm_name, raw_norm).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_match = raw_str
+            if best_score >= 0.9:
+                return best_match
+            return None
 
         def _parse_summary_kinds(summary_text: str) -> Dict[str, str]:
             kind_map: Dict[str, str] = {}
@@ -160,10 +182,15 @@ class ExecutionPlannerAgent:
                 if not name:
                     continue
                 canonical = req.get("canonical_name")
-                if not canonical:
+                raw_match = _resolve_exact_header(canonical or name)
+                if raw_match:
+                    canonical = raw_match
+                    req["canonical_name"] = canonical
+                elif not canonical:
                     canonical = _canonicalize_name(name)
                     req["canonical_name"] = canonical
-                canonical_cols.append(canonical)
+                if canonical:
+                    canonical_cols.append(canonical)
             contract["data_requirements"] = reqs
             if canonical_cols:
                 contract["canonical_columns"] = canonical_cols

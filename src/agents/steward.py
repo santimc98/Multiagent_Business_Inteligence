@@ -77,8 +77,8 @@ class StewardAgent:
                                encoding=detected_encoding, engine='python', on_bad_lines='skip')
                 was_sampled = False # Can't guarantee sampling in fallback generic mode easily without nrows, but usually fine
             
-            # 4. Standardize & Scrub
-            df.columns = df.columns.str.strip().str.replace(' ', '_')
+            # 4. Preserve raw headers & Scrub
+            df.columns = [str(c) for c in df.columns]
             scrubber = PIIScrubber()
             df = scrubber.scrub_dataframe(df)
 
@@ -316,13 +316,13 @@ class StewardAgent:
 
         if trimmed_cols:
             sample = trimmed_cols[:5]
-            ambiguities += f"- Column names have leading/trailing whitespace (e.g., {sample}); strip before matching.\n"
+            ambiguities += f"- Column names have leading/trailing whitespace (e.g., {sample}); preserve exact names and account for whitespace when matching.\n"
         if spaced_cols:
             sample = spaced_cols[:5]
-            ambiguities += f"- Column names contain spaces (e.g., {sample}); normalize to underscores for canonical_name mapping.\n"
+            ambiguities += f"- Column names contain spaces (e.g., {sample}); preserve exact names and use explicit mapping if needed.\n"
         if punct_cols:
             sample = punct_cols[:5]
-            ambiguities += f"- Column names contain punctuation/special chars (e.g., {sample}); normalize before matching.\n"
+            ambiguities += f"- Column names contain punctuation/special chars (e.g., {sample}); preserve exact names and map carefully.\n"
         if collision_examples:
             sample = collision_examples[:3]
             ambiguities += f"- Canonicalization collisions after normalization (examples: {sample}); disambiguate in mapping.\n"

@@ -12,8 +12,9 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "First pd.read_csv must use dialect variables (sep/decimal/encoding) from contract/manifest; do not hardcode literals.",
         "Respect expected_kind: numeric -> pd.to_numeric; datetime -> pd.to_datetime; categorical -> keep as string.",
         "Do not import sys.",
+        "Preserve exact canonical_name strings (including spaces/symbols); do not normalize away punctuation.",
         "Do not drop required/derived columns solely for being constant; record as constant in manifest.",
-        "When deriving contract columns, use normalized column mappings instead of hardcoding raw names.",
+        "When deriving contract columns, use the provided canonical_name mapping and preserve the exact header names.",
         "If a required source column for derivations is missing, raise a clear ValueError (do not default all rows).",
         "Do not validate required columns before canonicalization; match after normalization mapping.",
         "Only enforce existence for source='input' columns; source='derived' must be created after mapping.",
@@ -28,6 +29,7 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
     ],
     "reasoning_checklist": [
         "Use canonical_name (if provided) for consistent references across mapping, validation, and derivations.",
+        "If canonical_name includes spaces or symbols, keep it exact when selecting columns.",
         "Verify required columns after normalization/mapping; do not treat pre-mapped absence as missing.",
         "If a numeric-looking column is typed as object/string, treat conversion as a risk before comparisons/normalization.",
         "If data_risks mention canonicalization collisions, ensure column selection remains unambiguous.",

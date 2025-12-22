@@ -77,7 +77,7 @@ class DataEngineerAgent:
         - Save manifest to data/cleaning_manifest.json (json.dump(..., default=_json_default)).
         - Use canonical_name from the contract for all column references.
         - Derive required columns using clear, deterministic logic.
-        - Build a normalized header map (lowercase, strip, replace non-alnum with _) to resolve raw headers to canonical_name before validating missing columns.
+        - Build a header map for lookup (normalize only for matching), but preserve canonical_name exactly (including spaces/symbols) in the output.
         """
         
         # USER TEMPLATE (Static)
