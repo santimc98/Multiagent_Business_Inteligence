@@ -740,6 +740,10 @@ def _build_de_runtime_diagnosis(error_details: str) -> List[str]:
         lines.append(
             "KeyError indicates a column name mismatch after renaming/normalization; selection list includes a missing column."
         )
+    if "not supported between instances of 'str' and 'int'" in lower or "not supported between instances of 'str' and 'float'" in lower:
+        lines.append(
+            "Type comparison on object/string data: convert %plazoConsumido (or any percentage string) to numeric before >/< checks; use pd.to_numeric/clean_plazo_consumido and compare the numeric series."
+        )
     return lines
 
 def _build_de_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]) -> str:
