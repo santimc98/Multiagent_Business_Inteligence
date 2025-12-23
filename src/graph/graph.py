@@ -3,6 +3,7 @@ import os
 import subprocess
 import re
 import json
+import hashlib
 import threading
 from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal
@@ -2957,7 +2958,6 @@ def retry_handler(state: AgentState) -> AgentState:
         current_history = current_history[-20:]
 
     return {
-        "iteration_count": state['iteration_count'] + 1,
         "feedback_history": current_history
     }
     
@@ -3011,6 +3011,35 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             json.dump(case_report, f, indent=2)
     except Exception as err:
         print(f"Warning: failed to persist case_alignment_report.json: {err}")
+
+    # Track case alignment history for adaptive stopping
+    case_history = list(state.get("case_alignment_history", []) or [])
+    try:
+        metrics = case_report.get("metrics", {}) if isinstance(case_report, dict) else {}
+        violations = metrics.get("adjacent_refscore_violations")
+        if violations is not None:
+            case_history.append(float(violations))
+    except Exception:
+        pass
+
+    # Detect stale metrics file across iterations (diagnostic for ML)
+    metrics_report = _load_json_safe("data/metrics.json")
+    metrics_signature = None
+    if isinstance(metrics_report, dict) and metrics_report:
+        try:
+            payload = json.dumps(metrics_report, sort_keys=True, ensure_ascii=True).encode("utf-8")
+            metrics_signature = hashlib.sha256(payload).hexdigest()
+        except Exception:
+            metrics_signature = None
+    prev_metrics_signature = state.get("metrics_signature")
+    if metrics_signature and metrics_signature == prev_metrics_signature:
+        new_history.append(
+            "METRICS_UNCHANGED: data/metrics.json is identical to the prior iteration; ensure metrics are recomputed and saved per run."
+        )
+    if not metrics_report:
+        new_history.append(
+            "METRICS_MISSING: data/metrics.json not found or empty; downstream evaluation may be using stale metrics."
+        )
     iter_id = int(state.get("iteration_count", 0)) + 1
     saved_iter_artifacts = _persist_iteration_artifacts(iter_id)
 
@@ -3086,15 +3115,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         print(f"Advice: {feedback}")
 
     review_feedback = feedback or state.get("review_feedback", "")
-    case_history = list(state.get("case_alignment_history", []))
-    if isinstance(case_report, dict):
-        metrics = case_report.get("metrics", {}) or {}
-        val = metrics.get("adjacent_refscore_violations", metrics.get("case_order_violations"))
-        try:
-            if val is not None:
-                case_history.append(float(val))
-        except Exception:
-            pass
     result_state = {
         "review_verdict": status,
         "review_feedback": review_feedback,
@@ -3103,6 +3123,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "output_contract_report": oc_report,
         "case_alignment_report": case_report,
         "case_alignment_history": case_history,
+        "metrics_signature": metrics_signature,
         "last_gate_context": gate_context,
     }
     if review_counters:
