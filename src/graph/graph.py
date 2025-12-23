@@ -3167,12 +3167,23 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         print(f"Advice: {feedback}")
 
     review_feedback = feedback or state.get("review_feedback", "")
+    case_history = list(state.get("case_alignment_history", []))
+    if isinstance(case_report, dict):
+        metrics = case_report.get("metrics", {}) or {}
+        val = metrics.get("adjacent_refscore_violations", metrics.get("case_order_violations"))
+        try:
+            if val is not None:
+                case_history.append(float(val))
+        except Exception:
+            pass
     result_state = {
         "review_verdict": status,
         "review_feedback": review_feedback,
         "execution_feedback": feedback,
         "feedback_history": new_history,
         "output_contract_report": oc_report,
+        "case_alignment_report": case_report,
+        "case_alignment_history": case_history,
         "last_gate_context": gate_context,
     }
     if review_counters:
@@ -3289,9 +3300,33 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     }
 
 def check_evaluation(state: AgentState):
-    if state.get('iteration_count', 0) >= 3:
+    if state.get('iteration_count', 0) >= 6:
         print("WARNING: Max iterations reached. Proceeding with current results.")
         return "approved"
+
+    # Adaptive stop: if case alignment degrades or stagnates, stop early.
+    case_report = state.get("case_alignment_report", {}) or {}
+    metrics = case_report.get("metrics", {}) if isinstance(case_report, dict) else {}
+    try:
+        curr_violation_rate = float(metrics.get("adjacent_refscore_violations", metrics.get("case_order_violations", 1.0)))
+    except Exception:
+        curr_violation_rate = None
+    prev_rates = state.get("case_alignment_history", []) or []
+    if curr_violation_rate is not None:
+        new_history = prev_rates + [curr_violation_rate]
+        # stop if last two iterations didn't improve by at least 5%
+        if len(new_history) >= 3:
+            last = new_history[-1]
+            prev = new_history[-2]
+            prev2 = new_history[-3]
+            if last >= prev * 0.95 and prev >= prev2 * 0.95:
+                print("WARNING: Case alignment not improving across iterations. Stopping early.")
+                return "approved"
+        # stop if regression >10% vs best so far
+        best = min(new_history) if new_history else curr_violation_rate
+        if curr_violation_rate > best * 1.10:
+            print("WARNING: Case alignment regressed vs best. Stopping early.")
+            return "approved"
 
     if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
         return "retry"
