@@ -17,7 +17,6 @@ def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
     output_contract = _safe_load_json("data/output_contract_report.json")
     case_alignment = _safe_load_json("data/case_alignment_report.json")
     integrity = _safe_load_json("data/integrity_audit_report.json")
-    postmortem = _safe_load_json("data/postmortem_decision.json")
 
     issues = integrity.get("issues", []) if isinstance(integrity, dict) else []
     severity_counts = {}
@@ -35,7 +34,6 @@ def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "output_contract": output_contract,
         "case_alignment": case_alignment,
         "integrity_issues_summary": severity_counts,
-        "postmortem_decision": postmortem,
         "budget_counters": state.get("budget_counters", {}),
         "run_budget": state.get("run_budget", {}),
         "data_risks": contract.get("data_risks", []),

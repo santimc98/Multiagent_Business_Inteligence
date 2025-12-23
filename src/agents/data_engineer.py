@@ -58,7 +58,7 @@ class DataEngineerAgent:
         2. Do NOT output JSON plans or pseudo-code.
         3. NO NETWORK/FS OPS: Do NOT use requests/subprocess/os.system and do not access filesystem outside declared input/output paths.
         4. BAN pandas private APIs: do not use pandas.io.* or pd.io.parsers.*.
-        5. If the audit includes RUNTIME_ERROR_CONTEXT or POSTMORTEM_CONTEXT, fix the root cause and regenerate the full script.
+        5. If the audit includes RUNTIME_ERROR_CONTEXT, fix the root cause and regenerate the full script.
         
         *** INPUT PARAMETERS ***
         - Input: '$input_path'

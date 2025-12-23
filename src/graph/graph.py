@@ -23,7 +23,6 @@ from src.agents.data_engineer import DataEngineerAgent
 from src.agents.reviewer import ReviewerAgent
 from src.agents.qa_reviewer import QAReviewerAgent # New QA Gate
 from src.agents.execution_planner import ExecutionPlannerAgent
-from src.agents.postmortem import PostmortemAgent
 from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
 from src.utils.pdf_generator import convert_report_to_pdf
@@ -751,71 +750,6 @@ def _build_de_runtime_diagnosis(error_details: str) -> List[str]:
         )
     return lines
 
-def _build_de_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]) -> str:
-    last_gate = state.get("last_gate_context") or {}
-    required_fixes = last_gate.get("required_fixes", [])
-    gate_feedback = last_gate.get("feedback", "")
-    err_msg = state.get("error_message", "") or ""
-    exec_out = state.get("execution_output", "") or ""
-    reason = decision.get("reason", "") or ""
-    why = ""
-    if required_fixes:
-        why = f"Gate required fixes: {required_fixes}"
-    else:
-        why = _infer_de_failure_cause(gate_feedback or err_msg or exec_out)
-    if not reason:
-        reason = err_msg or gate_feedback or "Data Engineer failure."
-    if not why:
-        why = "Unknown root cause. Inspect header mapping, canonicalization, and required input checks."
-    lines = ["POSTMORTEM_CONTEXT_FOR_DE:"]
-    if reason:
-        lines.append(f"FAILURE_SUMMARY: {reason}")
-    if why:
-        lines.append(f"WHY_IT_HAPPENED: {why}")
-    if gate_feedback:
-        lines.append(f"LAST_GATE_FEEDBACK: {gate_feedback}")
-    if err_msg:
-        lines.append(f"ERROR_MESSAGE: {err_msg}")
-    if exec_out:
-        lines.append(f"EXECUTION_OUTPUT_TAIL: {exec_out[-1200:]}")
-    lines.append("FIX_GUIDANCE: Fix the root cause and regenerate the full cleaning script.")
-    return "\n".join(lines)
-
-def _build_ml_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]) -> str:
-    last_gate = state.get("last_gate_context") or {}
-    required_fixes = last_gate.get("required_fixes", [])
-    gate_feedback = last_gate.get("feedback", "")
-    err_msg = state.get("error_message", "") or ""
-    exec_out = state.get("execution_output", "") or ""
-    reason = decision.get("reason", "") or ""
-    ml_expl = (state.get("ml_failure_explanation") or "").strip()
-    why = ""
-    if required_fixes:
-        why = f"Gate required fixes: {required_fixes}"
-    else:
-        why = _infer_de_failure_cause(gate_feedback or err_msg or exec_out)
-    if not reason:
-        reason = err_msg or gate_feedback or "ML Engineer failure."
-    if ml_expl:
-        why = ml_expl
-    if not why:
-        why = "Unknown root cause. Inspect feature mapping, target variance, and dialect usage."
-    lines = ["POSTMORTEM_CONTEXT_FOR_ML:"]
-    if reason:
-        lines.append(f"FAILURE_SUMMARY: {reason}")
-    if why:
-        lines.append(f"WHY_IT_HAPPENED: {why}")
-    if ml_expl:
-        lines.append(f"FAILURE_EXPLANATION: {ml_expl}")
-    if gate_feedback:
-        lines.append(f"LAST_GATE_FEEDBACK: {gate_feedback}")
-    if err_msg:
-        lines.append(f"ERROR_MESSAGE: {err_msg}")
-    if exec_out:
-        lines.append(f"EXECUTION_OUTPUT_TAIL: {exec_out[-1200:]}")
-    lines.append("FIX_GUIDANCE: Fix the root cause and regenerate the full ML script.")
-    return "\n".join(lines)
-
 def _merge_de_audit_override(base: str, payload: str) -> str:
     base = base or ""
     payload = payload or ""
@@ -946,7 +880,6 @@ class AgentState(TypedDict):
     leakage_audit_summary: str
     ml_skipped_reason: str
     execution_contract: Dict[str, Any]
-    postmortem_decision: Dict[str, Any]
     restrategize_count: int
     strategist_context_override: str
     missing_repeat_count: int
@@ -969,7 +902,6 @@ translator = BusinessTranslatorAgent()
 reviewer = ReviewerAgent()
 qa_reviewer = QAReviewerAgent()
 execution_planner = ExecutionPlannerAgent()
-postmortem_agent = PostmortemAgent()
 failure_explainer = FailureExplainerAgent()
 results_advisor = ResultsAdvisorAgent()
 
@@ -2420,19 +2352,6 @@ def check_engineer_success(state: AgentState):
     return "success"
 
 
-def check_postmortem_action(state: AgentState):
-    decision = state.get("postmortem_decision", {}) or {}
-    action = decision.get("action")
-    if action == "retry_data_engineer":
-        return "retry_de"
-    if action == "retry_ml_engineer":
-        return "retry_ml"
-    if action == "re_strategize":
-        return "restrat"
-    if action == "stop":
-        return "stop"
-    return "stop"
-
 def run_reviewer(state: AgentState) -> AgentState:
     print("--- REVIEWER AGENT ---")
     abort_state = _abort_if_requested(state, "reviewer")
@@ -3252,7 +3171,7 @@ def check_execution_status(state: AgentState):
         if attempt <= max_runtime_fixes:
             print(f"Runtime Error detected (Attempt {attempt}). Preparing runtime fix.")
             return "retry_fix"
-        print(f"Runtime Error detected (Attempt {attempt}). Delegating to Postmortem.")
+        print(f"Runtime Error detected (Attempt {attempt}). Max runtime fixes reached.")
         return "failed"
             
     return "evaluate"
@@ -3405,166 +3324,6 @@ def run_translator(state: AgentState) -> AgentState:
     except Exception:
         pass
     return {"final_report": report}
-
-
-def run_postmortem(state: AgentState) -> AgentState:
-    print("--- [POSTMORTEM] Tech Lead Decision ---")
-    if abort_requested() or "ABORTED_BY_USER" in str(state.get("error_message", "")):
-        decision = {
-            "action": "stop",
-            "reason": "Run aborted by user.",
-            "context_patch": None,
-        }
-        return {"postmortem_decision": decision}
-    run_id = state.get("run_id")
-    if run_id:
-        log_run_event(run_id, "postmortem_start", {})
-    # Load integrity audit issues if available
-    integrity_issues = []
-    try:
-        with open("data/integrity_audit_report.json", "r", encoding="utf-8") as f:
-            report = json.load(f)
-            integrity_issues = report.get("issues", [])
-    except Exception:
-        integrity_issues = []
-
-    context = {
-        "business_objective": state.get("business_objective", ""),
-        "selected_strategy": state.get("selected_strategy", {}),
-        "execution_contract": state.get("execution_contract", {}),
-        "integrity_issues": integrity_issues,
-        "output_contract_report": {},
-        "execution_output": state.get("execution_output", ""),
-        "review_feedback": state.get("review_feedback", ""),
-        "feedback_history": state.get("feedback_history", []),
-        "iteration_count": state.get("iteration_count", 0),
-        "restrategize_count": state.get("restrategize_count", 0),
-        "error_message": state.get("error_message", ""),
-        "missing_repeat_count": state.get("missing_repeat_count", 0),
-        "last_gate_context": state.get("last_gate_context", {}),
-    }
-    try:
-        with open("data/output_contract_report.json", "r", encoding="utf-8") as f:
-            context["output_contract_report"] = json.load(f)
-    except Exception:
-        context["output_contract_report"] = {}
-    decision = postmortem_agent.decide(context)
-    if not isinstance(decision, dict):
-        decision = postmortem_agent._fallback(context)
-    try:
-        os.makedirs("data", exist_ok=True)
-        with open("data/postmortem_decision.json", "w", encoding="utf-8") as f:
-            json.dump(decision, f, indent=2)
-    except Exception as err:
-        print(f"Warning: failed to persist postmortem_decision.json: {err}")
-    if run_id:
-        log_run_event(run_id, "postmortem_complete", {"action": decision.get("action")})
-
-    # Build state patch
-    new_state = {}
-    new_state["postmortem_decision"] = decision
-    action = decision.get("action")
-    context_patch_raw = decision.get("context_patch")
-    if isinstance(context_patch_raw, str):
-        try:
-            context_patch_raw = json.loads(context_patch_raw)
-        except Exception:
-            context_patch_raw = {}
-    context_patch = context_patch_raw if isinstance(context_patch_raw, dict) else {}
-    if decision.get("context_patch") is not None and not isinstance(context_patch_raw, dict):
-        warn_msg = "POSTMORTEM_BAD_SHAPE: context_patch not dict"
-        fh = list(state.get("feedback_history", []))
-        fh.append(warn_msg)
-        new_state["feedback_history"] = fh
-    if context_patch and not context_patch.get("target"):
-        # If patch has no explicit target, route to strategist context override to avoid dropping it.
-        try:
-            new_state["strategist_context_override"] = json.dumps(context_patch)
-        except Exception:
-            new_state["strategist_context_override"] = str(context_patch)
-        context_patch = {}
-    if context_patch:
-        target = context_patch.get("target")
-        payload = context_patch.get("payload", "")
-        if target == "data_engineer_audit_override":
-            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, str(payload))
-        elif target == "ml_engineer_audit_override":
-            base_override = state.get("ml_engineer_audit_override") or state.get("data_summary", "")
-            new_state["ml_engineer_audit_override"] = _merge_de_audit_override(base_override, str(payload))
-        elif target == "feedback_history":
-            fh = list(new_state.get("feedback_history", state.get("feedback_history", [])))
-            fh.append(payload)
-            new_state["feedback_history"] = fh
-        elif target == "strategist_context_override":
-            new_state["strategist_context_override"] = payload
-
-    if action == "retry_data_engineer":
-        base_override = new_state.get("data_engineer_audit_override")
-        if not base_override:
-            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-        auto_payload = _build_de_postmortem_context(state, decision)
-        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, auto_payload)
-    if action == "retry_ml_engineer":
-        base_override = new_state.get("ml_engineer_audit_override")
-        if not base_override:
-            base_override = state.get("ml_engineer_audit_override") or state.get("data_summary", "")
-        expl_text = ""
-        try:
-            error_details = state.get("last_runtime_error_tail") or state.get("execution_output") or state.get("error_message", "")
-            code = state.get("generated_code") or state.get("last_generated_code") or ""
-            expl_ctx = state.get("ml_context_snapshot") or {}
-            expl_text = failure_explainer.explain_ml_failure(
-                code=code,
-                error_details=str(error_details),
-                context=expl_ctx,
-            )
-            if expl_text:
-                try:
-                    os.makedirs("artifacts", exist_ok=True)
-                    with open(os.path.join("artifacts", "ml_engineer_failure_explainer.txt"), "w", encoding="utf-8") as f_exp:
-                        f_exp.write(expl_text.strip())
-                except Exception as exp_err:
-                    print(f"Warning: failed to persist ml_engineer_failure_explainer.txt: {exp_err}")
-        except Exception as expl_err:
-            print(f"Warning: ML failure explainer failed: {expl_err}")
-        state_with_expl = dict(state)
-        if expl_text:
-            state_with_expl["ml_failure_explanation"] = expl_text.strip()
-            new_state["ml_failure_explanation"] = expl_text.strip()
-        auto_payload = _build_ml_postmortem_context(state_with_expl, decision)
-        new_state["ml_engineer_audit_override"] = _merge_de_audit_override(base_override, auto_payload)
-
-    sr_raw = decision.get("should_reset")
-    should_reset = sr_raw if isinstance(sr_raw, dict) else {}
-    if decision.get("should_reset") is not None and not isinstance(sr_raw, dict):
-        fh = list(new_state.get("feedback_history", state.get("feedback_history", [])))
-        fh.append("POSTMORTEM_BAD_SHAPE: should_reset not dict")
-        new_state["feedback_history"] = fh
-    if should_reset.get("reset_ml_patch_context"):
-        new_state["reset_ml_patch_context"] = True
-        new_state["last_generated_code"] = None
-        new_state["last_gate_context"] = None
-    if should_reset.get("reset_review_streaks"):
-        new_state["review_reject_streak"] = 0
-        new_state["qa_reject_streak"] = 0
-
-    err_msg_lower = str(state.get("error_message", "")).lower()
-    missing_pattern = ("missing required columns" in err_msg_lower) or ("mapping failed" in err_msg_lower) or ("dialect" in err_msg_lower) or ("pd.read_csv" in err_msg_lower)
-    if action == "re_strategize":
-        new_state["restrategize_count"] = state.get("restrategize_count", 0) + 1
-        # reset iteration loop
-        new_state["iteration_count"] = 0
-        new_state["last_generated_code"] = None
-        new_state["last_gate_context"] = None
-        new_state["review_reject_streak"] = 0
-        new_state["qa_reject_streak"] = 0
-        new_state["missing_repeat_count"] = 0
-    else:
-        prev_missing = state.get("missing_repeat_count", 0) or 0
-        new_state["missing_repeat_count"] = prev_missing + 1 if missing_pattern else 0
-    return new_state
-
 # Generate Unique PDF Path to avoid file locks
 import uuid
 
@@ -3616,7 +3375,6 @@ workflow.add_node("execute_code", execute_code)
 workflow.add_node("evaluate_results", run_result_evaluator) # New Node
 workflow.add_node("retry_handler", retry_handler)
 workflow.add_node("prepare_runtime_fix", prepare_runtime_fix) # New Node
-workflow.add_node("postmortem", run_postmortem)
 
 workflow.add_node("translator", run_translator)
 workflow.add_node("generate_pdf", generate_pdf_artifact)
@@ -3655,7 +3413,7 @@ workflow.add_conditional_edges(
     check_data_success,
     {
         "success": "engineer",
-        "failed": "postmortem" # Let postmortem decide retry/stop
+        "failed": "translator"
     }
 )
 
@@ -3671,7 +3429,7 @@ workflow.add_conditional_edges(
     {
         "evaluate": "evaluate_results",
         "retry_fix": "prepare_runtime_fix",
-        "failed": "postmortem"
+        "failed": "translator"
     }
 )
 
@@ -3688,16 +3446,6 @@ workflow.add_conditional_edges(
 )
 
 workflow.add_edge("retry_handler", "engineer")
-workflow.add_conditional_edges(
-    "postmortem",
-    check_postmortem_action,
-    {
-        "retry_de": "data_engineer",
-        "retry_ml": "engineer",
-        "restrat": "strategist",
-        "stop": "translator",
-    }
-)
 workflow.add_edge("translator", "generate_pdf")
 workflow.add_edge("generate_pdf", END)
 

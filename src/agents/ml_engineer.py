@@ -55,7 +55,7 @@ class MLEngineerAgent:
         *** HARD CONSTRAINTS (VIOLATION = FAILURE) ***
         1. OUTPUT VALID PYTHON CODE ONLY (no markdown/code fences).
         2. Do NOT output JSON plans or pseudo-code.
-        3. If the audit includes RUNTIME_ERROR_CONTEXT or POSTMORTEM_CONTEXT_FOR_ML, fix the root cause and regenerate the full script.
+        3. If the audit includes RUNTIME_ERROR_CONTEXT, fix the root cause and regenerate the full script.
 
         *** EXECUTION STYLE (FREEDOM WITH GUARDRAILS) ***
         - You are free to design the code structure and modeling approach; do NOT follow a rigid template.
