@@ -676,12 +676,30 @@ def dialect_guard_violations(code: str, csv_sep: str, csv_decimal: str, csv_enco
     }
     kw_map = {kw.arg: kw.value for kw in target_call.keywords if kw.arg}
 
+    def _normalize_encoding(value: str) -> str:
+        return str(value).strip().lower().replace("_", "-")
+
+    def _encoding_matches(expected_value: str, actual_value: str) -> bool:
+        exp = _normalize_encoding(expected_value)
+        act = _normalize_encoding(actual_value)
+        if exp in {"utf-8", "utf8"}:
+            return act in {"utf-8", "utf8", "utf-8-sig", "utf8-sig"}
+        if exp in {"utf-8-sig", "utf8-sig"}:
+            return act in {"utf-8", "utf8", "utf-8-sig", "utf8-sig"}
+        return exp == act
+
     for param, expected_value in expected.items():
         if param not in kw_map:
             violations.append(f"pd.read_csv missing {param}= for dialect")
             continue
         val_node = kw_map[param]
         if isinstance(val_node, ast.Constant) and isinstance(val_node.value, str):
+            if param == "encoding":
+                if not _encoding_matches(expected_value, val_node.value):
+                    violations.append(
+                        f"pd.read_csv {param} literal '{val_node.value}' does not match expected '{expected_value}'"
+                    )
+                continue
             if val_node.value != expected_value:
                 violations.append(f"pd.read_csv {param} literal '{val_node.value}' does not match expected '{expected_value}'")
         else:
