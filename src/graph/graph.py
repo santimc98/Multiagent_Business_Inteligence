@@ -2130,10 +2130,13 @@ def run_engineer(state: AgentState) -> AgentState:
     if not ok:
         if run_id:
             log_run_event(run_id, "budget_exceeded", {"label": "ml_engineer", "error": err_msg})
+        last_code = state.get("last_generated_code")
+        last_success_output = state.get("last_successful_execution_output")
         return {
             "error_message": err_msg,
-            "generated_code": "# Generation Failed",
-            "execution_output": err_msg,
+            "generated_code": last_code or "# Generation Failed",
+            "execution_output": last_success_output or err_msg,
+            "execution_output_stale": bool(last_success_output),
             "budget_counters": counters,
         }
     if run_id:
@@ -2914,7 +2917,16 @@ def execute_code(state: AgentState) -> AgentState:
     print(f"Execution finished. Plots generated: {len(plots_local)}")
     
     # Check for Runtime Errors in Output (Traceback)
-    error_in_output = "Traceback (most recent call last)" in output or "EXECUTION ERROR" in output
+    sandbox_failed = (
+        "Sandbox Execution Failed" in output
+        or "peer closed connection" in output
+        or "incomplete chunked read" in output
+    )
+    error_in_output = (
+        "Traceback (most recent call last)" in output
+        or "EXECUTION ERROR" in output
+        or sandbox_failed
+    )
     
     runtime_tail = None
     ml_skipped_reason = state.get("ml_skipped_reason", None)
@@ -2948,7 +2960,7 @@ def execute_code(state: AgentState) -> AgentState:
                 "output_missing": len(oc_report.get("missing", [])) if isinstance(oc_report, dict) else None,
             },
         )
-    return {
+    result = {
         "execution_output": output,
         "plots_local": plots_local,
         "has_partial_visuals": has_partial_visuals,
@@ -2956,8 +2968,14 @@ def execute_code(state: AgentState) -> AgentState:
         "last_runtime_error_tail": runtime_tail,
         "ml_skipped_reason": ml_skipped_reason,
         "output_contract_report": oc_report,
+        "sandbox_failed": sandbox_failed,
         "budget_counters": counters,
     }
+    if not error_in_output:
+        result["last_successful_execution_output"] = output
+        result["last_successful_plots"] = plots_local
+        result["last_successful_output_contract_report"] = oc_report
+    return result
 
 def retry_handler(state: AgentState) -> AgentState:
     print("--- [!] Performance Low. Retrying... ---")
@@ -3195,7 +3213,14 @@ def check_execution_status(state: AgentState):
     skipped_reason = state.get("ml_skipped_reason")
     
     # Traceback check (Runtime Error)
-    has_error = "Traceback (most recent call last)" in output or "EXECUTION ERROR" in output
+    has_error = (
+        "Traceback (most recent call last)" in output
+        or "EXECUTION ERROR" in output
+        or "Sandbox Execution Failed" in output
+        or "peer closed connection" in output
+        or "incomplete chunked read" in output
+        or state.get("sandbox_failed")
+    )
     determinism_error = "DETERMINISTIC_TARGET_RELATION" in output
     undefined_precheck = "STATIC_PRECHECK_UNDEFINED" in output
 
@@ -3300,20 +3325,27 @@ def run_translator(state: AgentState) -> AgentState:
     if run_id:
         log_run_event(run_id, "translator_start", {})
     
-    # Handle Failure Case
-    # Handle Failure Case
     error_msg = state.get("error_message")
     
     # Extract visuals context
     has_partial_visuals = state.get("has_partial_visuals", False)
     plots_local = state.get("plots_local", [])
     
+    report_state = dict(state)
+    if error_msg and state.get("last_successful_execution_output"):
+        if "BUDGET_EXCEEDED" in str(error_msg):
+            report_state["execution_output"] = state.get("last_successful_execution_output")
+            if state.get("last_successful_plots"):
+                report_state["plots_local"] = state.get("last_successful_plots")
+                report_state["has_partial_visuals"] = True
+    report_has_partial = report_state.get("has_partial_visuals", has_partial_visuals)
+    report_plots = report_state.get("plots_local", plots_local)
     try:
         report = translator.generate_report(
-            state, 
+            report_state,
             error_message=error_msg,
-            has_partial_visuals=has_partial_visuals,
-            plots=plots_local
+            has_partial_visuals=report_has_partial,
+            plots=report_plots
         )
     except Exception as e:
         print(f"CRITICAL: Translator crashed in host: {e}")

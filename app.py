@@ -310,11 +310,18 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         
         with col_code:
             st.markdown("**Código Generado:**")
-            st.code(result.get('generated_code', '# No code'), language='python')
+            ml_code = result.get('generated_code', '# No code')
+            if ml_code.strip() == "# Generation Failed":
+                ml_code = result.get('last_generated_code', ml_code)
+            st.code(ml_code, language='python')
         
         with col_out:
             st.markdown("**Salida de Consola:**")
-            st.text_area("Output", result.get('execution_output', ''), height=400)
+            ml_output = result.get('execution_output', '')
+            last_ok = result.get('last_successful_execution_output')
+            if "BUDGET_EXCEEDED" in str(ml_output) and last_ok:
+                ml_output = f"{ml_output}\n\n--- Last successful execution output ---\n{last_ok}"
+            st.text_area("Output", ml_output, height=400)
 
     with tab4:
         st.subheader("Informe para Directivos (Translator)")
