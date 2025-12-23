@@ -2333,6 +2333,7 @@ def run_engineer(state: AgentState) -> AgentState:
             "generated_code": code,
             "last_generated_code": code, # Update for next patch
             "ml_data_path": data_path,
+            "error_message": "",
             "ml_context_snapshot": {
                 "cleaned_column_inventory": header_cols,
                 "cleaned_aliasing_collisions": aliasing if header_cols else {},
