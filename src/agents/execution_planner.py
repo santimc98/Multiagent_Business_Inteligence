@@ -181,7 +181,15 @@ class ExecutionPlannerAgent:
                 name = req.get("name")
                 if not name:
                     continue
+                source = (req.get("source") or "input").lower()
                 canonical = req.get("canonical_name")
+                if source == "derived":
+                    if not canonical:
+                        canonical = _canonicalize_name(name)
+                        req["canonical_name"] = canonical
+                    if canonical:
+                        canonical_cols.append(canonical)
+                    continue
                 raw_match = _resolve_exact_header(canonical or name)
                 if raw_match:
                     canonical = raw_match
@@ -201,6 +209,45 @@ class ExecutionPlannerAgent:
                 if note not in notes:
                     notes.append(note)
                 contract["notes_for_engineers"] = notes
+            return contract
+
+        def _ensure_case_id_requirement(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            spec = contract.get("spec_extraction") or {}
+            case_taxonomy = spec.get("case_taxonomy")
+            if not isinstance(case_taxonomy, list) or not case_taxonomy:
+                return contract
+            reqs = contract.get("data_requirements", []) or []
+            case_names = {"case_id", "case", "caso", "caseid", "case_id"}
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                name = (req.get("name") or "").strip()
+                if _norm(name) in case_names:
+                    return contract
+                canonical = (req.get("canonical_name") or "").strip()
+                if _norm(canonical) in case_names:
+                    return contract
+            reqs.append(
+                {
+                    "name": "Case_ID",
+                    "role": "case_id",
+                    "expected_range": None,
+                    "allowed_null_frac": 0.0,
+                    "source": "derived",
+                    "expected_kind": "categorical",
+                    "canonical_name": "Case_ID",
+                }
+            )
+            contract["data_requirements"] = reqs
+            notes = contract.get("notes_for_engineers")
+            if not isinstance(notes, list):
+                notes = []
+            note = "Case taxonomy present; include a case identifier column (e.g., Case_ID) in cleaned outputs."
+            if note not in notes:
+                notes.append(note)
+            contract["notes_for_engineers"] = notes
             return contract
 
         def _detect_canonical_collisions() -> List[tuple[str, List[str]]]:
@@ -598,6 +645,7 @@ class ExecutionPlannerAgent:
             }
             contract = _apply_inventory_source(contract)
             contract = _apply_expected_kind(contract)
+            contract = _ensure_case_id_requirement(contract)
             contract = _attach_canonical_names(contract)
             contract = enforce_percentage_ranges(contract)
             contract = ensure_role_runbooks(contract)
@@ -703,6 +751,7 @@ Return the contract JSON.
                 }
             contract = _apply_inventory_source(contract)
             contract = _apply_expected_kind(contract)
+            contract = _ensure_case_id_requirement(contract)
             contract = _attach_canonical_names(contract)
             contract = enforce_percentage_ranges(contract)
             contract = ensure_role_runbooks(contract)

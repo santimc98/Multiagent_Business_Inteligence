@@ -3262,6 +3262,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     code = state.get("generated_code") or state.get("last_generated_code") or ""
     counters = dict(state.get("budget_counters") or {})
     review_counters = counters
+    audit_rejected = False
     if code:
         analysis_type = strategy.get("analysis_type", "predictive")
         review_warnings: List[str] = []
@@ -3283,10 +3284,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             review_counters = counters
             if ok:
                 qa_result = qa_reviewer.review_code(code, strategy, business_objective)
-                if qa_result and qa_result.get("status") != "APPROVED":
-                    review_warnings.append(
-                        f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
-                    )
+            if qa_result and qa_result.get("status") != "APPROVED":
+                review_warnings.append(
+                    f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
+                )
             else:
                 review_warnings.append(f"QA_CODE_AUDIT_SKIPPED: {err_msg}")
         except Exception as qa_err:
@@ -3295,6 +3296,19 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             warn_text = "\n".join(review_warnings)
             feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
             new_history.append(warn_text)
+            audit_rejected = any(
+                "REVIEWER_CODE_AUDIT[REJECTED]" in warn_text
+                or "QA_CODE_AUDIT[REJECTED]" in warn_text
+                for warn_text in review_warnings
+            )
+
+    if audit_rejected:
+        status = "NEEDS_IMPROVEMENT"
+        if feedback:
+            feedback = f"{feedback}\nCODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes."
+        else:
+            feedback = "CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes."
+        new_history.append("CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes.")
 
     gate_context = {
         "source": "case_alignment_gate" if case_report.get("status") == "FAIL" else "result_evaluator",

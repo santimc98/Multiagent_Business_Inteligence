@@ -88,6 +88,18 @@ def _pick_column(df: pd.DataFrame, target_name: Optional[str], kind: str) -> Opt
     return None
 
 
+def _pick_case_column(df: pd.DataFrame) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+    for col in df.columns:
+        norm = _normalize(col)
+        if norm in {"case", "caseid", "case_id", "caso", "casoid"}:
+            return col
+        if norm.startswith("case") or "case" in norm or "caso" in norm:
+            return col
+    return None
+
+
 def _compute_adjacent_violations(ref: pd.Series, score: pd.Series) -> int:
     df = pd.DataFrame({"ref": ref, "score": score}).dropna()
     if df.empty:
@@ -249,6 +261,7 @@ def build_case_alignment_report(
                 mode = "row_level"
                 break
 
+    case_count = None
     if ref_series is None or score_series is None:
         if os.path.exists(case_summary_path):
             try:
@@ -258,6 +271,12 @@ def build_case_alignment_report(
                     decimal=dialect["decimal"],
                     encoding=dialect["encoding"],
                 )
+                if not cs.empty:
+                    case_col = _pick_case_column(cs)
+                    if case_col:
+                        case_count = int(cs[case_col].nunique(dropna=True))
+                    else:
+                        case_count = int(len(cs))
                 ref_col = _pick_column(cs, target_name, "target")
                 score_col = _pick_column(cs, None, "score_mean")
                 if ref_col and score_col:
@@ -293,9 +312,14 @@ def build_case_alignment_report(
         "weight_concentration_max": weight_metrics.get("max_weight"),
         "weight_concentration_hhi": weight_metrics.get("hhi"),
         "near_zero_weights_count": weight_metrics.get("near_zero_weights_count"),
+        "case_count": case_count,
     }
 
     failures = []
+    if case_count is not None and case_count < 2:
+        failures.append("insufficient_case_variation")
+    if case_count is None and (spearman is None or kendall is None):
+        failures.append("insufficient_case_variation")
     if spearman is not None and thresholds["spearman_min"] is not None and spearman < thresholds["spearman_min"]:
         failures.append("spearman_case_means")
     if kendall is not None and thresholds["kendall_min"] is not None and kendall < thresholds["kendall_min"]:
