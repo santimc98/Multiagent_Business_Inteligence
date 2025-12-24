@@ -799,6 +799,155 @@ def _load_json_safe(path: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+def _extract_weights_from_obj(obj: Any) -> Dict[str, float]:
+    if not isinstance(obj, dict):
+        return {}
+    if isinstance(obj.get("weights"), dict):
+        return {str(k): float(v) for k, v in obj["weights"].items() if _is_number(v)}
+    if isinstance(obj.get("feature_weights"), dict):
+        return {str(k): float(v) for k, v in obj["feature_weights"].items() if _is_number(v)}
+    weights = obj.get("weights")
+    features = obj.get("features")
+    if isinstance(weights, list) and isinstance(features, list) and len(weights) == len(features):
+        out = {}
+        for idx, feat in enumerate(features):
+            val = weights[idx]
+            if _is_number(val):
+                out[str(feat)] = float(val)
+        if out:
+            return out
+    weights = obj.get("optimized_weights")
+    features = obj.get("feature_cols") or obj.get("feature_columns")
+    if isinstance(weights, list) and isinstance(features, list) and len(weights) == len(features):
+        out = {}
+        for idx, feat in enumerate(features):
+            val = weights[idx]
+            if _is_number(val):
+                out[str(feat)] = float(val)
+        if out:
+            return out
+    return {}
+
+def _is_number(value: Any) -> bool:
+    try:
+        float(value)
+        return True
+    except Exception:
+        return False
+
+def _infer_objective_signature(code: str) -> Dict[str, Any]:
+    if not code:
+        return {}
+    lower = code.lower()
+    optimizer = None
+    for opt in ("linprog", "slsqp", "minimize", "cobyla", "trust-constr", "differential_evolution"):
+        if opt in lower:
+            optimizer = opt
+            break
+    terms = []
+    for token in (
+        "case_order_violations",
+        "adjacent_refscore_violations",
+        "case_spearman",
+        "case_level",
+        "case_means",
+        "kendall",
+        "spearman",
+        "rank_correlation",
+        "violation",
+        "penalty",
+        "regularization",
+    ):
+        if token in lower and token not in terms:
+            terms.append(token)
+    code_hash = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:10]
+    return {"optimizer": optimizer or "unknown", "terms": terms[:6], "code_hash": code_hash}
+
+def _format_metric_delta(label: str, prev: Any, curr: Any) -> str:
+    if prev is None or curr is None:
+        return f"{label}: {curr}"
+    try:
+        delta = float(curr) - float(prev)
+        return f"{label}: {prev} -> {curr} (delta {delta:+.4f})"
+    except Exception:
+        return f"{label}: {prev} -> {curr}"
+
+def _build_iteration_memory(
+    iter_id: int,
+    metrics_report: Dict[str, Any],
+    case_report: Dict[str, Any],
+    weights_report: Dict[str, Any],
+    code: str,
+    prev_summary: Dict[str, Any] | None,
+    advisor_note: str | None,
+) -> Dict[str, Any]:
+    objective_sig = _infer_objective_signature(code)
+    weights = _extract_weights_from_obj(weights_report)
+    top_weights = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    metrics_global = (metrics_report or {}).get("global_ranking", {})
+    metrics_case = (metrics_report or {}).get("case_level", {})
+    case_metrics = (case_report or {}).get("metrics", {})
+    summary = {
+        "iteration_id": iter_id,
+        "objective_signature": objective_sig,
+        "weights_top": top_weights,
+        "metrics_global": metrics_global,
+        "metrics_case_level": metrics_case,
+        "case_alignment_metrics": case_metrics,
+        "failures": case_report.get("failures", []) if isinstance(case_report, dict) else [],
+    }
+    if advisor_note:
+        summary["advisor_note"] = advisor_note.strip()
+    if prev_summary:
+        summary["delta"] = {
+            "spearman_case_means": {
+                "prev": prev_summary.get("case_alignment_metrics", {}).get("spearman_case_means"),
+                "curr": case_metrics.get("spearman_case_means"),
+            },
+            "adjacent_refscore_violations": {
+                "prev": prev_summary.get("case_alignment_metrics", {}).get("adjacent_refscore_violations"),
+                "curr": case_metrics.get("adjacent_refscore_violations"),
+            },
+            "global_spearman": {
+                "prev": prev_summary.get("metrics_global", {}).get("spearman"),
+                "curr": metrics_global.get("spearman"),
+            },
+        }
+    return summary
+
+def _build_edit_instructions(summary: Dict[str, Any]) -> str:
+    if not summary:
+        return ""
+    objective = summary.get("objective_signature", {})
+    failures = summary.get("failures", [])
+    delta = summary.get("delta", {})
+    weights_top = summary.get("weights_top", [])
+    lines = ["EDIT THESE BLOCKS (modify previous code; do not rewrite):"]
+    if objective:
+        terms = ", ".join(objective.get("terms") or [])
+        lines.append(
+            f"- Objective: optimizer={objective.get('optimizer')} terms=[{terms}] code_hash={objective.get('code_hash')}"
+        )
+    if weights_top:
+        weights_text = ", ".join([f"{k}={v:.4f}" for k, v in weights_top])
+        lines.append(f"- Weights(top): {weights_text}")
+    if delta:
+        lines.append(
+            "- Metric deltas: "
+            + "; ".join(
+                [
+                    _format_metric_delta("spearman_case_means", delta.get("spearman_case_means", {}).get("prev"), delta.get("spearman_case_means", {}).get("curr")),
+                    _format_metric_delta("adjacent_refscore_violations", delta.get("adjacent_refscore_violations", {}).get("prev"), delta.get("adjacent_refscore_violations", {}).get("curr")),
+                    _format_metric_delta("global_spearman", delta.get("global_spearman", {}).get("prev"), delta.get("global_spearman", {}).get("curr")),
+                ]
+            )
+        )
+    if failures:
+        lines.append(f"- Current failures: {failures}")
+    advisor_note = summary.get("advisor_note")
+    if advisor_note:
+        lines.append(f"- Advisor: {advisor_note}")
+    return "\n".join(lines)
 def _summarize_case_summary(path: str) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
         return {}
@@ -868,6 +1017,14 @@ class AgentState(TypedDict):
     final_report: str
     # Feedback Loop Fields
     iteration_count: int
+    ml_iteration_memory: List[Dict[str, Any]]
+    ml_iteration_memory_block: str
+    metrics_signature: str
+    execution_output_stale: bool
+    sandbox_failed: bool
+    last_successful_execution_output: str
+    last_successful_plots: List[str]
+    last_successful_output_contract_report: Dict[str, Any]
     model_performance: float
     feedback_history: List[str]
     # PDF
@@ -2135,6 +2292,7 @@ def run_engineer(state: AgentState) -> AgentState:
         return {
             "error_message": err_msg,
             "generated_code": last_code or "# Generation Failed",
+            "last_generated_code": last_code,
             "execution_output": last_success_output or err_msg,
             "execution_output_stale": bool(last_success_output),
             "budget_counters": counters,
@@ -3197,6 +3355,35 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     print(f"Warning: failed to persist ml_results_advisor.txt: {adv_err}")
         except Exception as adv_err:
             print(f"Warning: results advisor failed: {adv_err}")
+
+    # Iteration memory (delta + objective + weights) for patch-mode guidance
+    iteration_memory = list(state.get("ml_iteration_memory", []) or [])
+    prev_summary = iteration_memory[-1] if iteration_memory else None
+    summary = _build_iteration_memory(
+        iter_id=iter_id,
+        metrics_report=metrics_report,
+        case_report=case_report,
+        weights_report=_load_json_safe("data/weights.json"),
+        code=code,
+        prev_summary=prev_summary,
+        advisor_note=result_state.get("ml_results_advice"),
+    )
+    if summary:
+        iteration_memory.append(summary)
+        iteration_memory = iteration_memory[-3:]
+        try:
+            os.makedirs(os.path.join("artifacts", "iterations"), exist_ok=True)
+            summary_path = os.path.join("artifacts", "iterations", f"ml_iteration_summary_iter_{iter_id}.json")
+            with open(summary_path, "w", encoding="utf-8") as f_sum:
+                json.dump(summary, f_sum, indent=2, ensure_ascii=False)
+        except Exception as mem_err:
+            print(f"Warning: failed to persist ml_iteration_summary_iter_{iter_id}.json: {mem_err}")
+    edit_block = _build_edit_instructions(summary)
+    if edit_block:
+        gate_context["edit_instructions"] = edit_block
+    result_state["ml_iteration_memory"] = iteration_memory
+    result_state["ml_iteration_memory_block"] = edit_block
+
     if status == "NEEDS_IMPROVEMENT":
         result_state["iteration_count"] = state.get("iteration_count", 0) + 1
     if run_id:
@@ -3332,18 +3519,19 @@ def run_translator(state: AgentState) -> AgentState:
     plots_local = state.get("plots_local", [])
     
     report_state = dict(state)
-    if error_msg and state.get("last_successful_execution_output"):
-        if "BUDGET_EXCEEDED" in str(error_msg):
-            report_state["execution_output"] = state.get("last_successful_execution_output")
-            if state.get("last_successful_plots"):
-                report_state["plots_local"] = state.get("last_successful_plots")
-                report_state["has_partial_visuals"] = True
+    report_error = error_msg
+    if error_msg and "BUDGET_EXCEEDED" in str(error_msg) and state.get("last_successful_execution_output"):
+        report_state["execution_output"] = state.get("last_successful_execution_output")
+        if state.get("last_successful_plots"):
+            report_state["plots_local"] = state.get("last_successful_plots")
+            report_state["has_partial_visuals"] = True
+        report_error = None
     report_has_partial = report_state.get("has_partial_visuals", has_partial_visuals)
     report_plots = report_state.get("plots_local", plots_local)
     try:
         report = translator.generate_report(
             report_state,
-            error_message=error_msg,
+            error_message=report_error,
             has_partial_visuals=report_has_partial,
             plots=report_plots
         )

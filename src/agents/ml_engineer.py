@@ -251,6 +251,9 @@ class MLEngineerAgent:
         $feedback_text
         *** FEEDBACK DIGEST (Recent) ***
         $feedback_digest
+
+        *** EDIT THESE BLOCKS (FROM LAST ITERATION) ***
+        $edit_instructions
         
         *** REQUIRED FIXES (CHECKLIST) ***
         $fixes_bullets
@@ -283,6 +286,7 @@ class MLEngineerAgent:
                 fixes_bullets=fixes_bullets,
                 previous_code=previous_code,
                 feedback_digest=feedback_digest,
+                edit_instructions=str(gate_context.get("edit_instructions", "")),
                 strategy_title=strategy.get('title', 'Unknown'),
                 data_path=data_path
             )
