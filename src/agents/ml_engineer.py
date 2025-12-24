@@ -17,18 +17,18 @@ _scan_code_safety_ref = "scan_code_safety"
 class MLEngineerAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the ML Engineer Agent with MIMO v2 Flash.
+        Initializes the ML Engineer Agent with DeepSeek Reasoner.
         """
-        self.api_key = api_key or os.getenv("MIMO_API_KEY")
+        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
-            raise ValueError("MIMO API Key is required.")
+            raise ValueError("DeepSeek API Key is required.")
 
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url="https://api.xiaomimimo.com/v1",
+            base_url="https://api.deepseek.com/v1",
             timeout=None,
         )
-        self.model_name = "mimo-v2-flash"
+        self.model_name = "deepseek-reasoner"
 
     def generate_code(
         self,
@@ -305,7 +305,7 @@ class MLEngineerAgent:
         from src.utils.retries import call_with_retries
 
         def _call_model():
-            print(f"DEBUG: ML Engineer calling MIMO Model ({self.model_name})...")
+            print(f"DEBUG: ML Engineer calling DeepSeek Model ({self.model_name})...")
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
@@ -323,7 +323,7 @@ class MLEngineerAgent:
 
         try:
             content = call_with_retries(_call_model, max_retries=5, backoff_factor=2, initial_delay=2)
-            print("DEBUG: MIMO response received.")
+            print("DEBUG: DeepSeek response received.")
             code = self._clean_code(content)
             if code.strip().startswith("{") or code.strip().startswith("["):
                 return "# Error: ML_CODE_REQUIRED"
