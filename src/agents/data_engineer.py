@@ -91,19 +91,21 @@ class DataEngineerAgent:
         )
 
         from src.utils.retries import call_with_retries
+        from src.utils.llm_throttle import glm_call_slot
 
         def _call_model():
             print(f"DEBUG: Data Engineer calling GLM Model ({self.model_name})...")
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": USER_TEMPLATE}
-                ],
-                temperature=0.1
-            )
-                    
-            content = response.choices[0].message.content
+            with glm_call_slot():
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": USER_TEMPLATE}
+                    ],
+                    temperature=0.1
+                )
+
+                content = response.choices[0].message.content
             
              # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
             if "504 Gateway Time-out" in content or "<html" in content.lower():
@@ -130,7 +132,7 @@ class DataEngineerAgent:
             return content
 
         try:
-            content = call_with_retries(_call_model, max_retries=3)
+            content = call_with_retries(_call_model, max_retries=4, backoff_factor=2, initial_delay=2)
             print("DEBUG: GLM response received.")
             
             code = self._clean_code(content)

@@ -30,7 +30,7 @@ class BusinessTranslatorAgent:
 
         genai.configure(api_key=self.api_key)
         self.model = genai.GenerativeModel(
-            model_name="gemini-3-flash",
+            model_name="gemini-3-flash-preview",
             generation_config={"temperature": 0.7},
         )
 
