@@ -6,7 +6,8 @@ import re
 import difflib
 
 from dotenv import load_dotenv
-from openai import OpenAI
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from src.utils.contract_validation import (
     ensure_role_runbooks,
     DEFAULT_DATA_ENGINEER_RUNBOOK,
@@ -45,16 +46,30 @@ class ExecutionPlannerAgent:
     """
 
     def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv("MIMO_API_KEY")
+        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
             self.client = None
         else:
-            self.client = OpenAI(
-                api_key=self.api_key,
-                base_url="https://api.xiaomimimo.com/v1",
-                timeout=None,
+            genai.configure(api_key=self.api_key)
+            generation_config = {
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "top_k": 40,
+                "max_output_tokens": 8192,
+                "response_mime_type": "application/json",
+            }
+            safety_settings = {
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+            }
+            self.client = genai.GenerativeModel(
+                model_name="gemini-3-flash-preview",
+                generation_config=generation_config,
+                safety_settings=safety_settings,
             )
-        self.model_name = "mimo-v2-flash"
+        self.model_name = "gemini-3-flash-preview"
 
     def generate_contract(self, strategy: Dict[str, Any], data_summary: str = "", business_objective: str = "", column_inventory: list[str] | None = None) -> Dict[str, Any]:
         def _norm(name: str) -> str:
@@ -741,39 +756,30 @@ class ExecutionPlannerAgent:
         column_inventory_json = json.dumps(column_inventory or [])
         system_prompt = Template(
             """
-You are a senior execution planner. Produce a JSON contract to guide data cleaning and modeling.
+You are a senior execution planner inside a multi-agent system. Produce a JSON contract that helps
+downstream AI engineers reason better (guidance, not rigid imperative rules).
+
 Requirements:
 - Output JSON ONLY (no markdown/code fences).
-- Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations, notes_for_engineers, required_dependencies, data_risks, spec_extraction, planner_self_check.
-        - data_requirements: list of {name, role, expected_range, allowed_null_frac, source, expected_kind}. expected_kind in {numeric, datetime, categorical, unknown}.
-- Each data_requirement may include source: "input" | "derived" (default input). If role==target and the name is not present in the column inventory from data_summary, mark source="derived" if reasonable.
-- expected_range e.g. [0,1] for probabilities/scores/percentages if implied by the column description.
-- validations: generic checks (e.g., ranking_coherence spearman, out_of_range).
-  - Do NOT invent columns; base everything on the provided strategy and data_summary.
-  - If a required column is NOT present in the column inventory, mark source="derived" and add a data_risks note.
-  - data_risks should list potential failure modes (missing columns, low variance, dialect/encoding sensitivity, sampling).
-  - required_outputs should always include data/cleaned_data.csv. For scoring/weights/ranking strategies, also include data/weights.json, data/case_summary.csv, and at least one plot like static/plots/*.png. For standard classification/regression, include data/metrics.json and one plot.
-  - Include role_runbooks for data_engineer and ml_engineer with: goals, must, must_not, safe_idioms, reasoning_checklist, validation_checklist, and (for DE) manifest_requirements; (for ML) methodology and outputs.
-  - If role == "date", use expected_range=null. Do not mix numeric ranges with null (avoid [0, null]); either null or a full numeric range when appropriate.
-          - COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
-          - required_dependencies is optional; include only if strongly implied by the strategy title or data_summary. Use module names (e.g., "xgboost", "statsmodels", "pyarrow", "openpyxl"). Otherwise use [].
-        - Include quality_gates (spearman_min, violations_max, inactive_share_max, max_weight_max, hhi_max, near_zero_max) and optimization_preferences (regularization + ranking_loss).
-        - Include business_alignment with optimization_priorities (ordered list with priority/goal/metric/direction) and acceptance_criteria tied to quality_gates and spec_extraction.
-        - Include role_runbooks as above to guide engineers with run-time safe idioms and reasoning checks.
-  - SPEC EXTRACTION (from business_objective + strategy): include a spec_extraction object with:
-    - scoring_formula: a string formula if explicitly stated, else null.
-    - derived_columns: list of {name, formula, depends_on, constraints} for any explicitly described derived fields.
-    - case_taxonomy: list of {case_id_or_name, conditions, ref_score, precedence} if the objective defines cases or tables.
-    - constraints: list of explicit constraints (e.g., weight non-negativity, sum-to-one) if stated.
-    - deliverables: list of explicitly requested outputs (tables, checks, comparisons) if stated.
-    - target_type: "ranking" or "ordinal" if the objective says ordinal/ranking, else null.
-    - leakage_policy: "allow_deterministic_for_design" if the target/case is defined using input variables; else null.
-    - If a spec element is not stated, leave it empty/null. Do NOT invent.
-  - SELF CHECK: include planner_self_check list with short statements verifying:
-    - If scoring_formula is not null, it appears in spec_extraction.
-    - If case_taxonomy is non-empty, deliverables include a case-level table.
-    - If constraints are stated, they appear in constraints.
-    - If target_type is ordinal/ranking, include a ranking validation in validations.
+- Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations,
+  notes_for_engineers, required_dependencies, data_risks, spec_extraction, planner_self_check.
+- data_requirements: list of {name, role, expected_range, allowed_null_frac, source, expected_kind}.
+  expected_kind in {numeric, datetime, categorical, unknown}.
+- Each data_requirement may include source: "input" | "derived" (default input).
+- Use expected_range when the business context implies it (e.g., [0,1] for normalized scores/ratios).
+- validations: generic checks (ranking coherence, out-of-range, weight constraints).
+- Prefer using columns from the strategy and data_summary; if something must be derived, mark source="derived"
+  and explain in data_risks.
+- required_outputs must include data/cleaned_data.csv. For scoring/weights/ranking tasks, include
+  data/weights.json, data/case_summary.csv, and at least one plot in static/plots/*.png.
+- Include role_runbooks to guide reasoning (goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist).
+- COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
+- required_dependencies is optional; include only if strongly implied by the strategy title or data_summary.
+- Include quality_gates and optimization_preferences when relevant.
+- Include business_alignment with ordered optimization priorities and acceptance criteria.
+- SPEC EXTRACTION: map explicit formulas, derived columns, cases, constraints, deliverables, target_type, leakage_policy.
+  If not stated, leave empty/null; do not invent.
+- SELF CHECK: short statements validating that spec_extraction and validations match the stated objective.
   """
         ).substitute(column_inventory=column_inventory_json)
         user_prompt_template = Template(
@@ -800,15 +806,9 @@ Return the contract JSON.
             column_inventory=json.dumps(column_inventory or []),
         )
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.2,
-            )
-            content = response.choices[0].message.content
+            full_prompt = f"{system_prompt}\n\nUSER_INPUT:\n{user_prompt}"
+            response = self.client.generate_content(full_prompt)
+            content = response.text
             content = content.replace("```json", "").replace("```", "").strip()
             contract = json.loads(content)
             if not isinstance(contract, dict) or "data_requirements" not in contract:

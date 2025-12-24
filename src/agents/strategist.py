@@ -3,35 +3,50 @@ import json
 import re
 from typing import Dict, Any, List
 from dotenv import load_dotenv
-from openai import OpenAI
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 load_dotenv()
 
 class StrategistAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Strategist Agent with MIMO v2 Flash.
+        Initializes the Strategist Agent with Gemini 3 Flash Preview.
         """
-        self.api_key = api_key or os.getenv("MIMO_API_KEY")
+        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
-            raise ValueError("MIMO API Key is required.")
-        
-        # Initialize OpenAI Client for MIMO
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://api.xiaomimimo.com/v1"
+            raise ValueError("Google API Key is required.")
+
+        genai.configure(api_key=self.api_key)
+        generation_config = {
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "top_k": 40,
+            "max_output_tokens": 8192,
+            "response_mime_type": "application/json",
+        }
+        self.safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
+        self.model = genai.GenerativeModel(
+            model_name="gemini-3-flash-preview",
+            generation_config=generation_config,
+            safety_settings=self.safety_settings,
         )
-        self.model_name = "mimo-v2-flash"
 
     def generate_strategies(self, data_summary: str, user_request: str) -> Dict[str, Any]:
         """
-        Generates analysis strategies based on the data summary and user request.
+        Generates a single strategy based on the data summary and user request.
         """
         
         from src.utils.prompting import render_prompt
 
         SYSTEM_PROMPT_TEMPLATE = """
-        You are a Chief Data Strategist. Your goal is to formulate a precise analysis strategy given a dataset summary and a user business question.
+        You are a Chief Data Strategist inside a multi-agent system. Your goal is to craft ONE optimal strategy
+        that downstream AI engineers can execute successfully.
         
         *** DATASET SUMMARY ***
         $data_summary
@@ -40,11 +55,9 @@ class StrategistAgent:
         "$user_request"
         
         *** YOUR TASK ***
-        1. Analyze the user's intent (e.g., "Why are we losing money?", "Predict churn", "Cluster customers").
-        2. BRAINSTORM 3 DISTINCT STRATEGIES to solve this problem:
-           - **Strategy 1 (Quick Win):** Simple, fast, high interpretability (e.g. Correlation/Regression).
-           - **Strategy 2 (Advanced):** High performance, predictive power (e.g. Random Forest/XGBoost/Clustering).
-           - **Strategy 3 (Creative/Alternative):** A different angle (e.g. Segmentation if asked for Churn, or Time Series if applicable).
+        - Provide ONE strategy that maximizes business alignment AND is feasible for the AI engineers to execute.
+        - Think about the capabilities/constraints of the system (cleaning, mapping, optimization, reporting).
+        - State which variables are required and which data science techniques should be used.
         
         *** DATA SCIENCE FIRST PRINCIPLES (UNIVERSAL REASONING) ***
         1. **REPRESENTATIVENESS (The "Bias" Check):**
@@ -59,8 +72,9 @@ class StrategistAgent:
            
         *** CRITICAL OUTPUT RULES ***
         - RETURN ONLY RAW JSON. NO MARKDOWN. NO COMMENTS.
-        - The output must be a dictionary with a single key "strategies" containing a LIST of 3 objects.
-        - Each object keys: "title", "analysis_type", "hypothesis", "required_columns" (list of strings), "estimated_difficulty", "reasoning".
+        - The output must be a dictionary with a single key "strategies" containing a LIST of 1 object.
+        - The object keys: "title", "analysis_type", "hypothesis", "required_columns" (list of strings),
+          "techniques" (list of strings), "estimated_difficulty", "reasoning".
         - "required_columns": Use EXACT column names from the summary.
         """
         
@@ -70,20 +84,9 @@ class StrategistAgent:
             user_request=user_request
         )
         
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "Generate the strategy JSON."}
-        ]
-
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                response_format={'type': 'json_object'},
-                temperature=0.1
-            )
-            
-            content = response.choices[0].message.content
+            response = self.model.generate_content(system_prompt)
+            content = response.text
             cleaned_content = self._clean_json(content)
             single_strategy = json.loads(cleaned_content)
             
@@ -96,9 +99,10 @@ class StrategistAgent:
                 "title": "Error Fallback Strategy",
                 "analysis_type": "statistical",
                 "hypothesis": "Could not generate complex strategy. Analyzing basic correlations.",
-                "required_columns": [], 
-                "estimated_difficulty": "Low", 
-                "reasoning": f"MIMO API Failed: {e}"
+                "required_columns": [],
+                "techniques": ["correlation_analysis"],
+                "estimated_difficulty": "Low",
+                "reasoning": f"Gemini API Failed: {e}"
             }]}
 
     def _clean_json(self, text: str) -> str:
