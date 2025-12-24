@@ -16,16 +16,16 @@ class ResultsAdvisorAgent:
     """
 
     def __init__(self, api_key: Any = None):
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        self.api_key = api_key or os.getenv("MIMO_API_KEY")
         if not self.api_key:
             self.client = None
         else:
             self.client = OpenAI(
                 api_key=self.api_key,
-                base_url="https://api.deepseek.com/v1",
+                base_url="https://api.xiaomimimo.com/v1",
                 timeout=None,
             )
-        self.model_name = "deepseek-reasoner"
+        self.model_name = "mimo-v2-flash"
 
     def generate_ml_advice(self, context: Dict[str, Any]) -> str:
         if not context:

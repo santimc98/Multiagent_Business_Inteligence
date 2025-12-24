@@ -1,7 +1,7 @@
 import os
 from typing import Dict, Any, List
 from dotenv import load_dotenv
-from openai import OpenAI
+from zai import ZaiClient
 
 load_dotenv()
 
@@ -17,21 +17,14 @@ _scan_code_safety_ref = "scan_code_safety"
 class MLEngineerAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the ML Engineer Agent with DeepSeek (Moonshot AI).
+        Initializes the ML Engineer Agent with GLM 4.7.
         """
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        self.api_key = api_key or os.getenv("GLM_API_KEY")
         if not self.api_key:
-            raise ValueError("DeepSeek API Key is required.")
-        
-        # Initialize OpenAI Client for DeepSeek (Moonshot)
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://api.deepseek.com/v1",
-            timeout=None
-        )
-        self.model_name = "deepseek-reasoner" # Fallback/Standard
-        # USER REQUESTED: Switch to 'deepseek-reasoner' due to credit limits.
-        self.model_name = "deepseek-reasoner"
+            raise ValueError("GLM API Key is required.")
+
+        self.client = ZaiClient(api_key=self.api_key)
+        self.model_name = "glm-4.7"
 
     def generate_code(
         self,
@@ -308,44 +301,26 @@ class MLEngineerAgent:
         from src.utils.retries import call_with_retries
 
         def _call_model():
-            print(f"DEBUG: ML Engineer calling DeepSeek Model ({self.model_name})...")
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=current_temp
-                )
-            except Exception as e:
-                # Fallback Logic
-                error_str = str(e).lower()
-                if "not found" in error_str or "model" in error_str:
-                     print(f"WARNING: Model {self.model_name} failed ({e}). Attempting FALLBACK to 'deepseek-chat'.")
-                     self.model_name = "deepseek-chat" # Updates for subsequent calls too
-                     response = self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_message}
-                        ],
-                        temperature=current_temp
-                    )
-                     print("FALLBACK MODEL USED: deepseek-chat")
-                else:
-                    raise e
+            print(f"DEBUG: ML Engineer calling GLM Model ({self.model_name})...")
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                temperature=current_temp
+            )
             
             content = response.choices[0].message.content
             
             # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
             if "504 Gateway Time-out" in content or "<html" in content.lower():
-                raise ConnectionError("DeepSeek Server Timeout (504 Recieved)")
+                raise ConnectionError("LLM Server Timeout (504 Received)")
             return content
 
         try:
             content = call_with_retries(_call_model, max_retries=3)
-            print("DEBUG: DeepSeek response received.")
+            print("DEBUG: GLM response received.")
             code = self._clean_code(content)
             if code.strip().startswith("{") or code.strip().startswith("["):
                 return "# Error: ML_CODE_REQUIRED"

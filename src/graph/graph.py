@@ -1186,7 +1186,7 @@ def run_steward(state: AgentState) -> AgentState:
     }
 
 def run_strategist(state: AgentState) -> AgentState:
-    print("--- [2] Strategist: Formulating 3 Strategies (DeepSeek Reasoner) ---")
+    print("--- [2] Strategist: Formulating 3 Strategies (MIMO v2 Flash) ---")
     abort_state = _abort_if_requested(state, "strategist")
     if abort_state:
         return abort_state

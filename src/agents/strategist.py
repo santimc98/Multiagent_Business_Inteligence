@@ -10,18 +10,18 @@ load_dotenv()
 class StrategistAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Strategist Agent with DeepSeek Reasoner.
+        Initializes the Strategist Agent with MIMO v2 Flash.
         """
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        self.api_key = api_key or os.getenv("MIMO_API_KEY")
         if not self.api_key:
-            raise ValueError("DeepSeek API Key is required.")
+            raise ValueError("MIMO API Key is required.")
         
-        # Initialize OpenAI Client for DeepSeek
+        # Initialize OpenAI Client for MIMO
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url="https://api.deepseek.com/v1"
+            base_url="https://api.xiaomimimo.com/v1"
         )
-        self.model_name = "deepseek-reasoner"
+        self.model_name = "mimo-v2-flash"
 
     def generate_strategies(self, data_summary: str, user_request: str) -> Dict[str, Any]:
         """
@@ -98,7 +98,7 @@ class StrategistAgent:
                 "hypothesis": "Could not generate complex strategy. Analyzing basic correlations.",
                 "required_columns": [], 
                 "estimated_difficulty": "Low", 
-                "reasoning": f"DeepSeek API Failed: {e}"
+                "reasoning": f"MIMO API Failed: {e}"
             }]}
 
     def _clean_json(self, text: str) -> str:

@@ -2,7 +2,7 @@ import os
 import re
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
-from openai import OpenAI
+import google.generativeai as genai
 
 load_dotenv()
 
@@ -22,18 +22,17 @@ def _safe_load_json(path: str):
 class BusinessTranslatorAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Business Translator Agent with DeepSeek Reasoner.
+        Initializes the Business Translator Agent with Gemini 3 Flash.
         """
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
-            raise ValueError("DeepSeek API Key is required.")
-        
-        # Initialize OpenAI Client for DeepSeek
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://api.deepseek.com/v1"
+            raise ValueError("Google API Key is required.")
+
+        genai.configure(api_key=self.api_key)
+        self.model = genai.GenerativeModel(
+            model_name="gemini-3-flash",
+            generation_config={"temperature": 0.7},
         )
-        self.model_name = "deepseek-reasoner"
 
     def generate_report(self, state: Dict[str, Any], error_message: Optional[str] = None, has_partial_visuals: bool = False, plots: Optional[List[str]] = None) -> str:
         
@@ -226,15 +225,10 @@ class BusinessTranslatorAgent:
             final_state_str=str(state)
         )
 
+        full_prompt = f"{system_prompt}\n\n{user_message}"
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.7 
-            )
-            return response.choices[0].message.content
+            response = self.model.generate_content(full_prompt)
+            return (getattr(response, "text", "") or "").strip()
         except Exception as e:
             return f"Error generating report: {e}"

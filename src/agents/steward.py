@@ -15,7 +15,7 @@ from src.utils.pii_scrubber import PIIScrubber
 class StewardAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Steward Agent with Gemini 2.5 Flash.
+        Initializes the Steward Agent with Gemini 3 Flash.
         """
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
@@ -24,7 +24,7 @@ class StewardAgent:
         genai.configure(api_key=self.api_key)
         
         self.model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash", 
+            model_name="gemini-3-flash",
             generation_config={"temperature": 0.2}
         )
 

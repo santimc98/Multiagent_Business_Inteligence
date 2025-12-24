@@ -2,28 +2,21 @@ import os
 import re
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
-from openai import OpenAI
+from zai import ZaiClient
 
 load_dotenv()
 
 class DataEngineerAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Data Engineer Agent with DeepSeek (Moonshot AI).
+        Initializes the Data Engineer Agent with GLM 4.7.
         """
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        self.api_key = api_key or os.getenv("GLM_API_KEY")
         if not self.api_key:
-            raise ValueError("DeepSeek API Key is required.")
+            raise ValueError("GLM API Key is required.")
         
-        # Initialize OpenAI Client for DeepSeek (Moonshot)
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://api.deepseek.com/v1",
-            timeout=None
-        )
-        self.model_name = "deepseek-reasoner" # Standard model ID. 'kimi-k2-thinking' might be non-standard, falling back to v1-8k if needed, or respecting user Input if strictly required. 
-        # USER REQUESTED: Switch to 'deepseek-reasoner' due to credit limits.
-        self.model_name = "deepseek-reasoner"
+        self.client = ZaiClient(api_key=self.api_key)
+        self.model_name = "glm-4.7"
 
     def generate_cleaning_script(
         self,
@@ -100,39 +93,21 @@ class DataEngineerAgent:
         from src.utils.retries import call_with_retries
 
         def _call_model():
-            print(f"DEBUG: Data Engineer calling DeepSeek Model ({self.model_name})...")
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": USER_TEMPLATE}
-                    ],
-                    temperature=0.1
-                )
-            except Exception as e:
-                # Fallback Logic
-                error_str = str(e).lower()
-                if "not found" in error_str or "model" in error_str:
-                     print(f"WARNING: Model {self.model_name} failed ({e}). Attempting FALLBACK to 'deepseek-chat'.")
-                     self.model_name = "deepseek-chat" # Updates for subsequent calls too
-                     response = self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": USER_TEMPLATE}
-                        ],
-                        temperature=0.1
-                    )
-                     print("FALLBACK MODEL USED: deepseek-chat")
-                else:
-                    raise e
+            print(f"DEBUG: Data Engineer calling GLM Model ({self.model_name})...")
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": USER_TEMPLATE}
+                ],
+                temperature=0.1
+            )
                     
             content = response.choices[0].message.content
             
              # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
             if "504 Gateway Time-out" in content or "<html" in content.lower():
-                raise ConnectionError("DeepSeek Server Timeout (504 Recieved)")
+                raise ConnectionError("LLM Server Timeout (504 Received)")
 
             # Check for JSON error messages that are NOT valid code
             content_stripped = content.strip()
@@ -156,7 +131,7 @@ class DataEngineerAgent:
 
         try:
             content = call_with_retries(_call_model, max_retries=3)
-            print("DEBUG: DeepSeek response received.")
+            print("DEBUG: GLM response received.")
             
             code = self._clean_code(content)
             

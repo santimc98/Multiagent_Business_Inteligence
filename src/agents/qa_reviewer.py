@@ -11,18 +11,18 @@ load_dotenv()
 class QAReviewerAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the QA Reviewer Agent with DeepSeek Reasoner.
+        Initializes the QA Reviewer Agent with MIMO v2 Flash.
         Role: Strict Code Quality Gate.
         """
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        self.api_key = api_key or os.getenv("MIMO_API_KEY")
         if not self.api_key:
-            raise ValueError("DeepSeek API Key is required.")
+            raise ValueError("MIMO API Key is required.")
         
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url="https://api.deepseek.com/v1"
+            base_url="https://api.xiaomimimo.com/v1"
         )
-        self.model_name = "deepseek-reasoner"
+        self.model_name = "mimo-v2-flash"
 
     def review_code(self, code: str, strategy: Dict[str, Any], business_objective: str) -> Dict[str, Any]:
         """
