@@ -23,6 +23,8 @@ def call_with_retries(
                 or "engine_overloaded_error" in error_str
                 or "timeout" in error_str
                 or "rate limit" in error_str
+                or "concurrency" in error_str
+                or "1302" in error_str
             )
 
             if not is_retryable or attempt >= max_retries:

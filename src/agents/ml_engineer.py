@@ -320,7 +320,7 @@ class MLEngineerAgent:
             return content
 
         try:
-            content = call_with_retries(_call_model, max_retries=4, backoff_factor=2, initial_delay=2)
+            content = call_with_retries(_call_model, max_retries=5, backoff_factor=2, initial_delay=2)
             print("DEBUG: GLM response received.")
             code = self._clean_code(content)
             if code.strip().startswith("{") or code.strip().startswith("["):
