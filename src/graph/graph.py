@@ -153,6 +153,105 @@ def _extract_manifest_alerts(manifest: Dict[str, Any], derived_columns: List[str
 
     return alerts
 
+def _summarize_row_drop(
+    manifest: Dict[str, Any],
+    required_cols: List[str],
+    min_drop_frac: float = 0.5,
+    min_null_increase_frac: float = 0.2,
+    initial_override: int | None = None,
+    after_override: int | None = None,
+) -> Dict[str, Any]:
+    if not isinstance(manifest, dict):
+        return {}
+    row_counts = manifest.get("row_counts") or {}
+    try:
+        initial = int(
+            row_counts.get("initial")
+            or row_counts.get("rows_before")
+            or row_counts.get("input")
+            or row_counts.get("total")
+        )
+    except Exception:
+        initial = None
+    try:
+        after = int(
+            row_counts.get("after_cleaning")
+            or row_counts.get("final")
+            or row_counts.get("rows_after")
+            or row_counts.get("after")
+            or row_counts.get("output")
+        )
+    except Exception:
+        after = None
+
+    if initial_override is not None:
+        initial = initial_override
+    if after_override is not None:
+        after = after_override
+
+    if not initial or after is None or initial <= 0:
+        return {}
+    drop = max(initial - after, 0)
+    drop_frac = drop / initial if initial else 0.0
+    if drop_frac < min_drop_frac:
+        return {}
+
+    norm = normalize_manifest(manifest)
+    conversions = norm.get("conversions", {}) or {}
+    suspects: List[Dict[str, Any]] = []
+    for col in required_cols or []:
+        key = str(col).lower()
+        conv = conversions.get(key)
+        if not isinstance(conv, dict):
+            continue
+        null_inc = conv.get("null_increase")
+        try:
+            null_inc_val = float(null_inc)
+        except Exception:
+            continue
+        if null_inc_val <= 0:
+            continue
+        if initial and null_inc_val / initial < min_null_increase_frac:
+            continue
+        suspects.append(
+            {
+                "column": col,
+                "null_increase": int(null_inc_val),
+                "from_dtype": conv.get("from_dtype"),
+                "to_dtype": conv.get("to_dtype"),
+                "method": conv.get("method"),
+            }
+        )
+
+    return {
+        "initial": initial,
+        "after": after,
+        "drop": drop,
+        "drop_frac": round(drop_frac, 4),
+        "suspects": suspects,
+    }
+
+def _count_raw_rows(csv_path: str, encoding: str, sep: str | None = None, decimal: str | None = None) -> int | None:
+    try:
+        import pandas as pd
+
+        df = pd.read_csv(
+            csv_path,
+            encoding=encoding,
+            sep=sep or ",",
+            decimal=decimal or ".",
+            usecols=[0],
+            low_memory=False,
+        )
+        return len(df)
+    except Exception:
+        try:
+            with open(csv_path, "r", encoding=encoding, errors="ignore") as f:
+                count = sum(1 for _ in f)
+            return max(count - 1, 0)
+        except Exception:
+            return None
+
 def _parse_manifest_warning_list(warning: str) -> List[str]:
     import ast
     if ":" not in warning:
@@ -403,63 +502,6 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     ba = normalized.get("business_alignment")
     if not isinstance(ba, dict):
         ba = {}
-    optimization_priorities = ba.get("optimization_priorities")
-    if not isinstance(optimization_priorities, list) or not optimization_priorities:
-        target_type = str(spec.get("target_type") or "").lower()
-        derived_cols = spec.get("derived_columns") or []
-        derived_names = []
-        if isinstance(derived_cols, list):
-            for item in derived_cols:
-                if isinstance(item, dict):
-                    name = item.get("name")
-                else:
-                    name = item
-                if name:
-                    derived_names.append(str(name).lower())
-        has_cases = bool(spec.get("case_taxonomy")) or any("case" in name or "caso" in name for name in derived_names)
-        has_refscore = any("refscore" in name for name in derived_names)
-        if has_cases and (("rank" in target_type) or ("ordinal" in target_type) or has_refscore):
-            optimization_priorities = [
-                {
-                    "priority": 1,
-                    "goal": "minimize_case_order_violations",
-                    "metric": "case_order_violations",
-                    "direction": "minimize",
-                },
-                {
-                    "priority": 2,
-                    "goal": "maximize_case_level_rank_correlation",
-                    "metric": "case_level_spearman",
-                    "direction": "maximize",
-                },
-                {
-                    "priority": 3,
-                    "goal": "maximize_global_rank_correlation",
-                    "metric": "spearman",
-                    "direction": "maximize",
-                },
-            ]
-        else:
-            optimization_priorities = [
-                {
-                    "priority": 1,
-                    "goal": "maximize_global_rank_correlation",
-                    "metric": "spearman",
-                    "direction": "maximize",
-                }
-            ]
-    ba["optimization_priorities"] = optimization_priorities
-
-    acceptance = ba.get("acceptance_criteria")
-    if not isinstance(acceptance, dict):
-        acceptance = {}
-    gates = normalized.get("quality_gates") or {}
-    if isinstance(gates, dict):
-        if acceptance.get("spearman_min") is None and gates.get("spearman_min") is not None:
-            acceptance["spearman_min"] = gates.get("spearman_min")
-        if acceptance.get("case_order_violations_max") is None and gates.get("violations_max") is not None:
-            acceptance["case_order_violations_max"] = gates.get("violations_max")
-    ba["acceptance_criteria"] = acceptance
     normalized["business_alignment"] = ba
 
     return normalized
@@ -488,10 +530,10 @@ def _detect_refscore_alias(execution_output: str, contract: Dict[str, Any]) -> b
 
 DEFAULT_RUN_BUDGET = {
     "max_de_calls": 4,
-    "max_ml_calls": 5,
+    "max_ml_calls": 6,
     "max_reviewer_calls": 5,
     "max_qa_calls": 5,
-    "max_execution_calls": 3,
+    "max_execution_calls": 6,
 }
 
 def _ensure_budget_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -938,6 +980,62 @@ def _read_csv_header(csv_path: str, encoding: str, sep: str) -> List[str]:
     except Exception:
         return []
 
+def _cleanup_run_artifacts() -> None:
+    paths_to_remove = [
+        os.path.join("artifacts", "ml_engineer_last.py"),
+        os.path.join("artifacts", "ml_engineer_context.json"),
+        os.path.join("artifacts", "ml_engineer_context_ops.txt"),
+        os.path.join("artifacts", "ml_results_advisor.txt"),
+        os.path.join("artifacts", "ml_engineer_failure_explainer.txt"),
+        os.path.join("artifacts", "data_engineer_last.py"),
+        os.path.join("artifacts", "data_engineer_sandbox_last.log"),
+    ]
+    for path in paths_to_remove:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    # Clear iteration artifacts
+    iter_dir = os.path.join("artifacts", "iterations")
+    if os.path.isdir(iter_dir):
+        for filename in os.listdir(iter_dir):
+            file_path = os.path.join(iter_dir, filename)
+            try:
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
+
+    # Clear previous outputs that can contaminate new runs
+    data_files = [
+        os.path.join("data", "weights.json"),
+        os.path.join("data", "case_summary.csv"),
+        os.path.join("data", "metrics.json"),
+        os.path.join("data", "scored_rows.csv"),
+        os.path.join("data", "case_alignment_report.json"),
+        os.path.join("data", "output_contract_report.json"),
+        os.path.join("data", "execution_contract.json"),
+    ]
+    for path in data_files:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    # Clear plots from previous runs
+    plots_dir = os.path.join("static", "plots")
+    if os.path.isdir(plots_dir):
+        for filename in os.listdir(plots_dir):
+            file_path = os.path.join(plots_dir, filename)
+            try:
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
+
 def _load_json_safe(path: str) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
         return {}
@@ -947,6 +1045,15 @@ def _load_json_safe(path: str) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+def _hash_json(payload: Any) -> str | None:
+    if not payload:
+        return None
+    try:
+        data = json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        return hashlib.sha256(data).hexdigest()
+    except Exception:
+        return None
 
 def _extract_weights_from_obj(obj: Any) -> Dict[str, float]:
     if not isinstance(obj, dict):
@@ -976,6 +1083,187 @@ def _extract_weights_from_obj(obj: Any) -> Dict[str, float]:
         if out:
             return out
     return {}
+
+def _summarize_weight_uniformity(weights_obj: Dict[str, Any]) -> Dict[str, Any]:
+    weights = _extract_weights_from_obj(weights_obj)
+    if not weights:
+        return {"uniform": None}
+    vals = list(weights.values())
+    try:
+        max_val = max(vals)
+        min_val = min(vals)
+        mean_val = sum(vals) / len(vals)
+        spread = max_val - min_val
+    except Exception:
+        return {"uniform": None}
+    return {
+        "uniform": spread < 1e-6,
+        "min": float(min_val),
+        "max": float(max_val),
+        "mean": float(mean_val),
+        "spread": float(spread),
+    }
+
+def _normalize_metrics_from_weights(weights_obj: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(weights_obj, dict):
+        return {}
+    metrics = weights_obj.get("metrics") if isinstance(weights_obj.get("metrics"), dict) else {}
+    spearman = (
+        metrics.get("global_spearman_correlation")
+        or metrics.get("spearman_correlation")
+        or metrics.get("spearman")
+    )
+    kendall = metrics.get("kendall_correlation") or metrics.get("kendall_tau")
+    case_spearman = (
+        metrics.get("case_level_spearman_correlation")
+        or metrics.get("case_order_spearman")
+    )
+    ranking_violations = metrics.get("ranking_violations")
+    max_weight = metrics.get("max_weight")
+    hhi = metrics.get("weight_hhi")
+    near_zero = metrics.get("near_zero_weights") or metrics.get("near_zero_weights_count")
+    if spearman is None and kendall is None and case_spearman is None and max_weight is None:
+        return {}
+    report = {
+        "global_ranking": {
+            "spearman": float(spearman) if _is_number(spearman) else None,
+            "spearman_p": metrics.get("global_spearman_p_value") if metrics else None,
+            "kendall_tau": float(kendall) if _is_number(kendall) else None,
+        },
+        "case_level": {
+            "spearman": float(case_spearman) if _is_number(case_spearman) else None,
+            "adjacent_violations_pct": None,
+            "adjacent_violations_count": int(ranking_violations) if _is_number(ranking_violations) else None,
+        },
+        "weight_concentration": {
+            "max_weight": float(max_weight) if _is_number(max_weight) else None,
+            "hhi": float(hhi) if _is_number(hhi) else None,
+            "weights_near_zero": int(near_zero) if _is_number(near_zero) else None,
+        },
+        "baseline_comparison": {},
+    }
+    return report
+
+def _load_output_dialect_local(manifest_path: str = "data/cleaning_manifest.json") -> Dict[str, str]:
+    defaults = {"sep": ",", "decimal": ".", "encoding": "utf-8"}
+    manifest = _load_json_safe(manifest_path) or {}
+    if isinstance(manifest, dict):
+        output_dialect = manifest.get("output_dialect") or {}
+        if isinstance(output_dialect, dict):
+            return {
+                "sep": output_dialect.get("sep", defaults["sep"]),
+                "decimal": output_dialect.get("decimal", defaults["decimal"]),
+                "encoding": output_dialect.get("encoding", defaults["encoding"]),
+            }
+    return defaults
+
+def _compute_adjacent_violations(ref_series, score_series) -> int:
+    import pandas as pd
+    df = pd.DataFrame({"ref": ref_series, "score": score_series}).dropna()
+    if df.empty:
+        return 0
+    df = df.sort_values("ref")
+    refs = df["ref"].values
+    scores = df["score"].values
+    violations = 0
+    for idx in range(len(scores) - 1):
+        if refs[idx + 1] > refs[idx] and scores[idx + 1] < scores[idx]:
+            violations += 1
+    return int(violations)
+
+def _compute_metrics_from_scored_rows(
+    scored_rows_path: str = "data/scored_rows.csv",
+    case_summary_path: str = "data/case_summary.csv",
+    weights_obj: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    if not os.path.exists(scored_rows_path):
+        return {}
+    try:
+        import pandas as pd
+    except Exception:
+        return {}
+    dialect = _load_output_dialect_local()
+    try:
+        df = pd.read_csv(
+            scored_rows_path,
+            sep=dialect["sep"],
+            decimal=dialect["decimal"],
+            encoding=dialect["encoding"],
+        )
+    except Exception:
+        return {}
+    score_candidates = ["Score_nuevo", "ScoreNuevo", "score_nuevo", "Score_Nuevo"]
+    ref_candidates = ["RefScore", "refscore", "Ref_Score"]
+    case_candidates = ["Case_ID", "Case", "case_id", "caso", "caso_id"]
+
+    score_col = next((c for c in score_candidates if c in df.columns), None)
+    ref_col = next((c for c in ref_candidates if c in df.columns), None)
+    case_col = next((c for c in case_candidates if c in df.columns), None)
+    if not score_col or not ref_col:
+        return {}
+
+    ref_series = pd.to_numeric(df[ref_col], errors="coerce")
+    score_series = pd.to_numeric(df[score_col], errors="coerce")
+    spearman = None
+    kendall = None
+    try:
+        spearman = float(ref_series.corr(score_series, method="spearman"))
+        kendall = float(ref_series.corr(score_series, method="kendall"))
+    except Exception:
+        pass
+
+    case_spearman = None
+    adjacent_violations = None
+    if case_col and case_col in df.columns:
+        try:
+            case_means = (
+                df[[case_col, score_col, ref_col]]
+                .copy()
+                .groupby(case_col)
+                .agg({score_col: "mean", ref_col: "first"})
+                .reset_index()
+            )
+            ref_case = pd.to_numeric(case_means[ref_col], errors="coerce")
+            score_case = pd.to_numeric(case_means[score_col], errors="coerce")
+            case_spearman = float(ref_case.corr(score_case, method="spearman"))
+            adjacent_violations = _compute_adjacent_violations(ref_case, score_case)
+        except Exception:
+            pass
+
+    weights = _extract_weights_from_obj(weights_obj or {})
+    weight_metrics = {
+        "max_weight": None,
+        "hhi": None,
+        "weights_near_zero": None,
+    }
+    if weights:
+        vals = list(weights.values())
+        try:
+            max_weight = max(vals)
+            hhi = sum(v ** 2 for v in vals)
+            near_zero = sum(1 for v in vals if v < 0.01)
+            weight_metrics = {
+                "max_weight": float(max_weight),
+                "hhi": float(hhi),
+                "weights_near_zero": int(near_zero),
+            }
+        except Exception:
+            pass
+
+    return {
+        "global_ranking": {
+            "spearman": spearman,
+            "spearman_p": None,
+            "kendall_tau": kendall,
+        },
+        "case_level": {
+            "spearman": case_spearman,
+            "adjacent_violations_pct": None,
+            "adjacent_violations_count": int(adjacent_violations) if adjacent_violations is not None else None,
+        },
+        "weight_concentration": weight_metrics,
+        "baseline_comparison": {},
+    }
 
 def _is_number(value: Any) -> bool:
     try:
@@ -1169,8 +1457,13 @@ class AgentState(TypedDict):
     ml_iteration_memory: List[Dict[str, Any]]
     ml_iteration_memory_block: str
     metrics_signature: str
+    weights_signature: str
     execution_output_stale: bool
     sandbox_failed: bool
+    sandbox_retry_count: int
+    max_sandbox_retries: int
+    ml_call_refund_pending: bool
+    execution_call_refund_pending: bool
     last_successful_execution_output: str
     last_successful_plots: List[str]
     last_successful_output_contract_report: Dict[str, Any]
@@ -1199,6 +1492,7 @@ class AgentState(TypedDict):
     review_reject_streak: int
     qa_reject_streak: int
     execution_attempt: int # Track runtime retries
+    runtime_fix_count: int
     last_runtime_error_tail: str # Added for Runtime Error Visibility
     data_engineer_audit_override: str
     ml_engineer_audit_override: str
@@ -1238,6 +1532,7 @@ def run_steward(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "steward")
     if abort_state:
         return abort_state
+    _cleanup_run_artifacts()
     run_id = state.get("run_id") if state else None
     if not run_id:
         run_id = uuid.uuid4().hex[:8]
@@ -2097,6 +2392,92 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
                     return run_data_engineer(new_state)
 
+                required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+                raw_rows = _count_raw_rows(csv_path, csv_encoding, csv_sep, csv_decimal)
+                cleaned_encoding = None
+                try:
+                    cleaned_encoding = (
+                        manifest_data.get("output_dialect", {}).get("encoding")
+                        if isinstance(manifest_data.get("output_dialect"), dict)
+                        else None
+                    )
+                except Exception:
+                    cleaned_encoding = None
+                cleaned_encoding = cleaned_encoding or "utf-8"
+                cleaned_sep = None
+                cleaned_decimal = None
+                try:
+                    if isinstance(manifest_data.get("output_dialect"), dict):
+                        cleaned_sep = manifest_data["output_dialect"].get("sep")
+                        cleaned_decimal = manifest_data["output_dialect"].get("decimal")
+                except Exception:
+                    cleaned_sep = None
+                    cleaned_decimal = None
+                cleaned_rows = _count_raw_rows(local_cleaned_path, cleaned_encoding, cleaned_sep, cleaned_decimal)
+                row_drop_summary = _summarize_row_drop(
+                    manifest_data,
+                    required_input,
+                    initial_override=raw_rows,
+                    after_override=cleaned_rows,
+                )
+                if row_drop_summary and not state.get("de_row_drop_retry_done"):
+                    new_state = dict(state)
+                    new_state["de_row_drop_retry_done"] = True
+                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                    payload = (
+                        "CLEANING_RECOVERY_ALERT:\n"
+                        f"- rows_initial={row_drop_summary.get('initial')}\n"
+                        f"- rows_after={row_drop_summary.get('after')}\n"
+                        f"- drop_frac={row_drop_summary.get('drop_frac')}\n"
+                    )
+                    suspects = row_drop_summary.get("suspects") or []
+                    if suspects:
+                        payload += "SUSPECT_CONVERSIONS:\n" + json.dumps(suspects, ensure_ascii=True)
+                        try:
+                            header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+                            norm_map = {}
+                            for col in header_cols:
+                                normed = _norm_name(col)
+                                if normed and normed not in norm_map:
+                                    norm_map[normed] = col
+                            suspect_cols = [item.get("column") for item in suspects if item.get("column")]
+                            sample_context = _build_required_sample_context(
+                                csv_path, input_dialect, suspect_cols, norm_map, max_rows=200
+                            )
+                            if sample_context:
+                                payload = f"{payload}\n\n{sample_context}"
+                        except Exception:
+                            pass
+                    try:
+                        explainer_text = failure_explainer.explain_data_engineer_failure(
+                            code=code,
+                            error_details=payload,
+                            context={
+                                "strategy_title": selected.get("title", "") if selected else "",
+                                "csv_dialect": input_dialect,
+                                "required_input_columns": required_input,
+                                "row_drop_summary": row_drop_summary,
+                            },
+                        )
+                    except Exception as explainer_err:
+                        print(f"Warning: failure explainer failed: {explainer_err}")
+                        explainer_text = ""
+                    if explainer_text:
+                        payload = payload + "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                        try:
+                            os.makedirs("artifacts", exist_ok=True)
+                            with open(
+                                os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
+                                "w",
+                                encoding="utf-8",
+                            ) as f_exp:
+                                f_exp.write(explainer_text.strip())
+                        except Exception as exp_err:
+                            print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
+                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                    print("ROW_DROP_GUARD: retrying Data Engineer with recovery context.")
+                    return run_data_engineer(new_state)
+
                 print("Cleaning Success (Artifacts Downloaded).")
     
                 # Apply output_dialect for downstream reads
@@ -2707,11 +3088,15 @@ def run_engineer(state: AgentState) -> AgentState:
             "last_generated_code": code, # Update for next patch
             "ml_data_path": data_path,
             "error_message": "",
+            "ml_call_refund_pending": True,
+            "execution_call_refund_pending": True,
             "ml_context_snapshot": {
                 "cleaned_column_inventory": header_cols,
                 "cleaned_aliasing_collisions": aliasing if header_cols else {},
                 "derived_columns_present": derived_present if header_cols else [],
                 "raw_required_sample_context": sample_context,
+                "feature_semantics": (execution_contract or {}).get("feature_semantics", []),
+                "business_sanity_checks": (execution_contract or {}).get("business_sanity_checks", []),
             },
             "budget_counters": counters,
         }
@@ -3060,6 +3445,13 @@ def execute_code(state: AgentState) -> AgentState:
     if run_id:
         log_run_event(run_id, "execution_start", {})
     code = state['generated_code']
+
+    # Prevent stale metrics from previous iterations
+    try:
+        if os.path.exists("data/metrics.json"):
+            os.remove("data/metrics.json")
+    except Exception:
+        pass
     
     # 0. Static Safety Scan
     is_safe, violations = scan_code_safety(code)
@@ -3278,6 +3670,7 @@ def execute_code(state: AgentState) -> AgentState:
         "Sandbox Execution Failed" in output
         or "peer closed connection" in output
         or "incomplete chunked read" in output
+        or "Response 404" in output
     )
     error_in_output = (
         "Traceback (most recent call last)" in output
@@ -3296,6 +3689,18 @@ def execute_code(state: AgentState) -> AgentState:
         runtime_tail = tail
         if "DETERMINISTIC_TARGET_RELATION" in tail:
             ml_skipped_reason = "DETERMINISTIC_TARGET_RELATION"
+        if state.get("ml_call_refund_pending"):
+            refund_counters = dict(state.get("budget_counters") or {})
+            if refund_counters.get("ml_calls", 0) > 0:
+                refund_counters["ml_calls"] = max(0, refund_counters.get("ml_calls", 0) - 1)
+            counters = refund_counters
+            state["budget_counters"] = refund_counters
+        if state.get("execution_call_refund_pending"):
+            refund_counters = dict(state.get("budget_counters") or {})
+            if refund_counters.get("execution_calls", 0) > 0:
+                refund_counters["execution_calls"] = max(0, refund_counters.get("execution_calls", 0) - 1)
+            counters = refund_counters
+            state["budget_counters"] = refund_counters
         
     # Validate required outputs early
     output_contract = state.get("execution_contract", {}).get("required_outputs", [])
@@ -3326,9 +3731,13 @@ def execute_code(state: AgentState) -> AgentState:
         "ml_skipped_reason": ml_skipped_reason,
         "output_contract_report": oc_report,
         "sandbox_failed": sandbox_failed,
+        "sandbox_retry_count": 0 if not sandbox_failed else state.get("sandbox_retry_count", 0),
+        "ml_call_refund_pending": False,
+        "execution_call_refund_pending": False,
         "budget_counters": counters,
     }
     if not error_in_output:
+        result["runtime_fix_count"] = 0
         result["last_successful_execution_output"] = output
         result["last_successful_plots"] = plots_local
         result["last_successful_output_contract_report"] = oc_report
@@ -3352,6 +3761,19 @@ def retry_handler(state: AgentState) -> AgentState:
 
     return {
         "feedback_history": current_history
+    }
+
+def retry_sandbox_execution(state: AgentState) -> AgentState:
+    retry_count = int(state.get("sandbox_retry_count", 0)) + 1
+    max_retries = int(state.get("max_sandbox_retries", 2))
+    print(f"--- [!] Sandbox failure detected. Retrying execution ({retry_count}/{max_retries}) ---")
+    history = list(state.get("feedback_history", []))
+    last_output = state.get("execution_output", "")
+    if last_output:
+        history.append(f"SANDBOX_RETRY {retry_count}: {last_output[-500:]}")
+    return {
+        "sandbox_retry_count": retry_count,
+        "feedback_history": history,
     }
     
 def run_result_evaluator(state: AgentState) -> AgentState:
@@ -3417,22 +3839,47 @@ def run_result_evaluator(state: AgentState) -> AgentState:
 
     # Detect stale metrics file across iterations (diagnostic for ML)
     metrics_report = _load_json_safe("data/metrics.json")
-    metrics_signature = None
-    if isinstance(metrics_report, dict) and metrics_report:
-        try:
-            payload = json.dumps(metrics_report, sort_keys=True, ensure_ascii=True).encode("utf-8")
-            metrics_signature = hashlib.sha256(payload).hexdigest()
-        except Exception:
-            metrics_signature = None
+    weights_report = _load_json_safe("data/weights.json")
+    metrics_signature = _hash_json(metrics_report)
+    weights_signature = _hash_json(weights_report)
     prev_metrics_signature = state.get("metrics_signature")
+    prev_weights_signature = state.get("weights_signature")
+    metrics_stale = False
     if metrics_signature and metrics_signature == prev_metrics_signature:
-        new_history.append(
-            "METRICS_UNCHANGED: data/metrics.json is identical to the prior iteration; ensure metrics are recomputed and saved per run."
-        )
+        if weights_signature and weights_signature != prev_weights_signature:
+            metrics_stale = True
+            new_history.append(
+                "METRICS_STALE: data/metrics.json unchanged while weights changed; recompute metrics from current outputs."
+            )
+        else:
+            new_history.append(
+                "METRICS_UNCHANGED: data/metrics.json is identical to the prior iteration; ensure metrics are recomputed and saved per run."
+            )
     if not metrics_report:
         new_history.append(
             "METRICS_MISSING: data/metrics.json not found or empty; downstream evaluation may be using stale metrics."
         )
+    if not metrics_report or metrics_stale:
+        synthesized = _normalize_metrics_from_weights(weights_report)
+        if not synthesized:
+            synthesized = _compute_metrics_from_scored_rows(
+                scored_rows_path="data/scored_rows.csv",
+                case_summary_path="data/case_summary.csv",
+                weights_obj=weights_report,
+            )
+        if synthesized:
+            metrics_report = dict(synthesized)
+            metrics_report["source"] = "computed_fallback"
+            metrics_signature = _hash_json(metrics_report)
+            new_history.append(
+                "METRICS_FALLBACK: metrics synthesized from weights/scored_rows due to missing or stale metrics.json."
+            )
+            try:
+                os.makedirs("data", exist_ok=True)
+                with open("data/metrics.json", "w", encoding="utf-8") as f_metrics:
+                    json.dump(metrics_report, f_metrics, indent=2)
+            except Exception as metrics_err:
+                print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
     iter_id = int(state.get("iteration_count", 0)) + 1
     saved_iter_artifacts = _persist_iteration_artifacts(iter_id)
 
@@ -3540,6 +3987,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "case_alignment_report": case_report,
         "case_alignment_history": case_history,
         "metrics_signature": metrics_signature,
+        "weights_signature": weights_signature,
         "last_gate_context": gate_context,
     }
     if review_counters:
@@ -3556,7 +4004,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 "output_contract_report": oc_report,
                 "case_summary_stats": _summarize_case_summary("data/case_summary.csv"),
                 "weights": _load_json_safe("data/weights.json"),
+                "weights_uniformity": _summarize_weight_uniformity(_load_json_safe("data/weights.json")),
                 "metrics": _load_json_safe("data/metrics.json"),
+                "review_feedback": feedback,
                 "business_alignment": contract.get("business_alignment", {}),
                 "spec_extraction": contract.get("spec_extraction", {}),
                 "saved_iteration_artifacts": saved_iter_artifacts,
@@ -3619,6 +4069,7 @@ def check_execution_status(state: AgentState):
 
     output = state.get("execution_output", "")
     attempt = state.get("execution_attempt", 1)
+    runtime_fix_count = int(state.get("runtime_fix_count", 0))
     skipped_reason = state.get("ml_skipped_reason")
     
     # Traceback check (Runtime Error)
@@ -3628,10 +4079,18 @@ def check_execution_status(state: AgentState):
         or "Sandbox Execution Failed" in output
         or "peer closed connection" in output
         or "incomplete chunked read" in output
+        or "Response 404" in output
         or state.get("sandbox_failed")
     )
     determinism_error = "DETERMINISTIC_TARGET_RELATION" in output
     undefined_precheck = "STATIC_PRECHECK_UNDEFINED" in output
+    sandbox_error = (
+        state.get("sandbox_failed")
+        or "Sandbox Execution Failed" in output
+        or "peer closed connection" in output
+        or "incomplete chunked read" in output
+        or "Response 404" in output
+    )
 
     if determinism_error or skipped_reason == "DETERMINISTIC_TARGET_RELATION":
         return "evaluate"
@@ -3639,19 +4098,32 @@ def check_execution_status(state: AgentState):
     if undefined_precheck:
         return "retry_fix"
 
-    if has_error:
-        max_runtime_fixes = state.get("max_runtime_fix_attempts", 2)
-        if attempt <= max_runtime_fixes:
-            print(f"Runtime Error detected (Attempt {attempt}). Preparing runtime fix.")
-            return "retry_fix"
-        print(f"Runtime Error detected (Attempt {attempt}). Max runtime fixes reached.")
+    if sandbox_error:
+        retry_count = int(state.get("sandbox_retry_count", 0))
+        max_retries = int(state.get("max_sandbox_retries", 2))
+        if retry_count < max_retries:
+            return "retry_sandbox"
+        print(f"Sandbox failure detected. Max retries reached ({retry_count}/{max_retries}).")
         return "failed"
-            
+
+    if has_error:
+        max_runtime_fixes = int(state.get("max_runtime_fix_attempts", 3))
+        next_attempt = runtime_fix_count + 1
+        if runtime_fix_count < max_runtime_fixes:
+            print(f"Runtime Error detected (Attempt {next_attempt}/{max_runtime_fixes}). Preparing runtime fix.")
+            return "retry_fix"
+        print(f"Runtime Error detected (Attempt {runtime_fix_count}/{max_runtime_fixes}). Max runtime fixes reached.")
+        return "failed_runtime"
+             
     return "evaluate"
 
 def prepare_runtime_fix(state: AgentState) -> AgentState:
     print("--- [!] Preparing Runtime Fix Context ---")
     output = state.get("execution_output", "")
+    base_fix_count = int(state.get("runtime_fix_count", 0))
+    terminal_fix = bool(state.get("runtime_fix_terminal"))
+    fix_attempt = base_fix_count if terminal_fix else base_fix_count + 1
+    max_runtime_fixes = int(state.get("max_runtime_fix_attempts", 3))
     
     error_context = {
         "source": "Execution Runtime",
@@ -3687,9 +4159,18 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     return {
         "last_gate_context": error_context,
          # We add error to history so it persists
-        "feedback_history": state.get("feedback_history", []) + [f"RUNTIME ERROR (Attempt {state.get('execution_attempt')}):\n{output[-500:]}"],
+        "feedback_history": state.get("feedback_history", []) + [f"RUNTIME ERROR (Attempt {fix_attempt}/{max_runtime_fixes}):\n{output[-500:]}"],
         "ml_engineer_audit_override": ml_override,
+        "runtime_fix_count": base_fix_count if terminal_fix else fix_attempt,
     }
+
+def finalize_runtime_failure(state: AgentState) -> AgentState:
+    print("--- [!] Final runtime failure: capturing failure explanation ---")
+    state_with_terminal = dict(state)
+    state_with_terminal["runtime_fix_terminal"] = True
+    result = prepare_runtime_fix(state_with_terminal)
+    result["runtime_fix_terminal"] = True
+    return result
 
 def check_evaluation(state: AgentState):
     if state.get('iteration_count', 0) >= 6:
@@ -3851,10 +4332,12 @@ workflow.add_node("data_engineer", run_data_engineer)
 workflow.add_node("engineer", run_engineer)
 workflow.add_node("reviewer", run_reviewer)
 workflow.add_node("qa_reviewer", run_qa_reviewer) # QA Node
+workflow.add_node("final_runtime_fix", finalize_runtime_failure)
 workflow.add_node("ml_preflight", run_ml_preflight)
 workflow.add_node("execute_code", execute_code)
 workflow.add_node("evaluate_results", run_result_evaluator) # New Node
 workflow.add_node("retry_handler", retry_handler)
+workflow.add_node("retry_sandbox", retry_sandbox_execution)
 workflow.add_node("prepare_runtime_fix", prepare_runtime_fix) # New Node
 
 workflow.add_node("translator", run_translator)
@@ -3910,11 +4393,15 @@ workflow.add_conditional_edges(
     {
         "evaluate": "evaluate_results",
         "retry_fix": "prepare_runtime_fix",
-        "failed": "translator"
+        "retry_sandbox": "retry_sandbox",
+        "failed": "translator",
+        "failed_runtime": "final_runtime_fix",
     }
 )
 
 workflow.add_edge("prepare_runtime_fix", "engineer")
+workflow.add_edge("final_runtime_fix", "translator")
+workflow.add_edge("retry_sandbox", "execute_code")
 
 # Conditional Edge for Result Evaluation
 workflow.add_conditional_edges(

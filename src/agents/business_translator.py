@@ -9,6 +9,7 @@ load_dotenv()
 from string import Template
 import json
 from typing import Dict, Any, Optional, List
+import csv
 from src.utils.prompting import render_prompt
 
 
@@ -18,6 +19,44 @@ def _safe_load_json(path: str):
             return json.load(f)
     except Exception:
         return None
+
+def _safe_load_csv(path: str, max_rows: int = 200):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = []
+            for _, row in zip(range(max_rows), reader):
+                rows.append(row)
+            return {
+                "columns": reader.fieldnames or [],
+                "rows": rows,
+                "row_count_sampled": len(rows),
+            }
+    except Exception:
+        return None
+
+def _summarize_numeric_columns(rows: List[Dict[str, Any]], columns: List[str], max_cols: int = 12):
+    numeric_summary = {}
+    for col in columns:
+        values = []
+        for row in rows:
+            raw = row.get(col)
+            if raw is None or raw == "":
+                continue
+            try:
+                values.append(float(str(raw).replace(",", ".")))
+            except Exception:
+                continue
+        if values:
+            numeric_summary[col] = {
+                "min": min(values),
+                "max": max(values),
+                "mean": sum(values) / len(values),
+                "n": len(values),
+            }
+        if len(numeric_summary) >= max_cols:
+            break
+    return numeric_summary
 
 class BusinessTranslatorAgent:
     def __init__(self, api_key: str = None):
@@ -72,6 +111,13 @@ class BusinessTranslatorAgent:
         output_contract_report = _safe_load_json("data/output_contract_report.json") or {}
         case_alignment_report = _safe_load_json("data/case_alignment_report.json") or {}
         plot_insights = _safe_load_json("data/plot_insights.json") or {}
+        steward_summary = _safe_load_json("data/steward_summary.json") or {}
+        cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
+        run_summary = _safe_load_json("data/run_summary.json") or {}
+        weights_payload = _safe_load_json("data/weights.json") or {}
+        scored_rows = _safe_load_csv("data/scored_rows.csv")
+        case_summary = _safe_load_csv("data/case_summary.csv")
+        cleaned_rows = _safe_load_csv("data/cleaned_data.csv", max_rows=100)
 
         def _summarize_integrity():
             issues = integrity_audit.get("issues", []) if isinstance(integrity_audit, dict) else []
@@ -94,6 +140,76 @@ class BusinessTranslatorAgent:
             present = output_contract_report.get("present", [])
             return f"Outputs present={len(present)} missing={len(miss)}"
 
+        def _summarize_steward():
+            if not steward_summary:
+                return "No steward summary."
+            summary = steward_summary.get("summary", "")
+            encoding = steward_summary.get("encoding")
+            sep = steward_summary.get("sep")
+            decimal = steward_summary.get("decimal")
+            return {
+                "summary": summary[:1200],
+                "encoding": encoding,
+                "sep": sep,
+                "decimal": decimal,
+                "file_size_bytes": steward_summary.get("file_size_bytes"),
+            }
+
+        def _summarize_cleaning():
+            if not cleaning_manifest:
+                return "No cleaning manifest."
+            row_counts = cleaning_manifest.get("row_counts", {})
+            conversions = cleaning_manifest.get("conversions", {})
+            dropped = cleaning_manifest.get("dropped_rows", {})
+            return {
+                "row_counts": row_counts,
+                "dropped_rows": dropped,
+                "conversion_keys": list(conversions.keys())[:12],
+            }
+
+        def _summarize_weights():
+            if not weights_payload:
+                return "No weights/metrics payload."
+            metrics = weights_payload.get("metrics") if isinstance(weights_payload, dict) else None
+            weights = weights_payload.get("weights") if isinstance(weights_payload, dict) else None
+            return {
+                "metrics": metrics,
+                "weights": weights,
+            }
+
+        def _summarize_case_summary():
+            if not case_summary:
+                return "No case_summary.csv."
+            columns = case_summary.get("columns", [])
+            rows = case_summary.get("rows", [])
+            numeric_summary = _summarize_numeric_columns(rows, columns)
+            return {
+                "row_count_sampled": case_summary.get("row_count_sampled", 0),
+                "columns": columns,
+                "numeric_summary": numeric_summary,
+            }
+
+        def _summarize_scored_rows():
+            if not scored_rows:
+                return "No scored_rows.csv."
+            columns = scored_rows.get("columns", [])
+            rows = scored_rows.get("rows", [])
+            numeric_summary = _summarize_numeric_columns(rows, columns)
+            return {
+                "row_count_sampled": scored_rows.get("row_count_sampled", 0),
+                "columns": columns,
+                "numeric_summary": numeric_summary,
+            }
+
+        def _summarize_run():
+            if not run_summary:
+                return "No run_summary.json."
+            return {
+                "status": run_summary.get("status"),
+                "failed_gates": run_summary.get("failed_gates", []),
+                "warnings": run_summary.get("warnings", []),
+                "metrics": run_summary.get("metrics", {}),
+            }
 
         def _summarize_case_alignment():
             if not case_alignment_report:
@@ -152,6 +268,12 @@ class BusinessTranslatorAgent:
         output_contract_context = _summarize_output_contract()
         case_alignment_context = _summarize_case_alignment()
         case_alignment_business_status = _case_alignment_business_status()
+        steward_context = _summarize_steward()
+        cleaning_context = _summarize_cleaning()
+        weights_context = _summarize_weights()
+        case_summary_context = _summarize_case_summary()
+        scored_rows_context = _summarize_scored_rows()
+        run_summary_context = _summarize_run()
 
         # Define Template
         SYSTEM_PROMPT_TEMPLATE = Template("""
@@ -176,6 +298,12 @@ class BusinessTranslatorAgent:
         - Output Contract: $output_contract_context
         - Case Alignment QA: $case_alignment_context
         - Business Readiness (Case Alignment): $case_alignment_business_status
+        - Steward Summary: $steward_context
+        - Cleaning Summary: $cleaning_context
+        - Run Summary: $run_summary_context
+        - Model Metrics & Weights: $weights_context
+        - Case Summary Snapshot: $case_summary_context
+        - Scored Rows Snapshot: $scored_rows_context
         - Plot Insights (data-driven): $plot_insights_json
         
         ERROR CONDITION:
@@ -215,6 +343,12 @@ class BusinessTranslatorAgent:
             output_contract_context=output_contract_context,
             case_alignment_context=case_alignment_context,
             case_alignment_business_status=json.dumps(case_alignment_business_status, ensure_ascii=False),
+            steward_context=json.dumps(steward_context, ensure_ascii=False),
+            cleaning_context=json.dumps(cleaning_context, ensure_ascii=False),
+            run_summary_context=json.dumps(run_summary_context, ensure_ascii=False),
+            weights_context=json.dumps(weights_context, ensure_ascii=False),
+            case_summary_context=json.dumps(case_summary_context, ensure_ascii=False),
+            scored_rows_context=json.dumps(scored_rows_context, ensure_ascii=False),
             plot_insights_json=json.dumps(plot_insights, ensure_ascii=False)
         )
         

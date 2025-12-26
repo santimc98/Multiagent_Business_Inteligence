@@ -77,7 +77,9 @@ class ResultsAdvisorAgent:
         failures = case_report.get("failures", []) or []
         metrics = case_report.get("metrics", {}) or {}
         weights = context.get("weights", {}) or {}
+        weights_uniformity = context.get("weights_uniformity", {}) or {}
         output_report = context.get("output_contract_report", {}) or {}
+        review_feedback = str(context.get("review_feedback") or "")
         if prev_report:
             prev_metrics = prev_report.get("metrics", {}) or {}
             try:
@@ -105,6 +107,22 @@ class ResultsAdvisorAgent:
                 lines.append(
                     "ISSUE: weight concentration high; WHY: optimization collapses to one feature; FIX: add L2/entropy regularization or cap max weight."
                 )
+        if weights_uniformity.get("uniform") is True:
+            lines.append(
+                "ISSUE: weights are effectively uniform; WHY: optimizer likely fell back to equal weights or objective is too flat; FIX: change initialization/penalties to break symmetry and force weight differentiation."
+            )
+        if "data leakage" in review_feedback.lower() or "leakage" in review_feedback.lower():
+            lines.append(
+                "ISSUE: data leakage risk flagged; WHY: target or proxy is inside feature set; FIX: explicitly exclude target-derived columns from features and validate post-mapping."
+            )
+        if "successflag" in review_feedback.lower() and "feature" in review_feedback.lower():
+            lines.append(
+                "ISSUE: SuccessFlag used as feature; WHY: target leakage in conversion model; FIX: remove SuccessFlag from features and use only pre-contract attributes."
+            )
+        if "contract" in review_feedback.lower() and "only" in review_feedback.lower() and "success" in review_feedback.lower():
+            lines.append(
+                "ISSUE: pricing model trained only on wins; WHY: biases price ceiling estimate; FIX: train pricing on full dataset and optimize revenue via price*probability."
+            )
         if isinstance(weights, dict):
             weight_list = weights.get("optimized_weights") or []
             if weight_list and max(weight_list) > 0.6:

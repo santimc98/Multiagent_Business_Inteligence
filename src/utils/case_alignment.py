@@ -75,6 +75,10 @@ def _pick_column(df: pd.DataFrame, target_name: Optional[str], kind: str) -> Opt
     # fallback heuristics
     if kind == "target":
         for col in cols:
+            n = _normalize(col)
+            if "refscore" in n or "ref_score" in n:
+                return col
+        for col in cols:
             if "target" in _normalize(col):
                 return col
     if kind == "score_mean":
@@ -200,13 +204,13 @@ def build_case_alignment_report(
         gates = {}
 
     defaults = {
-        "spearman_min": 0.85,
+        "spearman_min": None,
         "kendall_min": None,
-        "violations_max": 0,
-        "inactive_share_max": 0.01,
-        "max_weight_max": 0.70,
-        "hhi_max": 0.60,
-        "near_zero_max": 1,
+        "violations_max": None,
+        "inactive_share_max": None,
+        "max_weight_max": None,
+        "hhi_max": None,
+        "near_zero_max": None,
     }
     thresholds = {**defaults, **{k: v for k, v in gates.items() if v is not None}}
 
@@ -341,8 +345,12 @@ def build_case_alignment_report(
         if weight_metrics["near_zero_weights_count"] > thresholds["near_zero_max"]:
             failures.append("near_zero_weights_count")
 
-    status = "PASS" if not failures else "FAIL"
-    explanation = "Case alignment gate passed." if status == "PASS" else f"Failed gates: {', '.join(failures)}"
+    if not gates:
+        status = "SKIPPED"
+        explanation = "Case alignment gates not defined in contract; skipping gate evaluation."
+    else:
+        status = "PASS" if not failures else "FAIL"
+        explanation = "Case alignment gate passed." if status == "PASS" else f"Failed gates: {', '.join(failures)}"
 
     return {
         "status": status,

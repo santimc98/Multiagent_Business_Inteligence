@@ -7,6 +7,8 @@ import time
 import glob
 import signal
 import threading
+import io
+import zipfile
 from datetime import datetime
 
 # Ensure src is in path
@@ -15,6 +17,13 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from src.graph.graph import app_graph, request_abort, clear_abort
 
 _SIGNAL_HANDLER_INSTALLED = False
+
+def _load_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 def _handle_shutdown(signum, frame):
     request_abort(f"signal={signum}")
@@ -358,3 +367,27 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
                 file_name=f"Reporte_Ejecutivo_{timestamp}.pdf",
                 mime="application/pdf"
             )
+
+        # Download ML artifacts based on outputs generated in this run
+        output_report = result.get("output_contract_report")
+        if not isinstance(output_report, dict):
+            output_report = _load_json("data/output_contract_report.json") or {}
+        present_outputs = output_report.get("present", []) if isinstance(output_report, dict) else []
+        present_files = [p for p in present_outputs if isinstance(p, str) and os.path.exists(p)]
+
+        if present_files:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for file_path in present_files:
+                    arcname = os.path.relpath(file_path, start=os.getcwd())
+                    zf.write(file_path, arcname=arcname)
+            zip_buffer.seek(0)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+            st.download_button(
+                label="Descargar entregables ML (ZIP)",
+                data=zip_buffer.getvalue(),
+                file_name=f"Entregables_ML_{timestamp}.zip",
+                mime="application/zip"
+            )
+        else:
+            st.info("No se encontraron entregables ML para descargar en esta ejecución.")
