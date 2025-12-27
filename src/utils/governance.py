@@ -24,13 +24,16 @@ def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
         sev = str(issue.get("severity", "unknown"))
         severity_counts[sev] = severity_counts.get(sev, 0) + 1
 
+    review_verdict = state.get("last_successful_review_verdict") or state.get("review_verdict")
+    gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context")
+
     return {
         "run_id": state.get("run_id"),
         "timestamp": datetime.utcnow().isoformat(),
         "strategy_title": contract.get("strategy_title", ""),
         "business_objective": contract.get("business_objective", ""),
-        "review_verdict": state.get("review_verdict"),
-        "last_gate_context": state.get("last_gate_context"),
+        "review_verdict": review_verdict,
+        "last_gate_context": gate_context,
         "output_contract": output_contract,
         "case_alignment": case_alignment,
         "integrity_issues_summary": severity_counts,
@@ -53,10 +56,11 @@ def write_governance_report(state: Dict[str, Any], path: str = "data/governance_
 def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     case_alignment = _safe_load_json("data/case_alignment_report.json")
     output_contract = _safe_load_json("data/output_contract_report.json")
-    status = state.get("review_verdict") or "UNKNOWN"
+    status = state.get("last_successful_review_verdict") or state.get("review_verdict") or "UNKNOWN"
     failed_gates = []
-    if isinstance(state.get("last_gate_context"), dict):
-        failed_gates = state.get("last_gate_context", {}).get("failed_gates", []) or []
+    gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context")
+    if isinstance(gate_context, dict):
+        failed_gates = gate_context.get("failed_gates", []) or []
     if isinstance(case_alignment, dict) and case_alignment.get("status") == "FAIL":
         failed_gates.extend(case_alignment.get("failures", []))
     if isinstance(output_contract, dict) and output_contract.get("missing"):

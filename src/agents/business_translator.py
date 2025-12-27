@@ -58,6 +58,42 @@ def _summarize_numeric_columns(rows: List[Dict[str, Any]], columns: List[str], m
             break
     return numeric_summary
 
+def _pick_top_examples(rows: List[Dict[str, Any]], columns: List[str], value_keys: List[str], label_keys: List[str], max_rows: int = 3):
+    if not rows or not columns:
+        return None
+    value_key = None
+    for key in value_keys:
+        if key in columns:
+            value_key = key
+            break
+    if not value_key:
+        return None
+    def _coerce_num(row):
+        raw = row.get(value_key)
+        if raw is None or raw == "":
+            return None
+        try:
+            return float(str(raw).replace(",", "."))
+        except Exception:
+            return None
+    scored = []
+    for row in rows:
+        val = _coerce_num(row)
+        if val is None:
+            continue
+        scored.append((val, row))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    examples = []
+    for val, row in scored[:max_rows]:
+        example = {"value_key": value_key, "value": val}
+        for label in label_keys:
+            if label in row and row.get(label) not in (None, ""):
+                example[label] = row.get(label)
+        examples.append(example)
+    return examples
+
 class BusinessTranslatorAgent:
     def __init__(self, api_key: str = None):
         """
@@ -78,6 +114,13 @@ class BusinessTranslatorAgent:
         # Sanitize Visuals Context
         has_partial_visuals = bool(has_partial_visuals)
         plots = plots or []
+        artifact_index = state.get("artifact_index") or []
+        artifact_index = [a for a in artifact_index if isinstance(a, str)]
+
+        def _artifact_available(path: str) -> bool:
+            if artifact_index:
+                return path in artifact_index
+            return os.path.exists(path)
         
         # Safe extraction of strategy info
         strategy = state.get('selected_strategy', {})
@@ -114,10 +157,11 @@ class BusinessTranslatorAgent:
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
         run_summary = _safe_load_json("data/run_summary.json") or {}
-        weights_payload = _safe_load_json("data/weights.json") or {}
-        scored_rows = _safe_load_csv("data/scored_rows.csv")
-        case_summary = _safe_load_csv("data/case_summary.csv")
-        cleaned_rows = _safe_load_csv("data/cleaned_data.csv", max_rows=100)
+        weights_payload = _safe_load_json("data/weights.json") if _artifact_available("data/weights.json") else None
+        weights_payload = weights_payload or {}
+        scored_rows = _safe_load_csv("data/scored_rows.csv") if _artifact_available("data/scored_rows.csv") else None
+        case_summary = _safe_load_csv("data/case_summary.csv") if _artifact_available("data/case_summary.csv") else None
+        cleaned_rows = _safe_load_csv("data/cleaned_data.csv", max_rows=100) if _artifact_available("data/cleaned_data.csv") else None
 
         def _summarize_integrity():
             issues = integrity_audit.get("issues", []) if isinstance(integrity_audit, dict) else []
@@ -189,10 +233,24 @@ class BusinessTranslatorAgent:
             columns = case_summary.get("columns", [])
             rows = case_summary.get("rows", [])
             numeric_summary = _summarize_numeric_columns(rows, columns)
+            examples = _pick_top_examples(
+                rows,
+                columns,
+                value_keys=[
+                    "Expected_Value_mean",
+                    "ExpectedValue_mean",
+                    "Expected_Value",
+                    "ExpectedValue",
+                    "Predicted_Price_mean",
+                    "Predicted_Price",
+                ],
+                label_keys=["Sector", "Size_Decile", "Debtors_Decile", "Segment", "Typology_Cluster"],
+            )
             return {
                 "row_count_sampled": case_summary.get("row_count_sampled", 0),
                 "columns": columns,
                 "numeric_summary": numeric_summary,
+                "examples": examples,
             }
 
         def _summarize_scored_rows():
@@ -201,10 +259,22 @@ class BusinessTranslatorAgent:
             columns = scored_rows.get("columns", [])
             rows = scored_rows.get("rows", [])
             numeric_summary = _summarize_numeric_columns(rows, columns)
+            examples = _pick_top_examples(
+                rows,
+                columns,
+                value_keys=[
+                    "Expected_Value",
+                    "ExpectedValue",
+                    "expected_revenue_pred",
+                    "ExpectedRevenue",
+                ],
+                label_keys=["Sector", "Account", "FiscalId", "Size", "Debtors"],
+            )
             return {
                 "row_count_sampled": scored_rows.get("row_count_sampled", 0),
                 "columns": columns,
                 "numeric_summary": numeric_summary,
+                "examples": examples,
             }
 
         def _summarize_run():
@@ -280,6 +350,7 @@ class BusinessTranslatorAgent:
         case_summary_context = _summarize_case_summary()
         scored_rows_context = _summarize_scored_rows()
         run_summary_context = _summarize_run()
+        artifacts_context = artifact_index if artifact_index else []
 
         # Define Template
         SYSTEM_PROMPT_TEMPLATE = Template("""
@@ -311,6 +382,7 @@ class BusinessTranslatorAgent:
         - Case Summary Snapshot: $case_summary_context
         - Scored Rows Snapshot: $scored_rows_context
         - Plot Insights (data-driven): $plot_insights_json
+        - Artifacts Available: $artifacts_context
         
         ERROR CONDITION:
         $error_condition
@@ -327,7 +399,10 @@ class BusinessTranslatorAgent:
         1. Context: What did we set out to discover?
         2. Execution: What did the agents do? (Cleaned data, ran $analysis_type model).
         3. Explain the provided charts or results (found in the context below).
-        4. Conclusion: Did we validate the hypothesis?
+        4. Use artifacts to ground the report: cite at least two concrete values from Case Summary or Scored Rows
+           (e.g., sector/segment and its Expected Value or recommended price) and mention the source files
+           (case_summary.csv, scored_rows.csv, weights.json) when available.
+        5. Conclusion: Did we validate the hypothesis?
         Use Plot Insights to describe what each chart *shows* (key numbers, shifts, thresholds), not just
         what the chart type is.
         If Business Readiness indicates NO_APTO_PARA_PRODUCCION, explicitly state it and summarize the main failure reasons and recommendation in executive language.
@@ -355,7 +430,8 @@ class BusinessTranslatorAgent:
             weights_context=json.dumps(weights_context, ensure_ascii=False),
             case_summary_context=json.dumps(case_summary_context, ensure_ascii=False),
             scored_rows_context=json.dumps(scored_rows_context, ensure_ascii=False),
-            plot_insights_json=json.dumps(plot_insights, ensure_ascii=False)
+            plot_insights_json=json.dumps(plot_insights, ensure_ascii=False),
+            artifacts_context=json.dumps(artifacts_context, ensure_ascii=False)
         )
         
         # Execution Results
