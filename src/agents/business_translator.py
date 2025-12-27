@@ -161,10 +161,16 @@ class BusinessTranslatorAgent:
             row_counts = cleaning_manifest.get("row_counts", {})
             conversions = cleaning_manifest.get("conversions", {})
             dropped = cleaning_manifest.get("dropped_rows", {})
+            conversion_keys = []
+            if isinstance(conversions, dict):
+                conversion_keys = list(conversions.keys())[:12]
+            elif isinstance(conversions, list):
+                conversion_keys = [c.get("column") for c in conversions if isinstance(c, dict) and c.get("column")]
+                conversion_keys = conversion_keys[:12]
             return {
                 "row_counts": row_counts,
                 "dropped_rows": dropped,
-                "conversion_keys": list(conversions.keys())[:12],
+                "conversion_keys": conversion_keys,
             }
 
         def _summarize_weights():
