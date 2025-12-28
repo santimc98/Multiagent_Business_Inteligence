@@ -3995,6 +3995,11 @@ def execute_code(state: AgentState) -> AgentState:
             plot for plot in fallback_plots_local
             if not os.path.basename(plot).startswith("fallback_")
         ]
+    # Only flag partial visuals when there was an execution error or sandbox failure
+    if not error_in_output and not sandbox_failed:
+        has_partial_visuals = False
+    else:
+        has_partial_visuals = len(plots_local) > 0
 
     # Validate required outputs early
     output_contract = state.get("execution_contract", {}).get("required_outputs", [])
@@ -4584,15 +4589,16 @@ def run_translator(state: AgentState) -> AgentState:
     report_state.setdefault("sandbox_failed", state.get("sandbox_failed", False))
     report_plots = report_state.get("plots_local", plots_local)
     report_artifacts = list(report_state.get("artifact_index") or [])
-    if not report_error and not report_state.get("execution_error") and not report_state.get("sandbox_failed"):
+    error_flag = bool(report_error) or report_state.get("execution_error") or report_state.get("sandbox_failed")
+    if not error_flag:
         if fallback_plots:
             report_plots = [plot for plot in report_plots if plot not in fallback_plots]
             report_state["plots_local"] = report_plots
-            report_state["has_partial_visuals"] = bool(report_plots)
             if report_artifacts:
                 report_artifacts = [path for path in report_artifacts if path not in fallback_plots]
                 report_state["artifact_index"] = report_artifacts
-    report_has_partial = report_state.get("has_partial_visuals", has_partial_visuals)
+    report_state["has_partial_visuals"] = bool(report_plots) and error_flag
+    report_has_partial = report_state["has_partial_visuals"]
     try:
         report = translator.generate_report(
             report_state,

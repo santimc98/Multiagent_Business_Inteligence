@@ -249,6 +249,25 @@ class BusinessTranslatorAgent:
                 return "No case_summary.csv."
             columns = case_summary.get("columns", [])
             rows = case_summary.get("rows", [])
+            if "metric" in columns and "value" in columns:
+                metrics = {}
+                for row in rows:
+                    key = row.get("metric")
+                    if not key:
+                        continue
+                    raw_value = row.get("value")
+                    if raw_value is None or raw_value == "":
+                        metrics[key] = None
+                        continue
+                    try:
+                        metrics[key] = float(str(raw_value).replace(",", "."))
+                    except Exception:
+                        metrics[key] = raw_value
+                return {
+                    "row_count_sampled": case_summary.get("row_count_sampled", 0),
+                    "columns": columns,
+                    "metrics": metrics,
+                }
             numeric_summary = _summarize_numeric_columns(rows, columns)
             examples = _pick_top_examples(
                 rows,
@@ -424,6 +443,8 @@ class BusinessTranslatorAgent:
         4. Use artifacts to ground the report: cite at least two concrete values from Case Summary or Scored Rows
            (e.g., sector/segment and its Expected Value or recommended price) and mention the source files
            (case_summary.csv, scored_rows.csv, weights.json) when available.
+           IMPORTANT: Use only numbers that appear in Case Summary Snapshot, Scored Rows Snapshot, or Model Metrics.
+           If a specific number is not present, state "No disponible" instead of guessing.
         5. Conclusion: Did we validate the hypothesis?
         Use Plot Insights to describe what each chart *shows* (key numbers, shifts, thresholds), not just
         what the chart type is.
