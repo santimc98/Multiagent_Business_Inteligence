@@ -1,3 +1,4 @@
+import difflib
 import json
 import os
 from typing import Any, Dict, List, Tuple
@@ -20,6 +21,175 @@ def _safe_load_csv(path: str) -> pd.DataFrame | None:
         return pd.read_csv(path)
     except Exception:
         return None
+
+
+def _is_number(value: Any) -> bool:
+    try:
+        float(value)
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_key(name: str) -> str:
+    return str(name or "").strip().lower().replace(" ", "_")
+
+
+def _metric_category(metric_name: str) -> str:
+    key = _normalize_key(metric_name)
+    if any(token in key for token in ["spearman", "kendall", "rank", "corr", "correlation"]):
+        return "ranking"
+    if any(
+        token in key
+        for token in [
+            "f1",
+            "roc",
+            "auc",
+            "pr_auc",
+            "average_precision",
+            "precision",
+            "recall",
+            "accuracy",
+            "balanced_accuracy",
+            "log_loss",
+            "logloss",
+            "brier",
+        ]
+    ):
+        return "classification"
+    if any(token in key for token in ["mae", "rmse", "mse", "mape", "smape", "r2", "r_squared"]):
+        return "regression"
+    return "other"
+
+
+def _metric_higher_is_better(metric_name: str) -> bool:
+    key = _normalize_key(metric_name)
+    if any(token in key for token in ["loss", "error", "mae", "rmse", "mse", "mape", "smape", "brier"]):
+        return False
+    if "r2" in key or "r_squared" in key:
+        return True
+    return True
+
+
+def _is_baseline_metric(metric_name: str) -> bool:
+    key = _normalize_key(metric_name)
+    return any(token in key for token in ["baseline", "dummy", "naive", "null", "default"])
+
+
+def _collect_metric_entries(obj: Any, prefix: str, pool: Dict[str, float]) -> None:
+    if not isinstance(obj, dict):
+        return
+    for key, value in obj.items():
+        metric_key = f"{prefix}{key}" if prefix else str(key)
+        if _is_number(value):
+            pool[metric_key] = float(value)
+        elif isinstance(value, dict):
+            _collect_metric_entries(value, f"{metric_key}.", pool)
+
+
+def _extract_metric_pool(weights: Dict[str, Any], metrics_report: Dict[str, Any]) -> Dict[str, float]:
+    pool: Dict[str, float] = {}
+    if isinstance(weights, dict):
+        for key in ["metrics", "classification_metrics", "regression_metrics", "model_metrics", "global_metrics"]:
+            metrics = weights.get(key)
+            if isinstance(metrics, dict):
+                for metric_key, metric_val in metrics.items():
+                    if _is_number(metric_val):
+                        pool[str(metric_key)] = float(metric_val)
+        for metric_key, metric_val in weights.items():
+            if isinstance(metric_val, (int, float)):
+                pool[str(metric_key)] = float(metric_val)
+    if isinstance(metrics_report, dict):
+        _collect_metric_entries(metrics_report, "", pool)
+    return pool
+
+
+def _select_metric(
+    metric_pool: Dict[str, float],
+    category: str,
+    preference: List[str],
+    baseline_only: bool | None = None,
+) -> Tuple[str | None, float | None]:
+    if not metric_pool:
+        return None, None
+    candidates = {
+        key: value for key, value in metric_pool.items() if _metric_category(key) == category
+    }
+    if baseline_only is True:
+        candidates = {key: value for key, value in candidates.items() if _is_baseline_metric(key)}
+    elif baseline_only is False:
+        candidates = {key: value for key, value in candidates.items() if not _is_baseline_metric(key)}
+    if not candidates:
+        return None, None
+    normalized = {key: _normalize_key(key) for key in candidates}
+    for token in preference:
+        for key, norm in normalized.items():
+            if token in norm:
+                return key, candidates[key]
+    chosen = sorted(candidates.keys())[0]
+    return chosen, candidates[chosen]
+
+
+def _align_quality_gates(
+    gates: Dict[str, Any], metric_pool: Dict[str, float]
+) -> Dict[str, Any]:
+    if not isinstance(gates, dict) or not gates:
+        return {
+            "status": "no_gates",
+            "mapped_gates": {},
+            "unmapped_gates": {},
+            "available_metrics": sorted(metric_pool.keys()),
+        }
+    mapped: Dict[str, Any] = {}
+    unmapped: Dict[str, Any] = {}
+    available_metrics = list(metric_pool.keys())
+    for gate_key, threshold in gates.items():
+        if not gate_key:
+            continue
+        if gate_key in metric_pool:
+            mapped[str(gate_key)] = {
+                "metric": gate_key,
+                "threshold": threshold,
+                "match": "exact",
+                "similarity": 1.0,
+            }
+            continue
+        gate_category = _metric_category(gate_key)
+        if gate_category == "other":
+            unmapped[str(gate_key)] = threshold
+            continue
+        category_candidates = [key for key in available_metrics if _metric_category(key) == gate_category]
+        if not category_candidates:
+            unmapped[str(gate_key)] = threshold
+            continue
+        normalized_gate = _normalize_key(gate_key)
+        best_key = None
+        best_score = 0.0
+        for candidate in category_candidates:
+            score = difflib.SequenceMatcher(None, normalized_gate, _normalize_key(candidate)).ratio()
+            if score > best_score:
+                best_score = score
+                best_key = candidate
+        if best_key is None:
+            unmapped[str(gate_key)] = threshold
+            continue
+        match_type = "similarity" if best_score >= 0.6 else "category_fallback"
+        if best_score < 0.6 and len(category_candidates) > 1:
+            unmapped[str(gate_key)] = threshold
+            continue
+        mapped[str(gate_key)] = {
+            "metric": best_key,
+            "threshold": threshold,
+            "match": match_type,
+            "similarity": float(best_score),
+        }
+    status = "aligned" if not unmapped else "partial"
+    return {
+        "status": status,
+        "mapped_gates": mapped,
+        "unmapped_gates": unmapped,
+        "available_metrics": sorted(metric_pool.keys()),
+    }
 
 
 def _find_target_column(contract: Dict[str, Any], df: pd.DataFrame | None) -> str | None:
@@ -62,16 +232,27 @@ def _segment_coverage(case_summary: pd.DataFrame | None, min_size: int | None) -
 def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
     weights = _safe_load_json("data/weights.json")
+    metrics_report = _safe_load_json("data/metrics.json")
     cleaned = _safe_load_csv("data/cleaned_data.csv")
     case_summary = _safe_load_csv("data/case_summary.csv")
 
-    cls_metrics = weights.get("classification_metrics", {}) if isinstance(weights, dict) else {}
-    reg_metrics = weights.get("regression_metrics", {}) if isinstance(weights, dict) else {}
+    metric_pool = _extract_metric_pool(weights, metrics_report)
+    cls_preference = ["f1", "roc_auc", "auc", "pr_auc", "average_precision", "accuracy", "precision", "recall"]
+    reg_preference = ["mae", "rmse", "mse", "mape", "smape", "r2"]
+    cls_metric_name, cls_metric = _select_metric(metric_pool, "classification", cls_preference, baseline_only=False)
+    cls_baseline_name, cls_baseline = _select_metric(metric_pool, "classification", cls_preference, baseline_only=True)
+    reg_metric_name, reg_metric = _select_metric(metric_pool, "regression", reg_preference, baseline_only=False)
+    reg_baseline_name, reg_baseline = _select_metric(metric_pool, "regression", reg_preference, baseline_only=True)
 
-    f1 = cls_metrics.get("f1_score_cv_mean")
-    f1_baseline = cls_metrics.get("baseline_f1")
-    mae = reg_metrics.get("mae_cv_mean")
-    mae_baseline = reg_metrics.get("baseline_mae")
+    cls_higher = _metric_higher_is_better(cls_metric_name) if cls_metric_name else True
+    reg_higher = _metric_higher_is_better(reg_metric_name) if reg_metric_name else False
+    cls_lift = _calc_lift(cls_baseline, cls_metric, higher_is_better=cls_higher)
+    reg_lift = _calc_lift(reg_baseline, reg_metric, higher_is_better=reg_higher)
+
+    f1 = cls_metric if cls_metric_name and "f1" in _normalize_key(cls_metric_name) else None
+    f1_baseline = cls_baseline if cls_baseline_name and "f1" in _normalize_key(cls_baseline_name) else None
+    mae = reg_metric if reg_metric_name and "mae" in _normalize_key(reg_metric_name) else None
+    mae_baseline = reg_baseline if reg_baseline_name and "mae" in _normalize_key(reg_baseline_name) else None
 
     f1_lift = _calc_lift(f1_baseline, f1, higher_is_better=True)
     mae_lift = _calc_lift(mae_baseline, mae, higher_is_better=False)
@@ -79,7 +260,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     row_count = int(cleaned.shape[0]) if cleaned is not None else None
     feature_count = None
     if isinstance(weights, dict):
-        feat = weights.get("feature_importance")
+        feat = weights.get("feature_importance") or weights.get("feature_importances")
         if isinstance(feat, dict):
             feature_count = len(feat)
 
@@ -96,8 +277,17 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
             class_balance = None
 
     quality_gates = contract.get("quality_gates", {}) if isinstance(contract, dict) else {}
+    if not isinstance(quality_gates, dict):
+        quality_gates = {}
+    if not quality_gates and isinstance(contract, dict):
+        raw_gates = contract.get("quality_gates_raw")
+        if isinstance(raw_gates, list):
+            for item in raw_gates:
+                if isinstance(item, dict) and item.get("metric") is not None and item.get("threshold") is not None:
+                    quality_gates[str(item["metric"])] = item["threshold"]
     min_segment_size = quality_gates.get("min_segment_size")
     small_segment_frac, small_segment_count = _segment_coverage(case_summary, min_segment_size)
+    gate_alignment = _align_quality_gates(quality_gates, metric_pool)
 
     reasons: List[str] = []
     signals: Dict[str, Any] = {
@@ -113,11 +303,31 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "mae_cv_mean": mae,
         "baseline_mae": mae_baseline,
         "mae_lift": mae_lift,
+        "classification_metric_name": cls_metric_name,
+        "classification_metric": cls_metric,
+        "classification_baseline_name": cls_baseline_name,
+        "classification_baseline": cls_baseline,
+        "classification_lift": cls_lift,
+        "regression_metric_name": reg_metric_name,
+        "regression_metric": reg_metric,
+        "regression_baseline_name": reg_baseline_name,
+        "regression_baseline": reg_baseline,
+        "regression_lift": reg_lift,
+        "available_metrics": sorted(metric_pool.keys()),
     }
 
-    if f1_lift is not None and f1_lift < 0.05:
+    if cls_metric is None:
+        reasons.append("classification_metric_missing")
+    if reg_metric is None:
+        reasons.append("regression_metric_missing")
+    if cls_metric is not None and cls_baseline is None:
+        reasons.append("classification_baseline_missing")
+    if reg_metric is not None and reg_baseline is None:
+        reasons.append("regression_baseline_missing")
+
+    if cls_lift is not None and cls_lift < 0.05:
         reasons.append("classification_lift_low")
-    if mae_lift is not None and mae_lift < 0.1:
+    if reg_lift is not None and reg_lift < 0.1:
         reasons.append("regression_lift_low")
     if rows_per_feature is not None and rows_per_feature < 10:
         reasons.append("high_dimensionality_low_sample")
@@ -126,8 +336,10 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     if small_segment_frac is not None and small_segment_frac > 0.3:
         reasons.append("segments_too_small")
 
-    data_limited = len(reasons) >= 2 or (
-        (f1_lift is not None and f1_lift < 0.02) and (mae_lift is not None and mae_lift < 0.05)
+    data_limited = len(
+        [r for r in reasons if not r.endswith("_missing")]
+    ) >= 2 or (
+        (cls_lift is not None and cls_lift < 0.02) and (reg_lift is not None and reg_lift < 0.05)
     )
 
     recommendations: List[str] = []
@@ -141,8 +353,14 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         recommendations.append("Improve class balance by collecting more rare outcomes or sampling evenly.")
     if "segments_too_small" in reasons:
         recommendations.append("Aggregate segments or collect more cases per segment before recommending prices.")
+    if "classification_metric_missing" in reasons or "regression_metric_missing" in reasons:
+        recommendations.append("Persist model performance metrics alongside weights.json for data adequacy checks.")
+    if "classification_baseline_missing" in reasons or "regression_baseline_missing" in reasons:
+        recommendations.append("Include baseline metrics (dummy/naive) to quantify lift over trivial models.")
 
     status = "data_limited" if data_limited else "sufficient_signal"
+    if cls_metric is None or reg_metric is None:
+        status = "insufficient_signal"
     threshold = int(state.get("data_adequacy_threshold", 3) or 3)
     consecutive = int(state.get("data_adequacy_consecutive", 0) or 0)
 
@@ -151,6 +369,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "reasons": reasons,
         "recommendations": recommendations,
         "signals": signals,
+        "quality_gates_alignment": gate_alignment,
         "consecutive_data_limited": consecutive,
         "data_limited_threshold": threshold,
         "threshold_reached": consecutive >= threshold,

@@ -68,6 +68,16 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         failed_gates.append("output_contract_missing")
     adequacy_summary = {}
     if isinstance(data_adequacy, dict):
+        alignment = data_adequacy.get("quality_gates_alignment", {}) if isinstance(data_adequacy, dict) else {}
+        alignment_summary = {}
+        if isinstance(alignment, dict) and alignment:
+            mapped = alignment.get("mapped_gates", {}) if isinstance(alignment, dict) else {}
+            unmapped = alignment.get("unmapped_gates", {}) if isinstance(alignment, dict) else {}
+            alignment_summary = {
+                "status": alignment.get("status"),
+                "mapped_gate_count": len(mapped) if isinstance(mapped, dict) else 0,
+                "unmapped_gate_count": len(unmapped) if isinstance(unmapped, dict) else 0,
+            }
         adequacy_summary = {
             "status": data_adequacy.get("status"),
             "reasons": data_adequacy.get("reasons", []),
@@ -75,6 +85,7 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
             "consecutive_data_limited": data_adequacy.get("consecutive_data_limited"),
             "data_limited_threshold": data_adequacy.get("data_limited_threshold"),
             "threshold_reached": data_adequacy.get("threshold_reached"),
+            "quality_gates_alignment": alignment_summary,
         }
     return {
         "run_id": state.get("run_id"),

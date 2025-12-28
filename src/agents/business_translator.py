@@ -94,6 +94,73 @@ def _pick_top_examples(rows: List[Dict[str, Any]], columns: List[str], value_key
         examples.append(example)
     return examples
 
+def _is_number(value: Any) -> bool:
+    try:
+        float(value)
+        return True
+    except Exception:
+        return False
+
+def _extract_numeric_metrics(metrics: Dict[str, Any], max_items: int = 8):
+    if not isinstance(metrics, dict):
+        return []
+    items = []
+    for key, value in metrics.items():
+        if _is_number(value):
+            items.append((str(key), float(value)))
+        if len(items) >= max_items:
+            break
+    return items
+
+def _build_fact_cards(case_summary_ctx, scored_rows_ctx, weights_ctx, data_adequacy_ctx, max_items: int = 8):
+    facts = []
+    if isinstance(case_summary_ctx, dict):
+        examples = case_summary_ctx.get("examples") or []
+        for example in examples:
+            value_key = example.get("value_key")
+            value = example.get("value")
+            if value_key and _is_number(value):
+                labels = {k: v for k, v in example.items() if k not in {"value_key", "value"}}
+                facts.append({
+                    "source": "case_summary.csv",
+                    "metric": value_key,
+                    "value": float(value),
+                    "labels": labels,
+                })
+    if isinstance(scored_rows_ctx, dict):
+        examples = scored_rows_ctx.get("examples") or []
+        for example in examples:
+            value_key = example.get("value_key")
+            value = example.get("value")
+            if value_key and _is_number(value):
+                labels = {k: v for k, v in example.items() if k not in {"value_key", "value"}}
+                facts.append({
+                    "source": "scored_rows.csv",
+                    "metric": value_key,
+                    "value": float(value),
+                    "labels": labels,
+                })
+    if isinstance(weights_ctx, dict):
+        for key in ("metrics", "classification", "regression", "propensity_model", "price_model"):
+            metrics = weights_ctx.get(key)
+            for metric_key, metric_val in _extract_numeric_metrics(metrics):
+                facts.append({
+                    "source": "weights.json",
+                    "metric": metric_key,
+                    "value": metric_val,
+                    "labels": {"model_block": key},
+                })
+    if isinstance(data_adequacy_ctx, dict):
+        signals = data_adequacy_ctx.get("signals", {})
+        for metric_key, metric_val in _extract_numeric_metrics(signals):
+            facts.append({
+                "source": "data_adequacy_report.json",
+                "metric": metric_key,
+                "value": metric_val,
+                "labels": {},
+            })
+    return facts[:max_items]
+
 class BusinessTranslatorAgent:
     def __init__(self, api_key: str = None):
         """
@@ -163,6 +230,7 @@ class BusinessTranslatorAgent:
         scored_rows = _safe_load_csv("data/scored_rows.csv") if _artifact_available("data/scored_rows.csv") else None
         case_summary = _safe_load_csv("data/case_summary.csv") if _artifact_available("data/case_summary.csv") else None
         cleaned_rows = _safe_load_csv("data/cleaned_data.csv", max_rows=100) if _artifact_available("data/cleaned_data.csv") else None
+        business_objective = state.get("business_objective") or contract.get("business_objective") or ""
 
         def _summarize_integrity():
             issues = integrity_audit.get("issues", []) if isinstance(integrity_audit, dict) else []
@@ -174,9 +242,18 @@ class BusinessTranslatorAgent:
             return f"Issues by severity: {severity_counts}; Top3: {top}"
 
         def _summarize_contract():
-            req_out = contract.get("required_outputs", [])
-            validations = contract.get("validations", [])
-            return f"Required outputs: {req_out}; Validations: {validations}"
+            if not contract:
+                return "No execution contract."
+            return {
+                "strategy_title": contract.get("strategy_title"),
+                "business_objective": contract.get("business_objective"),
+                "required_outputs": contract.get("required_outputs", []),
+                "validations": contract.get("validations", []),
+                "quality_gates": contract.get("quality_gates", {}),
+                "business_alignment": contract.get("business_alignment", {}),
+                "spec_extraction": contract.get("spec_extraction", {}),
+                "iteration_policy": contract.get("iteration_policy", {}),
+            }
 
         def _summarize_output_contract():
             if not output_contract_report:
@@ -324,6 +401,27 @@ class BusinessTranslatorAgent:
                 "metrics": run_summary.get("metrics", {}),
             }
 
+        def _summarize_gate_context():
+            gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context") or {}
+            if not gate_context:
+                return "No gate context."
+            if isinstance(gate_context, dict):
+                return {
+                    "source": gate_context.get("source"),
+                    "status": gate_context.get("status"),
+                    "failed_gates": gate_context.get("failed_gates", []),
+                    "required_fixes": gate_context.get("required_fixes", []),
+                }
+            return str(gate_context)[:1200]
+
+        def _summarize_review_feedback():
+            feedback = state.get("review_feedback") or state.get("execution_feedback") or ""
+            if isinstance(feedback, dict):
+                return feedback
+            if isinstance(feedback, str):
+                return feedback[:2000]
+            return str(feedback)[:2000]
+
         def _summarize_data_adequacy():
             if not data_adequacy_report:
                 return "No data adequacy report."
@@ -332,6 +430,7 @@ class BusinessTranslatorAgent:
                 "reasons": data_adequacy_report.get("reasons", []),
                 "recommendations": data_adequacy_report.get("recommendations", []),
                 "signals": data_adequacy_report.get("signals", {}),
+                "quality_gates_alignment": data_adequacy_report.get("quality_gates_alignment", {}),
                 "consecutive_data_limited": data_adequacy_report.get("consecutive_data_limited"),
                 "data_limited_threshold": data_adequacy_report.get("data_limited_threshold"),
                 "threshold_reached": data_adequacy_report.get("threshold_reached"),
@@ -394,6 +493,8 @@ class BusinessTranslatorAgent:
         output_contract_context = _summarize_output_contract()
         case_alignment_context = _summarize_case_alignment()
         case_alignment_business_status = _case_alignment_business_status()
+        gate_context = _summarize_gate_context()
+        review_feedback_context = _summarize_review_feedback()
         steward_context = _summarize_steward()
         cleaning_context = _summarize_cleaning()
         weights_context = _summarize_weights()
@@ -402,14 +503,16 @@ class BusinessTranslatorAgent:
         run_summary_context = _summarize_run()
         data_adequacy_context = _summarize_data_adequacy()
         model_metrics_context = _summarize_model_metrics()
+        facts_context = _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
         artifacts_context = artifact_index if artifact_index else []
 
         # Define Template
         SYSTEM_PROMPT_TEMPLATE = Template("""
-        You are a Data Storyteller and Executive Consultant.
-        Your goal is to translate technical data outputs into a compelling business narrative for the CEO.
+        You are a Senior Executive Translator and Data Storyteller.
+        Your goal is to translate technical outputs into a decision-ready business narrative.
         
-        TONE: Professional, insightful, concise. Avoid technical jargon where possible.
+        TONE: Professional, evidence-driven, decisive. Avoid unnecessary jargon.
+        STYLE: Prioritize decision, evidence, risks, and next actions. No fluff.
         
         *** FORMATTING CONSTRAINTS (CRITICAL) ***
         1. **LANGUAGE:** DETECT the language of the 'Business Objective' in the state. GENERATE THE REPORT IN THAT SAME LANGUAGE. (If objective is Spanish, output Spanish).
@@ -419,6 +522,7 @@ class BusinessTranslatorAgent:
              * Metric: Value
         
         CONTEXT:
+        - Business Objective: $business_objective
         - Strategy: $strategy_title
         - Hypothesis: $hypothesis
         - Compliance Check: $compliance
@@ -427,10 +531,13 @@ class BusinessTranslatorAgent:
         - Output Contract: $output_contract_context
         - Case Alignment QA: $case_alignment_context
         - Business Readiness (Case Alignment): $case_alignment_business_status
+        - Gate Context: $gate_context
+        - Review Feedback: $review_feedback
         - Steward Summary: $steward_context
         - Cleaning Summary: $cleaning_context
         - Run Summary: $run_summary_context
         - Data Adequacy: $data_adequacy_context
+        - Fact Cards (use as evidence): $facts_context
         - Model Metrics & Weights: $weights_context
         - Model Metrics (Expanded): $model_metrics_context
         - Case Summary Snapshot: $case_summary_context
@@ -449,48 +556,53 @@ class BusinessTranslatorAgent:
         CRITICAL: If "has_partial_visuals" is true, you MUST state: "Despite individual errors, partial visualizations were generated." and refer to the plots listed in "plots_list". Do NOT say "No visualizations created" if they exist.
         
         IF SUCCESS:
-        Synthesize the journey:
-        1. Context: What did we set out to discover?
-        2. Execution: What did the agents do? (Cleaned data, ran $analysis_type model).
-        3. Explain the provided charts or results (found in the context below).
-        3b. Explain key model metrics in business terms (AUC, R², MAE/MAPE, uplift), 
-            and relate them to the business objective and acceptance criteria. If metrics
-            are weak or ambiguous, state the business risk clearly.
+        Produce a senior-level executive report with these required sections:
+        1) Executive Decision: ONE line with readiness (GO / PILOT / NO-GO) and why.
+        2) Objective & Approach: What we set out to do and the approach used.
+        3) Evidence & Metrics: Cite 3+ concrete numbers from Fact Cards or snapshots, with source file names.
+           If a number is unavailable, write "No disponible" and state which artifact is missing.
+        4) Business Impact: Translate metrics into business implications and expected value.
+        5) Risks & Limitations: Call out data risks, gate failures, or misalignment with the objective.
+        6) Recommended Next Actions: 2-5 specific actions (short-term + data improvements).
+        7) Visual Insights: Explain what each plot shows using Plot Insights; do not describe only the chart type.
+
+        Ensure logical consistency: do not claim elasticity, uplift, or improvements unless supported by metrics or plots.
+        If quality gates are missing or misaligned, explicitly state that evaluation confidence is reduced.
         IF DATA ADEQUACY:
         If Data Adequacy indicates status "data_limited" AND threshold_reached is true,
         explicitly say the performance ceiling is likely due to data quality/coverage,
         and list 2-4 concrete data improvement steps from Data Adequacy recommendations.
-        4. Use artifacts to ground the report: cite at least two concrete values from Case Summary or Scored Rows
-           (e.g., sector/segment and its Expected Value or recommended price) and mention the source files
-           (case_summary.csv, scored_rows.csv, weights.json) when available.
-           IMPORTANT: Use only numbers that appear in Case Summary Snapshot, Scored Rows Snapshot, or Model Metrics.
-           If a specific number is not present, state "No disponible" instead of guessing.
-        5. Conclusion: Did we validate the hypothesis?
-        Use Plot Insights to describe what each chart *shows* (key numbers, shifts, thresholds), not just
-        what the chart type is.
-        If Business Readiness indicates NO_APTO_PARA_PRODUCCION, explicitly state it and summarize the main failure reasons and recommendation in executive language.
-        
+        If Data Adequacy indicates "insufficient_signal", state that metrics are incomplete
+        and the report should be treated as directional, not decision-grade.
+
+        If Business Readiness indicates NO_APTO_PARA_PRODUCCION, explicitly state it and summarize
+        the main reasons using gate context and review feedback in executive language.
+
         OUTPUT: Markdown format (NO TABLES).
         """)
         
         error_condition_str = f"CRITICAL ERROR ENCOUNTERED: {error_message}" if error_message else "No critical errors."
 
         system_prompt = SYSTEM_PROMPT_TEMPLATE.substitute(
+            business_objective=business_objective,
             strategy_title=strategy_title,
             hypothesis=hypothesis,
             compliance=compliance,
             error_condition=error_condition_str,
             visuals_context_json=visuals_context_json,
             analysis_type=analysis_type,
-            contract_context=contract_context,
+            contract_context=json.dumps(contract_context, ensure_ascii=False),
             integrity_context=integrity_context,
             output_contract_context=output_contract_context,
             case_alignment_context=case_alignment_context,
             case_alignment_business_status=json.dumps(case_alignment_business_status, ensure_ascii=False),
+            gate_context=json.dumps(gate_context, ensure_ascii=False),
+            review_feedback=json.dumps(review_feedback_context, ensure_ascii=False),
             steward_context=json.dumps(steward_context, ensure_ascii=False),
             cleaning_context=json.dumps(cleaning_context, ensure_ascii=False),
             run_summary_context=json.dumps(run_summary_context, ensure_ascii=False),
             data_adequacy_context=json.dumps(data_adequacy_context, ensure_ascii=False),
+            facts_context=json.dumps(facts_context, ensure_ascii=False),
             weights_context=json.dumps(weights_context, ensure_ascii=False),
             model_metrics_context=json.dumps(model_metrics_context, ensure_ascii=False),
             case_summary_context=json.dumps(case_summary_context, ensure_ascii=False),

@@ -46,6 +46,11 @@ data/feature_integrity_report.json
 data/weights.json
 data/metrics.json
 data/case_summary.csv
+data/scored_rows.csv
+data/run_summary.json
+data/governance_report.json
+data/data_adequacy_report.json
+data/dataset_memory.json
 
 # local artifacts
 /data/case_alignment_report.json
