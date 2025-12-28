@@ -62,6 +62,7 @@ from src.utils.dataset_memory import (
     summarize_memory,
 )
 from src.utils.governance import write_governance_report, build_run_summary
+from src.utils.data_adequacy import build_data_adequacy_report, write_data_adequacy_report
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -4220,6 +4221,29 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         feedback = f"{feedback}\n{feedback_missing}" if feedback else feedback_missing
         new_history.append(f"OUTPUT_CONTRACT_MISSING: {miss_text}")
 
+    data_adequacy_report = {}
+    adequacy_status = None
+    adequacy_threshold = int(state.get("data_adequacy_threshold", 3) or 3)
+    adequacy_consecutive = int(state.get("data_adequacy_consecutive", 0) or 0)
+    try:
+        data_adequacy_report = build_data_adequacy_report(state)
+        adequacy_status = data_adequacy_report.get("status")
+        if adequacy_status == "data_limited":
+            adequacy_consecutive += 1
+        else:
+            adequacy_consecutive = 0
+        data_adequacy_report["consecutive_data_limited"] = adequacy_consecutive
+        data_adequacy_report["data_limited_threshold"] = adequacy_threshold
+        data_adequacy_report["threshold_reached"] = adequacy_consecutive >= adequacy_threshold
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/data_adequacy_report.json", "w", encoding="utf-8") as f_adequacy:
+                json.dump(data_adequacy_report, f_adequacy, indent=2, ensure_ascii=False)
+        except Exception as adequacy_err:
+            print(f"Warning: failed to persist data_adequacy_report.json: {adequacy_err}")
+    except Exception as adequacy_err:
+        print(f"Warning: data adequacy evaluation failed: {adequacy_err}")
+
     if _detect_refscore_alias(execution_output, contract):
         status = "NEEDS_IMPROVEMENT"
         alias_msg = (
@@ -4323,6 +4347,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "metric_iterations": metric_iterations,
         "compliance_passed": compliance_passed,
         "last_iteration_type": iteration_type,
+        "data_adequacy_consecutive": adequacy_consecutive,
+        "data_adequacy_threshold": adequacy_threshold,
+        "data_adequacy_status": adequacy_status,
     }
     if status in ["APPROVED", "APPROVE_WITH_WARNINGS"]:
         result_state["last_successful_review_verdict"] = status
@@ -4634,6 +4661,7 @@ def run_translator(state: AgentState) -> AgentState:
         """
         
     try:
+        write_data_adequacy_report(state)
         write_governance_report(state)
         summary = build_run_summary(state)
         try:

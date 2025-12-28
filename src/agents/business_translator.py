@@ -153,6 +153,7 @@ class BusinessTranslatorAgent:
         integrity_audit = _safe_load_json("data/integrity_audit_report.json") or {}
         output_contract_report = _safe_load_json("data/output_contract_report.json") or {}
         case_alignment_report = _safe_load_json("data/case_alignment_report.json") or {}
+        data_adequacy_report = _safe_load_json("data/data_adequacy_report.json") or {}
         plot_insights = _safe_load_json("data/plot_insights.json") or {}
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
@@ -323,6 +324,19 @@ class BusinessTranslatorAgent:
                 "metrics": run_summary.get("metrics", {}),
             }
 
+        def _summarize_data_adequacy():
+            if not data_adequacy_report:
+                return "No data adequacy report."
+            return {
+                "status": data_adequacy_report.get("status"),
+                "reasons": data_adequacy_report.get("reasons", []),
+                "recommendations": data_adequacy_report.get("recommendations", []),
+                "signals": data_adequacy_report.get("signals", {}),
+                "consecutive_data_limited": data_adequacy_report.get("consecutive_data_limited"),
+                "data_limited_threshold": data_adequacy_report.get("data_limited_threshold"),
+                "threshold_reached": data_adequacy_report.get("threshold_reached"),
+            }
+
         def _summarize_case_alignment():
             if not case_alignment_report:
                 return "No case alignment report."
@@ -386,6 +400,7 @@ class BusinessTranslatorAgent:
         case_summary_context = _summarize_case_summary()
         scored_rows_context = _summarize_scored_rows()
         run_summary_context = _summarize_run()
+        data_adequacy_context = _summarize_data_adequacy()
         model_metrics_context = _summarize_model_metrics()
         artifacts_context = artifact_index if artifact_index else []
 
@@ -415,6 +430,7 @@ class BusinessTranslatorAgent:
         - Steward Summary: $steward_context
         - Cleaning Summary: $cleaning_context
         - Run Summary: $run_summary_context
+        - Data Adequacy: $data_adequacy_context
         - Model Metrics & Weights: $weights_context
         - Model Metrics (Expanded): $model_metrics_context
         - Case Summary Snapshot: $case_summary_context
@@ -440,6 +456,10 @@ class BusinessTranslatorAgent:
         3b. Explain key model metrics in business terms (AUC, R², MAE/MAPE, uplift), 
             and relate them to the business objective and acceptance criteria. If metrics
             are weak or ambiguous, state the business risk clearly.
+        IF DATA ADEQUACY:
+        If Data Adequacy indicates status "data_limited" AND threshold_reached is true,
+        explicitly say the performance ceiling is likely due to data quality/coverage,
+        and list 2-4 concrete data improvement steps from Data Adequacy recommendations.
         4. Use artifacts to ground the report: cite at least two concrete values from Case Summary or Scored Rows
            (e.g., sector/segment and its Expected Value or recommended price) and mention the source files
            (case_summary.csv, scored_rows.csv, weights.json) when available.
@@ -470,6 +490,7 @@ class BusinessTranslatorAgent:
             steward_context=json.dumps(steward_context, ensure_ascii=False),
             cleaning_context=json.dumps(cleaning_context, ensure_ascii=False),
             run_summary_context=json.dumps(run_summary_context, ensure_ascii=False),
+            data_adequacy_context=json.dumps(data_adequacy_context, ensure_ascii=False),
             weights_context=json.dumps(weights_context, ensure_ascii=False),
             model_metrics_context=json.dumps(model_metrics_context, ensure_ascii=False),
             case_summary_context=json.dumps(case_summary_context, ensure_ascii=False),

@@ -56,6 +56,7 @@ def write_governance_report(state: Dict[str, Any], path: str = "data/governance_
 def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     case_alignment = _safe_load_json("data/case_alignment_report.json")
     output_contract = _safe_load_json("data/output_contract_report.json")
+    data_adequacy = _safe_load_json("data/data_adequacy_report.json")
     status = state.get("last_successful_review_verdict") or state.get("review_verdict") or "UNKNOWN"
     failed_gates = []
     gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context")
@@ -65,9 +66,20 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         failed_gates.extend(case_alignment.get("failures", []))
     if isinstance(output_contract, dict) and output_contract.get("missing"):
         failed_gates.append("output_contract_missing")
+    adequacy_summary = {}
+    if isinstance(data_adequacy, dict):
+        adequacy_summary = {
+            "status": data_adequacy.get("status"),
+            "reasons": data_adequacy.get("reasons", []),
+            "recommendations": data_adequacy.get("recommendations", []),
+            "consecutive_data_limited": data_adequacy.get("consecutive_data_limited"),
+            "data_limited_threshold": data_adequacy.get("data_limited_threshold"),
+            "threshold_reached": data_adequacy.get("threshold_reached"),
+        }
     return {
         "run_id": state.get("run_id"),
         "status": status,
         "failed_gates": list(dict.fromkeys(failed_gates)),
         "budget_counters": state.get("budget_counters", {}),
+        "data_adequacy": adequacy_summary,
     }
