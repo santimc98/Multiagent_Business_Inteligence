@@ -220,12 +220,29 @@ class BusinessTranslatorAgent:
         def _summarize_weights():
             if not weights_payload:
                 return "No weights/metrics payload."
-            metrics = weights_payload.get("metrics") if isinstance(weights_payload, dict) else None
-            weights = weights_payload.get("weights") if isinstance(weights_payload, dict) else None
-            return {
-                "metrics": metrics,
-                "weights": weights,
-            }
+            if not isinstance(weights_payload, dict):
+                return weights_payload
+            summary = {}
+            for key in ("metrics", "weights", "propensity_model", "price_model", "optimization", "regression", "classification"):
+                if key in weights_payload:
+                    summary[key] = weights_payload.get(key)
+            if not summary:
+                summary["keys"] = list(weights_payload.keys())[:12]
+            return summary
+
+        def _summarize_model_metrics():
+            metrics_summary = {}
+            if isinstance(weights_payload, dict):
+                for key in ("metrics", "propensity_model", "price_model", "optimization", "regression", "classification"):
+                    if key in weights_payload:
+                        metrics_summary[key] = weights_payload.get(key)
+            if isinstance(run_summary, dict):
+                run_metrics = run_summary.get("metrics")
+                if run_metrics:
+                    metrics_summary["run_summary_metrics"] = run_metrics
+            if not metrics_summary:
+                return "No explicit model metrics found."
+            return metrics_summary
 
         def _summarize_case_summary():
             if not case_summary:
@@ -350,6 +367,7 @@ class BusinessTranslatorAgent:
         case_summary_context = _summarize_case_summary()
         scored_rows_context = _summarize_scored_rows()
         run_summary_context = _summarize_run()
+        model_metrics_context = _summarize_model_metrics()
         artifacts_context = artifact_index if artifact_index else []
 
         # Define Template
@@ -379,6 +397,7 @@ class BusinessTranslatorAgent:
         - Cleaning Summary: $cleaning_context
         - Run Summary: $run_summary_context
         - Model Metrics & Weights: $weights_context
+        - Model Metrics (Expanded): $model_metrics_context
         - Case Summary Snapshot: $case_summary_context
         - Scored Rows Snapshot: $scored_rows_context
         - Plot Insights (data-driven): $plot_insights_json
@@ -399,6 +418,9 @@ class BusinessTranslatorAgent:
         1. Context: What did we set out to discover?
         2. Execution: What did the agents do? (Cleaned data, ran $analysis_type model).
         3. Explain the provided charts or results (found in the context below).
+        3b. Explain key model metrics in business terms (AUC, R², MAE/MAPE, uplift), 
+            and relate them to the business objective and acceptance criteria. If metrics
+            are weak or ambiguous, state the business risk clearly.
         4. Use artifacts to ground the report: cite at least two concrete values from Case Summary or Scored Rows
            (e.g., sector/segment and its Expected Value or recommended price) and mention the source files
            (case_summary.csv, scored_rows.csv, weights.json) when available.
@@ -428,6 +450,7 @@ class BusinessTranslatorAgent:
             cleaning_context=json.dumps(cleaning_context, ensure_ascii=False),
             run_summary_context=json.dumps(run_summary_context, ensure_ascii=False),
             weights_context=json.dumps(weights_context, ensure_ascii=False),
+            model_metrics_context=json.dumps(model_metrics_context, ensure_ascii=False),
             case_summary_context=json.dumps(case_summary_context, ensure_ascii=False),
             scored_rows_context=json.dumps(scored_rows_context, ensure_ascii=False),
             plot_insights_json=json.dumps(plot_insights, ensure_ascii=False),

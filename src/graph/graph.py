@@ -411,6 +411,9 @@ def _build_signal_summary_context(
         summary["column_count"] = len(header_cols)
     if required_cols:
         summary["required_columns"] = required_cols
+        summary["required_feature_count"] = len(required_cols)
+        if row_count:
+            summary["rows_per_required_feature"] = round(row_count / max(len(required_cols), 1), 2)
         raw_cols = []
         canon_to_raw: Dict[str, str] = {}
         for col in required_cols:
@@ -443,6 +446,45 @@ def _build_signal_summary_context(
                 }
             if stats:
                 summary["required_column_sample_stats"] = stats
+        required_raw = set(canon_to_raw.values())
+        candidate_cols = [col for col in header_cols if col not in required_raw]
+        if candidate_cols:
+            summary["candidate_column_count"] = len(candidate_cols)
+            sample_candidates = candidate_cols[:40]
+            candidate_df = sample_raw_columns(csv_path, dialect, sample_candidates, nrows=200, dtype=str)
+            if candidate_df is not None and not candidate_df.empty:
+                candidate_stats: List[Dict[str, Any]] = []
+                for col in sample_candidates:
+                    if col not in candidate_df.columns:
+                        continue
+                    series = candidate_df[col]
+                    try:
+                        values = series.astype(str)
+                        non_null_ratio = float(values.replace("", None).notna().mean())
+                        nunique = int(values.dropna().nunique())
+                        examples = [str(v) for v in values.dropna().head(3).tolist()]
+                    except Exception:
+                        non_null_ratio = None
+                        nunique = None
+                        examples = []
+                    likely_id = False
+                    try:
+                        sample_len = len(values.dropna())
+                        if sample_len > 0 and nunique is not None:
+                            likely_id = nunique >= max(int(sample_len * 0.9), 25)
+                    except Exception:
+                        likely_id = False
+                    candidate_stats.append(
+                        {
+                            "column": col,
+                            "sample_non_null_ratio": non_null_ratio,
+                            "sample_nunique": nunique,
+                            "sample_examples": examples,
+                            "likely_id": likely_id,
+                        }
+                    )
+                if candidate_stats:
+                    summary["candidate_columns"] = candidate_stats
     return summary
 
 def _build_required_raw_map(
@@ -1428,6 +1470,39 @@ def _format_metric_delta(label: str, prev: Any, curr: Any) -> str:
     except Exception:
         return f"{label}: {prev} -> {curr}"
 
+def _extract_metrics_snapshot(metrics_report: Dict[str, Any], weights_report: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {}
+    if isinstance(metrics_report, dict):
+        global_ranking = metrics_report.get("global_ranking", {})
+        if isinstance(global_ranking, dict) and _is_number(global_ranking.get("spearman")):
+            snapshot["global_spearman"] = float(global_ranking["spearman"])
+    if not isinstance(weights_report, dict):
+        return snapshot
+    propensity = weights_report.get("propensity_model")
+    if isinstance(propensity, dict):
+        for key in ("auc_cv_mean", "auc_cv_std", "baseline_auc", "improvement_pct"):
+            value = propensity.get(key)
+            if _is_number(value):
+                snapshot[f"propensity_{key}"] = float(value)
+        if "calibrated" in propensity:
+            snapshot["propensity_calibrated"] = bool(propensity.get("calibrated"))
+    price = weights_report.get("price_model")
+    if isinstance(price, dict):
+        for key in ("mae_cv_mean", "mape_cv_mean", "baseline_mae", "improvement_pct"):
+            value = price.get(key)
+            if _is_number(value):
+                snapshot[f"price_{key}"] = float(value)
+        model_type = price.get("model_type")
+        if isinstance(model_type, str):
+            snapshot["price_model_type"] = model_type
+    optimization = weights_report.get("optimization")
+    if isinstance(optimization, dict):
+        for key in ("total_typologies", "high_value_threshold", "low_value_threshold"):
+            value = optimization.get(key)
+            if _is_number(value):
+                snapshot[f"optimization_{key}"] = float(value)
+    return snapshot
+
 def _build_iteration_memory(
     iter_id: int,
     metrics_report: Dict[str, Any],
@@ -1443,6 +1518,7 @@ def _build_iteration_memory(
     metrics_global = (metrics_report or {}).get("global_ranking", {})
     metrics_case = (metrics_report or {}).get("case_level", {})
     case_metrics = (case_report or {}).get("metrics", {})
+    metrics_snapshot = _extract_metrics_snapshot(metrics_report, weights_report)
     summary = {
         "iteration_id": iter_id,
         "objective_signature": objective_sig,
@@ -1451,10 +1527,19 @@ def _build_iteration_memory(
         "metrics_case_level": metrics_case,
         "case_alignment_metrics": case_metrics,
         "failures": case_report.get("failures", []) if isinstance(case_report, dict) else [],
+        "metrics_snapshot": metrics_snapshot,
     }
     if advisor_note:
         summary["advisor_note"] = advisor_note.strip()
     if prev_summary:
+        delta_snapshot: Dict[str, Any] = {}
+        prev_snapshot = prev_summary.get("metrics_snapshot", {}) if isinstance(prev_summary, dict) else {}
+        if isinstance(prev_snapshot, dict):
+            for key, curr_val in metrics_snapshot.items():
+                prev_val = prev_snapshot.get(key)
+                if prev_val is None and curr_val is None:
+                    continue
+                delta_snapshot[key] = {"prev": prev_val, "curr": curr_val}
         summary["delta"] = {
             "spearman_case_means": {
                 "prev": prev_summary.get("case_alignment_metrics", {}).get("spearman_case_means"),
@@ -1469,6 +1554,8 @@ def _build_iteration_memory(
                 "curr": metrics_global.get("spearman"),
             },
         }
+        if delta_snapshot:
+            summary["delta"]["metrics_snapshot"] = delta_snapshot
     return summary
 
 def _build_edit_instructions(summary: Dict[str, Any]) -> str:
@@ -1487,7 +1574,24 @@ def _build_edit_instructions(summary: Dict[str, Any]) -> str:
     if weights_top:
         weights_text = ", ".join([f"{k}={v:.4f}" for k, v in weights_top])
         lines.append(f"- Weights(top): {weights_text}")
+    metrics_snapshot = summary.get("metrics_snapshot", {})
+    if isinstance(metrics_snapshot, dict) and metrics_snapshot:
+        snap_items = []
+        for key in sorted(metrics_snapshot.keys())[:6]:
+            snap_items.append(f"{key}={metrics_snapshot[key]}")
+        lines.append(f"- Metrics snapshot: {', '.join(snap_items)}")
     if delta:
+        metrics_delta = delta.get("metrics_snapshot", {}) if isinstance(delta, dict) else {}
+        extra_metrics = []
+        if isinstance(metrics_delta, dict):
+            for key in sorted(metrics_delta.keys())[:4]:
+                extra_metrics.append(
+                    _format_metric_delta(
+                        key,
+                        metrics_delta.get(key, {}).get("prev"),
+                        metrics_delta.get(key, {}).get("curr"),
+                    )
+                )
         lines.append(
             "- Metric deltas: "
             + "; ".join(
@@ -1495,6 +1599,7 @@ def _build_edit_instructions(summary: Dict[str, Any]) -> str:
                     _format_metric_delta("spearman_case_means", delta.get("spearman_case_means", {}).get("prev"), delta.get("spearman_case_means", {}).get("curr")),
                     _format_metric_delta("adjacent_refscore_violations", delta.get("adjacent_refscore_violations", {}).get("prev"), delta.get("adjacent_refscore_violations", {}).get("curr")),
                     _format_metric_delta("global_spearman", delta.get("global_spearman", {}).get("prev"), delta.get("global_spearman", {}).get("curr")),
+                    *extra_metrics,
                 ]
             )
         )
@@ -4477,7 +4582,6 @@ def run_translator(state: AgentState) -> AgentState:
         report_error = None
     report_state.setdefault("execution_error", state.get("execution_error", False))
     report_state.setdefault("sandbox_failed", state.get("sandbox_failed", False))
-    report_has_partial = report_state.get("has_partial_visuals", has_partial_visuals)
     report_plots = report_state.get("plots_local", plots_local)
     report_artifacts = list(report_state.get("artifact_index") or [])
     if not report_error and not report_state.get("execution_error") and not report_state.get("sandbox_failed"):
@@ -4488,6 +4592,7 @@ def run_translator(state: AgentState) -> AgentState:
             if report_artifacts:
                 report_artifacts = [path for path in report_artifacts if path not in fallback_plots]
                 report_state["artifact_index"] = report_artifacts
+    report_has_partial = report_state.get("has_partial_visuals", has_partial_visuals)
     try:
         report = translator.generate_report(
             report_state,
@@ -4552,12 +4657,14 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
     
     # Check for visualizations
     if "static/plots" not in report:
-        import glob
-        plots = glob.glob("static/plots/*.png")
+        plots = state.get("plots_local", []) or []
+        fallback_plots = state.get("fallback_plots", []) or []
+        has_exec_error = bool(state.get("execution_error") or state.get("sandbox_failed"))
+        if not has_exec_error and fallback_plots:
+            plots = [plot for plot in plots if plot not in fallback_plots]
         if plots:
             report += "\n\n## Visualizations\n"
             for plot in plots:
-                # Use relative path for markdown
                 report += f"![{os.path.basename(plot)}]({plot})\n"
     
     # Generate unique filename
