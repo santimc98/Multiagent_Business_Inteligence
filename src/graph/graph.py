@@ -21,6 +21,7 @@ from src.agents.ml_engineer import MLEngineerAgent
 from src.agents.business_translator import BusinessTranslatorAgent
 # from src.agents.selector import SelectorAgent # DEPRECATED
 from src.agents.data_engineer import DataEngineerAgent
+from src.agents.cleaning_reviewer import CleaningReviewerAgent
 from src.agents.reviewer import ReviewerAgent
 from src.agents.qa_reviewer import QAReviewerAgent # New QA Gate
 from src.agents.execution_planner import ExecutionPlannerAgent
@@ -1741,6 +1742,7 @@ steward = StewardAgent()
 strategist = StrategistAgent()
 domain_expert = DomainExpertAgent() # New Agent
 data_engineer = DataEngineerAgent()
+cleaning_reviewer = CleaningReviewerAgent()
 ml_engineer = MLEngineerAgent()
 translator = BusinessTranslatorAgent()
 reviewer = ReviewerAgent()
@@ -2757,6 +2759,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             load_json,
             detect_destructive_drop,
             format_patch_instructions,
+            sample_raw_columns,
         )
         
         try:
@@ -2868,6 +2871,114 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     "cleaned_data_preview": "Error: Empty Required Columns",
                     "error_message": "CRITICAL: Required input columns are empty after cleaning.",
                 }
+
+            # --- CLEANING REVIEWER (LLM) ---
+            if cleaning_reviewer:
+                try:
+                    manifest_obj = load_json(local_manifest_path)
+                    conversions = manifest_obj.get("conversions", []) if isinstance(manifest_obj, dict) else []
+                    type_checks = manifest_obj.get("type_checks", []) if isinstance(manifest_obj, dict) else []
+                    leakage_check = manifest_obj.get("leakage_check", {}) if isinstance(manifest_obj, dict) else {}
+                    steward_summary = _load_json_safe("data/steward_summary.json")
+
+                    cleaned_stats = {}
+                    cleaned_samples = {}
+                    cleaned_value_counts = {}
+                    for col in required_cols:
+                        if col not in df_mapped.columns:
+                            continue
+                        series = df_mapped[col]
+                        if series.dtype == object:
+                            stripped = series.astype(str).str.strip()
+                            null_like = series.isna() | (stripped == "")
+                        else:
+                            null_like = series.isna()
+                        cleaned_stats[col] = {
+                            "dtype": str(series.dtype),
+                            "null_frac": float(null_like.mean()) if len(series) else 0.0,
+                            "non_null_count": int((~null_like).sum()),
+                            "unique_count": int(series.nunique(dropna=True)),
+                        }
+                        try:
+                            cleaned_samples[col] = series.dropna().astype(str).head(6).tolist()
+                        except Exception:
+                            cleaned_samples[col] = []
+                        try:
+                            vc = series.dropna().astype(str).value_counts().head(6)
+                            cleaned_value_counts[col] = {str(k): int(v) for k, v in vc.items()}
+                        except Exception:
+                            cleaned_value_counts[col] = {}
+
+                    raw_samples = {}
+                    raw_pattern_stats = {}
+                    try:
+                        sample_df = sample_raw_columns(csv_path, input_dialect, required_cols, nrows=200, dtype=str)
+                        if not sample_df.empty:
+                            for col in sample_df.columns:
+                                raw_series = sample_df[col].dropna().astype(str)
+                                raw_samples[col] = raw_series.head(6).tolist()
+                                if not raw_series.empty:
+                                    total = len(raw_series)
+                                    raw_pattern_stats[col] = {
+                                        "numeric_like_ratio": float(sum(any(ch.isdigit() for ch in val) for val in raw_series) / total),
+                                        "dot_ratio": float(sum("." in val for val in raw_series) / total),
+                                        "comma_ratio": float(sum("," in val for val in raw_series) / total),
+                                        "percent_ratio": float(sum("%" in val for val in raw_series) / total),
+                                        "currency_ratio": float(sum(("€" in val) or ("â‚¬" in val) or ("$" in val) or ("£" in val) for val in raw_series) / total),
+                                    }
+                    except Exception:
+                        raw_samples = {}
+                        raw_pattern_stats = {}
+
+                    review_context = {
+                        "business_objective": business_objective,
+                        "strategy_title": selected.get("title", ""),
+                        "required_columns": required_cols,
+                        "input_dialect": input_dialect,
+                        "raw_samples": raw_samples,
+                        "raw_pattern_stats": raw_pattern_stats,
+                        "cleaned_stats": cleaned_stats,
+                        "cleaned_samples": cleaned_samples,
+                        "cleaned_value_counts": cleaned_value_counts,
+                        "manifest_conversions": conversions,
+                        "manifest_type_checks": type_checks,
+                        "leakage_check": leakage_check,
+                        "steward_summary": steward_summary,
+                        "execution_contract": {
+                            "data_requirements": contract.get("data_requirements", []),
+                            "validations": contract.get("validations", []),
+                            "feature_availability": contract.get("feature_availability", []),
+                        },
+                        "cleaning_code_excerpt": code[:4000],
+                    }
+                    review_result = cleaning_reviewer.review_cleaning(review_context)
+                    try:
+                        os.makedirs("artifacts", exist_ok=True)
+                        with open(os.path.join("artifacts", "cleaning_reviewer_report.json"), "w", encoding="utf-8") as f_rep:
+                            json.dump(review_result, f_rep, indent=2, ensure_ascii=False)
+                    except Exception:
+                        pass
+
+                    if isinstance(review_result, dict) and review_result.get("status") == "REJECTED":
+                        if not state.get("cleaning_reviewer_retry_done"):
+                            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                            fixes = review_result.get("required_fixes", [])
+                            fixes_text = ""
+                            if isinstance(fixes, list) and fixes:
+                                fixes_text = "\nREQUIRED_FIXES:\n- " + "\n- ".join(str(item) for item in fixes)
+                            payload = "CLEANING_REVIEWER_ALERT:\n" + str(review_result.get("feedback", "")).strip() + fixes_text
+                            new_state = dict(state)
+                            new_state["cleaning_reviewer_retry_done"] = True
+                            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                            print("Cleaning reviewer rejected output: retrying Data Engineer with guidance.")
+                            return run_data_engineer(new_state)
+                        return {
+                            "cleaning_code": code,
+                            "cleaned_data_preview": "Error: Cleaning Reviewer Rejected",
+                            "error_message": "CRITICAL: Cleaning reviewer rejected cleaned data.",
+                        }
+                except Exception as review_err:
+                    print(f"Warning: cleaning reviewer failed: {review_err}")
 
             # Guard: derived columns should not be constant if present
             derived_issues = []
