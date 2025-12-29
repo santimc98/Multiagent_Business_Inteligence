@@ -23,11 +23,13 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Do not validate required columns before canonicalization; match after normalization mapping.",
         "Only enforce existence for source='input' columns; source='derived' must be created after mapping.",
         "Ensure _json_default handles numpy scalar types (np.bool_, np.integer, np.floating) before json.dump.",
+        "If a derived column has derived_owner='ml_engineer', do not create a placeholder; leave it absent for downstream derivation.",
     ],
     "must_not": [
         "Do not blindly strip '.'; infer thousands/decimal from patterns.",
         "Do not leave numeric columns as object when expected_kind is numeric; fix or abort with clear error.",
         "Do not create downstream ML artifacts (weights/metrics); only cleaned_data.csv + cleaning_manifest.json.",
+        "Do not fabricate constant placeholders for derived grouping/segment columns without a formula or depends_on.",
     ],
     "safe_idioms": [
         "For ratios of boolean patterns use mask.mean(); avoid sum(mask.sum()) or sum(<scalar>).",
@@ -43,6 +45,7 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "If normalization causes name collisions, choose deterministically and log a warning for traceability.",
         "If conversion yields too many NaN, revert and log instead of dropping required columns.",
         "If derived columns are required, confirm source inputs exist and document any NA handling assumptions.",
+        "If derived_owner indicates ML ownership, defer derivation and document that it will be created later.",
         "When checking dtype on a selected column, handle duplicate labels consistently and log the choice.",
         "If referencing contract/config content in code, ensure it is valid Python (JSON null/true/false must be handled).",
     ],

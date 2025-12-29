@@ -172,7 +172,8 @@ class MLEngineerAgent:
         
         *** DERIVED COLUMN HANDLING (MANDATORY) ***
         - If the cleaned dataset already contains derived columns listed in the execution contract (source="derived"), use them directly and do NOT recompute or overwrite them.
-        - Only derive a column if it is missing. If deriving, preserve NaN values; do not coerce NaN to 0 unless the contract explicitly states a default.
+        - If a derived column has derived_owner="ml_engineer", you MAY derive/recompute it even if present (e.g., placeholder from cleaning); document the choice.
+        - Only derive a column if it is missing or marked as ML-owned. If deriving, preserve NaN values; do not coerce NaN to 0 unless the contract explicitly states a default.
         
         *** BASELINE COMPARISON (MANDATORY IF AVAILABLE) ***
         - If a baseline metric column exists (role "baseline_metric" in the contract or a non-derived "Score" column),

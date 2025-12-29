@@ -522,7 +522,10 @@ def _filter_contract_for_data_engineer(contract: Dict[str, Any]) -> Dict[str, An
         if not isinstance(req, dict):
             continue
         role = (req.get("role") or "").lower()
+        owner = (req.get("derived_owner") or "").lower()
         if role == "output":
+            continue
+        if req.get("source") == "derived" and owner == "ml_engineer":
             continue
         filtered.append(req)
         name = req.get("canonical_name") or req.get("name")
@@ -562,6 +565,25 @@ def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None
         if not name:
             continue
         source = req.get("source", "input") or "input"
+        if sources is None or source in sources:
+            out.append(name)
+    return out
+
+def _resolve_contract_columns_for_cleaning(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
+    if not contract or not isinstance(contract, dict):
+        return []
+    reqs = contract.get("data_requirements", []) or []
+    out: List[str] = []
+    for req in reqs:
+        if not isinstance(req, dict):
+            continue
+        name = req.get("canonical_name") or req.get("name")
+        if not name:
+            continue
+        source = req.get("source", "input") or "input"
+        owner = (req.get("derived_owner") or "").lower()
+        if source == "derived" and owner == "ml_engineer":
+            continue
         if sources is None or source in sources:
             out.append(name)
     return out
@@ -2077,7 +2099,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "csv_decimal": csv_decimal,
             "header_cols": header_cols,
             "required_input_columns": _resolve_required_input_columns(state.get("execution_contract", {}), selected),
-            "required_all_columns": _resolve_contract_columns(de_contract),
+            "required_all_columns": _resolve_contract_columns_for_cleaning(de_contract),
             "required_raw_header_map": required_raw_map,
             "raw_required_sample_context": sample_context,
             "data_engineer_audit_override": data_engineer_audit_override,
@@ -2777,7 +2799,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             contract = state.get("execution_contract", {}) or {}
             required_cols = _resolve_required_input_columns(contract, selected)
             contract_all_cols = _resolve_contract_columns(contract)
-            contract_derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
+            contract_derived_cols = _resolve_contract_columns_for_cleaning(contract, sources={"derived", "output"})
             cleaned_columns_set = set(df.columns.str.lower())
             
             print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")

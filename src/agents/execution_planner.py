@@ -822,7 +822,9 @@ class ExecutionPlannerAgent:
             for sentence in re.split(r"[\n\.]", lower):
                 if not any(p in sentence for p in phrases):
                     continue
-                match = re.search(r"(?<!\d)(\d+(?:[.,]\d+)?)", sentence)
+                match = re.search(r"(?:=|->|:)\s*([0-9]+(?:[.,][0-9]+)?)", sentence)
+                if not match:
+                    match = re.search(r"\b([0-9]+(?:[.,][0-9]+)?)\b", sentence)
                 if not match:
                     continue
                 raw_val = match.group(1).replace(",", ".")
@@ -831,6 +833,42 @@ class ExecutionPlannerAgent:
                 except ValueError:
                     continue
             return None
+
+        def _assign_derived_owners(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            spec = contract.get("spec_extraction") or {}
+            formulas = spec.get("formulas") if isinstance(spec, dict) else {}
+            formula_keys = set()
+            if isinstance(formulas, dict):
+                formula_keys = {_norm(k) for k in formulas.keys()}
+            derived_spec = spec.get("derived_columns") if isinstance(spec, dict) else []
+            derived_keys = set()
+            if isinstance(derived_spec, list):
+                for entry in derived_spec:
+                    if isinstance(entry, dict):
+                        name = entry.get("name")
+                        if name:
+                            derived_keys.add(_norm(name))
+            reqs = contract.get("data_requirements", []) or []
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                if req.get("source", "input") != "derived":
+                    continue
+                if req.get("derived_owner"):
+                    continue
+                name = req.get("canonical_name") or req.get("name")
+                norm_name = _norm(name) if name else ""
+                role = (req.get("role") or "").lower()
+                if norm_name in derived_keys or norm_name in formula_keys:
+                    req["derived_owner"] = "data_engineer"
+                elif "segment" in role or "group" in role or "cluster" in role:
+                    req["derived_owner"] = "ml_engineer"
+                else:
+                    req["derived_owner"] = "ml_engineer"
+            contract["data_requirements"] = reqs
+            return contract
 
         def _attach_variable_semantics(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
@@ -1088,6 +1126,7 @@ class ExecutionPlannerAgent:
             contract = _attach_business_alignment(contract)
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
+            contract = _assign_derived_owners(contract)
             contract = _attach_variable_semantics(contract)
             contract = _ensure_availability_reasoning(contract)
             contract = _ensure_iteration_policy(contract)
@@ -1197,6 +1236,7 @@ Return the contract JSON.
             contract = _attach_business_alignment(contract)
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
+            contract = _assign_derived_owners(contract)
             contract = _attach_variable_semantics(contract)
             contract = _ensure_availability_reasoning(contract)
             contract = _ensure_iteration_policy(contract)

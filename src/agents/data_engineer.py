@@ -78,6 +78,7 @@ class DataEngineerAgent:
         - Canonical columns must contain cleaned values (do not leave raw strings in canonical columns while writing cleaned_* shadows).
         - Print a CLEANING_VALIDATION section that reports dtype/null_frac and basic range checks for each required column.
         - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
+        - If a derived column has derived_owner='ml_engineer', do NOT create placeholders; leave it absent and document in the manifest.
         """
         
         # USER TEMPLATE (Static)
