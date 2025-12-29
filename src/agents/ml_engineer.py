@@ -126,6 +126,7 @@ class MLEngineerAgent:
         - Required Outputs: $required_outputs
         - Canonical Columns: $canonical_columns
         - Business Alignment: $business_alignment_json
+        - Alignment Requirements: $alignment_requirements_json
         - Feature Semantics (business meaning): $feature_semantics_json
         - Business Sanity Checks (interpretation aids): $business_sanity_checks_json
         - Execution Contract (json): $execution_contract_json
@@ -233,6 +234,10 @@ class MLEngineerAgent:
         - Ensure os.makedirs('data', exist_ok=True) before saving outputs.
         - Save per-row scored outputs to `data/scored_rows.csv` when derived outputs are in the contract.
         - Use json.dump(..., default=_json_default) for any JSON outputs.
+        - Write `data/alignment_check.json` with fields: status (PASS|WARN|FAIL), failure_mode (data_limited|method_choice|unknown),
+          summary, and per-requirement statuses based on Alignment Requirements. Print `ALIGNMENT_CHECK: <status>` to stdout.
+        - If alignment fails due to data limits, continue with WARN and add strong warnings. If alignment fails due to method choice,
+          fix the approach or print `FAIL_CONTRACT:<reason>`.
         - Print a final block: `QA_SELF_CHECK: PASS` and list which items were satisfied.
         - For ordinal scoring: enforce w>=0 and sum(w)=1; add some regularization to avoid degenerate weights.
         - Report max weight and ranking violations; include these metrics in data/weights.json.
@@ -265,6 +270,7 @@ class MLEngineerAgent:
             required_outputs=json.dumps((execution_contract or {}).get("required_outputs", [])),
             canonical_columns=json.dumps((execution_contract or {}).get("canonical_columns", [])),
             business_alignment_json=json.dumps((execution_contract or {}).get("business_alignment", {}), indent=2),
+            alignment_requirements_json=json.dumps((execution_contract or {}).get("alignment_requirements", []), indent=2),
             feature_semantics_json=json.dumps((execution_contract or {}).get("feature_semantics", []), indent=2),
             business_sanity_checks_json=json.dumps((execution_contract or {}).get("business_sanity_checks", []), indent=2),
             data_path=data_path,

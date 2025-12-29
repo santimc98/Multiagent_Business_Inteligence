@@ -976,6 +976,202 @@ class ExecutionPlannerAgent:
                 contract["iteration_policy"] = {}
             return contract
 
+        def _normalize_alignment_requirements(items: Any) -> List[Dict[str, Any]]:
+            if not isinstance(items, list):
+                return []
+            normalized: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for idx, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                req_id = str(item.get("id") or f"custom_{idx}")
+                if not req_id or req_id in seen:
+                    continue
+                seen.add(req_id)
+                req = {
+                    "id": req_id,
+                    "requirement": str(item.get("requirement") or item.get("description") or "").strip(),
+                    "rationale": str(item.get("rationale") or "").strip(),
+                    "success_criteria": item.get("success_criteria") if isinstance(item.get("success_criteria"), list) else [],
+                    "evidence": item.get("evidence") if isinstance(item.get("evidence"), list) else [],
+                    "applies_when": str(item.get("applies_when") or "always"),
+                    "failure_mode_on_miss": str(item.get("failure_mode_on_miss") or "method_choice"),
+                }
+                normalized.append(req)
+            return normalized
+
+        def _detect_segment_context(text: str) -> bool:
+            if not text:
+                return False
+            norm_text = _norm(text)
+            tokens = [
+                "segment",
+                "segmentation",
+                "segmented",
+                "cluster",
+                "cohort",
+                "case",
+                "bucket",
+                "grupo",
+                "segmento",
+                "clase",
+                "caso",
+            ]
+            token_norms = [_norm(tok) for tok in tokens if tok]
+            return any(tok and tok in norm_text for tok in token_norms)
+
+        def _build_alignment_requirements(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+            requirements: List[Dict[str, Any]] = []
+
+            def _add(req_id: str, requirement: str, rationale: str, success: List[str], applies_when: str, failure_mode: str):
+                requirements.append(
+                    {
+                        "id": req_id,
+                        "requirement": requirement,
+                        "rationale": rationale,
+                        "success_criteria": success,
+                        "evidence": [],
+                        "applies_when": applies_when,
+                        "failure_mode_on_miss": failure_mode,
+                    }
+                )
+
+            _add(
+                "objective_alignment",
+                "Methodology directly answers the business objective and the strategy analysis_type.",
+                "Prevents optimizing an easier proxy that misses the business goal.",
+                [
+                    "Approach matches analysis_type/techniques or a justified alternative is documented.",
+                    "Outputs support the business decision stated in the objective.",
+                ],
+                "always",
+                "method_choice",
+            )
+
+            decision_vars = contract.get("decision_variables") or []
+            if isinstance(decision_vars, list) and decision_vars:
+                preview = [str(v) for v in decision_vars[:5]]
+                if len(decision_vars) > 5:
+                    preview.append("...")
+                _add(
+                    "decision_variable_handling",
+                    f"Decision variables are modeled as controllable inputs ({', '.join(preview)}).",
+                    "Pricing/decision inputs must drive elasticity or optimization rather than be ignored.",
+                    [
+                        "Decision variables are used in modeling or optimization.",
+                        "If excluded, explain why and quantify the impact on recommendations.",
+                    ],
+                    "decision_variables_present",
+                    "method_choice",
+                )
+
+            segment_required = False
+            spec = contract.get("spec_extraction") or {}
+            case_taxonomy = spec.get("case_taxonomy") if isinstance(spec, dict) else None
+            if isinstance(case_taxonomy, list) and case_taxonomy:
+                segment_required = True
+            roles = [
+                str(req.get("role") or "").lower()
+                for req in contract.get("data_requirements", [])
+                if isinstance(req, dict)
+            ]
+            if any(tok in role for role in roles for tok in ["segment", "group", "cluster"]):
+                segment_required = True
+            combined_text = "\n".join(
+                [
+                    business_objective or "",
+                    data_summary or "",
+                    json.dumps(strategy, ensure_ascii=True) if isinstance(strategy, dict) else "",
+                ]
+            )
+            if _detect_segment_context(combined_text):
+                segment_required = True
+            if segment_required:
+                _add(
+                    "segment_alignment",
+                    "Segment-level or case-level analysis is produced when segmentation is part of the strategy.",
+                    "Global-only results can mask segment variability required for the decision.",
+                    [
+                        "Segment-level metrics or elasticity are reported.",
+                        "If only one segment is valid, warn and aggregate with rationale.",
+                    ],
+                    "segmentation_relevant",
+                    "data_limited",
+                )
+
+            feature_availability = contract.get("feature_availability")
+            if isinstance(feature_availability, list) and feature_availability:
+                _add(
+                    "availability_alignment",
+                    "Training uses only pre-decision features; post-outcome fields are excluded or audited.",
+                    "Ensures recommendations are based on information available at decision time.",
+                    [
+                        "Features used for modeling are available at decision time.",
+                        "Post-outcome fields are excluded or documented as leakage risks.",
+                    ],
+                    "feature_availability_present",
+                    "method_choice",
+                )
+
+            quality_gates = contract.get("quality_gates")
+            if isinstance(quality_gates, dict) and quality_gates:
+                _add(
+                    "validation_minimum",
+                    "Validation metrics are computed and compared to quality gates.",
+                    "Keeps the solution aligned with the minimum acceptance criteria.",
+                    [
+                        "Metrics are reported and checked against quality_gates.",
+                        "Shortfalls are explained with data limitations or remediation steps.",
+                    ],
+                    "quality_gates_present",
+                    "method_choice",
+                )
+
+            return requirements
+
+        def _attach_alignment_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            existing = contract.get("alignment_requirements")
+            base_reqs = _build_alignment_requirements(contract)
+            merged: List[Dict[str, Any]] = []
+            base_by_id = {req.get("id"): dict(req) for req in base_reqs if isinstance(req, dict)}
+            merged.extend(base_reqs)
+
+            normalized_existing = _normalize_alignment_requirements(existing)
+            for item in normalized_existing:
+                req_id = item.get("id")
+                if not req_id:
+                    continue
+                if req_id in base_by_id:
+                    base_item = base_by_id[req_id]
+                    for key in ("requirement", "rationale", "applies_when", "failure_mode_on_miss"):
+                        if item.get(key):
+                            base_item[key] = item[key]
+                    if item.get("success_criteria"):
+                        base_item["success_criteria"] = item["success_criteria"]
+                    if item.get("evidence"):
+                        base_item["evidence"] = item["evidence"]
+                else:
+                    merged.append(item)
+                    base_by_id[req_id] = item
+
+            contract["alignment_requirements"] = merged
+
+            checklist = contract.get("compliance_checklist")
+            if not isinstance(checklist, list):
+                checklist = []
+            for req in merged:
+                req_id = req.get("id")
+                req_text = req.get("requirement")
+                if not req_id or not req_text:
+                    continue
+                line = f"Alignment requirement ({req_id}): {req_text}"
+                if line not in checklist:
+                    checklist.append(line)
+            contract["compliance_checklist"] = checklist
+            return contract
+
         def _normalize_quality_gates(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return contract
@@ -1129,6 +1325,7 @@ class ExecutionPlannerAgent:
             contract = _assign_derived_owners(contract)
             contract = _attach_variable_semantics(contract)
             contract = _ensure_availability_reasoning(contract)
+            contract = _attach_alignment_requirements(contract)
             contract = _ensure_iteration_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
 
@@ -1173,6 +1370,8 @@ Requirements:
   These are reasoning aids, not hard rules.
 - Include compliance_checklist (list of concrete compliance items that must pass before metric tuning begins).
   Derive it from the contract itself (quality_gates, required_outputs, leakage policy) rather than generic boilerplate.
+- Include alignment_requirements: concise alignment checks derived from objective/strategy (decision variables,
+  segment-level validity, validation minima). Keep them universal and evidence-focused.
 - Include iteration_policy with:
   * compliance_bootstrap_max (iterations to fix compliance issues),
   * metric_improvement_max (iterations to improve metrics),
@@ -1239,6 +1438,7 @@ Return the contract JSON.
             contract = _assign_derived_owners(contract)
             contract = _attach_variable_semantics(contract)
             contract = _ensure_availability_reasoning(contract)
+            contract = _attach_alignment_requirements(contract)
             contract = _ensure_iteration_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
         except Exception:

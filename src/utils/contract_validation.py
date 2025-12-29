@@ -80,6 +80,7 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "When writing JSON artifacts, use json.dump(..., default=_json_default) to handle numpy/pandas types.",
         "If contract includes decision_variables, treat them as decision inputs (not leakage by default) and document any selection-bias risks.",
         "If contract includes missing_sentinels, treat sentinel values as missing during modeling and consider adding an observed-flag feature.",
+        "If contract includes alignment_requirements, write data/alignment_check.json with PASS/WARN/FAIL and failure_mode.",
     ],
     "must_not": [
         "Do not import sys.",
@@ -107,10 +108,11 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Run leakage/variance checks before training.",
         "Report HHI/max weight/near-zero weights for scoring weights.",
         "Print QA_SELF_CHECK with satisfied checklist items.",
+        "Print ALIGNMENT_CHECK with status and ensure alignment_check.json exists when required.",
     ],
     "outputs": {
         "required": ["data/cleaned_data.csv"],
-        "optional": ["data/weights.json", "static/plots/*.png", "data/scored_rows.csv"],
+        "optional": ["data/weights.json", "static/plots/*.png", "data/scored_rows.csv", "data/alignment_check.json"],
     },
 }
 

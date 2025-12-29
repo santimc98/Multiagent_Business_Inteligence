@@ -221,6 +221,7 @@ class BusinessTranslatorAgent:
         output_contract_report = _safe_load_json("data/output_contract_report.json") or {}
         case_alignment_report = _safe_load_json("data/case_alignment_report.json") or {}
         data_adequacy_report = _safe_load_json("data/data_adequacy_report.json") or {}
+        alignment_check_report = _safe_load_json("data/alignment_check.json") or {}
         plot_insights = _safe_load_json("data/plot_insights.json") or {}
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
@@ -436,6 +437,16 @@ class BusinessTranslatorAgent:
                 "threshold_reached": data_adequacy_report.get("threshold_reached"),
             }
 
+        def _summarize_alignment_check():
+            if not alignment_check_report:
+                return "No alignment check."
+            return {
+                "status": alignment_check_report.get("status"),
+                "failure_mode": alignment_check_report.get("failure_mode"),
+                "summary": alignment_check_report.get("summary"),
+                "requirements": alignment_check_report.get("requirements", []),
+            }
+
         def _summarize_case_alignment():
             if not case_alignment_report:
                 return "No case alignment report."
@@ -493,6 +504,7 @@ class BusinessTranslatorAgent:
         output_contract_context = _summarize_output_contract()
         case_alignment_context = _summarize_case_alignment()
         case_alignment_business_status = _case_alignment_business_status()
+        alignment_check_context = _summarize_alignment_check()
         gate_context = _summarize_gate_context()
         review_feedback_context = _summarize_review_feedback()
         steward_context = _summarize_steward()
@@ -531,6 +543,7 @@ class BusinessTranslatorAgent:
         - Output Contract: $output_contract_context
         - Case Alignment QA: $case_alignment_context
         - Business Readiness (Case Alignment): $case_alignment_business_status
+        - Alignment Check: $alignment_check_context
         - Gate Context: $gate_context
         - Review Feedback: $review_feedback
         - Steward Summary: $steward_context
@@ -577,6 +590,8 @@ class BusinessTranslatorAgent:
 
         If Business Readiness indicates NO_APTO_PARA_PRODUCCION, explicitly state it and summarize
         the main reasons using gate context and review feedback in executive language.
+        If Alignment Check is WARN or FAIL, explicitly state the limitation and whether it is data-limited
+        or method-choice, and reflect it in Risks & Limitations.
 
         OUTPUT: Markdown format (NO TABLES).
         """)
@@ -602,6 +617,7 @@ class BusinessTranslatorAgent:
             cleaning_context=json.dumps(cleaning_context, ensure_ascii=False),
             run_summary_context=json.dumps(run_summary_context, ensure_ascii=False),
             data_adequacy_context=json.dumps(data_adequacy_context, ensure_ascii=False),
+            alignment_check_context=json.dumps(alignment_check_context, ensure_ascii=False),
             facts_context=json.dumps(facts_context, ensure_ascii=False),
             weights_context=json.dumps(weights_context, ensure_ascii=False),
             model_metrics_context=json.dumps(model_metrics_context, ensure_ascii=False),

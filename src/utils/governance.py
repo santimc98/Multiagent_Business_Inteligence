@@ -16,6 +16,7 @@ def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
     output_contract = _safe_load_json("data/output_contract_report.json")
     case_alignment = _safe_load_json("data/case_alignment_report.json")
+    alignment_check = _safe_load_json("data/alignment_check.json")
     integrity = _safe_load_json("data/integrity_audit_report.json")
 
     issues = integrity.get("issues", []) if isinstance(integrity, dict) else []
@@ -36,6 +37,7 @@ def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "last_gate_context": gate_context,
         "output_contract": output_contract,
         "case_alignment": case_alignment,
+        "alignment_check": alignment_check,
         "integrity_issues_summary": severity_counts,
         "budget_counters": state.get("budget_counters", {}),
         "run_budget": state.get("run_budget", {}),
@@ -57,6 +59,7 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     case_alignment = _safe_load_json("data/case_alignment_report.json")
     output_contract = _safe_load_json("data/output_contract_report.json")
     data_adequacy = _safe_load_json("data/data_adequacy_report.json")
+    alignment_check = _safe_load_json("data/alignment_check.json")
     status = state.get("last_successful_review_verdict") or state.get("review_verdict") or "UNKNOWN"
     failed_gates = []
     gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context")
@@ -93,4 +96,9 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         "failed_gates": list(dict.fromkeys(failed_gates)),
         "budget_counters": state.get("budget_counters", {}),
         "data_adequacy": adequacy_summary,
+        "alignment_check": {
+            "status": alignment_check.get("status"),
+            "failure_mode": alignment_check.get("failure_mode"),
+            "summary": alignment_check.get("summary"),
+        } if isinstance(alignment_check, dict) and alignment_check else {},
     }

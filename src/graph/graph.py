@@ -600,6 +600,18 @@ def _ensure_scored_rows_output(contract: Dict[str, Any]) -> Dict[str, Any]:
         contract["required_outputs"] = outputs
     return contract
 
+def _ensure_alignment_check_output(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+    reqs = contract.get("alignment_requirements", [])
+    if not isinstance(reqs, list) or not reqs:
+        return contract
+    outputs = contract.get("required_outputs", []) or []
+    if "data/alignment_check.json" not in outputs:
+        outputs.append("data/alignment_check.json")
+    contract["required_outputs"] = outputs
+    return contract
+
 def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return {}
@@ -650,6 +662,8 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
         normalized["iteration_policy"] = {}
     if not isinstance(normalized.get("compliance_checklist"), list):
         normalized["compliance_checklist"] = []
+    if not isinstance(normalized.get("alignment_requirements"), list):
+        normalized["alignment_requirements"] = []
 
     return normalized
 
@@ -862,6 +876,8 @@ def ml_quality_preflight(code: str) -> List[str]:
     code_lower = code.lower()
     if "mapping summary" not in code_lower:
         issues.append("MAPPING_SUMMARY")
+    if "alignment_check" not in code_lower:
+        issues.append("ALIGNMENT_CHECK_OUTPUT")
 
     try:
         tree = ast.parse(code)
@@ -2006,6 +2022,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
     contract = _normalize_execution_contract(contract)
     contract = ensure_role_runbooks(contract)
     contract = _ensure_scored_rows_output(contract)
+    contract = _ensure_alignment_check_output(contract)
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/execution_contract.json", "w", encoding="utf-8") as f:
@@ -4402,6 +4419,43 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         feedback = f"{feedback}\n{feedback_missing}" if feedback else feedback_missing
         new_history.append(f"OUTPUT_CONTRACT_MISSING: {miss_text}")
 
+    alignment_failed_gates: List[str] = []
+    alignment_check = _load_json_safe("data/alignment_check.json")
+    alignment_requirements = contract.get("alignment_requirements", []) if isinstance(contract, dict) else []
+    if isinstance(alignment_requirements, list) and alignment_requirements:
+        if not alignment_check:
+            status = "NEEDS_IMPROVEMENT"
+            alignment_failed_gates.append("alignment_check_missing")
+            msg = "ALIGNMENT_CHECK_MISSING: data/alignment_check.json not found."
+            feedback = f"{feedback}\n{msg}" if feedback else msg
+            new_history.append(msg)
+        else:
+            raw_status = str(alignment_check.get("status", "")).upper()
+            failure_mode = str(alignment_check.get("failure_mode", "")).lower()
+            summary = alignment_check.get("summary") or alignment_check.get("notes") or ""
+            data_modes = {"data_limited", "data", "insufficient_data", "data_limitations"}
+            method_modes = {"method_choice", "method", "strategy", "approach"}
+            msg = f"ALIGNMENT_CHECK_{raw_status}: failure_mode={failure_mode}; summary={summary}"
+            if raw_status in {"WARN", "FAIL"}:
+                if failure_mode in data_modes:
+                    if status != "NEEDS_IMPROVEMENT":
+                        status = "APPROVE_WITH_WARNINGS"
+                    new_history.append(msg)
+                    feedback = f"{feedback}\n{msg}" if feedback else msg
+                elif failure_mode in method_modes or raw_status == "FAIL":
+                    status = "NEEDS_IMPROVEMENT"
+                    alignment_failed_gates.append("alignment_method_choice")
+                    new_history.append(msg)
+                    feedback = f"{feedback}\n{msg}" if feedback else msg
+                else:
+                    if raw_status == "FAIL":
+                        status = "NEEDS_IMPROVEMENT"
+                        alignment_failed_gates.append("alignment_unknown")
+                    elif status != "NEEDS_IMPROVEMENT":
+                        status = "APPROVE_WITH_WARNINGS"
+                    new_history.append(msg)
+                    feedback = f"{feedback}\n{msg}" if feedback else msg
+
     data_adequacy_report = {}
     adequacy_status = None
     adequacy_threshold = int(state.get("data_adequacy_threshold", 3) or 3)
@@ -4486,12 +4540,25 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             feedback = "CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes."
         new_history.append("CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes.")
 
+    failed_gates = case_report.get("failures", []) if case_report.get("status") == "FAIL" else []
+    required_fixes = list(failed_gates)
+    if alignment_failed_gates:
+        for item in alignment_failed_gates:
+            if item not in failed_gates:
+                failed_gates.append(item)
+                required_fixes.append(item)
+    if case_report.get("status") == "FAIL":
+        gate_source = "case_alignment_gate"
+    elif alignment_failed_gates:
+        gate_source = "alignment_check"
+    else:
+        gate_source = "result_evaluator"
     gate_context = {
-        "source": "case_alignment_gate" if case_report.get("status") == "FAIL" else "result_evaluator",
+        "source": gate_source,
         "status": status,
         "feedback": feedback,
-        "failed_gates": case_report.get("failures", []) if case_report.get("status") == "FAIL" else [],
-        "required_fixes": case_report.get("failures", []) if case_report.get("status") == "FAIL" else [],
+        "failed_gates": failed_gates,
+        "required_fixes": required_fixes,
     }
 
     print(f"Reviewer Verdict: {status}")
