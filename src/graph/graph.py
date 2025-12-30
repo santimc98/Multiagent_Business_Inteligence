@@ -63,6 +63,7 @@ from src.utils.dataset_memory import (
 )
 from src.utils.governance import write_governance_report, build_run_summary
 from src.utils.data_adequacy import build_data_adequacy_report, write_data_adequacy_report
+from src.utils.code_extract import is_syntax_valid
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -713,6 +714,15 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "CROSS_VALIDATION_REQUIRED": [
             "Use cross-validation (StratifiedKFold/KFold) and report mean/std; avoid only train_test_split.",
         ],
+        "DATA_LOAD_MISSING": [
+            "Load the cleaned dataset using pd.read_csv with the detected dialect before processing.",
+        ],
+        "REQUIRED_OUTPUTS_MISSING": [
+            "Write all required outputs to the exact contract paths before exiting.",
+        ],
+        "AST_PARSE_FAILED": [
+            "Return valid Python syntax; do not output partial code or truncated blocks.",
+        ],
         "ALIGNMENT_CHECK_OUTPUT": [
             "Write data/alignment_check.json with per-requirement status and evidence (metrics, artifacts, or logs).",
         ],
@@ -962,6 +972,20 @@ def ml_quality_preflight(code: str) -> List[str]:
     except Exception:
         return ["AST_PARSE_FAILED"]
 
+    has_read_csv = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "read_csv":
+                if isinstance(func.value, ast.Name) and func.value.id in {"pd", "pandas"}:
+                    has_read_csv = True
+                    break
+            if isinstance(func, ast.Name) and func.id == "read_csv":
+                has_read_csv = True
+                break
+    if not has_read_csv:
+        issues.append("DATA_LOAD_MISSING")
+
     def _condition_checks_nunique_guard(test_node: ast.AST) -> bool:
         if not isinstance(test_node, ast.Compare):
             return False
@@ -1109,6 +1133,15 @@ def ml_quality_preflight(code: str) -> List[str]:
         issues.append("CROSS_VALIDATION_REQUIRED")
 
     return issues
+
+def _missing_required_output_refs(code: str, outputs: List[str]) -> List[str]:
+    if not code or not outputs:
+        return []
+    missing: List[str] = []
+    for output in outputs:
+        if output and output not in code:
+            missing.append(output)
+    return missing
 
 def dialect_guard_violations(code: str, csv_sep: str, csv_decimal: str, csv_encoding: str, expected_path: str | None = None) -> List[str]:
     """
@@ -1370,6 +1403,8 @@ def _normalize_alignment_check(
                     evidence_val = item.get("evidence") or item.get("notes") or []
                     if isinstance(evidence_val, list):
                         req_evidence = [str(v) for v in evidence_val if v]
+                    elif isinstance(evidence_val, str) and evidence_val.strip():
+                        req_evidence = [evidence_val.strip()]
                     break
         if req_status is None and isinstance(per_req, dict):
             raw = per_req.get(req_id)
@@ -1379,6 +1414,8 @@ def _normalize_alignment_check(
             raw_ev = evidence_map.get(req_id)
             if isinstance(raw_ev, list):
                 req_evidence = [str(v) for v in raw_ev if v]
+            elif isinstance(raw_ev, str) and raw_ev.strip():
+                req_evidence = [raw_ev.strip()]
         if not req_status:
             missing_status += 1
             req_status = "MISSING"
@@ -3991,6 +4028,24 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     if abort_state:
         return abort_state
     code = state.get("generated_code", "")
+    if code and not is_syntax_valid(code):
+        feedback = "ML_PREFLIGHT_SYNTAX_ERROR: Generated code is not valid Python syntax."
+        history = list(state.get("feedback_history", []))
+        history.append(feedback)
+        gate_context = {
+            "source": "ml_preflight",
+            "status": "REJECTED",
+            "feedback": feedback,
+            "failed_gates": ["AST_PARSE_FAILED"],
+            "required_fixes": ["AST_PARSE_FAILED"],
+        }
+        return {
+            "ml_preflight_failed": True,
+            "feedback_history": history,
+            "last_gate_context": gate_context,
+            "review_verdict": "REJECTED",
+            "review_feedback": feedback,
+        }
     contract = state.get("execution_contract", {}) or {}
     required_deps = contract.get("required_dependencies", []) or []
     dep_result = check_dependency_precheck(code, required_deps)
@@ -4028,9 +4083,14 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         }
 
     issues = ml_quality_preflight(code)
+    missing_outputs = _missing_required_output_refs(code, contract.get("required_outputs", []) or [])
+    if missing_outputs:
+        issues.append("REQUIRED_OUTPUTS_MISSING")
     if issues:
         expanded = _expand_required_fixes(issues, issues)
         feedback = f"ML_PREFLIGHT_MISSING: {', '.join(issues)}"
+        if missing_outputs:
+            feedback += f" | Missing output refs: {missing_outputs}"
         history = list(state.get("feedback_history", []))
         history.append(feedback)
         gate_context = {

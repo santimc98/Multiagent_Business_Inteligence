@@ -8,14 +8,15 @@ def extract_code_block(text: str) -> str:
     """
     if not isinstance(text, str):
         return str(text)
-    # ```python ... ```
-    m = re.search(r"```python(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    # Prefer all fenced code blocks (python or generic) and join.
+    blocks = re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    cleaned = [b.strip() for b in blocks if isinstance(b, str) and b.strip()]
+    if cleaned:
+        return "\n\n".join(cleaned).strip()
+    # Handle unterminated fences (e.g., truncated output)
+    m = re.search(r"```(?:python)?", text, re.IGNORECASE)
     if m:
-        return m.group(1).strip()
-    # ``` ... ```
-    m = re.search(r"```(.*?)```", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
+        return text[m.end():].strip()
     return text.strip()
 
 

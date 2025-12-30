@@ -53,6 +53,65 @@ class MLEngineerAgent:
         else:
             raise ValueError(f"Unsupported ML_ENGINEER_PROVIDER: {self.provider}")
 
+    def _compact_execution_contract(self, contract: Dict[str, Any] | None) -> Dict[str, Any]:
+        if not isinstance(contract, dict):
+            return {}
+        keep_keys = [
+            "contract_version",
+            "strategy_title",
+            "business_objective",
+            "required_columns",
+            "required_outputs",
+            "alignment_requirements",
+            "business_alignment",
+            "feature_semantics",
+            "business_sanity_checks",
+            "feature_availability",
+            "availability_summary",
+            "required_dependencies",
+            "spec_extraction",
+            "compliance_checklist",
+        ]
+        compact: Dict[str, Any] = {}
+        for key in keep_keys:
+            if key in contract:
+                compact[key] = contract.get(key)
+        for key in ["canonical_columns", "column_mapping_rules", "column_mapping"]:
+            vals = contract.get(key)
+            if isinstance(vals, list) and vals:
+                compact[key] = vals[:80]
+        return compact
+
+    def _truncate_prompt_text(self, text: str, max_len: int, head_len: int, tail_len: int) -> str:
+        if not text:
+            return text
+        if len(text) <= max_len:
+            return text
+        safe_head = max(0, min(head_len, max_len))
+        safe_tail = max(0, min(tail_len, max_len - safe_head))
+        if safe_head + safe_tail == 0:
+            return text[:max_len]
+        if safe_head + safe_tail < max_len:
+            safe_head = max_len - safe_tail
+        return text[:safe_head] + "\n...[TRUNCATED]...\n" + text[-safe_tail:]
+
+    def _truncate_code_for_patch(self, code: str, max_len: int = 12000) -> str:
+        return self._truncate_prompt_text(code or "", max_len=max_len, head_len=7000, tail_len=4000)
+
+    def _check_script_completeness(self, code: str, required_outputs: List[str]) -> List[str]:
+        if not code:
+            return ["code_empty"]
+        issues: List[str] = []
+        lower = code.lower()
+        if "read_csv" not in lower:
+            issues.append("data_load_missing")
+        if not any(token in lower for token in ["to_csv", "json.dump", "plt.savefig", "savefig("]):
+            issues.append("artifact_write_missing")
+        missing_outputs = [out for out in (required_outputs or []) if out and out not in code]
+        if missing_outputs:
+            issues.append(f"required_outputs_missing: {missing_outputs}")
+        return issues
+
     def generate_code(
         self,
         strategy: Dict[str, Any],
@@ -260,6 +319,8 @@ class MLEngineerAgent:
         - Use canonical_name from the contract for all column references.
         - If the contract has spec_extraction, honor it (target_type, formulas, constraints).
         """
+
+        required_outputs = (execution_contract or {}).get("required_outputs", []) or []
         
         ml_runbook_json = json.dumps(
             (execution_contract or {}).get("role_runbooks", {}).get("ml_engineer", {}),
@@ -269,6 +330,7 @@ class MLEngineerAgent:
             (execution_contract or {}).get("spec_extraction", {}),
             indent=2,
         )
+        execution_contract_compact = self._compact_execution_contract(execution_contract or {})
         # Safe Rendering for System Prompt
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
@@ -277,8 +339,10 @@ class MLEngineerAgent:
             analysis_type=str(strategy.get('analysis_type', 'predictive')).upper(),
             hypothesis=strategy.get('hypothesis', 'N/A'),
             required_columns=json.dumps(strategy.get('required_columns', [])),
-            required_outputs=json.dumps((execution_contract or {}).get("required_outputs", [])),
-            canonical_columns=json.dumps((execution_contract or {}).get("canonical_columns", [])),
+            required_outputs=json.dumps(required_outputs),
+            canonical_columns=json.dumps(
+                execution_contract_compact.get("canonical_columns", (execution_contract or {}).get("canonical_columns", []))
+            ),
             business_alignment_json=json.dumps((execution_contract or {}).get("business_alignment", {}), indent=2),
             alignment_requirements_json=json.dumps((execution_contract or {}).get("alignment_requirements", []), indent=2),
             feature_semantics_json=json.dumps((execution_contract or {}).get("feature_semantics", []), indent=2),
@@ -288,7 +352,7 @@ class MLEngineerAgent:
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
-            execution_contract_json=json.dumps(execution_contract or {}, indent=2),
+            execution_contract_json=json.dumps(execution_contract_compact, indent=2),
             spec_extraction_json=spec_extraction_json,
             ml_engineer_runbook=ml_runbook_json,
             feature_availability_json=json.dumps(feature_availability or [], indent=2),
@@ -299,7 +363,11 @@ class MLEngineerAgent:
         )
         
         # USER TEMPLATES (Static)
-        USER_FIRSTPASS_TEMPLATE = "Generate the ML Python script for strategy: $strategy_title using data at $data_path. Check data/cleaning_manifest.json for dialect."
+        USER_FIRSTPASS_TEMPLATE = (
+            "Generate a COMPLETE, runnable ML Python script for strategy: $strategy_title "
+            "using data at $data_path. Include data loading, modeling, validation, "
+            "required outputs, and alignment_check.json. Return Python code only."
+        )
         
         USER_PATCH_TEMPLATE = """
         *** PATCH MODE ACTIVATED ***
@@ -325,6 +393,7 @@ class MLEngineerAgent:
         1. APPLY A MINIMAL PATCH to the previous Python code. DO NOT REWRITE FROM SCRATCH unless necessary.
         2. Address EVERY item in the Required Fixes checklist.
         3. Ensure all MANDATORY UNIVERSAL QA INVARIANTS are met.
+        4. Return the FULL script (not a partial diff/snippet).
         """
 
         # Construct User Message with Patch Mode Logic
@@ -336,13 +405,14 @@ class MLEngineerAgent:
             digest_prefixes = ("REVIEWER FEEDBACK", "QA TEAM FEEDBACK", "RESULT EVALUATION FEEDBACK", "OUTPUT_CONTRACT_MISSING")
             feedback_digest_items = [f for f in (feedback_history or []) if isinstance(f, str) and f.startswith(digest_prefixes)]
             feedback_digest = "\n".join(feedback_digest_items[-5:])
+            previous_code_block = self._truncate_code_for_patch(previous_code)
             
             user_message = render_prompt(
                 USER_PATCH_TEMPLATE,
                 gate_source=str(gate_context.get('source', 'QA Reviewer')).upper(),
                 feedback_text=feedback_text,
                 fixes_bullets=fixes_bullets,
-                previous_code=previous_code,
+                previous_code=previous_code_block,
                 feedback_digest=feedback_digest,
                 edit_instructions=str(gate_context.get("edit_instructions", "")),
                 strategy_title=strategy.get('title', 'Unknown'),
@@ -466,6 +536,28 @@ class MLEngineerAgent:
                     if is_syntax_valid(repaired):
                         code = repaired
                         break
+            completion_issues = self._check_script_completeness(code, required_outputs)
+            if completion_issues:
+                completion_system = (
+                    "You are a senior ML engineer. Return a COMPLETE runnable Python script. "
+                    "Do not return partial snippets, diffs, or TODOs. "
+                    "Preserve required outputs and alignment checks."
+                )
+                completion_user = (
+                    "Your last response is incomplete. Return the full script.\n"
+                    f"Missing/invalid sections: {completion_issues}\n"
+                    f"Required outputs: {required_outputs}\n\n"
+                    f"INCOMPLETE CODE:\n{code}"
+                )
+                completed = call_with_retries(
+                    lambda: _call_model_with_prompts(completion_system, completion_user, 0.0),
+                    max_retries=2,
+                    backoff_factor=2,
+                    initial_delay=1,
+                )
+                completed = self._clean_code(completed)
+                if is_syntax_valid(completed):
+                    code = completed
             return code
 
         except Exception as e:
