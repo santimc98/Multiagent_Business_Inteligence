@@ -67,6 +67,19 @@ from src.utils.data_adequacy import build_data_adequacy_report, write_data_adequ
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
 
+def _truncate_text(text: str, max_len: int = 18000, head_len: int = 10000, tail_len: int = 6000) -> str:
+    if not text:
+        return text
+    if len(text) <= max_len:
+        return text
+    safe_head = max(0, min(head_len, max_len))
+    safe_tail = max(0, min(tail_len, max_len - safe_head))
+    if safe_head + safe_tail == 0:
+        return text[:max_len]
+    if safe_head + safe_tail < max_len:
+        safe_head = max_len - safe_tail
+    return text[:safe_head] + "\n...[TRUNCATED]...\n" + text[-safe_tail:]
+
 _ABORT_EVENT = threading.Event()
 
 def request_abort(reason: str | None = None) -> None:
@@ -3675,6 +3688,10 @@ def run_engineer(state: AgentState) -> AgentState:
                     log_run_event(run_id, "ml_context_ops_preview", {"preview": ops_preview})
             except Exception as ops_err:
                 print(f"Warning: failed to persist ml_engineer_context_ops.txt: {ops_err}")
+        data_audit_context = _truncate_text(data_audit_context)
+        iteration_memory_block = _truncate_text(iteration_memory_block, max_len=6000, head_len=3500, tail_len=2000)
+        kwargs["data_audit_context"] = data_audit_context
+        kwargs["iteration_memory_block"] = iteration_memory_block
         code = ml_engineer.generate_code(**kwargs)
         try:
             os.makedirs("artifacts", exist_ok=True)
@@ -3682,6 +3699,14 @@ def run_engineer(state: AgentState) -> AgentState:
                 f_art.write(code)
         except Exception as artifact_err:
             print(f"Warning: failed to persist ml_engineer_last.py: {artifact_err}")
+        try:
+            iter_id = int(state.get("iteration_count", 0)) + 1
+            os.makedirs(os.path.join("artifacts", "iterations"), exist_ok=True)
+            iter_path = os.path.join("artifacts", "iterations", f"ml_code_iter_{iter_id}.py")
+            with open(iter_path, "w", encoding="utf-8") as f_iter:
+                f_iter.write(code)
+        except Exception as iter_err:
+            print(f"Warning: failed to persist ml_code_iter_{iter_id}.py: {iter_err}")
 
         if run_id:
             log_run_event(run_id, "ml_engineer_complete", {"code_len": len(code or "")})

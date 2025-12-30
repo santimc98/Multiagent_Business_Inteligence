@@ -7,8 +7,9 @@ load_dotenv()
 
 from string import Template
 import json
+import ast
 from src.utils.prompting import render_prompt
-from src.utils.code_extract import extract_code_block
+from src.utils.code_extract import extract_code_block, is_syntax_valid
 
 # NOTE: scan_code_safety referenced by tests as a required safety mechanism.
 # ML code executes in sandbox; keep the reference for integration checks.
@@ -370,7 +371,7 @@ class MLEngineerAgent:
         else:
             provider_label = "DeepSeek"
 
-        def _call_model():
+        def _call_model_with_prompts(sys_prompt: str, usr_prompt: str, temperature: float) -> str:
             print(f"DEBUG: ML Engineer calling {provider_label} Model ({self.model_name})...")
             if self.provider == "zai":
                 from src.utils.llm_throttle import glm_call_slot
@@ -378,16 +379,16 @@ class MLEngineerAgent:
                     response = self.client.chat.completions.create(
                         model=self.model_name,
                         messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_message}
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": usr_prompt}
                         ],
-                        temperature=current_temp,
+                        temperature=temperature,
                     )
                 content = response.choices[0].message.content
             elif self.provider in {"google", "gemini"}:
                 from google.generativeai.types import HarmCategory, HarmBlockThreshold
                 generation_config = {
-                    "temperature": current_temp,
+                    "temperature": temperature,
                     "top_p": 0.9,
                     "top_k": 40,
                     "max_output_tokens": 8192,
@@ -403,17 +404,17 @@ class MLEngineerAgent:
                     generation_config=generation_config,
                     safety_settings=safety_settings,
                 )
-                full_prompt = system_prompt + "\n\nUSER INPUT:\n" + user_message
+                full_prompt = sys_prompt + "\n\nUSER INPUT:\n" + usr_prompt
                 response = model.generate_content(full_prompt)
                 content = getattr(response, "text", "")
             else:
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": usr_prompt}
                     ],
-                    temperature=current_temp,
+                    temperature=temperature,
                 )
                 content = response.choices[0].message.content
             
@@ -422,12 +423,49 @@ class MLEngineerAgent:
                 raise ConnectionError("LLM Server Timeout (504 Received)")
             return content
 
+        def _syntax_error_message(candidate: str) -> str:
+            try:
+                ast.parse(candidate)
+                return ""
+            except SyntaxError as err:
+                return str(err)
+            except Exception as err:
+                return str(err)
+
         try:
-            content = call_with_retries(_call_model, max_retries=5, backoff_factor=2, initial_delay=2)
+            content = call_with_retries(
+                lambda: _call_model_with_prompts(system_prompt, user_message, current_temp),
+                max_retries=5,
+                backoff_factor=2,
+                initial_delay=2,
+            )
             print(f"DEBUG: {provider_label} response received.")
             code = self._clean_code(content)
             if code.strip().startswith("{") or code.strip().startswith("["):
                 return "# Error: ML_CODE_REQUIRED"
+            if not is_syntax_valid(code):
+                syntax_err = _syntax_error_message(code)
+                repair_system = (
+                    "You are a senior Python engineer. Fix syntax errors ONLY. "
+                    "Do not change logic or remove required outputs. "
+                    "Return VALID PYTHON CODE ONLY."
+                )
+                repair_user = (
+                    "Fix syntax errors in the code below. Keep logic intact. "
+                    f"Syntax error: {syntax_err}\n\nCODE:\n{code}"
+                )
+                repaired = code
+                for _ in range(2):
+                    repaired = call_with_retries(
+                        lambda: _call_model_with_prompts(repair_system, repair_user, 0.0),
+                        max_retries=2,
+                        backoff_factor=2,
+                        initial_delay=1,
+                    )
+                    repaired = self._clean_code(repaired)
+                    if is_syntax_valid(repaired):
+                        code = repaired
+                        break
             return code
 
         except Exception as e:
