@@ -4119,6 +4119,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             "review_feedback": feedback,
         }
     contract = state.get("execution_contract", {}) or {}
+    strategy = state.get("selected_strategy", {}) or {}
     required_deps = contract.get("required_dependencies", []) or []
     dep_result = check_dependency_precheck(code, required_deps)
     if dep_result.get("banned") or dep_result.get("blocked"):
