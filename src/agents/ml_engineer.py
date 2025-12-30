@@ -229,6 +229,12 @@ class MLEngineerAgent:
         - Any other missing required column = critical failure (raise ValueError).
         - After mapping, print `Mapping Summary: {...}` and align/rename to canonical names (order is flexible).
 
+        *** SEGMENTATION & MODEL FEATURE DECLARATIONS (MANDATORY) ***
+        - Define `SEGMENT_FEATURES = [...]` as a Python list of the pre-decision columns used to build segments.
+        - Define `MODEL_FEATURES = [...]` for the success model. It MUST include the decision variable (price).
+        - Use these lists directly when building segmentation and the model; do not hardcode column names elsewhere.
+        - Print `SEGMENT_FEATURES: [...]` and `MODEL_FEATURES: [...]` to stdout.
+
         *** INTERPRETABLE WEIGHTS / NORMALIZATION ***
         - When producing linear weights on already normalized features, DO NOT use StandardScaler/MinMaxScaler that would change interpretability. Keep features as-is if they are in [0,1].
         - Enforce non-negative weights with sum close to 1; if using a model, rescale coefficients to be >=0 and sum to 1 before reporting.
@@ -392,6 +398,7 @@ class MLEngineerAgent:
         - [ ] VERIFY COLUMN MAPPING: Ensure fuzzy match + aliasing check found in Protocol v2. No case-sensitive filtering.
         - [ ] VERIFY RENAMING: Ensure DataFrame columns are renamed to canonical required names.
         - [ ] DO NOT GENERATE SYNTHETIC DATA: Load the provided dataset from $data_path.
+        - [ ] DEFINE SEGMENT_FEATURES and MODEL_FEATURES lists and use them.
         
         *** PREVIOUS OUTPUT (TO PATCH) ***
         $previous_code

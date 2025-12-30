@@ -732,6 +732,18 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "ALIGNMENT_REQUIREMENTS_MISSING": [
             "Populate alignment_check.json with per-requirement status + evidence list.",
         ],
+        "SEGMENT_FEATURES_MISSING": [
+            "Define SEGMENT_FEATURES list with pre-decision columns and use it for segmentation.",
+        ],
+        "SEGMENT_FEATURES_INCOMPLETE": [
+            "SEGMENT_FEATURES must include all pre-decision columns from the contract (e.g., Size, Debtors, Sector).",
+        ],
+        "MODEL_FEATURES_MISSING": [
+            "Define MODEL_FEATURES list for the success model and use it to build X.",
+        ],
+        "MODEL_FEATURES_INCOMPLETE": [
+            "MODEL_FEATURES must include the decision variable (e.g., 1stYearAmount).",
+        ],
         "AST_PARSE_FAILED": [
             "Return valid Python syntax; do not output partial code or truncated blocks.",
         ],
@@ -1205,6 +1217,27 @@ def _detect_synthetic_data(code: str) -> bool:
         "load_wine",
     ]
     return any(marker in code_lower for marker in synthetic_markers)
+
+def _extract_named_string_list(code: str, names: List[str]) -> List[str]:
+    import ast
+
+    if not code or not names:
+        return []
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if not any(isinstance(t, ast.Name) and t.id in names for t in node.targets):
+                continue
+            if isinstance(node.value, ast.List):
+                values: List[str] = []
+                for elt in node.value.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        values.append(elt.value)
+                return values
+    return []
 
 def _missing_required_output_refs(code: str, outputs: List[str]) -> List[str]:
     if not code or not outputs:
@@ -4157,6 +4190,12 @@ def run_ml_preflight(state: AgentState) -> AgentState:
 
     issues = ml_quality_preflight(code)
     required_columns = contract.get("required_columns") or strategy.get("required_columns", []) or []
+    feature_availability = contract.get("feature_availability", []) or []
+    pre_decision_cols = [
+        item.get("column")
+        for item in feature_availability
+        if isinstance(item, dict) and str(item.get("availability", "")).lower() == "pre-decision"
+    ]
     required_outputs = contract.get("required_outputs", []) or []
     missing_outputs = _missing_required_output_refs(code, required_outputs)
     if missing_outputs:
@@ -4181,6 +4220,26 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         issues.append("SYNTHETIC_DATA_DETECTED")
     if "alignment_check.json" in (code or "") and "\"requirements\"" not in (code or "") and "'requirements'" not in (code or ""):
         issues.append("ALIGNMENT_REQUIREMENTS_MISSING")
+    segment_features = _extract_named_string_list(code, ["SEGMENT_FEATURES", "segment_features"])
+    if pre_decision_cols:
+        if not segment_features:
+            issues.append("SEGMENT_FEATURES_MISSING")
+        else:
+            missing_seg = [col for col in pre_decision_cols if col and col not in segment_features]
+            if missing_seg:
+                issues.append("SEGMENT_FEATURES_INCOMPLETE")
+    model_features = _extract_named_string_list(code, ["MODEL_FEATURES", "model_features"])
+    decision_vars = [
+        item.get("column")
+        for item in feature_availability
+        if isinstance(item, dict) and str(item.get("availability", "")).lower() == "decision"
+    ]
+    if decision_vars:
+        if not model_features:
+            issues.append("MODEL_FEATURES_MISSING")
+        else:
+            if not any(var in model_features for var in decision_vars if var):
+                issues.append("MODEL_FEATURES_INCOMPLETE")
     if issues:
         expanded = _expand_required_fixes(issues, issues)
         feedback = f"ML_PREFLIGHT_MISSING: {', '.join(issues)}"
