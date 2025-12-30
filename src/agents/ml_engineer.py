@@ -199,6 +199,7 @@ class MLEngineerAgent:
         - Feature Semantics (business meaning): $feature_semantics_json
         - Business Sanity Checks (interpretation aids): $business_sanity_checks_json
         - Execution Contract (json): $execution_contract_json
+        - Evaluation Spec (json): $evaluation_spec_json
         - Spec Extraction (source-of-truth): $spec_extraction_json
         - ROLE RUNBOOK (ML Engineer): $ml_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
         - Feature Availability: $feature_availability_json
@@ -316,6 +317,7 @@ class MLEngineerAgent:
         - Use json.dump(..., default=_json_default) for any JSON outputs.
         - Write `data/alignment_check.json` with fields: status (PASS|WARN|FAIL), failure_mode (data_limited|method_choice|unknown),
           summary, and per-requirement statuses based on Alignment Requirements with evidence for each requirement.
+          If Evaluation Spec provides alignment_requirements, use those IDs and required flags.
           Evidence can be metrics, file paths, or log excerpts; do not leave evidence empty. Print `ALIGNMENT_CHECK: <status>` to stdout.
         - If alignment fails due to data limits, continue with WARN and add strong warnings. If alignment fails due to method choice,
           fix the approach or print `FAIL_CONTRACT:<reason>`.
@@ -343,6 +345,7 @@ class MLEngineerAgent:
             indent=2,
         )
         execution_contract_compact = self._compact_execution_contract(execution_contract or {})
+        evaluation_spec_json = json.dumps((execution_contract or {}).get("evaluation_spec", {}), indent=2)
         # Safe Rendering for System Prompt
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
@@ -365,6 +368,7 @@ class MLEngineerAgent:
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
             execution_contract_json=json.dumps(execution_contract_compact, indent=2),
+            evaluation_spec_json=evaluation_spec_json,
             spec_extraction_json=spec_extraction_json,
             ml_engineer_runbook=ml_runbook_json,
             feature_availability_json=json.dumps(feature_availability or [], indent=2),

@@ -24,12 +24,18 @@ class QAReviewerAgent:
         )
         self.model_name = "mimo-v2-flash"
 
-    def review_code(self, code: str, strategy: Dict[str, Any], business_objective: str) -> Dict[str, Any]:
+    def review_code(
+        self,
+        code: str,
+        strategy: Dict[str, Any],
+        business_objective: str,
+        evaluation_spec: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         """
         Conducts a strict Quality Assurance audit on the generated code.
         Focus: Mapping integrity, Leakage prevention, Safety, consistency.
         """
-        static_reject = run_static_qa_checks(code)
+        static_reject = run_static_qa_checks(code, evaluation_spec)
         if static_reject:
             return static_reject
         
@@ -44,6 +50,11 @@ class QAReviewerAgent:
         """
 
         from src.utils.prompting import render_prompt
+
+        eval_spec_json = json.dumps(evaluation_spec or {}, indent=2)
+        qa_gates = []
+        if isinstance(evaluation_spec, dict):
+            qa_gates = evaluation_spec.get("qa_gates") or evaluation_spec.get("gates") or []
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are the Lead QA Engineer.
@@ -72,6 +83,8 @@ class QAReviewerAgent:
         INPUT CONTEXT:
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title
+        - Evaluation Spec (JSON): $evaluation_spec_json
+        - QA Gates (only these can fail): $qa_gates
         
         INSTRUCTIONS:
         - Analyze the code line-by-line.
@@ -79,6 +92,7 @@ class QAReviewerAgent:
         - If issues are minor (Style, Comments, non-critical Best Practices) but code is SAFE and CORRECT, return "APPROVE_WITH_WARNINGS".
         - Provide specific, actionable feedback on what is missing and how to fix it.
         - Do not request stylistic changes. Focus on correctness and safety.
+        - Only fail gates listed in QA Gates; otherwise mention as warnings.
         
         OUTPUT FORMAT (JSON):
         $output_format_instructions
@@ -88,6 +102,8 @@ class QAReviewerAgent:
             SYSTEM_PROMPT_TEMPLATE,
             business_objective=business_objective,
             strategy_title=strategy.get('title', 'Unknown'),
+            evaluation_spec_json=eval_spec_json,
+            qa_gates=qa_gates,
             output_format_instructions=output_format_instructions
         )
 
@@ -129,6 +145,14 @@ class QAReviewerAgent:
                         result[field] = []
                     else:
                          result[field] = val
+
+                allowed = set(qa_gates) if qa_gates else set()
+                if allowed:
+                    result["failed_gates"] = [g for g in result.get("failed_gates", []) if g in allowed]
+                    result["required_fixes"] = [g for g in result.get("required_fixes", []) if g in allowed]
+                    if result.get("status") == "REJECTED" and not result["failed_gates"]:
+                        result["status"] = "APPROVE_WITH_WARNINGS"
+                        result["feedback"] = "Spec-driven gating: no QA gates failed; downgraded to warnings."
                          
                 return result
             except json.JSONDecodeError:
@@ -378,7 +402,7 @@ class _StaticQAScanner(ast.NodeVisitor):
             self.has_split_fabrication = True
 
 
-def run_static_qa_checks(code: str) -> Optional[Dict[str, Any]]:
+def run_static_qa_checks(code: str, evaluation_spec: Dict[str, Any] | None = None) -> Optional[Dict[str, Any]]:
     """
     Deterministic pre-checks to block unsafe patterns without relying on the LLM.
     """
@@ -404,6 +428,18 @@ def run_static_qa_checks(code: str) -> Optional[Dict[str, Any]]:
     scanner = _StaticQAScanner()
     scanner.visit(tree)
 
+    qa_gates = []
+    objective_type = None
+    if isinstance(evaluation_spec, dict):
+        qa_gates = evaluation_spec.get("qa_gates") or evaluation_spec.get("gates") or []
+        objective_type = evaluation_spec.get("objective_type")
+    qa_gate_set = set(qa_gates) if qa_gates else set()
+    require_variance_guard = False
+    if qa_gate_set:
+        require_variance_guard = "target_variance_guard" in qa_gate_set or "consistency_checks" in qa_gate_set
+    else:
+        require_variance_guard = objective_type in {"predictive", "prescriptive"}
+
     if scanner.has_random_target_noise:
         return {
             "status": "REJECTED",
@@ -420,7 +456,7 @@ def run_static_qa_checks(code: str) -> Optional[Dict[str, Any]]:
             "required_fixes": ["Load with correct output_dialect and abort on delimiter mismatch; do not split columns."]
         }
 
-    if not scanner.has_variance_guard:
+    if require_variance_guard and not scanner.has_variance_guard:
         return {
             "status": "REJECTED",
             "feedback": "Missing target variance guard (nunique <= 1 must raise ValueError).",
@@ -429,8 +465,13 @@ def run_static_qa_checks(code: str) -> Optional[Dict[str, Any]]:
         }
 
     regression_present = scanner.has_regression_model or (scanner.has_fit_call and scanner.has_regression_metric)
+    require_leakage_guard = False
+    if qa_gate_set:
+        require_leakage_guard = "leakage_prevention" in qa_gate_set
+    else:
+        require_leakage_guard = objective_type in {"predictive", "prescriptive"}
 
-    if regression_present and not scanner.has_leakage_assert:
+    if require_leakage_guard and regression_present and not scanner.has_leakage_assert:
         return {
             "status": "REJECTED",
             "feedback": "Regression detected but assert_no_deterministic_target_leakage is missing before training.",

@@ -29,6 +29,7 @@ class ReviewerAgent:
         analysis_type: str = "predictive",
         business_objective: str = "",
         strategy_context: str = "",
+        evaluation_spec: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         
         output_format_instructions = """
@@ -43,6 +44,11 @@ class ReviewerAgent:
 
         from src.utils.prompting import render_prompt
 
+        eval_spec_json = json.dumps(evaluation_spec or {}, indent=2)
+        reviewer_gates = []
+        if isinstance(evaluation_spec, dict):
+            reviewer_gates = evaluation_spec.get("reviewer_gates") or evaluation_spec.get("gates") or []
+
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Technical Lead and Security Auditor.
         
@@ -50,6 +56,8 @@ class ReviewerAgent:
         - Analysis Type: "$analysis_type"
         - Business Objective: "$business_objective"
         - Strategy Context: "$strategy_context"
+        - Evaluation Spec (JSON): $evaluation_spec_json
+        - Reviewer Gates (only these can fail): $reviewer_gates
         
         ### CRITERIA FOR APPROVAL (QUALITY FIRST PRINCIPLES)
 
@@ -82,6 +90,11 @@ class ReviewerAgent:
         - **APPROVE_WITH_WARNINGS**: Minor issues (e.g. suboptimal parameter, messy comments, slight style deviations) that do NOT affect correctness or safety.
         - **APPROVED**: Code is clean, safe, and correct.
 
+        ### SPEC-DRIVEN EVALUATION (MANDATORY)
+        - Only fail gates that appear in Reviewer Gates.
+        - If a rule is NOT present in Reviewer Gates, you may mention it as a warning but MUST NOT reject for it.
+        - If Reviewer Gates is empty, fall back to the general criteria.
+
         ### OUTPUT FORMAT
         $output_format_instructions
         """
@@ -91,6 +104,8 @@ class ReviewerAgent:
             analysis_type=analysis_type.upper(),
             business_objective=business_objective,
             strategy_context=strategy_context,
+            evaluation_spec_json=eval_spec_json,
+            reviewer_gates=reviewer_gates,
             output_format_instructions=output_format_instructions,
         )
         
@@ -123,6 +138,14 @@ class ReviewerAgent:
                     result[field] = []
                 else:
                     result[field] = val
+
+            allowed = set(reviewer_gates) if reviewer_gates else set()
+            if allowed:
+                result["failed_gates"] = [g for g in result.get("failed_gates", []) if g in allowed]
+                result["required_fixes"] = [g for g in result.get("required_fixes", []) if g in allowed]
+                if result.get("status") == "REJECTED" and not result["failed_gates"]:
+                    result["status"] = "APPROVE_WITH_WARNINGS"
+                    result["feedback"] = "Spec-driven gating: no reviewer gates failed; downgraded to warnings."
             
             return result
 
@@ -139,7 +162,13 @@ class ReviewerAgent:
         text = re.sub(r'```', '', text)
         return text.strip()
 
-    def evaluate_results(self, execution_output: str, business_objective: str, strategy_context: str) -> Dict[str, Any]:
+    def evaluate_results(
+        self,
+        execution_output: str,
+        business_objective: str,
+        strategy_context: str,
+        evaluation_spec: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         """
         Evaluates execution results.
         Phase 1: Deterministic Runtime Error Triage (No LLM).
@@ -191,6 +220,8 @@ class ReviewerAgent:
 
         from src.utils.prompting import render_prompt
         
+        eval_spec_json = json.dumps(evaluation_spec or {}, indent=2)
+
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Data Science Lead.
         Your goal is to evaluate the RESULTS of an analysis against the Business Objective.
@@ -200,6 +231,9 @@ class ReviewerAgent:
         
         *** STRATEGY CONTEXT ***
         $strategy_context
+
+        *** EVALUATION SPEC (JSON) ***
+        $evaluation_spec_json
         
         *** EXECUTION OUTPUT (Truncated) ***
         $truncated_output
@@ -209,6 +243,7 @@ class ReviewerAgent:
         2. **Visuals:** Are plots generated? (If empty plots or no files, REJECT).
         3. **Metrics:** Are metrics reasonable? (e.g. Accuracy > 0.5 for balanced classes).
         4. **Validation:** If predictive, was Cross-Validation used?
+        - Only enforce criteria that are required by the Evaluation Spec.
         
         *** FALLBACK LOGIC ***
         - If results are "weak" (low accuracy) but methodology is sound => APPROVE with limitations note.
@@ -224,6 +259,7 @@ class ReviewerAgent:
             business_objective=business_objective,
             strategy_context=strategy_context,
             truncated_output=truncated_output,
+            evaluation_spec_json=eval_spec_json,
             output_format_instructions=output_format_instructions
         )
 

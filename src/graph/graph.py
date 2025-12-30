@@ -677,6 +677,8 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
         normalized["compliance_checklist"] = []
     if not isinstance(normalized.get("alignment_requirements"), list):
         normalized["alignment_requirements"] = []
+    if not isinstance(normalized.get("evaluation_spec"), dict):
+        normalized["evaluation_spec"] = {}
 
     return normalized
 
@@ -743,6 +745,24 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         ],
         "MODEL_FEATURES_INCOMPLETE": [
             "MODEL_FEATURES must include the decision variable (e.g., 1stYearAmount).",
+        ],
+        "segmentation_predecision": [
+            "Ensure segmentation uses only pre-decision features defined in SEGMENT_FEATURES.",
+        ],
+        "decision_variable_handling": [
+            "Use decision variables only in the optimization/modeling step, not for segmentation.",
+        ],
+        "price_optimization": [
+            "Provide a per-segment optimal price derived from Price * P(Success).",
+        ],
+        "validation_required": [
+            "Add cross-validation or an appropriate validation strategy per evaluation_spec.",
+        ],
+        "methodology_alignment": [
+            "Align model choice and outputs with the objective type in evaluation_spec.",
+        ],
+        "business_value": [
+            "Deliver artifacts/insights that directly answer the business objective.",
         ],
         "AST_PARSE_FAILED": [
             "Return valid Python syntax; do not output partial code or truncated blocks.",
@@ -1496,6 +1516,9 @@ def _normalize_alignment_check(
     for req in alignment_requirements or []:
         req_id = req.get("id")
         if not req_id:
+            continue
+        if isinstance(req, dict) and req.get("required") is False:
+            normalized_reqs.append({"id": req_id, "status": "SKIP", "evidence": []})
             continue
         req_status = None
         req_evidence: List[str] = []
@@ -2324,11 +2347,30 @@ def run_execution_planner(state: AgentState) -> AgentState:
     contract = ensure_role_runbooks(contract)
     contract = _ensure_scored_rows_output(contract)
     contract = _ensure_alignment_check_output(contract)
+    evaluation_spec = {}
+    try:
+        evaluation_spec = execution_planner.generate_evaluation_spec(
+            strategy=strategy,
+            contract=contract,
+            data_summary=data_summary,
+            business_objective=business_objective,
+            column_inventory=column_inventory,
+        )
+        if not isinstance(evaluation_spec, dict):
+            evaluation_spec = {}
+    except Exception as spec_err:
+        print(f"Warning: evaluation spec generation failed: {spec_err}")
+        evaluation_spec = {}
+    if evaluation_spec:
+        contract["evaluation_spec"] = evaluation_spec
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/execution_contract.json", "w", encoding="utf-8") as f:
             import json
             json.dump(contract, f, indent=2)
+        if evaluation_spec:
+            with open("data/evaluation_spec.json", "w", encoding="utf-8") as f_spec:
+                json.dump(evaluation_spec, f_spec, indent=2, ensure_ascii=False)
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
     if run_id:
@@ -2339,6 +2381,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
         )
     policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
     result = {"execution_contract": contract}
+    if evaluation_spec:
+        result["evaluation_spec"] = evaluation_spec
     if isinstance(policy, dict) and policy:
         result["iteration_policy"] = policy
         runtime_fix_max = policy.get("runtime_fix_max")
@@ -3934,12 +3978,13 @@ def run_reviewer(state: AgentState) -> AgentState:
     new_history = list(state.get('feedback_history', []))
     # Context Construction
     strategy = state.get('selected_strategy', {})
+    evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
     analysis_type = strategy.get('analysis_type', 'predictive')
     strategy_context = f"Strategy: {strategy.get('title')}\nType: {strategy.get('analysis_type')}\nRules: {strategy.get('reasoning')}"
     business_objective = state.get('business_objective', 'Analyze data.')
     
     try:
-        review = reviewer.review_code(code, analysis_type, business_objective, strategy_context)
+        review = reviewer.review_code(code, analysis_type, business_objective, strategy_context, evaluation_spec)
         print(f"Verdict: {review['status']}")
         
         # Update Streak
@@ -4041,7 +4086,8 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     current_history = list(state.get('feedback_history', []))
     try:
         # Run QA Audit
-        qa_result = qa_reviewer.review_code(code, strategy, business_objective)
+        evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
+        qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
         preflight_issues = ml_quality_preflight(code)
         has_variance_guard = "TARGET_VARIANCE_GUARD" not in preflight_issues
 
@@ -4189,8 +4235,19 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         }
 
     issues = ml_quality_preflight(code)
+    if isinstance(evaluation_spec, dict):
+        obj_type = str(evaluation_spec.get("objective_type") or "").lower()
+        validation_policy = evaluation_spec.get("validation_policy") or {}
+        require_cv = bool(validation_policy.get("require_cv")) if isinstance(validation_policy, dict) else False
+        if not require_cv and "CROSS_VALIDATION_REQUIRED" in issues:
+            issues = [i for i in issues if i != "CROSS_VALIDATION_REQUIRED"]
+        qa_gates = evaluation_spec.get("qa_gates") or evaluation_spec.get("gates") or []
+        require_variance = "target_variance_guard" in qa_gates or obj_type in {"predictive", "prescriptive"}
+        if not require_variance and "TARGET_VARIANCE_GUARD" in issues:
+            issues = [i for i in issues if i != "TARGET_VARIANCE_GUARD"]
     required_columns = contract.get("required_columns") or strategy.get("required_columns", []) or []
     feature_availability = contract.get("feature_availability", []) or []
+    evaluation_spec = state.get("evaluation_spec") or contract.get("evaluation_spec") or {}
     pre_decision_cols = [
         item.get("column")
         for item in feature_availability
@@ -4221,11 +4278,15 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     if "alignment_check.json" in (code or "") and "\"requirements\"" not in (code or "") and "'requirements'" not in (code or ""):
         issues.append("ALIGNMENT_REQUIREMENTS_MISSING")
     segment_features = _extract_named_string_list(code, ["SEGMENT_FEATURES", "segment_features"])
-    if pre_decision_cols:
+    segmentation_required = False
+    if isinstance(evaluation_spec, dict):
+        segmentation_required = bool((evaluation_spec.get("segmentation") or {}).get("required"))
+    if segmentation_required:
         if not segment_features:
             issues.append("SEGMENT_FEATURES_MISSING")
         else:
-            missing_seg = [col for col in pre_decision_cols if col and col not in segment_features]
+            expected_seg = pre_decision_cols or (evaluation_spec.get("segmentation") or {}).get("features") or []
+            missing_seg = [col for col in expected_seg if col and col not in segment_features]
             if missing_seg:
                 issues.append("SEGMENT_FEATURES_INCOMPLETE")
     model_features = _extract_named_string_list(code, ["MODEL_FEATURES", "model_features"])
@@ -4234,7 +4295,11 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         for item in feature_availability
         if isinstance(item, dict) and str(item.get("availability", "")).lower() == "decision"
     ]
-    if decision_vars:
+    model_required = False
+    if isinstance(evaluation_spec, dict):
+        obj_type = str(evaluation_spec.get("objective_type") or "").lower()
+        model_required = obj_type in {"predictive", "prescriptive"}
+    if decision_vars and model_required:
         if not model_features:
             issues.append("MODEL_FEATURES_MISSING")
         else:
@@ -4689,8 +4754,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     strategy = state.get('selected_strategy', {}) or {}
     strategy_context = f"Strategy: {strategy.get('title')}\nType: {strategy.get('analysis_type')}\nRules: {strategy.get('reasoning')}"
     business_objective = state.get('business_objective', '')
+    evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
     
-    eval_result = reviewer.evaluate_results(execution_output, business_objective, strategy_context)
+    eval_result = reviewer.evaluate_results(execution_output, business_objective, strategy_context, evaluation_spec)
     
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
@@ -4798,7 +4864,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
 
     alignment_failed_gates: List[str] = []
     alignment_check = _load_json_safe("data/alignment_check.json")
-    alignment_requirements = contract.get("alignment_requirements", []) if isinstance(contract, dict) else []
+    alignment_requirements = []
+    if isinstance(evaluation_spec, dict):
+        alignment_requirements = evaluation_spec.get("alignment_requirements") or []
+    if not alignment_requirements and isinstance(contract, dict):
+        alignment_requirements = contract.get("alignment_requirements", []) or []
     if isinstance(alignment_requirements, list) and alignment_requirements:
         if not alignment_check:
             status = "NEEDS_IMPROVEMENT"
@@ -4894,7 +4964,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             ok, counters, err_msg = _consume_budget(state, "reviewer_calls", "max_reviewer_calls", "Reviewer")
             review_counters = counters
             if ok:
-                review_result = reviewer.review_code(code, analysis_type, business_objective, strategy_context)
+                review_result = reviewer.review_code(code, analysis_type, business_objective, strategy_context, evaluation_spec)
                 if review_result and review_result.get("status") != "APPROVED":
                     review_warnings.append(
                         f"REVIEWER_CODE_AUDIT[{review_result.get('status')}]: {review_result.get('feedback')}"
@@ -4908,7 +4978,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             review_counters = counters
             qa_result = None
             if ok:
-                qa_result = qa_reviewer.review_code(code, strategy, business_objective)
+                qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
                 if qa_result and qa_result.get("status") != "APPROVED":
                     review_warnings.append(
                         f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"

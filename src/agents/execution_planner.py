@@ -1172,6 +1172,79 @@ class ExecutionPlannerAgent:
             contract["compliance_checklist"] = checklist
             return contract
 
+        def _build_evaluation_spec_fallback(contract: Dict[str, Any]) -> Dict[str, Any]:
+            objective_text = (contract.get("business_objective") or business_objective or "").lower()
+            strategy_text = json.dumps(strategy or {}).lower()
+            objective_type = "descriptive"
+            if any(tok in objective_text for tok in ["optimiz", "maximize", "optimal price", "precio", "revenue", "expected value"]):
+                objective_type = "prescriptive"
+            elif any(tok in objective_text for tok in ["predict", "classif", "regress", "forecast", "probability"]):
+                objective_type = "predictive"
+
+            decision_vars = contract.get("decision_variables") or []
+            decision_var = decision_vars[0] if decision_vars else None
+            segmentation_required = any(tok in strategy_text for tok in ["segment", "cluster", "typology", "tipolog"])
+            feature_availability = contract.get("feature_availability") or []
+            pre_decision = [
+                item.get("column")
+                for item in feature_availability
+                if isinstance(item, dict) and str(item.get("availability", "")).lower() == "pre-decision"
+            ]
+            leakage_features = [
+                item.get("column")
+                for item in feature_availability
+                if isinstance(item, dict) and "post" in str(item.get("availability", "")).lower()
+            ]
+            qa_gates = ["mapping_summary", "consistency_checks", "target_variance_guard", "outputs_required"]
+            if leakage_features:
+                qa_gates.append("leakage_prevention")
+            if segmentation_required:
+                qa_gates.append("segmentation_predecision")
+            reviewer_gates = ["methodology_alignment", "business_value"]
+            if objective_type in {"predictive", "prescriptive"}:
+                reviewer_gates.append("validation_required")
+            if objective_type == "prescriptive":
+                reviewer_gates.append("price_optimization")
+
+            alignment_requirements = contract.get("alignment_requirements") or []
+            if not alignment_requirements:
+                alignment_requirements = [
+                    {"id": "objective_alignment", "description": "Output aligns with business objective.", "required": True},
+                    {"id": "decision_variable_handling", "description": "Decision variables used correctly.", "required": bool(decision_var)},
+                    {"id": "segment_alignment", "description": "Segmentation uses only pre-decision features.", "required": segmentation_required},
+                    {"id": "validation_minimum", "description": "Validation performed per policy.", "required": True},
+                ]
+
+            return {
+                "objective_type": objective_type,
+                "segmentation": {
+                    "required": segmentation_required,
+                    "features": pre_decision if segmentation_required else [],
+                    "confidence": 0.4,
+                    "rationale": "Derived from strategy text and feature availability."
+                },
+                "decision_variable": {
+                    "name": decision_var,
+                    "confidence": 0.4,
+                    "rationale": "Derived from contract decision_variables."
+                },
+                "leakage_policy": {
+                    "audit_features": leakage_features,
+                    "correlation_threshold": 0.9,
+                    "exclude_on_leakage": True
+                },
+                "validation_policy": {
+                    "require_cv": objective_type in {"predictive", "prescriptive"},
+                    "baseline_required": objective_type in {"predictive", "prescriptive"}
+                },
+                "qa_gates": qa_gates,
+                "reviewer_gates": reviewer_gates,
+                "alignment_requirements": alignment_requirements,
+                "evidence_requirements": [{"artifact": out, "required": True} for out in contract.get("required_outputs", [])],
+                "confidence": 0.4,
+                "justification": "Fallback evaluation spec derived heuristically from contract and strategy."
+            }
+
         def _normalize_quality_gates(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return contract
@@ -1329,6 +1402,141 @@ class ExecutionPlannerAgent:
             contract = _ensure_iteration_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
 
+    def generate_evaluation_spec(
+        self,
+        strategy: Dict[str, Any],
+        contract: Dict[str, Any],
+        data_summary: str = "",
+        business_objective: str = "",
+        column_inventory: list[str] | None = None,
+    ) -> Dict[str, Any]:
+        def _fallback() -> Dict[str, Any]:
+            # Reuse the heuristic builder inside generate_contract scope via a lightweight copy
+            objective_text = (contract.get("business_objective") or business_objective or "").lower()
+            strategy_text = json.dumps(strategy or {}).lower()
+            objective_type = "descriptive"
+            if any(tok in objective_text for tok in ["optimiz", "maximize", "optimal price", "precio", "revenue", "expected value"]):
+                objective_type = "prescriptive"
+            elif any(tok in objective_text for tok in ["predict", "classif", "regress", "forecast", "probability"]):
+                objective_type = "predictive"
+
+            decision_vars = contract.get("decision_variables") or []
+            decision_var = decision_vars[0] if decision_vars else None
+            segmentation_required = any(tok in strategy_text for tok in ["segment", "cluster", "typology", "tipolog"])
+            feature_availability = contract.get("feature_availability") or []
+            pre_decision = [
+                item.get("column")
+                for item in feature_availability
+                if isinstance(item, dict) and str(item.get("availability", "")).lower() == "pre-decision"
+            ]
+            leakage_features = [
+                item.get("column")
+                for item in feature_availability
+                if isinstance(item, dict) and "post" in str(item.get("availability", "")).lower()
+            ]
+            qa_gates = ["mapping_summary", "consistency_checks", "target_variance_guard", "outputs_required"]
+            if leakage_features:
+                qa_gates.append("leakage_prevention")
+            if segmentation_required:
+                qa_gates.append("segmentation_predecision")
+            reviewer_gates = ["methodology_alignment", "business_value"]
+            if objective_type in {"predictive", "prescriptive"}:
+                reviewer_gates.append("validation_required")
+            if objective_type == "prescriptive":
+                reviewer_gates.append("price_optimization")
+
+            alignment_requirements = contract.get("alignment_requirements") or []
+            if not alignment_requirements:
+                alignment_requirements = [
+                    {"id": "objective_alignment", "description": "Output aligns with business objective.", "required": True},
+                    {"id": "decision_variable_handling", "description": "Decision variables used correctly.", "required": bool(decision_var)},
+                    {"id": "segment_alignment", "description": "Segmentation uses only pre-decision features.", "required": segmentation_required},
+                    {"id": "validation_minimum", "description": "Validation performed per policy.", "required": True},
+                ]
+
+            return {
+                "objective_type": objective_type,
+                "segmentation": {
+                    "required": segmentation_required,
+                    "features": pre_decision if segmentation_required else [],
+                    "confidence": 0.4,
+                    "rationale": "Derived from strategy text and feature availability."
+                },
+                "decision_variable": {
+                    "name": decision_var,
+                    "confidence": 0.4,
+                    "rationale": "Derived from contract decision_variables."
+                },
+                "leakage_policy": {
+                    "audit_features": leakage_features,
+                    "correlation_threshold": 0.9,
+                    "exclude_on_leakage": True
+                },
+                "validation_policy": {
+                    "require_cv": objective_type in {"predictive", "prescriptive"},
+                    "baseline_required": objective_type in {"predictive", "prescriptive"}
+                },
+                "qa_gates": qa_gates,
+                "reviewer_gates": reviewer_gates,
+                "alignment_requirements": alignment_requirements,
+                "evidence_requirements": [{"artifact": out, "required": True} for out in contract.get("required_outputs", [])],
+                "confidence": 0.4,
+                "justification": "Fallback evaluation spec derived heuristically from contract and strategy."
+            }
+
+        if not self.client:
+            return _fallback()
+
+        spec_template = {
+            "objective_type": "prescriptive|predictive|descriptive|causal|unknown",
+            "segmentation": {"required": False, "features": [], "confidence": 0.0, "rationale": ""},
+            "decision_variable": {"name": None, "confidence": 0.0, "rationale": ""},
+            "leakage_policy": {"audit_features": [], "correlation_threshold": 0.9, "exclude_on_leakage": True},
+            "validation_policy": {"require_cv": False, "baseline_required": False},
+            "qa_gates": [],
+            "reviewer_gates": [],
+            "alignment_requirements": [],
+            "evidence_requirements": [],
+            "confidence": 0.0,
+            "justification": ""
+        }
+
+        system_prompt = (
+            "You are a senior evaluation architect. Derive an evaluation_spec for QA/Reviewer based on the "
+            "business objective, strategy, and execution contract. Do NOT use static templates. "
+            "If unsure, set low confidence and mark requirements as non-required instead of inventing gates. "
+            "Return JSON only, matching the template. "
+            "Gate vocabulary (use only these ids): "
+            "mapping_summary, consistency_checks, target_variance_guard, leakage_prevention, outputs_required, "
+            "segmentation_predecision, decision_variable_handling, validation_required, price_optimization, "
+            "methodology_alignment, business_value."
+        )
+        user_payload = {
+            "business_objective": business_objective,
+            "strategy": strategy,
+            "contract_summary": {
+                "required_outputs": contract.get("required_outputs"),
+                "decision_variables": contract.get("decision_variables"),
+                "feature_availability": contract.get("feature_availability"),
+                "alignment_requirements": contract.get("alignment_requirements"),
+                "quality_gates": contract.get("quality_gates"),
+            },
+            "data_summary": data_summary,
+            "column_inventory": column_inventory,
+            "template": spec_template,
+        }
+
+        try:
+            response = self.client.generate_content(
+                json.dumps({"system": system_prompt, "input": user_payload})
+            )
+            content = getattr(response, "text", "")
+            spec = json.loads(content) if content else {}
+            if not isinstance(spec, dict):
+                return _fallback()
+            return spec
+        except Exception:
+            return _fallback()
         if not self.client:
             return _fallback()
 
