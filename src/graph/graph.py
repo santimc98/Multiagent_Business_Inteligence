@@ -1,10 +1,12 @@
 import sys
 import os
+import shutil
 import subprocess
 import re
 import json
 import hashlib
 import threading
+import time
 from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal
 from langgraph.graph import StateGraph, END
@@ -696,6 +698,128 @@ def _resolve_contract_columns_for_cleaning(contract: Dict[str, Any], sources: se
         if sources is None or source in sources:
             out.append(name)
     return out
+
+def _is_glob_pattern(path: str) -> bool:
+    if not path:
+        return False
+    return any(ch in path for ch in ["*", "?", "["]) or path.endswith(("/", "\\"))
+
+def _resolve_required_outputs(contract: Dict[str, Any]) -> List[str]:
+    if not isinstance(contract, dict):
+        return []
+    spec = contract.get("spec_extraction") or {}
+    deliverables = spec.get("deliverables") if isinstance(spec, dict) else None
+    if isinstance(deliverables, list) and deliverables:
+        required: List[str] = []
+        for item in deliverables:
+            if isinstance(item, dict):
+                if item.get("required") and item.get("path"):
+                    required.append(str(item.get("path")))
+            elif isinstance(item, str):
+                required.append(item)
+        return required
+    return contract.get("required_outputs", []) or []
+
+def _purge_execution_outputs(required_outputs: List[str]) -> None:
+    protected = {
+        "data/cleaned_data.csv",
+        "data/cleaned_full.csv",
+        "data/cleaning_manifest.json",
+        "data/dataset_profile.json",
+        "data/steward_summary.json",
+        "data/steward_summary.txt",
+        "data/column_mapping_summary.json",
+        "data/strategy_spec.json",
+        "data/plan.json",
+        "data/evaluation_spec.json",
+        "data/execution_contract.json",
+    }
+    for path in required_outputs or []:
+        if not path or _is_glob_pattern(path):
+            continue
+        if path in protected:
+            continue
+        if path.startswith("data/cleaned_"):
+            continue
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+    for extra in [
+        "data/metrics.json",
+        "data/scored_rows.csv",
+        "data/alignment_check.json",
+        "data/output_contract_report.json",
+        "analysis/leakage_report.json",
+        "analysis/price_elasticity_segments.csv",
+        "analysis/optimal_prices.csv",
+    ]:
+        if extra in protected:
+            continue
+        try:
+            if os.path.exists(extra):
+                os.remove(extra)
+        except Exception:
+            pass
+    for folder in ["analysis", "models", os.path.join("static", "plots")]:
+        try:
+            if os.path.isdir(folder):
+                shutil.rmtree(folder, ignore_errors=True)
+        except Exception:
+            pass
+
+def _find_stale_outputs(required_outputs: List[str], start_ts: float) -> List[str]:
+    stale: List[str] = []
+    if not required_outputs:
+        return stale
+    threshold = start_ts - 1.0
+    protected = {
+        "data/cleaned_data.csv",
+        "data/cleaned_full.csv",
+        "data/cleaning_manifest.json",
+        "data/dataset_profile.json",
+    }
+    for path in required_outputs:
+        if not path or _is_glob_pattern(path):
+            continue
+        if path in protected or path.startswith("data/cleaned_"):
+            continue
+        if not os.path.exists(path):
+            continue
+        try:
+            if os.path.getmtime(path) < threshold:
+                stale.append(path)
+        except Exception:
+            continue
+    return stale
+
+def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        contract = {}
+    spec = contract.get("spec_extraction")
+    if not isinstance(spec, dict):
+        spec = {}
+    eval_spec = evaluation_spec if isinstance(evaluation_spec, dict) else contract.get("evaluation_spec") or {}
+    alignment = contract.get("alignment_requirements") or (eval_spec.get("alignment_requirements") if isinstance(eval_spec, dict) else []) or []
+    return {
+        "contract_version": contract.get("contract_version"),
+        "strategy_title": contract.get("strategy_title"),
+        "business_objective": contract.get("business_objective"),
+        "required_outputs": contract.get("required_outputs", []) or [],
+        "data_requirements": contract.get("data_requirements", []) or [],
+        "alignment_requirements": alignment,
+        "canonical_columns": contract.get("canonical_columns", []) or [],
+        "feature_availability": contract.get("feature_availability", []) or [],
+        "availability_summary": contract.get("availability_summary", ""),
+        "evaluation_spec": eval_spec,
+        "spec_extraction": {
+            "derived_columns": spec.get("derived_columns") if isinstance(spec.get("derived_columns"), list) else [],
+            "scoring_formula": spec.get("scoring_formula") if isinstance(spec.get("scoring_formula"), str) else None,
+            "target_type": spec.get("target_type") if isinstance(spec.get("target_type"), str) else None,
+            "deliverables": spec.get("deliverables") if isinstance(spec.get("deliverables"), list) else [],
+        },
+    }
 
 def _infer_artifact_type(path: str, deliverable_kind: str | None = None) -> str:
     if deliverable_kind:
@@ -2221,6 +2345,35 @@ def _coerce_alignment_requirements(reqs: Any) -> List[Dict[str, Any]]:
             out.append(req_obj)
     return out
 
+def _extract_leakage_columns(payload: Any) -> List[str]:
+    cols: List[str] = []
+    if isinstance(payload, dict):
+        for key in ["columns", "features", "numeric_columns", "leaky_columns"]:
+            vals = payload.get(key)
+            if isinstance(vals, list):
+                for v in vals:
+                    if isinstance(v, str):
+                        cols.append(v)
+        pairs = payload.get("pairs") or payload.get("relations") or payload.get("top_pairs")
+        if isinstance(pairs, list):
+            for item in pairs:
+                if not isinstance(item, dict):
+                    continue
+                for key in ["column", "feature", "name", "col_a", "col_b", "x", "y"]:
+                    val = item.get(key)
+                    if isinstance(val, str):
+                        cols.append(val)
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, str):
+                cols.append(item)
+            elif isinstance(item, dict):
+                for key in ["column", "feature", "name", "col_a", "col_b", "x", "y"]:
+                    val = item.get(key)
+                    if isinstance(val, str):
+                        cols.append(val)
+    return cols
+
 def _artifact_alignment_gate(
     cleaned_path: str,
     scored_path: str,
@@ -2349,6 +2502,37 @@ def _artifact_alignment_gate(
     if scored_extras:
         sample = ", ".join(scored_extras[:5])
         issues.append(f"scored_rows_unknown_columns:{sample}")
+
+    leakage_path = os.path.join("analysis", "leakage_report.json")
+    if os.path.exists(leakage_path):
+        try:
+            with open(leakage_path, "r", encoding="utf-8") as f_leak:
+                leakage_payload = json.load(f_leak)
+            leak_cols = _extract_leakage_columns(leakage_payload)
+            if leak_cols:
+                numeric_cols = cleaned_df.select_dtypes(include=["number"]).columns.tolist()
+                numeric_norm = {_norm_name(c) for c in numeric_cols}
+                leak_unknown = [
+                    c for c in leak_cols if _norm_name(c) not in numeric_norm
+                ]
+                if leak_unknown:
+                    sample = ", ".join(leak_unknown[:5])
+                    issues.append(f"leakage_report_unknown_columns:{sample}")
+        except Exception as leak_err:
+            issues.append(f"leakage_report_read_failed:{leak_err}")
+
+    align_path = os.path.join("data", "alignment_check.json")
+    if os.path.exists(align_path):
+        try:
+            align_payload = _load_json_safe(align_path)
+            if isinstance(align_payload, dict):
+                for key in ["row_count", "input_rows", "n_rows", "dataset_rows", "total_rows"]:
+                    val = align_payload.get(key)
+                    if isinstance(val, int) and val != len(cleaned_df):
+                        issues.append("alignment_check_rowcount_mismatch")
+                        break
+        except Exception:
+            pass
 
     return issues
 
@@ -4477,7 +4661,7 @@ def run_engineer(state: AgentState) -> AgentState:
     strategy = state.get('selected_strategy')
     
     # Pass input context
-    data_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
+    data_path = "data/cleaned_data.csv"
     feedback_history = state.get('feedback_history', [])
     leakage_summary = state.get("leakage_audit_summary", "")
     data_audit_context = state.get('data_summary', '')
@@ -4490,7 +4674,42 @@ def run_engineer(state: AgentState) -> AgentState:
     csv_encoding = state.get('csv_encoding', 'utf-8') # Pass real encoding
     csv_sep = state.get('csv_sep', ',')
     csv_decimal = state.get('csv_decimal', '.')
-    execution_contract = state.get("execution_contract", {})
+    execution_contract = state.get("execution_contract", {}) or _load_json_safe("data/execution_contract.json")
+    evaluation_spec = state.get("evaluation_spec") or (execution_contract or {}).get("evaluation_spec") or {}
+    if isinstance(execution_contract, dict) and evaluation_spec and not execution_contract.get("evaluation_spec"):
+        execution_contract["evaluation_spec"] = evaluation_spec
+    contract_min = _build_contract_min(execution_contract, evaluation_spec)
+    if not execution_contract:
+        data_audit_context = _merge_de_audit_override(
+            data_audit_context,
+            "WARNING: execution_contract missing; using minimal contract context only.",
+        )
+    manifest_path = "data/cleaning_manifest.json"
+    if os.path.exists(manifest_path):
+        use_manifest = bool(state.get("use_output_dialect") or state.get("dialect_from_manifest"))
+        if not use_manifest and csv_sep == "," and csv_decimal == "." and str(csv_encoding).lower() in {"utf-8", "utf8"}:
+            use_manifest = True
+        if use_manifest:
+            try:
+                csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
+                    manifest_path, csv_sep, csv_decimal, csv_encoding
+                )
+                if dialect_updated:
+                    print(f"ML dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
+            except Exception:
+                pass
+    if not os.path.exists(data_path) and os.path.exists("data/cleaned_full.csv"):
+        data_path = "data/cleaned_full.csv"
+    required_input_cols = _resolve_required_input_columns(execution_contract, strategy)
+    header_cols = _read_csv_header(data_path, csv_encoding, csv_sep)
+    if data_path == "data/cleaned_data.csv" and required_input_cols:
+        header_norm = {_norm_name(c) for c in header_cols}
+        missing_required = [c for c in required_input_cols if _norm_name(c) not in header_norm]
+        if missing_required and os.path.exists("data/cleaned_full.csv"):
+            data_path = "data/cleaned_full.csv"
+            header_cols = _read_csv_header(data_path, csv_encoding, csv_sep)
+            note = f"ML_DATA_PATH_FALLBACK: using cleaned_full.csv due to missing required columns {missing_required[:5]}"
+            data_audit_context = _merge_de_audit_override(data_audit_context, note)
     feature_availability = (execution_contract or {}).get("feature_availability", [])
     availability_summary = (execution_contract or {}).get("availability_summary", "")
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
@@ -4530,8 +4749,7 @@ def run_engineer(state: AgentState) -> AgentState:
         )
         sig = inspect.signature(ml_engineer.generate_code)
         if "execution_contract" in sig.parameters:
-            kwargs["execution_contract"] = execution_contract
-        header_cols = _read_csv_header(data_path, csv_encoding, csv_sep)
+            kwargs["execution_contract"] = execution_contract or contract_min
         aliasing = {}
         derived_present = []
         sample_context = ""
@@ -4548,6 +4766,10 @@ def run_engineer(state: AgentState) -> AgentState:
             memory_slice = iteration_memory[-2:]
             context_ops_blocks.append(
                 "ITERATION_MEMORY_CONTEXT:\n" + json.dumps(memory_slice, ensure_ascii=True)
+            )
+        if contract_min:
+            context_ops_blocks.append(
+                "CONTRACT_MIN_CONTEXT:\n" + json.dumps(contract_min, ensure_ascii=True)
             )
         if header_cols:
             norm_map = {}
@@ -4658,6 +4880,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "context_ops_blocks": context_ops_blocks,
                 "required_features": strategy.get("required_columns", []),
                 "execution_contract": execution_contract,
+                "execution_contract_min": contract_min,
                 "data_audit_context": data_audit_context,
                 "ml_engineer_audit_override": ml_audit_override,
                 "feature_availability": feature_availability,
@@ -4736,6 +4959,9 @@ def run_engineer(state: AgentState) -> AgentState:
             "generated_code": code,
             "last_generated_code": code, # Update for next patch
             "ml_data_path": data_path,
+            "csv_sep": csv_sep,
+            "csv_decimal": csv_decimal,
+            "csv_encoding": csv_encoding,
             "error_message": "",
             "ml_call_refund_pending": True,
             "execution_call_refund_pending": True,
@@ -4746,6 +4972,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "raw_required_sample_context": sample_context,
                 "feature_semantics": (execution_contract or {}).get("feature_semantics", []),
                 "business_sanity_checks": (execution_contract or {}).get("business_sanity_checks", []),
+                "execution_contract_min": contract_min,
             },
             "budget_counters": counters,
         }
@@ -5237,6 +5464,7 @@ def execute_code(state: AgentState) -> AgentState:
         return {"error_message": err_msg, "execution_output": err_msg, "budget_counters": counters}
     if run_id:
         log_run_event(run_id, "execution_start", {})
+    exec_start_ts = time.time()
     code = state['generated_code']
 
     # Prevent stale metrics from previous iterations
@@ -5269,6 +5497,9 @@ def execute_code(state: AgentState) -> AgentState:
         fh = list(state.get("feedback_history", []))
         fh.append(f"DEPENDENCY_BLOCKED: {blocked}")
         return {"error_message": msg, "execution_output": msg, "feedback_history": fh, "budget_counters": counters}
+
+    required_outputs = _resolve_required_outputs(contract)
+    _purge_execution_outputs(required_outputs)
 
     # 0b. Undefined name preflight (avoid sandbox NameError)
     undefined = detect_undefined_names(code)
@@ -5397,7 +5628,7 @@ def execute_code(state: AgentState) -> AgentState:
                 print(f"Warning: Plot listing failed (Exit Code {ls_proc.exit_code})")
 
             # Download required outputs per contract (beyond plots)
-            req_outputs = state.get("execution_contract", {}).get("required_outputs", []) or []
+            req_outputs = required_outputs or state.get("execution_contract", {}).get("required_outputs", []) or []
             for pattern in req_outputs:
                 if not pattern:
                     continue
@@ -5462,6 +5693,10 @@ def execute_code(state: AgentState) -> AgentState:
     if artifact_issues:
         issue_text = "; ".join(artifact_issues)
         output = f"{output}\nEXECUTION ERROR: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
+
+    stale_outputs = _find_stale_outputs(required_outputs, exec_start_ts)
+    if stale_outputs:
+        output = f"{output}\nEXECUTION ERROR: STALE_OUTPUTS: {stale_outputs}"
     
     # Check for Runtime Errors in Output (Traceback)
     sandbox_failed = (

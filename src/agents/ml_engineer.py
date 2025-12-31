@@ -145,6 +145,7 @@ class MLEngineerAgent:
         1) OUTPUT VALID PYTHON CODE ONLY (no markdown, no code fences, no JSON-only plans).
         2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
         3) NEVER generate synthetic/placeholder data. Always load from '$data_path' only.
+        4) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
 
         SECURITY / SANDBOX (VIOLATION = FAILURE)
         - Do NOT import sys.
