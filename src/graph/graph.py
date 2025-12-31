@@ -1937,7 +1937,7 @@ def _load_json_any(path: str) -> Any:
 
 def _normalize_alignment_check(
     alignment_check: Dict[str, Any],
-    alignment_requirements: List[Dict[str, Any]],
+    alignment_requirements: List[Any],
 ) -> tuple[Dict[str, Any], List[str]]:
     issues: List[str] = []
     normalized = dict(alignment_check or {})
@@ -1954,10 +1954,17 @@ def _normalize_alignment_check(
     missing_status = 0
     missing_evidence = 0
     for req in alignment_requirements or []:
-        req_id = req.get("id")
+        if isinstance(req, str):
+            req_id = req.strip()
+            req_obj = {"id": req_id, "required": True}
+        elif isinstance(req, dict):
+            req_id = req.get("id") or req.get("name") or req.get("key") or req.get("requirement_id")
+            req_obj = req
+        else:
+            continue
         if not req_id:
             continue
-        if isinstance(req, dict) and req.get("required") is False:
+        if isinstance(req_obj, dict) and req_obj.get("required") is False:
             normalized_reqs.append({"id": req_id, "status": "SKIP", "evidence": []})
             continue
         req_status = None
@@ -2010,6 +2017,23 @@ def _normalize_alignment_check(
         issue_text = ", ".join(sorted(set(issues)))
         normalized["summary"] = f"{summary} Alignment issues: {issue_text}".strip()
     return normalized, issues
+
+def _coerce_alignment_requirements(reqs: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not isinstance(reqs, list):
+        return out
+    for idx, req in enumerate(reqs):
+        if isinstance(req, str) and req.strip():
+            out.append({"id": req.strip(), "required": True})
+            continue
+        if isinstance(req, dict):
+            req_id = req.get("id") or req.get("name") or req.get("key") or f"custom_{idx}"
+            req_obj = dict(req)
+            req_obj["id"] = req_id
+            if "required" not in req_obj:
+                req_obj["required"] = True
+            out.append(req_obj)
+    return out
 
 def _hash_json(payload: Any) -> str | None:
     if not payload:
@@ -5399,6 +5423,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         alignment_requirements = evaluation_spec.get("alignment_requirements") or []
     if not alignment_requirements and isinstance(contract, dict):
         alignment_requirements = contract.get("alignment_requirements", []) or []
+    alignment_requirements = _coerce_alignment_requirements(alignment_requirements)
     if isinstance(alignment_requirements, list) and alignment_requirements:
         if not alignment_check:
             status = "NEEDS_IMPROVEMENT"

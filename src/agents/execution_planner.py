@@ -1274,9 +1274,12 @@ class ExecutionPlannerAgent:
             normalized: List[Dict[str, Any]] = []
             seen: set[str] = set()
             for idx, item in enumerate(items):
+                if isinstance(item, str) and item.strip():
+                    req_id = item.strip()
+                    item = {"id": req_id, "requirement": req_id}
                 if not isinstance(item, dict):
                     continue
-                req_id = str(item.get("id") or f"custom_{idx}")
+                req_id = str(item.get("id") or item.get("name") or item.get("key") or f"custom_{idx}")
                 if not req_id or req_id in seen:
                     continue
                 seen.add(req_id)
