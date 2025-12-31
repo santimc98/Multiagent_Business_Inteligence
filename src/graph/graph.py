@@ -583,6 +583,101 @@ def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None
             out.append(name)
     return out
 
+def _resolve_allowed_columns_for_gate(
+    state: Dict[str, Any],
+    contract: Dict[str, Any],
+    evaluation_spec: Dict[str, Any] | None = None,
+) -> List[str]:
+    allowed: List[str] = []
+    canonical = contract.get("canonical_columns") if isinstance(contract, dict) else None
+    if isinstance(canonical, list):
+        allowed.extend([str(col) for col in canonical if col])
+    allowed.extend(_resolve_contract_columns(contract))
+
+    profile = state.get("profile") or state.get("dataset_profile")
+    if isinstance(profile, dict):
+        cols = profile.get("columns")
+        if isinstance(cols, list):
+            allowed.extend([str(col) for col in cols if col])
+
+    if not allowed:
+        csv_path = "data/cleaned_data.csv"
+        if os.path.exists(csv_path):
+            try:
+                import pandas as pd
+
+                csv_sep = state.get("csv_sep", ",")
+                csv_decimal = state.get("csv_decimal", ".")
+                csv_encoding = state.get("csv_encoding", "utf-8")
+                header_df = pd.read_csv(csv_path, nrows=0, sep=csv_sep, decimal=csv_decimal, encoding=csv_encoding)
+                allowed.extend([str(col) for col in header_df.columns.tolist() if col])
+            except Exception:
+                pass
+
+    derived = _resolve_contract_columns(contract, sources={"derived", "output"})
+    if derived:
+        allowed.extend([str(col) for col in derived if col])
+
+    spec = contract.get("spec_extraction") if isinstance(contract, dict) else None
+    if isinstance(spec, dict):
+        derived_cols = spec.get("derived_columns")
+        if isinstance(derived_cols, list):
+            for col in derived_cols:
+                if isinstance(col, dict):
+                    name = col.get("name") or col.get("canonical_name")
+                elif isinstance(col, str):
+                    name = col
+                else:
+                    name = None
+                if name:
+                    allowed.append(str(name))
+
+    if isinstance(evaluation_spec, dict):
+        target = evaluation_spec.get("target")
+        if isinstance(target, dict):
+            name = target.get("name")
+            if name:
+                allowed.append(str(name))
+
+    extra_allowed = [
+        "prediction",
+        "pred",
+        "predicted",
+        "predicted_value",
+        "predicted_label",
+        "predicted_prob",
+        "probability",
+        "prob",
+        "score",
+        "risk_score",
+        "rank",
+        "ranking",
+        "segment",
+        "segment_id",
+        "cluster",
+        "cluster_id",
+        "group",
+        "group_id",
+        "row_id",
+        "case_id",
+        "caseid",
+        "id",
+        "expected_value",
+        "actual",
+        "label",
+    ]
+    allowed.extend(extra_allowed)
+
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for col in allowed:
+        norm = _norm_name(col)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(col)
+    return deduped
+
 def _resolve_contract_columns_for_cleaning(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
     if not contract or not isinstance(contract, dict):
         return []
@@ -1037,6 +1132,9 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "DERIVED_TARGET_REQUIRED": [
             "If target is derived, add a guard to derive it when missing and log `DERIVED_TARGET:<name>` to stdout.",
         ],
+        "UNKNOWN_COLUMNS_REFERENCED": [
+            "Remove invented columns and only reference columns from the cleaned dataset / contract mapping.",
+        ],
         "CALIBRATED_IMPORTANCE_UNSUPPORTED": [
             "Avoid feature_importances_/base_estimator on CalibratedClassifierCV; use coef_ or skip importances.",
         ],
@@ -1324,7 +1422,11 @@ def _resolve_eval_flags(evaluation_spec: Dict[str, Any] | None) -> Dict[str, boo
         "requires_row_scoring": bool(requires_row_scoring),
     }
 
-def ml_quality_preflight(code: str, evaluation_spec: Dict[str, Any] | None = None) -> List[str]:
+def ml_quality_preflight(
+    code: str,
+    evaluation_spec: Dict[str, Any] | None = None,
+    allowed_columns: List[str] | None = None,
+) -> List[str]:
     """
     Static ML quality checks to prevent QA loops before reviewer/sandbox.
     Returns list of missing gates.
@@ -1515,6 +1617,11 @@ def ml_quality_preflight(code: str, evaluation_spec: Dict[str, Any] | None = Non
             issues.append("TIME_SERIES_SPLIT_REQUIRED")
         issues = [issue for issue in issues if issue != "CROSS_VALIDATION_REQUIRED"]
 
+    if allowed_columns:
+        unknown_cols = _detect_unknown_columns(code, allowed_columns)
+        if unknown_cols:
+            issues.append("UNKNOWN_COLUMNS_REFERENCED")
+
     return issues
 
 def _analyze_read_csv_usage(code: str) -> Dict[str, Any]:
@@ -1597,6 +1704,85 @@ def _extract_named_string_list(code: str, names: List[str]) -> List[str]:
                         values.append(elt.value)
                 return values
     return []
+
+def _extract_column_references(code: str) -> List[str]:
+    import ast
+
+    if not code:
+        return []
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+
+    list_vars: Dict[str, List[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if isinstance(node.value, (ast.List, ast.Tuple)):
+                values: List[str] = []
+                for elt in node.value.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        values.append(elt.value)
+                if values:
+                    list_vars[target.id] = values
+
+    refs: set[str] = set()
+
+    def _collect_from_slice(slice_node: ast.AST) -> None:
+        if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+            refs.add(slice_node.value)
+            return
+        if isinstance(slice_node, ast.Name) and slice_node.id in list_vars:
+            refs.update(list_vars[slice_node.id])
+            return
+        if isinstance(slice_node, (ast.List, ast.Tuple)):
+            for elt in slice_node.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    refs.add(elt.value)
+                elif isinstance(elt, ast.Name) and elt.id in list_vars:
+                    refs.update(list_vars[elt.id])
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Subscript):
+            continue
+        target = node.value
+        if isinstance(target, ast.Attribute) and target.attr in {"loc", "iloc"}:
+            slice_node = node.slice
+            if isinstance(slice_node, ast.Tuple) and len(slice_node.elts) >= 2:
+                _collect_from_slice(slice_node.elts[1])
+            else:
+                _collect_from_slice(slice_node)
+        elif isinstance(target, (ast.Name, ast.Attribute)):
+            _collect_from_slice(node.slice)
+
+    known_lists = [
+        "feature_cols",
+        "features",
+        "FEATURES",
+        "target_cols",
+        "TARGET_COLS",
+        "target_col",
+        "TARGET_COL",
+        "MODEL_FEATURES",
+        "SEGMENT_FEATURES",
+        "segment_features",
+        "model_features",
+    ]
+    for name in known_lists:
+        refs.update(list_vars.get(name, []))
+
+    return sorted(refs)
+
+def _detect_unknown_columns(code: str, allowed_columns: List[str]) -> List[str]:
+    if not code or not allowed_columns:
+        return []
+    allowed_norm = {_norm_name(col) for col in allowed_columns if col}
+    refs = _extract_column_references(code)
+    unknown = [col for col in refs if _norm_name(col) not in allowed_norm]
+    return unknown
 
 def _find_canonical_mismatches(features: List[str], required_columns: List[str]) -> List[Dict[str, str]]:
     mismatches: List[Dict[str, str]] = []
@@ -2034,6 +2220,137 @@ def _coerce_alignment_requirements(reqs: Any) -> List[Dict[str, Any]]:
                 req_obj["required"] = True
             out.append(req_obj)
     return out
+
+def _artifact_alignment_gate(
+    cleaned_path: str,
+    scored_path: str,
+    contract: Dict[str, Any],
+    evaluation_spec: Dict[str, Any] | None,
+    csv_sep: str,
+    csv_decimal: str,
+    csv_encoding: str,
+) -> List[str]:
+    issues: List[str] = []
+    if not cleaned_path or not os.path.exists(cleaned_path):
+        issues.append(f"cleaned_data_missing:{cleaned_path or 'data/cleaned_data.csv'}")
+        return issues
+
+    try:
+        import pandas as pd
+        cleaned_df = pd.read_csv(cleaned_path, sep=csv_sep, decimal=csv_decimal, encoding=csv_encoding)
+    except Exception as err:
+        issues.append(f"cleaned_data_read_failed:{err}")
+        return issues
+
+    flags = _resolve_eval_flags(evaluation_spec)
+    requires_row_scoring = bool(flags.get("requires_row_scoring"))
+    required_outputs = contract.get("required_outputs", []) if isinstance(contract, dict) else []
+    if "data/scored_rows.csv" in (required_outputs or []):
+        requires_row_scoring = True
+    deliverables = (contract.get("spec_extraction") or {}).get("deliverables") if isinstance(contract, dict) else None
+    if isinstance(deliverables, list):
+        for item in deliverables:
+            if isinstance(item, dict) and item.get("path") == "data/scored_rows.csv":
+                if bool(item.get("required")):
+                    requires_row_scoring = True
+                break
+            if isinstance(item, str) and item == "data/scored_rows.csv":
+                requires_row_scoring = True
+                break
+
+    if not requires_row_scoring:
+        return issues
+
+    if not scored_path or not os.path.exists(scored_path):
+        issues.append("scored_rows_missing")
+        return issues
+
+    try:
+        import pandas as pd
+        scored_df = pd.read_csv(scored_path, sep=csv_sep, decimal=csv_decimal, encoding=csv_encoding)
+    except Exception as err:
+        issues.append(f"scored_rows_read_failed:{err}")
+        return issues
+
+    if len(scored_df) != len(cleaned_df):
+        issues.append("scored_rows_rowcount_mismatch")
+
+    cleaned_cols = [str(c) for c in cleaned_df.columns]
+    scored_cols = [str(c) for c in scored_df.columns]
+    cleaned_norm = {_norm_name(c) for c in cleaned_cols}
+    scored_norm = {_norm_name(c) for c in scored_cols}
+    row_id_candidates = {"row_id", "case_id", "caseid", "id"}
+    has_row_id = any(c in row_id_candidates for c in scored_norm)
+    has_overlap = bool(cleaned_norm.intersection(scored_norm))
+    if not has_row_id and not has_overlap:
+        issues.append("scored_rows_missing_row_id_or_overlap")
+
+    allowed_cols: List[str] = list(cleaned_cols)
+    allowed_cols.extend(_resolve_contract_columns(contract, sources={"derived", "output"}))
+    spec = contract.get("spec_extraction") if isinstance(contract, dict) else None
+    if isinstance(spec, dict):
+        derived_cols = spec.get("derived_columns")
+        if isinstance(derived_cols, list):
+            for col in derived_cols:
+                if isinstance(col, dict):
+                    name = col.get("name") or col.get("canonical_name")
+                elif isinstance(col, str):
+                    name = col
+                else:
+                    name = None
+                if name:
+                    allowed_cols.append(str(name))
+
+    if isinstance(evaluation_spec, dict):
+        target = evaluation_spec.get("target")
+        if isinstance(target, dict) and target.get("name"):
+            allowed_cols.append(str(target.get("name")))
+
+    allowed_cols.extend(
+        [
+            "prediction",
+            "pred",
+            "predicted",
+            "predicted_value",
+            "predicted_label",
+            "predicted_prob",
+            "probability",
+            "prob",
+            "score",
+            "risk_score",
+            "rank",
+            "ranking",
+            "segment",
+            "segment_id",
+            "cluster",
+            "cluster_id",
+            "group",
+            "group_id",
+            "row_id",
+            "case_id",
+            "caseid",
+            "id",
+            "expected_value",
+            "actual",
+            "label",
+        ]
+    )
+    allowed_norm = {_norm_name(col) for col in allowed_cols if col}
+    scored_extras = []
+    for col in scored_cols:
+        norm = _norm_name(col)
+        if not norm:
+            continue
+        if norm in allowed_norm:
+            continue
+        if any(tok in norm for tok in ["pred", "score", "prob", "rank", "segment", "cluster", "group"]):
+            continue
+        scored_extras.append(col)
+    if scored_extras:
+        sample = ", ".join(scored_extras[:5])
+        issues.append(f"scored_rows_unknown_columns:{sample}")
+
+    return issues
 
 def _hash_json(payload: Any) -> str | None:
     if not payload:
@@ -4586,7 +4903,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
         except TypeError:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective)
-        preflight_issues = ml_quality_preflight(code)
+        preflight_issues = ml_quality_preflight(code, evaluation_spec)
         has_variance_guard = "TARGET_VARIANCE_GUARD" not in preflight_issues
 
         status = qa_result['status']
@@ -4734,7 +5051,8 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         }
 
     flags = _resolve_eval_flags(evaluation_spec)
-    issues = ml_quality_preflight(code, evaluation_spec)
+    allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
+    issues = ml_quality_preflight(code, evaluation_spec, allowed_columns)
     if isinstance(evaluation_spec, dict):
         obj_type = str(evaluation_spec.get("objective_type") or "").lower()
         validation_policy = evaluation_spec.get("validation_policy") or {}
@@ -4841,6 +5159,10 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             feedback += f" | Required columns hits: {col_coverage.get('hits')}"
         if canonical_mismatches:
             feedback += f" | Canonical mismatches: {canonical_mismatches}"
+        if "UNKNOWN_COLUMNS_REFERENCED" in issues and allowed_columns:
+            unknown_cols = _detect_unknown_columns(code, allowed_columns)
+            if unknown_cols:
+                feedback += f" | Unknown columns: {unknown_cols[:5]}"
         history = list(state.get("feedback_history", []))
         history.append(feedback)
         gate_context = {
@@ -5126,6 +5448,20 @@ def execute_code(state: AgentState) -> AgentState:
     has_partial_visuals = len(plots_local) > 0
     
     print(f"Execution finished. Plots generated: {len(plots_local)}")
+
+    eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
+    artifact_issues = _artifact_alignment_gate(
+        cleaned_path="data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv",
+        scored_path="data/scored_rows.csv",
+        contract=contract,
+        evaluation_spec=eval_spec,
+        csv_sep=state.get("csv_sep", ","),
+        csv_decimal=state.get("csv_decimal", "."),
+        csv_encoding=state.get("csv_encoding", "utf-8"),
+    )
+    if artifact_issues:
+        issue_text = "; ".join(artifact_issues)
+        output = f"{output}\nEXECUTION ERROR: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
     
     # Check for Runtime Errors in Output (Traceback)
     sandbox_failed = (

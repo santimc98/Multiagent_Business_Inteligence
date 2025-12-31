@@ -1846,6 +1846,60 @@ Return the contract JSON.
         business_objective: str = "",
         column_inventory: list[str] | None = None,
     ) -> Dict[str, Any]:
+        def _derive_target_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(spec, dict):
+                return spec
+            def _norm_text(value: Any) -> str:
+                return re.sub(r"[^0-9a-zA-Z]+", "", str(value).lower())
+            target_payload = spec.get("target")
+            if not isinstance(target_payload, dict):
+                target_payload = {}
+            target_name = target_payload.get("name")
+            derive_from = target_payload.get("derive_from") if isinstance(target_payload.get("derive_from"), dict) else None
+
+            reqs = contract.get("data_requirements", []) if isinstance(contract, dict) else []
+            target_req = None
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                role = (req.get("role") or "").lower()
+                if "target" in role or "label" in role:
+                    target_req = req
+                    break
+
+            if not target_name and target_req:
+                target_name = target_req.get("canonical_name") or target_req.get("name")
+
+            if target_req and (target_req.get("source") or "").lower() == "derived" and not derive_from:
+                spec_extraction = contract.get("spec_extraction") if isinstance(contract, dict) else None
+                derived_cols = spec_extraction.get("derived_columns") if isinstance(spec_extraction, dict) else None
+                if isinstance(derived_cols, list):
+                    for entry in derived_cols:
+                        if isinstance(entry, dict):
+                            name = entry.get("name") or entry.get("canonical_name")
+                            if name and target_name and _norm_text(name) == _norm_text(target_name):
+                                source_col = (
+                                    entry.get("source_column")
+                                    or entry.get("column")
+                                    or entry.get("from_column")
+                                    or entry.get("base_column")
+                                )
+                                if not source_col:
+                                    depends = entry.get("depends_on")
+                                    if isinstance(depends, list) and depends:
+                                        source_col = depends[0]
+                                positive_vals = entry.get("positive_values") or entry.get("positive") or entry.get("values")
+                                if isinstance(positive_vals, str):
+                                    positive_vals = [positive_vals]
+                                if source_col or positive_vals:
+                                    derive_from = {"column": source_col, "positive_values": positive_vals or []}
+                                break
+
+            if target_name:
+                target_payload = {"name": target_name, "derive_from": derive_from}
+                spec["target"] = target_payload
+            return spec
+
         def _derive_flag_defaults(spec: Dict[str, Any]) -> Dict[str, Any]:
             objective_type = str(spec.get("objective_type") or "").lower()
             requires_target = spec.get("requires_target")
@@ -1873,7 +1927,7 @@ Return the contract JSON.
             spec["requires_time_series_split"] = bool(requires_time_series_split)
             spec["requires_supervised_split"] = bool(requires_supervised_split)
             spec["requires_row_scoring"] = bool(requires_row_scoring)
-            return spec
+            return _derive_target_spec(spec)
 
         def _fallback() -> Dict[str, Any]:
             # Reuse the heuristic builder inside generate_contract scope via a lightweight copy
@@ -1976,6 +2030,7 @@ Return the contract JSON.
             "reviewer_gates": [],
             "alignment_requirements": [],
             "evidence_requirements": [],
+            "target": {"name": None, "derive_from": None},
             "requires_target": False,
             "requires_supervised_split": False,
             "requires_time_series_split": False,
@@ -1993,7 +2048,8 @@ Return the contract JSON.
             "mapping_summary, consistency_checks, target_variance_guard, leakage_prevention, outputs_required, "
             "segmentation_predecision, decision_variable_handling, validation_required, price_optimization, "
             "methodology_alignment, business_value. "
-            "Include requires_target/requires_supervised_split/requires_time_series_split/requires_row_scoring flags."
+            "Include requires_target/requires_supervised_split/requires_time_series_split/requires_row_scoring flags "
+            "and a target object {name, derive_from} when a target exists."
         )
         user_payload = {
             "business_objective": business_objective,
