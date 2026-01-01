@@ -85,6 +85,7 @@ class StewardAgent:
 
             # 5. Smart Profiling (V3)
             profile = self._smart_profile(df, business_objective)
+            shape = df.shape
             dataset_profile = build_dataset_profile(
                 df=df,
                 objective=business_objective,
@@ -101,7 +102,6 @@ class StewardAgent:
                 pass
             
             # 6. Construct Prompt
-            shape = df.shape
             metadata_str = f"""
             Rows: {shape[0]} (Estimated/Sampled: {was_sampled}), Columns: {shape[1]}
             Filesize: {file_size_mb:.2f} MB

@@ -1066,6 +1066,28 @@ def _ensure_scored_rows_output(
             ]
     return contract
 
+
+def _should_run_case_alignment(
+    contract: Dict[str, Any] | None,
+    evaluation_spec: Dict[str, Any] | None = None,
+) -> bool:
+    if not isinstance(contract, dict):
+        contract = {}
+    required_outputs = _resolve_required_outputs(contract)
+    required_set = {str(p) for p in (required_outputs or []) if p}
+    requires_outputs = bool(
+        required_set.intersection({"data/scored_rows.csv", "data/weights.json", "data/case_summary.csv"})
+    )
+    spec_requires = False
+    if isinstance(evaluation_spec, dict):
+        spec_requires = bool(
+            evaluation_spec.get("requires_case_alignment")
+            or evaluation_spec.get("case_alignment_required")
+            or evaluation_spec.get("requires_row_scoring")
+        )
+    flags = _resolve_eval_flags(evaluation_spec) if isinstance(evaluation_spec, dict) else {}
+    return requires_outputs or spec_requires or bool(flags.get("requires_row_scoring"))
+
 def _ensure_alignment_check_output(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return {}
@@ -5894,35 +5916,41 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if status == "NEEDS_IMPROVEMENT":
         new_history.append(f"RESULT EVALUATION FEEDBACK: {feedback}")
 
-    # Case alignment QA gate (optional if artifacts exist)
+    # Case alignment QA gate (optional if required by contract/spec)
     contract = state.get("execution_contract", {}) or {}
-    data_paths = []
-    if os.path.exists("data/cleaned_full.csv"):
-        data_paths.append("data/cleaned_full.csv")
-    if os.path.exists("data/cleaned_data.csv"):
-        data_paths.append("data/cleaned_data.csv")
-    case_report = build_case_alignment_report(
-        contract=contract,
-        case_summary_path="data/case_summary.csv",
-        weights_path="data/weights.json",
-        data_paths=data_paths,
-    )
+    case_alignment_required = _should_run_case_alignment(contract, evaluation_spec)
+    case_report: Dict[str, Any] = {
+        "status": "SKIP",
+        "failures": [],
+        "metrics": {},
+        "reason": "case alignment not required",
+    }
+    case_history = list(state.get("case_alignment_history", []) or [])
+    if case_alignment_required:
+        data_paths = []
+        if os.path.exists("data/cleaned_full.csv"):
+            data_paths.append("data/cleaned_full.csv")
+        if os.path.exists("data/cleaned_data.csv"):
+            data_paths.append("data/cleaned_data.csv")
+        case_report = build_case_alignment_report(
+            contract=contract,
+            case_summary_path="data/case_summary.csv",
+            weights_path="data/weights.json",
+            data_paths=data_paths,
+        )
+        try:
+            metrics = case_report.get("metrics", {}) if isinstance(case_report, dict) else {}
+            violations = metrics.get("adjacent_refscore_violations")
+            if violations is not None:
+                case_history.append(float(violations))
+        except Exception:
+            pass
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/case_alignment_report.json", "w", encoding="utf-8") as f:
             json.dump(case_report, f, indent=2)
     except Exception as err:
         print(f"Warning: failed to persist case_alignment_report.json: {err}")
-
-    # Track case alignment history for adaptive stopping
-    case_history = list(state.get("case_alignment_history", []) or [])
-    try:
-        metrics = case_report.get("metrics", {}) if isinstance(case_report, dict) else {}
-        violations = metrics.get("adjacent_refscore_violations")
-        if violations is not None:
-            case_history.append(float(violations))
-    except Exception:
-        pass
 
     # Detect stale metrics file across iterations (diagnostic for ML)
     metrics_report = _load_json_safe("data/metrics.json")
@@ -5970,7 +5998,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     iter_id = int(state.get("iteration_count", 0)) + 1
     saved_iter_artifacts = _persist_iteration_artifacts(iter_id)
 
-    if case_report.get("status") == "FAIL":
+    if case_alignment_required and case_report.get("status") == "FAIL":
         feedback = f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('explanation')}"
         status = "NEEDS_IMPROVEMENT"
         new_history.append(f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('failures')}")
@@ -6089,6 +6117,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     counters = dict(state.get("budget_counters") or {})
     review_counters = counters
     audit_rejected = False
+    hard_qa_gate_reject = False
+    hard_qa_gates = {"no_synthetic_data", "must_reference_contract_columns", "must_read_input_csv"}
     if code:
         analysis_type = strategy.get("analysis_type", "predictive")
         review_warnings: List[str] = []
@@ -6115,6 +6145,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     review_warnings.append(
                         f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
                     )
+                if qa_result and qa_result.get("status") == "REJECTED":
+                    failed = qa_result.get("failed_gates", []) or []
+                    if any(str(g).lower() in hard_qa_gates for g in failed):
+                        hard_qa_gate_reject = True
             else:
                 review_warnings.append(f"QA_CODE_AUDIT_SKIPPED: {err_msg}")
         except Exception as qa_err:
@@ -6151,7 +6185,18 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             except Exception:
                 pass
 
-    failed_gates = case_report.get("failures", []) if case_report.get("status") == "FAIL" else []
+    hard_qa_retry_count = int(state.get("hard_qa_retry_count", 0))
+    if status == "NEEDS_IMPROVEMENT" and hard_qa_gate_reject:
+        hard_qa_retry_count += 1
+        hard_note = "HARD_QA_GATE: synthetic data or contract-column violation detected; limit retries to 1."
+        new_history.append(hard_note)
+        feedback = f"{feedback}\n{hard_note}" if feedback else hard_note
+
+    failed_gates = (
+        case_report.get("failures", [])
+        if case_alignment_required and case_report.get("status") == "FAIL"
+        else []
+    )
     required_fixes = _expand_required_fixes(failed_gates, failed_gates)
     if alignment_failed_gates:
         for item in alignment_failed_gates:
@@ -6213,6 +6258,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "data_adequacy_consecutive": adequacy_consecutive,
         "data_adequacy_threshold": adequacy_threshold,
         "data_adequacy_status": adequacy_status,
+        "hard_qa_gate_reject": hard_qa_gate_reject,
+        "hard_qa_retry_count": hard_qa_retry_count,
     }
     if status in ["APPROVED", "APPROVE_WITH_WARNINGS"]:
         result_state["last_successful_review_verdict"] = status
@@ -6441,6 +6488,11 @@ def finalize_runtime_failure(state: AgentState) -> AgentState:
     return result
 
 def check_evaluation(state: AgentState):
+    if state.get("hard_qa_gate_reject"):
+        hard_count = int(state.get("hard_qa_retry_count", 0))
+        if hard_count > 1:
+            print("WARNING: Hard QA gate retry limit reached (max 1). Proceeding with current results.")
+            return "approved"
     policy = _get_iteration_policy(state)
     last_iter_type = state.get("last_iteration_type")
     if policy:

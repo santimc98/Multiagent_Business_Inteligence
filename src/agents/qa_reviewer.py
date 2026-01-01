@@ -85,6 +85,15 @@ class QAReviewerAgent:
            
         4. OUTPUT SAFETY (only if gate enabled):
            - If saving plots, `os.makedirs('static/plots', exist_ok=True)` MUST be called.
+
+        5. INPUT CSV LOADING (only if gate enabled):
+           - The code MUST call pandas.read_csv(...) to load the provided dataset.
+
+        6. NO SYNTHETIC DATA (only if gate enabled):
+           - The code MUST NOT fabricate datasets via random generators, sklearn.datasets.make_*, or literal DataFrame constructors.
+
+        7. CONTRACT COLUMNS (only if gate enabled):
+           - The code MUST reference canonical contract columns explicitly.
            
         INPUT CONTEXT:
         - Business Objective: "$business_objective"
@@ -201,6 +210,34 @@ def _is_random_call(call_node: ast.Call) -> bool:
     if any(tok in func_lower for tok in random_tokens):
         return True
     return any(func in func_lower for func in random_funcs)
+
+
+def _is_sklearn_make_call(call_node: ast.Call) -> bool:
+    name = _call_name(call_node)
+    name_lower = name.lower()
+    if "sklearn.datasets.make_" in name_lower or ".datasets.make_" in name_lower:
+        return True
+    if name_lower.startswith("make_"):
+        return True
+    return False
+
+
+def _is_dataframe_literal_call(call_node: ast.Call) -> bool:
+    name = _call_name(call_node)
+    name_lower = name.lower()
+    if not name_lower.endswith("dataframe"):
+        return False
+    for arg in call_node.args[:1]:
+        if isinstance(arg, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+            return True
+    for kw in call_node.keywords:
+        if kw.arg in (None, "data") and isinstance(kw.value, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+            return True
+    return False
+
+
+def _is_synthetic_data_call(call_node: ast.Call) -> bool:
+    return _is_random_call(call_node) or _is_sklearn_make_call(call_node) or _is_dataframe_literal_call(call_node)
 
 
 def _call_name(call_node: ast.Call) -> str:
@@ -381,6 +418,8 @@ class _StaticQAScanner(ast.NodeVisitor):
         self.has_mapping_summary_print = False
         self.has_mkdirs = False
         self.forbidden_imports_found = False
+        self.has_read_csv = False
+        self.has_synthetic_data = False
 
     def visit_Assign(self, node: ast.Assign):
         self._handle_assignment(node.targets, node.value)
@@ -400,9 +439,13 @@ class _StaticQAScanner(ast.NodeVisitor):
         if _is_split_fabrication_call(node):
             self.has_split_fabrication = True
         name = _call_name(node)
+        if _is_synthetic_data_call(node):
+            self.has_synthetic_data = True
         if isinstance(node.func, ast.Name) and node.func.id == "print":
             if any(_node_mentions_mapping(arg) for arg in node.args):
                 self.has_mapping_summary_print = True
+        if "read_csv" in name:
+            self.has_read_csv = True
         if "assert_no_deterministic_target_leakage" in name:
             self.has_leakage_assert = True
         if _looks_like_regressor(name):
@@ -485,6 +528,12 @@ class _StaticQAScanner(ast.NodeVisitor):
             self.has_split_fabrication = True
 
 
+MANDATORY_QA_GATES = [
+    "must_read_input_csv",
+    "no_synthetic_data",
+    "must_reference_contract_columns",
+]
+
 DEFAULT_QA_GATES = [
     "target_variance_guard",
     "train_eval_split",
@@ -492,6 +541,7 @@ DEFAULT_QA_GATES = [
     "dialect_mismatch_handling",
     "group_split_required",
     "security_sandbox",
+    *MANDATORY_QA_GATES,
 ]
 
 
@@ -505,8 +555,46 @@ def resolve_qa_gates(evaluation_spec: Dict[str, Any] | None) -> tuple[list[str],
             or []
         )
     if isinstance(qa_gates, list) and qa_gates:
-        return qa_gates, False
+        merged = list(dict.fromkeys([*qa_gates, *MANDATORY_QA_GATES]))
+        return merged, False
     return list(DEFAULT_QA_GATES), True
+
+
+def _resolve_contract_columns_for_qa(evaluation_spec: Dict[str, Any] | None) -> List[str]:
+    columns: List[str] = []
+    if isinstance(evaluation_spec, dict):
+        for key in ("canonical_columns", "contract_columns", "required_columns", "allowed_columns"):
+            vals = evaluation_spec.get(key)
+            if isinstance(vals, list):
+                columns.extend([str(c) for c in vals if c])
+        data_reqs = evaluation_spec.get("data_requirements")
+        if isinstance(data_reqs, list):
+            for req in data_reqs:
+                if not isinstance(req, dict):
+                    continue
+                name = req.get("canonical_name") or req.get("name")
+                if name:
+                    columns.append(str(name))
+    if not columns:
+        columns = ["Size", "Debtors", "Sector", "1stYearAmount", "CurrentPhase", "Probability"]
+    return columns
+
+
+def _code_mentions_columns(code: str, columns: List[str], tree: ast.AST | None = None) -> bool:
+    if not columns:
+        return False
+    col_set = {str(c) for c in columns if c}
+    if tree is not None:
+        literals = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        for col in col_set:
+            if col in literals:
+                return True
+    lowered = code.lower()
+    return any(col.lower() in lowered for col in col_set)
 
 
 def run_static_qa_checks(
@@ -545,6 +633,9 @@ def run_static_qa_checks(
     require_dialect_guard = "dialect_mismatch_handling" in qa_gate_set
     require_group_split = "group_split_required" in qa_gate_set
     require_security = "security_sandbox" in qa_gate_set
+    require_read_csv = "must_read_input_csv" in qa_gate_set
+    require_no_synth = "no_synthetic_data" in qa_gate_set
+    require_contract_columns = "must_reference_contract_columns" in qa_gate_set
     train_eval_gate = None
     if "train_eval_split" in qa_gate_set:
         train_eval_gate = "train_eval_split"
@@ -584,6 +675,29 @@ def run_static_qa_checks(
             "Load with correct output_dialect and abort on delimiter mismatch; do not split columns.",
         )
 
+    if require_read_csv and not scanner.has_read_csv:
+        _flag(
+            "must_read_input_csv",
+            "Missing pandas.read_csv call; code must load the provided input CSV.",
+            "Read the input CSV with pandas.read_csv and use it as the dataset source.",
+        )
+
+    if require_no_synth and scanner.has_synthetic_data:
+        _flag(
+            "no_synthetic_data",
+            "Synthetic data construction detected (random generators, make_* datasets, or literal DataFrame).",
+            "Remove synthetic data creation; load the real CSV and operate on contract columns only.",
+        )
+
+    contract_columns = _resolve_contract_columns_for_qa(evaluation_spec)
+    has_contract_column_reference = _code_mentions_columns(code, contract_columns, tree)
+    if require_contract_columns and not has_contract_column_reference:
+        _flag(
+            "must_reference_contract_columns",
+            "No references to contract canonical columns detected in code.",
+            "Reference contract columns explicitly (canonical names) when selecting features/targets.",
+        )
+
     if require_variance_guard and not scanner.has_variance_guard:
         _flag(
             "target_variance_guard",
@@ -621,6 +735,10 @@ def run_static_qa_checks(
         )
 
     facts_payload = facts if isinstance(facts, dict) else collect_static_qa_facts(code)
+    facts_payload["has_read_csv"] = scanner.has_read_csv
+    facts_payload["has_synthetic_data"] = scanner.has_synthetic_data
+    facts_payload["has_contract_column_reference"] = has_contract_column_reference
+    facts_payload["contract_columns_checked"] = contract_columns
     facts_payload["qa_gates"] = qa_gates
     facts_payload["default_gates_used"] = default_used
 
@@ -651,6 +769,9 @@ def collect_static_qa_facts(code: str) -> Dict[str, bool]:
         "has_mapping_summary_print": False,
         "has_mkdirs": False,
         "forbidden_imports_found": False,
+        "has_read_csv": False,
+        "has_synthetic_data": False,
+        "has_contract_column_reference": False,
     }
     try:
         tree = ast.parse(code)
@@ -669,4 +790,9 @@ def collect_static_qa_facts(code: str) -> Dict[str, bool]:
     facts["has_mapping_summary_print"] = scanner.has_mapping_summary_print
     facts["has_mkdirs"] = scanner.has_mkdirs
     facts["forbidden_imports_found"] = scanner.forbidden_imports_found
+    facts["has_read_csv"] = scanner.has_read_csv
+    facts["has_synthetic_data"] = scanner.has_synthetic_data
+    facts["has_contract_column_reference"] = _code_mentions_columns(
+        code, _resolve_contract_columns_for_qa(None), tree
+    )
     return facts
