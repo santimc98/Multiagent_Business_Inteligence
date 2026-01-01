@@ -27,6 +27,8 @@ class StewardAgent:
             model_name="gemini-3-flash-preview",
             generation_config={"temperature": 0.2}
         )
+        self.last_prompt = None
+        self.last_response = None
 
     def analyze_data(self, data_path: str, business_objective: str = "") -> Dict[str, Any]:
         """
@@ -151,9 +153,11 @@ class StewardAgent:
                 business_objective=business_objective,
                 metadata_str=metadata_str
             )
+            self.last_prompt = system_prompt
 
             response = self.model.generate_content(system_prompt)
             summary = (getattr(response, "text", "") or "").strip()
+            self.last_response = summary
 
             # Diagnostic logging for empty responses (best-effort, no PII)
             try:

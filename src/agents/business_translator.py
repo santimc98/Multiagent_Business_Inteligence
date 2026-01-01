@@ -210,6 +210,8 @@ class BusinessTranslatorAgent:
             model_name="gemini-3-flash-preview",
             generation_config={"temperature": 0.7},
         )
+        self.last_prompt = None
+        self.last_response = None
 
     def generate_report(self, state: Dict[str, Any], error_message: Optional[str] = None, has_partial_visuals: bool = False, plots: Optional[List[str]] = None) -> str:
         if not isinstance(state, dict):
@@ -657,9 +659,12 @@ class BusinessTranslatorAgent:
         )
 
         full_prompt = system_prompt + "\n\n" + user_message
+        self.last_prompt = full_prompt
 
         try:
             response = self.model.generate_content(full_prompt)
-            return (getattr(response, "text", "") or "").strip()
+            content = (getattr(response, "text", "") or "").strip()
+            self.last_response = content
+            return content
         except Exception as e:
             return f"Error generating report: {e}"

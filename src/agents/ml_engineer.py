@@ -52,6 +52,8 @@ class MLEngineerAgent:
             self.model_name = os.getenv("ML_ENGINEER_MODEL", "gemini-3-flash-preview") or "gemini-3-flash-preview"
         else:
             raise ValueError(f"Unsupported ML_ENGINEER_PROVIDER: {self.provider}")
+        self.last_prompt = None
+        self.last_response = None
 
     def _compact_execution_contract(self, contract: Dict[str, Any] | None) -> Dict[str, Any]:
         if not isinstance(contract, dict):
@@ -394,6 +396,7 @@ class MLEngineerAgent:
             provider_label = "DeepSeek"
 
         def _call_model_with_prompts(sys_prompt: str, usr_prompt: str, temperature: float) -> str:
+            self.last_prompt = sys_prompt + "\n\nUSER:\n" + usr_prompt
             print(f"DEBUG: ML Engineer calling {provider_label} Model ({self.model_name})...")
             if self.provider == "zai":
                 from src.utils.llm_throttle import glm_call_slot
@@ -439,6 +442,7 @@ class MLEngineerAgent:
                     temperature=temperature,
                 )
                 content = response.choices[0].message.content
+            self.last_response = content
             
             # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
             if "504 Gateway Time-out" in content or "<html" in content.lower():

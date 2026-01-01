@@ -36,6 +36,8 @@ class StrategistAgent:
             generation_config=generation_config,
             safety_settings=self.safety_settings,
         )
+        self.last_prompt = None
+        self.last_response = None
 
     def generate_strategies(self, data_summary: str, user_request: str) -> Dict[str, Any]:
         """
@@ -86,10 +88,12 @@ class StrategistAgent:
             data_summary=data_summary,
             user_request=user_request
         )
+        self.last_prompt = system_prompt
         
         try:
             response = self.model.generate_content(system_prompt)
             content = response.text
+            self.last_response = content
             cleaned_content = self._clean_json(content)
             single_strategy = json.loads(cleaned_content)
             strategy_spec = self._build_strategy_spec(single_strategy, data_summary, user_request)

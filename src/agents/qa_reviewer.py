@@ -23,6 +23,8 @@ class QAReviewerAgent:
             base_url="https://api.xiaomimimo.com/v1"
         )
         self.model_name = "mimo-v2-flash"
+        self.last_prompt = None
+        self.last_response = None
 
     def review_code(
         self,
@@ -132,6 +134,7 @@ class QAReviewerAgent:
         """
         
         user_message = render_prompt(USER_MESSAGE_TEMPLATE, code=code)
+        self.last_prompt = system_prompt + "\n\n" + user_message
         
         try:
             response = self.client.chat.completions.create(
@@ -143,6 +146,7 @@ class QAReviewerAgent:
                 response_format={"type": "json_object"}
             )
             content = response.choices[0].message.content
+            self.last_response = content
             
             # Parse JSON
             try:

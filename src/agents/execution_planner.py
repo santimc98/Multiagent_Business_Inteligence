@@ -136,6 +136,8 @@ class ExecutionPlannerAgent:
                 safety_settings=safety_settings,
             )
         self.model_name = "gemini-3-flash-preview"
+        self.last_prompt = None
+        self.last_response = None
 
     def generate_contract(self, strategy: Dict[str, Any], data_summary: str = "", business_objective: str = "", column_inventory: list[str] | None = None) -> Dict[str, Any]:
         def _norm(name: str) -> str:
@@ -1801,8 +1803,10 @@ Return the contract JSON.
         )
         try:
             full_prompt = system_prompt + "\n\nUSER_INPUT:\n" + user_prompt
+            self.last_prompt = full_prompt
             response = self.client.generate_content(full_prompt)
             content = response.text
+            self.last_response = content
             content = content.replace("```json", "").replace("```", "").strip()
             contract = json.loads(content)
             if not isinstance(contract, dict) or "data_requirements" not in contract:
@@ -2067,10 +2071,11 @@ Return the contract JSON.
         }
 
         try:
-            response = self.client.generate_content(
-                json.dumps({"system": system_prompt, "input": user_payload})
-            )
+            payload_text = json.dumps({"system": system_prompt, "input": user_payload})
+            self.last_prompt = payload_text
+            response = self.client.generate_content(payload_text)
             content = getattr(response, "text", "")
+            self.last_response = content
             spec = json.loads(content) if content else {}
             if not isinstance(spec, dict):
                 return _fallback()

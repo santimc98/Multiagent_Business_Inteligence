@@ -3,13 +3,23 @@ import os
 from datetime import datetime
 from typing import Any, Dict
 
+_RUN_LOG_PATHS: Dict[str, str] = {}
+
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
 def _log_path(run_id: str, log_dir: str = "logs") -> str:
+    custom = _RUN_LOG_PATHS.get(run_id)
+    if custom:
+        return custom
     return os.path.join(log_dir, f"run_{run_id}.jsonl")
+
+
+def register_run_log(run_id: str, path: str) -> None:
+    if run_id and path:
+        _RUN_LOG_PATHS[run_id] = path
 
 
 def init_run_log(run_id: str, metadata: Dict[str, Any], log_dir: str = "logs") -> str:

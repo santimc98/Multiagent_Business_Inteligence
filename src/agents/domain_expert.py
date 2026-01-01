@@ -23,6 +23,8 @@ class DomainExpertAgent:
             base_url="https://api.xiaomimimo.com/v1"
         )
         self.model_name = "mimo-v2-flash"
+        self.last_prompt = None
+        self.last_response = None
 
     def evaluate_strategies(self, data_summary: str, business_objective: str, strategies: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -74,6 +76,7 @@ class DomainExpertAgent:
             data_summary=data_summary,
             strategies_text=strategies_text
         )
+        self.last_prompt = system_prompt
         
         messages = [
             {"role": "system", "content": system_prompt},
@@ -89,6 +92,7 @@ class DomainExpertAgent:
             )
             
             content = response.choices[0].message.content
+            self.last_response = content
             cleaned_content = self._clean_json(content)
             return json.loads(cleaned_content)
             

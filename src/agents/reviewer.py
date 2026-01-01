@@ -37,6 +37,8 @@ class ReviewerAgent:
             base_url="https://api.xiaomimimo.com/v1"
         )
         self.model_name = "mimo-v2-flash"
+        self.last_prompt = None
+        self.last_response = None
 
     def review_code(
         self,
@@ -135,6 +137,7 @@ class ReviewerAgent:
         
         USER_PROMPT_TEMPLATE = "REVIEW THIS CODE:\n\n$code"
         user_prompt = render_prompt(USER_PROMPT_TEMPLATE, code=code)
+        self.last_prompt = system_prompt + "\n\n" + user_prompt
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -150,6 +153,7 @@ class ReviewerAgent:
             )
             
             content = response.choices[0].message.content
+            self.last_response = content
             cleaned_content = self._clean_json(content)
             result = json.loads(cleaned_content)
             
@@ -279,6 +283,7 @@ class ReviewerAgent:
             evaluation_spec_json=eval_spec_json,
             output_format_instructions=output_format_instructions
         )
+        self.last_prompt = system_prompt + "\n\nEvaluate results."
 
         try:
             response = self.client.chat.completions.create(
@@ -291,6 +296,7 @@ class ReviewerAgent:
                 temperature=0.1
             )
             content = response.choices[0].message.content
+            self.last_response = content
             cleaned_content = self._clean_json(content)
             result = json.loads(cleaned_content)
             

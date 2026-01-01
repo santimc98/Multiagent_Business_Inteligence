@@ -26,6 +26,8 @@ class ResultsAdvisorAgent:
                 timeout=None,
             )
         self.model_name = "mimo-v2-flash"
+        self.last_prompt = None
+        self.last_response = None
 
     def generate_ml_advice(self, context: Dict[str, Any]) -> str:
         if not context:
@@ -48,6 +50,7 @@ class ResultsAdvisorAgent:
             "Do NOT include code. Do NOT restate the full metrics dump."
         )
         user_prompt = "CONTEXT:\n" + context_snippet + "\n"
+        self.last_prompt = system_prompt + "\n\n" + user_prompt
 
         def _call_model():
             response = self.client.chat.completions.create(
@@ -65,6 +68,7 @@ class ResultsAdvisorAgent:
         except Exception:
             return self._fallback(context)
 
+        self.last_response = content
         return (content or "").strip()
 
     def generate_insights(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -135,6 +139,7 @@ class ResultsAdvisorAgent:
             "recommendations": recommendations,
             "summary_lines": summary_lines,
         }
+        self.last_response = insights
         if not summary_lines and metrics_summary:
             summary_lines.append("Metrics artifact available; review key performance indicators.")
         if not summary_lines:

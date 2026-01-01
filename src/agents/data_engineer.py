@@ -21,6 +21,8 @@ class DataEngineerAgent:
             timeout=None,
         )
         self.model_name = "deepseek-reasoner"
+        self.last_prompt = None
+        self.last_response = None
 
     def generate_cleaning_script(
         self,
@@ -97,6 +99,7 @@ class DataEngineerAgent:
             execution_contract_json=contract_json,
             data_engineer_runbook=de_runbook_json,
         )
+        self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE
 
         from src.utils.retries import call_with_retries
 
@@ -112,6 +115,7 @@ class DataEngineerAgent:
             )
 
             content = response.choices[0].message.content
+            self.last_response = content
             
              # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
             if "504 Gateway Time-out" in content or "<html" in content.lower():

@@ -57,6 +57,14 @@ from src.utils.data_engineer_preflight import data_engineer_preflight
 from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
 from src.utils.cleaning_executor import execute_cleaning_plan
 from src.utils.run_logger import init_run_log, log_run_event, finalize_run_log
+from src.utils.run_bundle import (
+    init_run_bundle,
+    log_agent_snapshot,
+    log_sandbox_attempt,
+    copy_run_artifacts,
+    copy_run_contracts,
+    write_run_manifest,
+)
 from src.utils.dataset_memory import (
     fingerprint_dataset,
     load_dataset_memory,
@@ -3119,6 +3127,20 @@ def run_steward(state: AgentState) -> AgentState:
     dataset_fingerprint = fingerprint_dataset(csv_path)
     memory_entries = load_dataset_memory()
     memory_context = summarize_memory(memory_entries, dataset_fingerprint)
+    init_run_bundle(run_id, state)
+    agent_models = {
+        "steward": getattr(getattr(steward, "model", None), "model_name", None),
+        "strategist": getattr(getattr(strategist, "model", None), "model_name", None),
+        "domain_expert": getattr(domain_expert, "model_name", None),
+        "execution_planner": getattr(execution_planner, "model_name", None),
+        "data_engineer": getattr(data_engineer, "model_name", None),
+        "cleaning_reviewer": getattr(cleaning_reviewer, "model_name", None),
+        "ml_engineer": getattr(ml_engineer, "model_name", None),
+        "reviewer": getattr(reviewer, "model_name", None),
+        "qa_reviewer": getattr(qa_reviewer, "model_name", None),
+        "results_advisor": getattr(results_advisor, "model_name", None),
+        "translator": getattr(translator, "model_name", None),
+    }
     init_run_log(
         run_id,
         {
@@ -3176,6 +3198,13 @@ def run_steward(state: AgentState) -> AgentState:
         "steward_complete",
         {"summary_len": len(summary or ""), "encoding": encoding, "sep": sep, "decimal": decimal},
     )
+    log_agent_snapshot(
+        run_id,
+        "steward",
+        prompt=getattr(steward, "last_prompt", None),
+        response=getattr(steward, "last_response", None) or result,
+        context={"csv_path": csv_path, "business_objective": state.get("business_objective") if state else ""},
+    )
 
     # Initialize loop variables
     budget_state = _ensure_budget_state(state or {})
@@ -3206,6 +3235,7 @@ def run_steward(state: AgentState) -> AgentState:
         "dataset_memory_context": memory_context,
         "run_budget": budget_state.get("run_budget", {}),
         "budget_counters": budget_state.get("budget_counters", {}),
+        "agent_models": agent_models,
     }
     if isinstance(result, dict):
         if "profile" in result:
@@ -3223,6 +3253,15 @@ def run_strategist(state: AgentState) -> AgentState:
     # Strategist now returns a dict with "strategies": [list of 3]
     user_context = state.get("strategist_context_override") or state.get("business_objective", "")
     result = strategist.generate_strategies(state['data_summary'], user_context)
+    run_id = state.get("run_id")
+    if run_id:
+        log_agent_snapshot(
+            run_id,
+            "strategist",
+            prompt=getattr(strategist, "last_prompt", None),
+            response=getattr(strategist, "last_response", None) or result,
+            context={"data_summary": state.get("data_summary", ""), "user_context": user_context},
+        )
     strategies_list = result.get('strategies', [])
     strategy_spec = result.get("strategy_spec", {})
     
@@ -3265,6 +3304,19 @@ def run_domain_expert(state: AgentState) -> AgentState:
     # Deliberation Step
     evaluation = domain_expert.evaluate_strategies(data_summary, business_objective, strategies_list)
     reviews = evaluation.get('reviews', [])
+    run_id = state.get("run_id")
+    if run_id:
+        log_agent_snapshot(
+            run_id,
+            "domain_expert",
+            prompt=getattr(domain_expert, "last_prompt", None),
+            response=getattr(domain_expert, "last_response", None) or evaluation,
+            context={
+                "data_summary": data_summary,
+                "business_objective": business_objective,
+                "strategy_count": len(strategies_list) if isinstance(strategies_list, list) else 0,
+            },
+        )
     
     # Selection Logic
     best_strategy = None
@@ -3409,6 +3461,14 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 result["max_runtime_fix_attempts"] = max(1, int(runtime_fix_max))
             except Exception:
                 pass
+    if run_id:
+        log_agent_snapshot(
+            run_id,
+            "execution_planner",
+            prompt=getattr(execution_planner, "last_prompt", None),
+            response=getattr(execution_planner, "last_response", None) or result,
+            context={"strategy": strategy, "business_objective": business_objective},
+        )
     return result
 
 
@@ -3506,6 +3566,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
             f_art.write(code)
     except Exception as art_err:
         print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
+    if run_id:
+        log_agent_snapshot(
+            run_id,
+            "data_engineer",
+            prompt=getattr(data_engineer, "last_prompt", None),
+            response=getattr(data_engineer, "last_response", None) or code,
+            context=context_payload,
+            script=code,
+        )
 
     plan_payload = None
     is_plan = False
@@ -4408,6 +4477,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             json.dump(review_result, f_rep, indent=2, ensure_ascii=False)
                     except Exception:
                         pass
+                    if run_id:
+                        log_agent_snapshot(
+                            run_id,
+                            "cleaning_reviewer",
+                            prompt=getattr(cleaning_reviewer, "last_prompt", None),
+                            response=getattr(cleaning_reviewer, "last_response", None) or review_result,
+                            context=review_context,
+                            verdicts=review_result,
+                        )
 
                     if isinstance(review_result, dict) and review_result.get("status") == "REJECTED":
                         if not state.get("cleaning_reviewer_retry_done"):
@@ -4701,6 +4779,12 @@ def run_engineer(state: AgentState) -> AgentState:
     if isinstance(execution_contract, dict) and evaluation_spec and not execution_contract.get("evaluation_spec"):
         execution_contract["evaluation_spec"] = evaluation_spec
     contract_min = _build_contract_min(execution_contract, evaluation_spec)
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open("data/contract_min.json", "w", encoding="utf-8") as f_min:
+            json.dump(contract_min, f_min, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
     if not execution_contract:
         data_audit_context = _merge_de_audit_override(
             data_audit_context,
@@ -4942,6 +5026,16 @@ def run_engineer(state: AgentState) -> AgentState:
                 f_art.write(code)
         except Exception as artifact_err:
             print(f"Warning: failed to persist ml_engineer_last.py: {artifact_err}")
+        if run_id:
+            log_agent_snapshot(
+                run_id,
+                "ml_engineer",
+                prompt=getattr(ml_engineer, "last_prompt", None),
+                response=getattr(ml_engineer, "last_response", None) or code,
+                context=ctx_payload,
+                script=code,
+                attempt=int(state.get("iteration_count", 0)) + 1,
+            )
         try:
             iter_id = int(state.get("iteration_count", 0)) + 1
             os.makedirs(os.path.join("artifacts", "iterations"), exist_ok=True)
@@ -5099,6 +5193,15 @@ def run_reviewer(state: AgentState) -> AgentState:
 
         if run_id:
             log_run_event(run_id, "reviewer_complete", {"status": review.get("status")})
+        if run_id:
+            log_agent_snapshot(
+                run_id,
+                "reviewer",
+                prompt=getattr(reviewer, "last_prompt", None),
+                response=getattr(reviewer, "last_response", None) or review,
+                context={"analysis_type": analysis_type, "business_objective": business_objective},
+                verdicts=review,
+            )
         return {
             "review_verdict": review['status'],
             "review_feedback": review['feedback'],
@@ -5218,6 +5321,15 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             
         if run_id:
             log_run_event(run_id, "qa_reviewer_complete", {"status": status})
+        if run_id:
+            log_agent_snapshot(
+                run_id,
+                "qa_reviewer",
+                prompt=getattr(qa_reviewer, "last_prompt", None),
+                response=getattr(qa_reviewer, "last_response", None) or qa_result,
+                context={"business_objective": business_objective},
+                verdicts=qa_result,
+            )
         return {
             "review_verdict": "APPROVED",
             "feedback_history": current_history,
@@ -5618,12 +5730,23 @@ def execute_code(state: AgentState) -> AgentState:
             print("Running code in Sandbox...")
             execution = sandbox.run_code(code)
             
+            stdout_text = "\n".join(execution.logs.stdout or [])
+            stderr_text = "\n".join(execution.logs.stderr or [])
             output = ""
-            if execution.logs.stdout: output += "\nSTDOUT:\n" + "\n".join(execution.logs.stdout)
-            if execution.logs.stderr: output += "\nSTDERR:\n" + "\n".join(execution.logs.stderr)
+            if stdout_text:
+                output += "\nSTDOUT:\n" + stdout_text
+            if stderr_text:
+                output += "\nSTDERR:\n" + stderr_text
             
             if execution.error:
                 output += f"\n\nEXECUTION ERROR:\n{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+            outputs_listing: List[str] = []
+            try:
+                listing_proc = sandbox.commands.run("sh -lc 'find . -maxdepth 4 -type f 2>/dev/null'")
+                if listing_proc.exit_code == 0:
+                    outputs_listing = [p for p in listing_proc.stdout.splitlines() if p.strip()]
+            except Exception:
+                outputs_listing = []
 
             # Robust Artifact Download (P0 Fix)
             # Use shell command that always succeeds even if no files found
@@ -5684,6 +5807,18 @@ def execute_code(state: AgentState) -> AgentState:
                                 print(f"Downloaded required output: {local_path}")
                     except Exception as dl_err:
                         print(f"Warning: failed to download required output {remote_path}: {dl_err}")
+            attempt_id = int(state.get("execution_attempt", 0)) + 1
+            if run_id:
+                log_sandbox_attempt(
+                    run_id,
+                    attempt_id,
+                    code=code,
+                    stdout=stdout_text,
+                    stderr=stderr_text,
+                    outputs_listing=outputs_listing,
+                    exit_code=getattr(execution, "exit_code", None),
+                    error_tail=(execution.error.traceback if execution.error else None),
+                )
 
     except Exception as e:
         output = f"Sandbox Execution Failed: {e}"
@@ -6293,6 +6428,15 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     "RESULTS_ADVISOR:\n" + advice.strip(),
                 )
                 result_state["ml_results_advice"] = advice.strip()
+                run_id = state.get("run_id")
+                if run_id:
+                    log_agent_snapshot(
+                        run_id,
+                        "results_advisor",
+                        prompt=getattr(results_advisor, "last_prompt", None),
+                        response=getattr(results_advisor, "last_response", None) or advice,
+                        context=advisor_ctx,
+                    )
                 try:
                     os.makedirs("artifacts", exist_ok=True)
                     with open(os.path.join("artifacts", "ml_results_advisor.txt"), "w", encoding="utf-8") as f_adv:
@@ -6323,6 +6467,15 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         }
         insights = results_advisor.generate_insights(insights_context)
         if insights:
+            run_id = state.get("run_id")
+            if run_id:
+                log_agent_snapshot(
+                    run_id,
+                    "results_advisor",
+                    prompt=getattr(results_advisor, "last_prompt", None),
+                    response=getattr(results_advisor, "last_response", None) or insights,
+                    context=insights_context,
+                )
             try:
                 os.makedirs("data", exist_ok=True)
                 with open("data/insights.json", "w", encoding="utf-8") as f_insights:
@@ -6621,6 +6774,18 @@ def run_translator(state: AgentState) -> AgentState:
         
         Please check the logs for more details.
         """
+    if run_id:
+        log_agent_snapshot(
+            run_id,
+            "translator",
+            prompt=getattr(translator, "last_prompt", None),
+            response=getattr(translator, "last_response", None) or report,
+            context={
+                "error_message": report_error,
+                "has_partial_visuals": report_has_partial,
+                "plot_count": len(report_plots) if isinstance(report_plots, list) else 0,
+            },
+        )
         
     try:
         os.makedirs("data", exist_ok=True)
@@ -6659,6 +6824,28 @@ def run_translator(state: AgentState) -> AgentState:
         if run_id:
             finalize_run_log(run_id, summary)
             log_run_event(run_id, "translator_complete", {"report_len": len(report or "")})
+            copy_run_contracts(
+                run_id,
+                [
+                    "data/execution_contract.json",
+                    "data/evaluation_spec.json",
+                    "data/artifact_index.json",
+                    "data/contract_min.json",
+                ],
+            )
+            copy_run_artifacts(
+                run_id,
+                [
+                    "data",
+                    "analysis",
+                    "models",
+                    "plots",
+                    "report",
+                    "reports",
+                    os.path.join("static", "plots"),
+                ],
+            )
+            write_run_manifest(run_id, state)
     except Exception:
         pass
     return {"final_report": report}

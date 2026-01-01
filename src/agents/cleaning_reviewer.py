@@ -27,6 +27,8 @@ class CleaningReviewerAgent:
                 timeout=None,
             )
         self.model_name = "mimo-v2-flash"
+        self.last_prompt = None
+        self.last_response = None
 
     def review_cleaning(self, context: Dict[str, Any]) -> Dict[str, Any]:
         if not self.client:
@@ -78,6 +80,7 @@ class CleaningReviewerAgent:
             + json.dumps(context, ensure_ascii=False) + "\n\n"
             + output_format
         )
+        self.last_prompt = system_prompt + "\n\n" + user_prompt
 
         def _call_model():
             response = self.client.chat.completions.create(
@@ -93,6 +96,7 @@ class CleaningReviewerAgent:
 
         try:
             content = call_with_retries(_call_model, max_retries=2)
+            self.last_response = content
             result = json.loads(content)
         except Exception:
             return {
