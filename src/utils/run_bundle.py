@@ -115,8 +115,9 @@ def init_run_bundle(
     state: Optional[Dict[str, Any]] = None,
     base_dir: str = RUNS_DIR,
     enable_tee: bool = True,
+    run_dir: Optional[str] = None,
 ) -> str:
-    run_dir = os.path.join(base_dir, run_id)
+    run_dir = run_dir or os.path.join(base_dir, run_id)
     _ensure_dir(run_dir)
     for sub in ["contracts", "agents", "sandbox", "artifacts"]:
         _ensure_dir(os.path.join(run_dir, sub))
@@ -242,10 +243,14 @@ def copy_run_contracts(run_id: str, sources: List[str]) -> None:
             pass
 
 
-def write_run_manifest(run_id: str, state: Dict[str, Any]) -> Optional[str]:
-    run_dir = get_run_dir(run_id)
-    if not run_dir:
-        return None
+def write_run_manifest(
+    run_id: str,
+    state: Dict[str, Any],
+    status_final: Optional[str] = None,
+    started_at: Optional[str] = None,
+    ended_at: Optional[str] = None,
+) -> Optional[str]:
+    run_dir = get_run_dir(run_id) or os.path.join(RUNS_DIR, "latest")
     csv_path = state.get("csv_path") or ""
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract") or {}
     evaluation_spec = _safe_load_json("data/evaluation_spec.json") or state.get("evaluation_spec") or {}
@@ -255,39 +260,49 @@ def write_run_manifest(run_id: str, state: Dict[str, Any]) -> Optional[str]:
     required_outputs = _normalize_required_outputs(contract)
     produced_outputs = _normalize_produced_outputs(artifact_index)
 
-    manifest = {
-        "run_id": run_id,
-        "timestamps": {
-            "start": state.get("run_start_ts"),
-            "end": datetime.utcnow().isoformat(),
-        },
-        "git_commit": _git_commit(),
-        "input": {
-            "path": csv_path,
-            "sha256": _hash_file(csv_path),
-            "dialect": {
-                "encoding": state.get("csv_encoding"),
-                "sep": state.get("csv_sep"),
-                "decimal": state.get("csv_decimal"),
-            },
-        },
-        "models_by_agent": state.get("agent_models", {}),
-        "required_outputs": required_outputs,
-        "produced_outputs": produced_outputs,
-        "required_outputs_missing": output_contract.get("missing", []),
-        "gates_summary": {
-            "status": run_summary.get("status") or state.get("review_verdict"),
-            "failed_gates": run_summary.get("failed_gates", []) if isinstance(run_summary, dict) else [],
-            "last_gate_context": state.get("last_gate_context", {}),
-        },
-        "sandbox_attempts": _RUN_ATTEMPTS.get(run_id, []),
-        "contracts": {
-            "execution_contract": bool(contract),
-            "evaluation_spec": bool(evaluation_spec),
-            "artifact_index": bool(artifact_index),
-            "contract_min": os.path.exists("data/contract_min.json"),
-        },
-    }
     manifest_path = os.path.join(run_dir, "run_manifest.json")
+    existing = _safe_load_json(manifest_path)
+    existing_dict = existing if isinstance(existing, dict) else {}
+
+    gates_summary = {
+        "status": run_summary.get("status") or state.get("review_verdict"),
+        "failed_gates": run_summary.get("failed_gates", []) if isinstance(run_summary, dict) else [],
+        "reason": (state.get("last_gate_context") or {}).get("feedback"),
+    }
+
+    manifest = dict(existing_dict)
+    existing_input = existing_dict.get("input")
+    if not csv_path and isinstance(existing_input, dict):
+        csv_path = existing_input.get("path") or ""
+    manifest.update(
+        {
+            "run_id": run_id,
+            "started_at": started_at or existing_dict.get("started_at") or state.get("run_start_ts"),
+            "ended_at": ended_at or datetime.utcnow().isoformat(),
+            "git_commit": _git_commit(),
+            "input": {
+                "path": csv_path,
+                "sha256": _hash_file(csv_path) or (existing_input or {}).get("sha256"),
+                "dialect": {
+                    "encoding": state.get("csv_encoding") or (existing_input or {}).get("dialect", {}).get("encoding"),
+                    "sep": state.get("csv_sep") or (existing_input or {}).get("dialect", {}).get("sep"),
+                    "decimal": state.get("csv_decimal") or (existing_input or {}).get("dialect", {}).get("decimal"),
+                },
+            },
+            "models_by_agent": state.get("agent_models", {}) or existing_dict.get("models_by_agent", {}),
+            "required_outputs": required_outputs,
+            "produced_outputs": produced_outputs,
+            "sandbox_attempts": _RUN_ATTEMPTS.get(run_id, []),
+            "required_outputs_missing": output_contract.get("missing", []),
+            "status_final": status_final or existing_dict.get("status_final") or gates_summary.get("status"),
+            "gates_summary": gates_summary,
+            "contracts": {
+                "execution_contract": bool(contract),
+                "evaluation_spec": bool(evaluation_spec),
+                "artifact_index": bool(artifact_index),
+                "contract_min": os.path.exists("data/contract_min.json"),
+            },
+        }
+    )
     _write_json(manifest_path, manifest)
     return manifest_path

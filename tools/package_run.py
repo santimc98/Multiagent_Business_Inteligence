@@ -1,10 +1,38 @@
 import argparse
+import json
 import os
 import sys
 import zipfile
 
+from src.utils.run_storage import apply_retention
+
+
+def _latest_dir(runs_dir: str) -> str:
+    return os.path.join(runs_dir, "latest")
+
+
+def _read_status(manifest_path: str) -> str | None:
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload.get("status_final")
+    except Exception:
+        return None
+
+
+def _read_run_id(manifest_path: str) -> str | None:
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload.get("run_id")
+    except Exception:
+        return None
+
 
 def _find_latest_run(runs_dir: str) -> str | None:
+    latest_dir = _latest_dir(runs_dir)
+    if os.path.isdir(latest_dir):
+        return "latest"
     if not os.path.isdir(runs_dir):
         return None
     candidates = []
@@ -25,10 +53,12 @@ def _find_latest_run(runs_dir: str) -> str | None:
 
 
 def _zip_run(run_id: str, runs_dir: str) -> str:
-    run_dir = os.path.join(runs_dir, run_id)
+    run_dir = _latest_dir(runs_dir) if run_id == "latest" else os.path.join(runs_dir, run_id)
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
-    zip_name = f"run_{run_id}.zip"
+    manifest_path = os.path.join(run_dir, "run_manifest.json")
+    actual_id = _read_run_id(manifest_path) or run_id
+    zip_name = f"run_{actual_id}.zip"
     zip_path = os.path.abspath(zip_name)
     base_dir = os.path.abspath(os.path.dirname(run_dir))
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -45,6 +75,7 @@ def main() -> int:
     parser.add_argument("--latest", action="store_true", help="Package the most recent run.")
     parser.add_argument("--run-id", default="", help="Package a specific run id.")
     parser.add_argument("--runs-dir", default="runs", help="Runs directory path.")
+    parser.add_argument("--archive-on-fail", action="store_true", help="Move zip into runs/archive when status_final != PASS.")
     args = parser.parse_args()
 
     run_id = args.run_id
@@ -59,6 +90,20 @@ def main() -> int:
     except Exception as exc:
         print(f"Failed to package run: {exc}")
         return 1
+
+    if args.archive_on_fail:
+        run_dir = _latest_dir(args.runs_dir) if run_id == "latest" else os.path.join(args.runs_dir, run_id)
+        status = _read_status(os.path.join(run_dir, "run_manifest.json"))
+        if status and str(status).upper() != "PASS":
+            archive_dir = os.path.join(args.runs_dir, "archive")
+            os.makedirs(archive_dir, exist_ok=True)
+            dest = os.path.join(archive_dir, os.path.basename(zip_path))
+            try:
+                os.replace(zip_path, dest)
+                zip_path = dest
+            except Exception:
+                pass
+            apply_retention(keep_last=5, archive_dir=archive_dir)
 
     print(f"Created {zip_path}")
     return 0

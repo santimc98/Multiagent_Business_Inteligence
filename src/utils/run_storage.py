@@ -1,0 +1,167 @@
+import json
+import os
+import shutil
+import zipfile
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from src.utils.run_bundle import write_run_manifest
+
+RUNS_DIR = "runs"
+LATEST_DIR = os.path.join(RUNS_DIR, "latest")
+ARCHIVE_DIR = os.path.join(RUNS_DIR, "archive")
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _safe_load_json(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def init_run_dir(run_id: str, started_at: Optional[str] = None, runs_dir: str = RUNS_DIR) -> str:
+    latest_dir = os.path.join(runs_dir, "latest")
+    if os.path.exists(latest_dir):
+        shutil.rmtree(latest_dir, ignore_errors=True)
+    for sub in ["contracts", "agents", "sandbox", "artifacts"]:
+        _ensure_dir(os.path.join(latest_dir, sub))
+    write_manifest_partial(
+        run_id=run_id,
+        manifest_path=os.path.join(latest_dir, "run_manifest.json"),
+        started_at=started_at,
+    )
+    return latest_dir
+
+
+def write_manifest_partial(
+    run_id: str,
+    manifest_path: str | None = None,
+    started_at: Optional[str] = None,
+    ended_at: Optional[str] = None,
+    input_info: Optional[Dict[str, Any]] = None,
+    agent_models: Optional[Dict[str, Any]] = None,
+    status_final: Optional[str] = None,
+) -> None:
+    path = manifest_path or os.path.join(LATEST_DIR, "run_manifest.json")
+    payload = _safe_load_json(path)
+    payload.setdefault("run_id", run_id)
+    if started_at:
+        payload["started_at"] = started_at
+    if ended_at:
+        payload["ended_at"] = ended_at
+    if input_info:
+        payload["input"] = input_info
+    if agent_models:
+        payload["models_by_agent"] = agent_models
+    if status_final:
+        payload["status_final"] = status_final
+    _ensure_dir(os.path.dirname(path))
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def normalize_status(status: str | None) -> str:
+    if not status:
+        return "CRASH"
+    upper = str(status).upper()
+    if upper in {"APPROVED", "APPROVE_WITH_WARNINGS", "PASS"}:
+        return "PASS"
+    if upper in {"NEEDS_IMPROVEMENT"}:
+        return "NEEDS_IMPROVEMENT"
+    if upper in {"REJECTED"}:
+        return "REJECTED"
+    if upper in {"FAIL", "FAILED"}:
+        return "FAIL"
+    if "CRASH" in upper:
+        return "CRASH"
+    return upper
+
+
+def finalize_run(
+    run_id: str,
+    status_final: str,
+    state: Optional[Dict[str, Any]] = None,
+    keep_last: int = 5,
+    runs_dir: str = RUNS_DIR,
+) -> None:
+    latest_dir = os.path.join(runs_dir, "latest")
+    _ensure_dir(os.path.join(runs_dir, "archive"))
+    status_final = normalize_status(status_final)
+    ended_at = datetime.utcnow().isoformat()
+    write_run_manifest(
+        run_id,
+        state or {},
+        status_final=status_final,
+        started_at=(state or {}).get("run_start_ts"),
+        ended_at=ended_at,
+    )
+    if status_final != "PASS":
+        _archive_latest(run_id, latest_dir, os.path.join(runs_dir, "archive"))
+        apply_retention(keep_last=keep_last, archive_dir=os.path.join(runs_dir, "archive"))
+
+
+def _archive_latest(run_id: str, latest_dir: str, archive_dir: str) -> Optional[str]:
+    if not os.path.isdir(latest_dir):
+        return None
+    _ensure_dir(archive_dir)
+    zip_name = f"run_{run_id}.zip"
+    zip_path = os.path.join(archive_dir, zip_name)
+    base_dir = os.path.abspath(os.path.dirname(latest_dir))
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(latest_dir):
+            for file in files:
+                path = os.path.join(root, file)
+                arcname = os.path.relpath(path, base_dir)
+                zf.write(path, arcname)
+    return zip_path
+
+
+def apply_retention(keep_last: int = 5, archive_dir: str = ARCHIVE_DIR) -> None:
+    if keep_last is None or keep_last <= 0:
+        return
+    if not os.path.isdir(archive_dir):
+        return
+    entries = []
+    for name in os.listdir(archive_dir):
+        if not name.endswith(".zip"):
+            continue
+        path = os.path.join(archive_dir, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            continue
+        entries.append((mtime, path))
+    entries.sort(reverse=True)
+    for _, path in entries[keep_last:]:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def clean_workspace_outputs() -> None:
+    for folder in ["analysis", "models", "reports", os.path.join("static", "plots")]:
+        if os.path.isdir(folder):
+            try:
+                shutil.rmtree(folder, ignore_errors=True)
+            except Exception:
+                pass
+    for path in [
+        os.path.join("data", "metrics.json"),
+        os.path.join("data", "scored_rows.csv"),
+        os.path.join("data", "alignment_check.json"),
+        os.path.join("data", "output_contract_report.json"),
+    ]:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass

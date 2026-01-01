@@ -65,6 +65,13 @@ from src.utils.run_bundle import (
     copy_run_contracts,
     write_run_manifest,
 )
+from src.utils.run_storage import (
+    init_run_dir,
+    write_manifest_partial,
+    finalize_run,
+    clean_workspace_outputs,
+    normalize_status,
+)
 from src.utils.dataset_memory import (
     fingerprint_dataset,
     load_dataset_memory,
@@ -111,6 +118,10 @@ def _abort_if_requested(state: Dict[str, Any], stage: str) -> Dict[str, Any] | N
     run_id = state.get("run_id") if isinstance(state, dict) else None
     if run_id:
         log_run_event(run_id, "abort_requested", {"stage": stage})
+        try:
+            finalize_run(run_id, status_final="CRASH", state=state)
+        except Exception:
+            pass
     return {
         "error_message": "ABORTED_BY_USER",
         "cleaned_data_preview": "Error: Aborted",
@@ -2575,6 +2586,18 @@ def _hash_json(payload: Any) -> str | None:
     except Exception:
         return None
 
+def _hash_file(path: str) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
 def _extract_weights_from_obj(obj: Any) -> Dict[str, float]:
     if not isinstance(obj, dict):
         return {}
@@ -3116,6 +3139,7 @@ def run_steward(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "steward")
     if abort_state:
         return abort_state
+    clean_workspace_outputs()
     _cleanup_run_artifacts()
     run_id = state.get("run_id") if state else None
     if not run_id:
@@ -3127,7 +3151,8 @@ def run_steward(state: AgentState) -> AgentState:
     dataset_fingerprint = fingerprint_dataset(csv_path)
     memory_entries = load_dataset_memory()
     memory_context = summarize_memory(memory_entries, dataset_fingerprint)
-    init_run_bundle(run_id, state)
+    run_dir = init_run_dir(run_id, started_at=run_start_ts)
+    init_run_bundle(run_id, state, run_dir=run_dir)
     agent_models = {
         "steward": getattr(getattr(steward, "model", None), "model_name", None),
         "strategist": getattr(getattr(strategist, "model", None), "model_name", None),
@@ -3169,6 +3194,15 @@ def run_steward(state: AgentState) -> AgentState:
     encoding = result.get('encoding', 'utf-8')
     sep = result.get('sep', ',')
     decimal = result.get('decimal', '.')
+    write_manifest_partial(
+        run_id=run_id,
+        input_info={
+            "path": csv_path,
+            "sha256": _hash_file(csv_path),
+            "dialect": {"encoding": encoding, "sep": sep, "decimal": decimal},
+        },
+        agent_models=agent_models,
+    )
 
     try:
         os.makedirs("data", exist_ok=True)
@@ -5600,6 +5634,7 @@ def execute_code(state: AgentState) -> AgentState:
         log_run_event(run_id, "execution_start", {})
     exec_start_ts = time.time()
     code = state['generated_code']
+    attempt_id = int(state.get("execution_attempt", 0)) + 1
 
     # Prevent stale metrics from previous iterations
     try:
@@ -5657,6 +5692,7 @@ def execute_code(state: AgentState) -> AgentState:
         os.environ["E2B_API_KEY"] = api_key 
         
         with Sandbox.create() as sandbox:
+            run_root = f"/home/user/run/{run_id}/attempt_{attempt_id}"
             print("Installing dependencies in Sandbox...")
             pkg_sets = get_sandbox_install_packages(required_deps)
             base_cmd = "pip install -q " + " ".join(pkg_sets["base"])
@@ -5664,19 +5700,14 @@ def execute_code(state: AgentState) -> AgentState:
             if pkg_sets["extra"]:
                 extra_cmd = "pip install -q " + " ".join(pkg_sets["extra"])
                 sandbox.commands.run(extra_cmd)
-            sandbox.commands.run("mkdir -p static/plots") # Ensure plots dir exists
-            sandbox.commands.run("mkdir -p data") # Ensure data dir exists for outputs
-            sandbox.commands.run(
-                "rm -rf analysis models static/plots "
-                "data/metrics.json data/scored_rows.csv data/alignment_check.json "
-                "data/output_contract_report.json data/qa_static_facts.json "
-                "data/weights.json data/case_summary.csv"
-            )
+            sandbox.commands.run(f"rm -rf {run_root}")
+            sandbox.commands.run(f"mkdir -p {run_root}/static/plots")
+            sandbox.commands.run(f"mkdir -p {run_root}/data")
             
             local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
             if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
                 local_csv = "data/cleaned_data.csv"
-            remote_csv = "/home/user/data.csv"
+            remote_csv = f"{run_root}/data.csv"
             
             if os.path.exists(local_csv):
                 with open(local_csv, "rb") as f:
@@ -5695,7 +5726,7 @@ def execute_code(state: AgentState) -> AgentState:
                 
                 # Manifest Round-trip (Upload & Patch)
                 local_manifest = "data/cleaning_manifest.json"
-                remote_manifest = "/home/user/cleaning_manifest.json"
+                remote_manifest = f"{run_root}/cleaning_manifest.json"
                 
                 if os.path.exists(local_manifest):
                     with open(local_manifest, "rb") as f:
@@ -5719,6 +5750,13 @@ def execute_code(state: AgentState) -> AgentState:
             else:
                 print("Warning: Local cleaned data not found. Upload skipped.")
 
+            working_dir_injection = (
+                "import os\n"
+                f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
+                f"os.chdir(r\"{run_root}\")\n"
+            )
+            code = working_dir_injection + code
+
             # Persist executed ML script for traceability
             try:
                 os.makedirs("artifacts", exist_ok=True)
@@ -5740,17 +5778,10 @@ def execute_code(state: AgentState) -> AgentState:
             
             if execution.error:
                 output += f"\n\nEXECUTION ERROR:\n{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
-            outputs_listing: List[str] = []
-            try:
-                listing_proc = sandbox.commands.run("sh -lc 'find . -maxdepth 4 -type f 2>/dev/null'")
-                if listing_proc.exit_code == 0:
-                    outputs_listing = [p for p in listing_proc.stdout.splitlines() if p.strip()]
-            except Exception:
-                outputs_listing = []
 
             # Robust Artifact Download (P0 Fix)
             # Use shell command that always succeeds even if no files found
-            ls_proc = sandbox.commands.run("sh -lc 'ls -1 static/plots/*.png 2>/dev/null || true'")
+            ls_proc = sandbox.commands.run(f"sh -lc 'ls -1 {run_root}/static/plots/*.png 2>/dev/null || true'")
             
             if ls_proc.exit_code == 0:
                 os.makedirs("static/plots", exist_ok=True)
@@ -5783,7 +5814,11 @@ def execute_code(state: AgentState) -> AgentState:
             for pattern in req_outputs:
                 if not pattern:
                     continue
-                list_cmd = f"sh -lc 'ls -1 {pattern} 2>/dev/null || true'"
+                if pattern.startswith("/"):
+                    remote_pattern = pattern
+                else:
+                    remote_pattern = f"{run_root}/{pattern}"
+                list_cmd = f"sh -lc 'ls -1 {remote_pattern} 2>/dev/null || true'"
                 lst = sandbox.commands.run(list_cmd)
                 if lst.exit_code != 0:
                     continue
@@ -5797,7 +5832,9 @@ def execute_code(state: AgentState) -> AgentState:
                             b64_content = proc.stdout.strip()
                             content = base64.b64decode(b64_content)
                             if len(content) >= 0:
-                                if remote_path.startswith("/home/user/"):
+                                if remote_path.startswith(run_root):
+                                    local_path = remote_path[len(run_root):].lstrip("/")
+                                elif remote_path.startswith("/home/user/"):
                                     local_path = remote_path[len("/home/user/"):].lstrip("/")
                                 else:
                                     local_path = remote_path.lstrip("/")
@@ -5807,7 +5844,14 @@ def execute_code(state: AgentState) -> AgentState:
                                 print(f"Downloaded required output: {local_path}")
                     except Exception as dl_err:
                         print(f"Warning: failed to download required output {remote_path}: {dl_err}")
-            attempt_id = int(state.get("execution_attempt", 0)) + 1
+            list_cmd = f"sh -lc 'cd {run_root} && find . -maxdepth 5 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+            outputs_listing = []
+            try:
+                listing_proc = sandbox.commands.run(list_cmd)
+                if listing_proc.exit_code == 0:
+                    outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
+            except Exception:
+                outputs_listing = []
             if run_id:
                 log_sandbox_attempt(
                     run_id,
@@ -6845,7 +6889,8 @@ def run_translator(state: AgentState) -> AgentState:
                     os.path.join("static", "plots"),
                 ],
             )
-            write_run_manifest(run_id, state)
+            status_final = normalize_status(summary.get("status") if isinstance(summary, dict) else None)
+            finalize_run(run_id, status_final=status_final, state=state)
     except Exception:
         pass
     return {"final_report": report}
