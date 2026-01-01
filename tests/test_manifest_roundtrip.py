@@ -9,7 +9,8 @@ def test_manifest_roundtrip_upload():
     state = {
         "generated_code": "import pandas as pd\n# Load Data\ndf = pd.read_csv('data/cleaned_data.csv')",
         "execution_output": "",
-        "execution_attempt": 1
+        "execution_attempt": 1,
+        "run_id": "testrun"
     }
     
     # Mock Sandbox and File Ops
@@ -38,15 +39,16 @@ def test_manifest_roundtrip_upload():
         # ASSERTIONS
         
         # 1. Verify Upload Call
-        # Should upload manifest to /home/user/cleaning_manifest.json
-        mock_instance.files.write.assert_any_call("/home/user/cleaning_manifest.json", mock_file())
+        # Should upload manifest to /home/user/run/<run_id>/attempt_<k>/cleaning_manifest.json
+        expected_manifest = "/home/user/run/testrun/attempt_2/cleaning_manifest.json"
+        mock_instance.files.write.assert_any_call(expected_manifest, mock_file())
         
         # 2. Verify Code Patching
         # The code passed to run_code should have the remote path
         args, _ = mock_instance.run_code.call_args
         executed_code = args[0]
         
-        assert "/home/user/cleaning_manifest.json" in executed_code
+        assert expected_manifest in executed_code
         # Ensure older path is NOT present if we replaced it (assuming input had it)
         # But input didn't have it in this simple string. Let's make input have it
         
@@ -55,7 +57,8 @@ def test_manifest_patching_logic():
         "generated_code": "import json\nimport pandas as pd\nmd = json.load(open('data/cleaning_manifest.json'))\ndf = pd.read_csv('./data/cleaned_data.csv')",
         "execution_output": "",
         "execution_attempt": 1,
-        "csv_path": "data/dummy.csv" # Required by checks? No, but maybe.
+        "csv_path": "data/dummy.csv", # Required by checks? No, but maybe.
+        "run_id": "testrun"
     }
     
     with patch("src.graph.graph.Sandbox") as MockSandbox, \
@@ -81,5 +84,6 @@ def test_manifest_patching_logic():
         args, _ = mock_instance.run_code.call_args
         executed_code = args[0]
         
-        assert "/home/user/cleaning_manifest.json" in executed_code
+        expected_manifest = "/home/user/run/testrun/attempt_2/cleaning_manifest.json"
+        assert expected_manifest in executed_code
         assert "data/cleaning_manifest.json" not in executed_code # Replaced

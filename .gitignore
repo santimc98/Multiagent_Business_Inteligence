@@ -28,6 +28,8 @@ static/plots/*.png
 final_report_*.pdf
 changes.patch
 logs/
+diff.patch
+run_bundle.zip
 
 # Data artifacts (keep raw fixtures and other CSVs)
 data/cleaned_data.csv
@@ -52,8 +54,19 @@ data/run_summary.json
 data/governance_report.json
 data/data_adequacy_report.json
 data/dataset_memory.json
+data/artifact_index.json
+data/dataset_profile.json
+data/executive_summary.md
+data/insights.json
+data/plan.json
+data/qa_static_facts.json
+data/strategy_spec.json
+data/contract_min.json
 
 # local artifacts
 /data/case_alignment_report.json
 /tatic/
+models/
+plots/
+reports/
 
