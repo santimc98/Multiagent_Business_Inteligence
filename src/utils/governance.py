@@ -90,10 +90,14 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
             "threshold_reached": data_adequacy.get("threshold_reached"),
             "quality_gates_alignment": alignment_summary,
         }
+    warnings = []
+    if state.get("qa_budget_exceeded"):
+        warnings.append("QA_INCOMPLETE: QA budget exceeded; QA audit skipped.")
     return {
         "run_id": state.get("run_id"),
         "status": status,
         "failed_gates": list(dict.fromkeys(failed_gates)),
+        "warnings": warnings,
         "budget_counters": state.get("budget_counters", {}),
         "data_adequacy": adequacy_summary,
         "alignment_check": {

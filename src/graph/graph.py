@@ -742,6 +742,17 @@ def _resolve_allowed_columns_for_gate(
         "label",
     ]
     allowed.extend(extra_allowed)
+    schema = contract.get("artifact_schemas") if isinstance(contract, dict) else None
+    if not isinstance(schema, dict):
+        spec = contract.get("spec_extraction") if isinstance(contract, dict) else None
+        if isinstance(spec, dict):
+            schema = spec.get("artifact_schemas")
+    if isinstance(schema, dict):
+        scored_schema = schema.get("data/scored_rows.csv")
+        if isinstance(scored_schema, dict):
+            extra_cols = scored_schema.get("allowed_extra_columns")
+            if isinstance(extra_cols, list):
+                allowed.extend([str(col) for col in extra_cols if col])
 
     seen: set[str] = set()
     deduped: List[str] = []
@@ -752,6 +763,22 @@ def _resolve_allowed_columns_for_gate(
         seen.add(norm)
         deduped.append(col)
     return deduped
+
+def _resolve_allowed_patterns_for_gate(contract: Dict[str, Any]) -> List[str]:
+    patterns: List[str] = []
+    if isinstance(contract, dict):
+        schema = contract.get("artifact_schemas")
+        if not isinstance(schema, dict):
+            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else None
+            if isinstance(spec, dict):
+                schema = spec.get("artifact_schemas")
+        if isinstance(schema, dict):
+            scored_schema = schema.get("data/scored_rows.csv")
+            if isinstance(scored_schema, dict):
+                allowed_patterns = scored_schema.get("allowed_name_patterns")
+                if isinstance(allowed_patterns, list):
+                    patterns.extend([str(pat) for pat in allowed_patterns if isinstance(pat, str) and pat.strip()])
+    return patterns
 
 def _resolve_contract_columns_for_cleaning(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
     if not contract or not isinstance(contract, dict):
@@ -1330,6 +1357,9 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "SYNTHETIC_DATA_DETECTED": [
             "Remove synthetic data generation; load and use the provided cleaned dataset only.",
         ],
+        "DATAFRAME_LITERAL_OVERWRITE": [
+            "Do not overwrite df/data with pd.DataFrame literals; always load from the cleaned CSV.",
+        ],
         "ALIGNMENT_REQUIREMENTS_MISSING": [
             "Populate alignment_check.json with per-requirement status + evidence list.",
         ],
@@ -1353,6 +1383,12 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         ],
         "UNKNOWN_COLUMNS_REFERENCED": [
             "Remove invented columns and only reference columns from the cleaned dataset / contract mapping.",
+        ],
+        "IMPUTER_REQUIRED": [
+            "Include SimpleImputer in the preprocessing pipeline before modeling.",
+        ],
+        "BASELINE_REQUIRED": [
+            "Add a DummyClassifier/DummyRegressor baseline and report its metric for lift.",
         ],
         "CALIBRATED_IMPORTANCE_UNSUPPORTED": [
             "Avoid feature_importances_/base_estimator on CalibratedClassifierCV; use coef_ or skip importances.",
@@ -1485,16 +1521,33 @@ def _ensure_budget_state(state: Dict[str, Any]) -> Dict[str, Any]:
     counters = dict(state.get("budget_counters") or {})
     for key in ["de_calls", "ml_calls", "reviewer_calls", "qa_calls", "execution_calls"]:
         counters.setdefault(key, 0)
+    limit_map = {
+        "de_calls": "max_de_calls",
+        "ml_calls": "max_ml_calls",
+        "reviewer_calls": "max_reviewer_calls",
+        "qa_calls": "max_qa_calls",
+        "execution_calls": "max_execution_calls",
+    }
+    for counter_key, limit_key in limit_map.items():
+        limit = budget.get(limit_key, DEFAULT_RUN_BUDGET.get(limit_key))
+        if limit is None:
+            continue
+        try:
+            if counters.get(counter_key, 0) > int(limit):
+                counters[counter_key] = int(limit)
+        except Exception:
+            continue
     return {"run_budget": budget, "budget_counters": counters}
 
 def _consume_budget(state: Dict[str, Any], counter_key: str, limit_key: str, label: str):
     budget = state.get("run_budget") or DEFAULT_RUN_BUDGET
     counters = dict(state.get("budget_counters") or {})
     limit = budget.get(limit_key, DEFAULT_RUN_BUDGET.get(limit_key))
-    used = counters.get(counter_key, 0) + 1
-    counters[counter_key] = used
-    if limit is not None and used > limit:
+    used = counters.get(counter_key, 0)
+    attempted = used + 1
+    if limit is not None and attempted > limit:
         return False, counters, f"BUDGET_EXCEEDED: {label} exceeded {used}/{limit}"
+    counters[counter_key] = attempted
     return True, counters, ""
 
 def detect_undefined_names(code: str) -> List[str]:
@@ -1645,6 +1698,7 @@ def ml_quality_preflight(
     code: str,
     evaluation_spec: Dict[str, Any] | None = None,
     allowed_columns: List[str] | None = None,
+    allowed_patterns: List[str] | None = None,
 ) -> List[str]:
     """
     Static ML quality checks to prevent QA loops before reviewer/sandbox.
@@ -1836,10 +1890,32 @@ def ml_quality_preflight(
             issues.append("TIME_SERIES_SPLIT_REQUIRED")
         issues = [issue for issue in issues if issue != "CROSS_VALIDATION_REQUIRED"]
 
+    def _has_symbol(names: set[str]) -> bool:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in names:
+                return True
+            if isinstance(node, ast.Attribute) and node.attr in names:
+                return True
+        return False
+
+    baseline_required = True
+    if flags["requires_target"] and baseline_required:
+        if not _has_symbol({"DummyClassifier", "DummyRegressor"}):
+            issues.append("BASELINE_REQUIRED")
+
+    if flags["requires_target"] or flags["requires_supervised_split"]:
+        if not _has_symbol({"SimpleImputer"}):
+            issues.append("IMPUTER_REQUIRED")
+
     if allowed_columns:
-        unknown_cols = _detect_unknown_columns(code, allowed_columns)
+        unknown_cols = _detect_unknown_columns(code, allowed_columns, allowed_patterns)
         if unknown_cols:
             issues.append("UNKNOWN_COLUMNS_REFERENCED")
+
+    if _detect_synthetic_data(code):
+        issues.append("SYNTHETIC_DATA_DETECTED")
+    if _detect_dataframe_literal_overwrite(code):
+        issues.append("DATAFRAME_LITERAL_OVERWRITE")
 
     return issues
 
@@ -1903,6 +1979,48 @@ def _detect_synthetic_data(code: str) -> bool:
     ]
     return any(marker in code_lower for marker in synthetic_markers)
 
+def _detect_dataframe_literal_overwrite(code: str) -> bool:
+    import ast
+
+    if not code:
+        return False
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return False
+
+    target_names = {"df", "data", "dataset", "cleaned_df", "scored_df"}
+
+    def _is_dataframe_literal(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        is_df = False
+        if isinstance(func, ast.Attribute) and func.attr == "DataFrame":
+            if isinstance(func.value, ast.Name) and func.value.id in {"pd", "pandas"}:
+                is_df = True
+        if isinstance(func, ast.Name) and func.id == "DataFrame":
+            is_df = True
+        if not is_df:
+            return False
+        if node.args:
+            arg0 = node.args[0]
+            if isinstance(arg0, (ast.Dict, ast.List, ast.Tuple)):
+                return True
+        for kw in node.keywords:
+            if kw.arg == "data" and isinstance(kw.value, (ast.Dict, ast.List, ast.Tuple)):
+                return True
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if hasattr(node, "targets") else [node.target]
+            for tgt in targets:
+                if isinstance(tgt, ast.Name) and tgt.id in target_names:
+                    if _is_dataframe_literal(node.value):
+                        return True
+    return False
+
 def _extract_named_string_list(code: str, names: List[str]) -> List[str]:
     import ast
 
@@ -1923,6 +2041,58 @@ def _extract_named_string_list(code: str, names: List[str]) -> List[str]:
                         values.append(elt.value)
                 return values
     return []
+
+def _extract_dataframe_literal_columns(code: str) -> List[str]:
+    import ast
+
+    if not code:
+        return []
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+
+    cols: set[str] = set()
+
+    def _collect_dict(node: ast.Dict) -> None:
+        for key in node.keys:
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                cols.add(key.value)
+
+    def _is_dataframe_call(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "DataFrame":
+            if isinstance(func.value, ast.Name) and func.value.id in {"pd", "pandas"}:
+                return True
+        if isinstance(func, ast.Name) and func.id == "DataFrame":
+            return True
+        return False
+
+    for node in ast.walk(tree):
+        if not _is_dataframe_call(node):
+            continue
+        if node.args:
+            arg0 = node.args[0]
+            if isinstance(arg0, ast.Dict):
+                _collect_dict(arg0)
+            elif isinstance(arg0, (ast.List, ast.Tuple)):
+                for elt in arg0.elts:
+                    if isinstance(elt, ast.Dict):
+                        _collect_dict(elt)
+        for kw in node.keywords:
+            if kw.arg != "data":
+                continue
+            value = kw.value
+            if isinstance(value, ast.Dict):
+                _collect_dict(value)
+            elif isinstance(value, (ast.List, ast.Tuple)):
+                for elt in value.elts:
+                    if isinstance(elt, ast.Dict):
+                        _collect_dict(elt)
+
+    return sorted(cols)
 
 def _extract_column_references(code: str) -> List[str]:
     import ast
@@ -1993,14 +2163,43 @@ def _extract_column_references(code: str) -> List[str]:
     for name in known_lists:
         refs.update(list_vars.get(name, []))
 
+    refs.update(_extract_dataframe_literal_columns(code))
     return sorted(refs)
 
-def _detect_unknown_columns(code: str, allowed_columns: List[str]) -> List[str]:
+def _detect_unknown_columns(
+    code: str,
+    allowed_columns: List[str],
+    allowed_patterns: List[str] | None = None,
+) -> List[str]:
     if not code or not allowed_columns:
         return []
+    import re
+
+    allowed_pattern_list = [str(pat) for pat in (allowed_patterns or []) if isinstance(pat, str) and pat.strip()]
+
+    def _pattern_name(name: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z]+", "_", str(name).lower()).strip("_")
+
     allowed_norm = {_norm_name(col) for col in allowed_columns if col}
     refs = _extract_column_references(code)
-    unknown = [col for col in refs if _norm_name(col) not in allowed_norm]
+    unknown = []
+    for col in refs:
+        norm = _norm_name(col)
+        if norm in allowed_norm:
+            continue
+        if allowed_pattern_list:
+            target = _pattern_name(col)
+            matched = False
+            for pattern in allowed_pattern_list:
+                try:
+                    if re.search(pattern, target):
+                        matched = True
+                        break
+                except re.error:
+                    continue
+            if matched:
+                continue
+        unknown.append(col)
     return unknown
 
 def _find_canonical_mismatches(features: List[str], required_columns: List[str]) -> List[Dict[str, str]]:
@@ -3201,6 +3400,7 @@ class AgentState(TypedDict):
     dataset_memory_context: str
     run_budget: Dict[str, Any]
     budget_counters: Dict[str, int]
+    qa_budget_exceeded: bool
 
 from src.agents.domain_expert import DomainExpertAgent
 
@@ -5455,6 +5655,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             "review_verdict": "REJECTED",
             "review_feedback": err_msg,
             "error_message": err_msg,
+            "qa_budget_exceeded": True,
             "budget_counters": counters,
         }
     if run_id:
@@ -5471,7 +5672,10 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
         except TypeError:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective)
-        preflight_issues = ml_quality_preflight(code, evaluation_spec)
+        contract = state.get("execution_contract", {}) or {}
+        allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
+        allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
+        preflight_issues = ml_quality_preflight(code, evaluation_spec, allowed_columns, allowed_patterns)
         has_variance_guard = "TARGET_VARIANCE_GUARD" not in preflight_issues
 
         status = qa_result['status']
@@ -5629,7 +5833,8 @@ def run_ml_preflight(state: AgentState) -> AgentState:
 
     flags = _resolve_eval_flags(evaluation_spec)
     allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
-    issues = ml_quality_preflight(code, evaluation_spec, allowed_columns)
+    allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
+    issues = ml_quality_preflight(code, evaluation_spec, allowed_columns, allowed_patterns)
     if isinstance(evaluation_spec, dict):
         obj_type = str(evaluation_spec.get("objective_type") or "").lower()
         validation_policy = evaluation_spec.get("validation_policy") or {}
@@ -5680,8 +5885,6 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         min_required = max(min_abs, min_ratio)
         if len(col_coverage.get("hits", [])) < min_required:
             issues.append("REQUIRED_COLUMNS_NOT_USED")
-    if _detect_synthetic_data(code) and not has_read_csv:
-        issues.append("SYNTHETIC_DATA_DETECTED")
     if "alignment_check.json" in (code or "") and "\"requirements\"" not in (code or "") and "'requirements'" not in (code or ""):
         issues.append("ALIGNMENT_REQUIREMENTS_MISSING")
     segment_features = _extract_named_string_list(code, ["SEGMENT_FEATURES", "segment_features"])
@@ -5737,7 +5940,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         if canonical_mismatches:
             feedback += f" | Canonical mismatches: {canonical_mismatches}"
         if "UNKNOWN_COLUMNS_REFERENCED" in issues and allowed_columns:
-            unknown_cols = _detect_unknown_columns(code, allowed_columns)
+            unknown_cols = _detect_unknown_columns(code, allowed_columns, allowed_patterns)
             if unknown_cols:
                 feedback += f" | Unknown columns: {unknown_cols[:5]}"
         history = list(state.get("feedback_history", []))
@@ -6520,6 +6723,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                         hard_qa_gate_reject = True
             else:
                 review_warnings.append(f"QA_CODE_AUDIT_SKIPPED: {err_msg}")
+                state["qa_budget_exceeded"] = True
         except Exception as qa_err:
             review_warnings.append(f"QA_CODE_AUDIT_ERROR: {qa_err}")
         if review_warnings:
@@ -6531,6 +6735,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 or "QA_CODE_AUDIT[REJECTED]" in warn_text
                 for warn_text in review_warnings
             )
+        if state.get("qa_budget_exceeded"):
+            warn_text = "QA_INCOMPLETE: QA budget exceeded; QA audit skipped."
+            feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
+            new_history.append(warn_text)
 
     if audit_rejected:
         status = "NEEDS_IMPROVEMENT"
@@ -6630,6 +6838,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "hard_qa_gate_reject": hard_qa_gate_reject,
         "hard_qa_retry_count": hard_qa_retry_count,
     }
+    if state.get("qa_budget_exceeded"):
+        result_state["qa_budget_exceeded"] = True
     if status in ["APPROVED", "APPROVE_WITH_WARNINGS"]:
         result_state["last_successful_review_verdict"] = status
         result_state["last_successful_gate_context"] = gate_context
@@ -7127,6 +7337,17 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
     
     if success:
         print(f"PDF generated at: {abs_pdf_path}")
+        run_id = state.get("run_id")
+        since_epoch = state.get("run_start_epoch")
+        if run_id:
+            copy_run_reports(run_id, [pdf_filename], since_epoch=since_epoch)
+        if state.get("run_bundle_dir"):
+            try:
+                dest_path = os.path.join(state.get("run_bundle_dir"), "report", "final_report.pdf")
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                shutil.copy2(pdf_filename, dest_path)
+            except Exception:
+                pass
         return {"final_report": state["final_report"], "pdf_path": pdf_filename}
     else:
         print("PDF Generation Failed")

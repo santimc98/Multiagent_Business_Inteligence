@@ -5,10 +5,14 @@ from src.graph.graph import run_ml_preflight
 def test_ml_preflight_fails_missing_variance_guard():
     code = """
 import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.dummy import DummyClassifier
 print("Mapping Summary: ...")
 feature_cols = ["a", "b"]
 X = df[feature_cols]
 y = df["target"]
+imputer = SimpleImputer()
+baseline = DummyClassifier()
 """
     issues = ml_quality_preflight(code)
     assert "TARGET_VARIANCE_GUARD" in issues
@@ -17,11 +21,15 @@ y = df["target"]
 def test_ml_preflight_fails_missing_mapping_summary():
     code = """
 import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.dummy import DummyClassifier
 feature_cols = ["a", "b"]
 X = df[feature_cols]
 y = df["target"]
 if y.nunique() <= 1:
     raise ValueError("Target has no variance; cannot train meaningful model.")
+imputer = SimpleImputer()
+baseline = DummyClassifier()
 """
     issues = ml_quality_preflight(code)
     assert "MAPPING_SUMMARY" in issues
@@ -30,12 +38,16 @@ if y.nunique() <= 1:
 def test_ml_preflight_passes_minimal_checks():
     code = """
 import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.dummy import DummyClassifier
 feature_cols = ["a", "b"]
 print("Mapping Summary: target -> y, features -> feature_cols")
 X = df[feature_cols]
 y = df["target"]
 if y.nunique() < 2:
     raise ValueError("Target has no variance; cannot train meaningful model.")
+imputer = SimpleImputer()
+baseline = DummyClassifier()
 """
     issues = ml_quality_preflight(code)
     assert issues == []
@@ -52,3 +64,73 @@ def test_ml_preflight_blocks_dependency_with_suggestion():
     history = result.get("feedback_history", [])
     assert any("DEPENDENCY_BLOCKED" in h for h in history)
     assert any("linprog" in h.lower() for h in history)
+
+
+def test_ml_preflight_flags_dataframe_literal_overwrite():
+    code = """
+import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.dummy import DummyClassifier
+print("Mapping Summary: ...")
+df = pd.DataFrame({"age": [1, 2], "income": [3, 4]})
+feature_cols = ["age"]
+X = df[feature_cols]
+y = df["income"]
+if y.nunique() < 2:
+    raise ValueError("Target has no variance; cannot train meaningful model.")
+imputer = SimpleImputer()
+baseline = DummyClassifier()
+"""
+    issues = ml_quality_preflight(code, allowed_columns=["age", "income"])
+    assert "DATAFRAME_LITERAL_OVERWRITE" in issues
+
+
+def test_ml_preflight_flags_unknown_columns_from_literals():
+    code = """
+import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.dummy import DummyClassifier
+print("Mapping Summary: ...")
+feature_cols = ["a"]
+X = df[feature_cols]
+y = df["target"]
+if y.nunique() < 2:
+    raise ValueError("Target has no variance; cannot train meaningful model.")
+pd.DataFrame({"age": [1, 2]})
+imputer = SimpleImputer()
+baseline = DummyClassifier()
+"""
+    issues = ml_quality_preflight(code, allowed_columns=["a", "target"])
+    assert "UNKNOWN_COLUMNS_REFERENCED" in issues
+
+
+def test_ml_preflight_requires_baseline():
+    code = """
+import pandas as pd
+from sklearn.impute import SimpleImputer
+print("Mapping Summary: ...")
+feature_cols = ["a", "b"]
+X = df[feature_cols]
+y = df["target"]
+if y.nunique() < 2:
+    raise ValueError("Target has no variance; cannot train meaningful model.")
+imputer = SimpleImputer()
+"""
+    issues = ml_quality_preflight(code)
+    assert "BASELINE_REQUIRED" in issues
+
+
+def test_ml_preflight_requires_imputer():
+    code = """
+import pandas as pd
+from sklearn.dummy import DummyClassifier
+print("Mapping Summary: ...")
+feature_cols = ["a", "b"]
+X = df[feature_cols]
+y = df["target"]
+if y.nunique() < 2:
+    raise ValueError("Target has no variance; cannot train meaningful model.")
+baseline = DummyClassifier()
+"""
+    issues = ml_quality_preflight(code)
+    assert "IMPUTER_REQUIRED" in issues

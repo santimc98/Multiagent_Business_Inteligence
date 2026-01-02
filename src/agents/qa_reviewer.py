@@ -580,7 +580,7 @@ def _resolve_contract_columns_for_qa(evaluation_spec: Dict[str, Any] | None) -> 
                 if name:
                     columns.append(str(name))
     if not columns:
-        columns = ["Size", "Debtors", "Sector", "1stYearAmount", "CurrentPhase", "Probability"]
+        return []
     return columns
 
 
@@ -694,6 +694,8 @@ def run_static_qa_checks(
         )
 
     contract_columns = _resolve_contract_columns_for_qa(evaluation_spec)
+    if not contract_columns:
+        require_contract_columns = False
     has_contract_column_reference = _code_mentions_columns(code, contract_columns, tree)
     if require_contract_columns and not has_contract_column_reference:
         _flag(
