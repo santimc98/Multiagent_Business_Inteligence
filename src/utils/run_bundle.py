@@ -97,16 +97,24 @@ def _normalize_required_outputs(contract: Dict[str, Any]) -> List[str]:
     return contract.get("required_outputs", []) or []
 
 
-def _normalize_produced_outputs(artifact_index: Any) -> List[str]:
+def _scan_run_outputs(run_dir: str) -> List[str]:
     produced: List[str] = []
-    if isinstance(artifact_index, list):
-        for item in artifact_index:
-            if isinstance(item, dict):
-                path = item.get("path")
-                if path:
-                    produced.append(str(path))
-            elif isinstance(item, str):
-                produced.append(item)
+    if not run_dir:
+        return produced
+    artifacts_dir = os.path.join(run_dir, "artifacts")
+    report_dir = os.path.join(run_dir, "report")
+    if os.path.isdir(artifacts_dir):
+        for root, _, files in os.walk(artifacts_dir):
+            for name in files:
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, artifacts_dir)
+                produced.append(rel.replace("\\", "/"))
+    if os.path.isdir(report_dir):
+        for root, _, files in os.walk(report_dir):
+            for name in files:
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, run_dir)
+                produced.append(rel.replace("\\", "/"))
     return produced
 
 
@@ -119,7 +127,7 @@ def init_run_bundle(
 ) -> str:
     run_dir = run_dir or os.path.join(base_dir, run_id)
     _ensure_dir(run_dir)
-    for sub in ["contracts", "agents", "sandbox", "artifacts"]:
+    for sub in ["contracts", "agents", "sandbox", "artifacts", "report"]:
         _ensure_dir(os.path.join(run_dir, sub))
     register_run_log(run_id, os.path.join(run_dir, "events.jsonl"))
     _RUN_DIRS[run_id] = run_dir
@@ -161,7 +169,7 @@ def log_agent_snapshot(
         return
     base = os.path.join(run_dir, "agents", agent)
     if attempt is not None:
-        base = os.path.join(base, f"attempt_{attempt}")
+        base = os.path.join(base, f"iteration_{attempt}")
     _ensure_dir(base)
     if prompt:
         _write_text(os.path.join(base, "prompt.txt"), str(prompt))
@@ -180,25 +188,41 @@ def log_agent_snapshot(
 
 def log_sandbox_attempt(
     run_id: str,
+    step: str,
     attempt: int,
     code: str,
     stdout: str,
     stderr: str,
     outputs_listing: Any,
+    downloaded_paths: Optional[List[str]] = None,
     exit_code: Optional[int] = None,
     error_tail: Optional[str] = None,
 ) -> None:
     run_dir = get_run_dir(run_id)
     if not run_dir:
         return
-    attempt_dir = os.path.join(run_dir, "sandbox", f"attempt_{attempt}")
+    safe_step = step or "unknown"
+    attempt_dir = os.path.join(run_dir, "sandbox", safe_step, f"attempt_{attempt}")
     _ensure_dir(attempt_dir)
     _write_text(os.path.join(attempt_dir, "code_sent.py"), code or "")
     _write_text(os.path.join(attempt_dir, "stdout.txt"), stdout or "")
     _write_text(os.path.join(attempt_dir, "stderr.txt"), stderr or "")
     if outputs_listing is not None:
         _write_json(os.path.join(attempt_dir, "outputs_listing.json"), outputs_listing)
+    if downloaded_paths:
+        dest_root = os.path.join(attempt_dir, "downloaded_artifacts")
+        for src in downloaded_paths:
+            if not src or not os.path.exists(src):
+                continue
+            rel = src if not os.path.isabs(src) else os.path.basename(src)
+            dest = os.path.join(dest_root, rel)
+            _ensure_dir(os.path.dirname(dest))
+            try:
+                shutil.copy2(src, dest)
+            except Exception:
+                pass
     record = {
+        "step": safe_step,
         "attempt": attempt,
         "exit_code": exit_code,
         "error_tail": error_tail,
@@ -215,13 +239,15 @@ def copy_run_artifacts(run_id: str, sources: List[str]) -> None:
     for src in sources:
         if not src or not os.path.exists(src):
             continue
-        base_name = os.path.basename(src.rstrip("/\\"))
-        dest = os.path.join(dest_root, base_name)
         try:
             if os.path.isdir(src):
+                base_name = os.path.basename(src.rstrip("/\\"))
+                dest = os.path.join(dest_root, base_name)
                 shutil.copytree(src, dest, dirs_exist_ok=True)
             else:
-                _ensure_dir(dest_root)
+                rel = src if not os.path.isabs(src) else os.path.basename(src)
+                dest = os.path.join(dest_root, rel)
+                _ensure_dir(os.path.dirname(dest))
                 shutil.copy2(src, dest)
         except Exception:
             pass
@@ -243,6 +269,29 @@ def copy_run_contracts(run_id: str, sources: List[str]) -> None:
             pass
 
 
+def copy_run_reports(run_id: str, sources: List[str]) -> None:
+    run_dir = get_run_dir(run_id)
+    if not run_dir:
+        return
+    dest_root = os.path.join(run_dir, "report")
+    _ensure_dir(dest_root)
+    for src in sources:
+        if not src or not os.path.exists(src):
+            continue
+        try:
+            if os.path.isdir(src):
+                base_name = os.path.basename(src.rstrip("/\\"))
+                dest = os.path.join(dest_root, base_name)
+                shutil.copytree(src, dest, dirs_exist_ok=True)
+            else:
+                rel = src if not os.path.isabs(src) else os.path.basename(src)
+                dest = os.path.join(dest_root, rel)
+                _ensure_dir(os.path.dirname(dest))
+                shutil.copy2(src, dest)
+        except Exception:
+            pass
+
+
 def write_run_manifest(
     run_id: str,
     state: Dict[str, Any],
@@ -250,15 +299,20 @@ def write_run_manifest(
     started_at: Optional[str] = None,
     ended_at: Optional[str] = None,
 ) -> Optional[str]:
-    run_dir = get_run_dir(run_id) or os.path.join(RUNS_DIR, "latest")
+    run_dir = get_run_dir(run_id) or os.path.join(RUNS_DIR, run_id)
     csv_path = state.get("csv_path") or ""
-    contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract") or {}
-    evaluation_spec = _safe_load_json("data/evaluation_spec.json") or state.get("evaluation_spec") or {}
-    artifact_index = _safe_load_json("data/artifact_index.json") or state.get("artifact_index") or []
-    output_contract = _safe_load_json("data/output_contract_report.json") or {}
-    run_summary = _safe_load_json("data/run_summary.json") or {}
+    contracts_dir = os.path.join(run_dir, "contracts")
+    contract = _safe_load_json(os.path.join(contracts_dir, "execution_contract.json")) or state.get("execution_contract") or {}
+    evaluation_spec = _safe_load_json(os.path.join(contracts_dir, "evaluation_spec.json")) or state.get("evaluation_spec") or {}
+    artifact_index = _safe_load_json(os.path.join(contracts_dir, "artifact_index.json")) or state.get("artifact_index") or []
+    output_contract = _safe_load_json(os.path.join(run_dir, "report", "output_contract_report.json"))
+    if not output_contract:
+        output_contract = _safe_load_json(os.path.join(run_dir, "artifacts", "data", "output_contract_report.json")) or {}
+    run_summary = _safe_load_json(os.path.join(run_dir, "report", "run_summary.json"))
+    if not run_summary:
+        run_summary = _safe_load_json(os.path.join(run_dir, "artifacts", "data", "run_summary.json")) or {}
     required_outputs = _normalize_required_outputs(contract)
-    produced_outputs = _normalize_produced_outputs(artifact_index)
+    produced_outputs = sorted(set(_scan_run_outputs(run_dir)))
 
     manifest_path = os.path.join(run_dir, "run_manifest.json")
     existing = _safe_load_json(manifest_path)
@@ -297,10 +351,10 @@ def write_run_manifest(
             "status_final": status_final or existing_dict.get("status_final") or gates_summary.get("status"),
             "gates_summary": gates_summary,
             "contracts": {
-                "execution_contract": bool(contract),
-                "evaluation_spec": bool(evaluation_spec),
-                "artifact_index": bool(artifact_index),
-                "contract_min": os.path.exists("data/contract_min.json"),
+                "execution_contract": os.path.exists(os.path.join(contracts_dir, "execution_contract.json")),
+                "evaluation_spec": os.path.exists(os.path.join(contracts_dir, "evaluation_spec.json")),
+                "artifact_index": os.path.exists(os.path.join(contracts_dir, "artifact_index.json")),
+                "contract_min": os.path.exists(os.path.join(contracts_dir, "contract_min.json")),
             },
         }
     )

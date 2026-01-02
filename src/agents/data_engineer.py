@@ -58,6 +58,7 @@ class DataEngineerAgent:
         3. NO NETWORK/FS OPS: Do NOT use requests/subprocess/os.system and do not access filesystem outside declared input/output paths.
         4. BAN pandas private APIs: do not use pandas.io.* or pd.io.parsers.*.
         5. If the audit includes RUNTIME_ERROR_CONTEXT, fix the root cause and regenerate the full script.
+        6. Do NOT use np.bool (deprecated). Use bool or np.bool_ if needed.
         
         *** INPUT PARAMETERS ***
         - Input: '$input_path'
@@ -79,6 +80,7 @@ class DataEngineerAgent:
         - Build a header map for lookup (normalize only for matching), but preserve canonical_name exactly (including spaces/symbols) in the output.
         - Canonical columns must contain cleaned values (do not leave raw strings in canonical columns while writing cleaned_* shadows).
         - Print a CLEANING_VALIDATION section that reports dtype/null_frac and basic range checks for each required column.
+        - When reporting min/max, only use numeric series (e.g., cleaned_vals) and skip object dtype to avoid col_data.max() crashes.
         - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
         - If a derived column has derived_owner='ml_engineer', do NOT create placeholders; leave it absent and document in the manifest.
         """

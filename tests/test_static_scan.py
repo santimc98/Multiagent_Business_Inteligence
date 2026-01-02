@@ -53,3 +53,9 @@ def test_block_filesystem_exploration():
     is_safe, violations = scan_code_safety(code)
     assert not is_safe
     assert any("os.listdir" in v for v in violations)
+
+def test_block_np_bool():
+    code = "import numpy as np\nflag = np.bool(1)\n"
+    is_safe, violations = scan_code_safety(code)
+    assert not is_safe
+    assert any("np.bool" in v for v in violations)

@@ -29,10 +29,18 @@ def _read_run_id(manifest_path: str) -> str | None:
         return None
 
 
+def _read_latest_run_id(runs_dir: str) -> str | None:
+    try:
+        with open(os.path.join(_latest_dir(runs_dir), "run_id.txt"), "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
 def _find_latest_run(runs_dir: str) -> str | None:
-    latest_dir = _latest_dir(runs_dir)
-    if os.path.isdir(latest_dir):
-        return "latest"
+    latest_id = _read_latest_run_id(runs_dir)
+    if latest_id:
+        return latest_id
     if not os.path.isdir(runs_dir):
         return None
     candidates = []
@@ -53,7 +61,7 @@ def _find_latest_run(runs_dir: str) -> str | None:
 
 
 def _zip_run(run_id: str, runs_dir: str) -> str:
-    run_dir = _latest_dir(runs_dir) if run_id == "latest" else os.path.join(runs_dir, run_id)
+    run_dir = os.path.join(runs_dir, run_id)
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
     manifest_path = os.path.join(run_dir, "run_manifest.json")
@@ -92,7 +100,7 @@ def main() -> int:
         return 1
 
     if args.archive_on_fail:
-        run_dir = _latest_dir(args.runs_dir) if run_id == "latest" else os.path.join(args.runs_dir, run_id)
+        run_dir = os.path.join(args.runs_dir, run_id)
         status = _read_status(os.path.join(run_dir, "run_manifest.json"))
         if status and str(status).upper() != "PASS":
             archive_dir = os.path.join(args.runs_dir, "archive")

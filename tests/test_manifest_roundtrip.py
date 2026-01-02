@@ -40,7 +40,7 @@ def test_manifest_roundtrip_upload():
         
         # 1. Verify Upload Call
         # Should upload manifest to /home/user/run/<run_id>/attempt_<k>/cleaning_manifest.json
-        expected_manifest = "/home/user/run/testrun/attempt_2/cleaning_manifest.json"
+        expected_manifest = "/home/user/run/testrun/ml_engineer/attempt_2/cleaning_manifest.json"
         mock_instance.files.write.assert_any_call(expected_manifest, mock_file())
         
         # 2. Verify Code Patching
@@ -84,6 +84,6 @@ def test_manifest_patching_logic():
         args, _ = mock_instance.run_code.call_args
         executed_code = args[0]
         
-        expected_manifest = "/home/user/run/testrun/attempt_2/cleaning_manifest.json"
+        expected_manifest = "/home/user/run/testrun/ml_engineer/attempt_2/cleaning_manifest.json"
         assert expected_manifest in executed_code
         assert "data/cleaning_manifest.json" not in executed_code # Replaced

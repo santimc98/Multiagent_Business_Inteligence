@@ -100,5 +100,8 @@ def scan_code_safety(code: str) -> Tuple[bool, List[str]]:
     # ParserBase
     if re.search(r'\bParserBase\b', code):
         violations.append("Usage of 'ParserBase' is PROHIBITED.")
+
+    if re.search(r"\bnp\.bool(?!_)\b", code) or re.search(r"\bnumpy\.bool(?!_)\b", code):
+        violations.append("Usage of 'np.bool' is PROHIBITED. Use 'np.bool_' instead.")
         
     return (len(violations) == 0, violations)

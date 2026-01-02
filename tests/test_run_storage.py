@@ -14,15 +14,16 @@ def test_latest_is_overwritten(tmp_path, monkeypatch):
     latest.mkdir(parents=True, exist_ok=True)
     dummy = latest / "dummy.txt"
     dummy.write_text("stale", encoding="utf-8")
-    init_run_dir("abc123", started_at="2025-01-01T00:00:00")
+    run_dir = init_run_dir("abc123", started_at="2025-01-01T00:00:00")
     assert not dummy.exists()
-    assert (latest / "run_manifest.json").exists()
+    assert (latest / "run_id.txt").exists()
+    assert (Path(run_dir) / "run_manifest.json").exists()
 
 
 def test_archive_on_fail(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    init_run_dir("fail123", started_at="2025-01-01T00:00:00")
-    (tmp_path / "runs" / "latest" / "dummy.txt").write_text("x", encoding="utf-8")
+    run_dir = init_run_dir("fail123", started_at="2025-01-01T00:00:00")
+    (Path(run_dir) / "dummy.txt").write_text("x", encoding="utf-8")
     finalize_run("fail123", status_final="FAIL", state={})
     archive = tmp_path / "runs" / "archive" / "run_fail123.zip"
     assert archive.exists()

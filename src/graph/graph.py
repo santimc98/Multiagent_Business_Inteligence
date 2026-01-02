@@ -63,6 +63,7 @@ from src.utils.run_bundle import (
     log_sandbox_attempt,
     copy_run_artifacts,
     copy_run_contracts,
+    copy_run_reports,
     write_run_manifest,
 )
 from src.utils.run_storage import (
@@ -332,6 +333,59 @@ def _find_empty_required_columns(df, required_cols: List[str], threshold: float 
                 }
             )
     return issues
+
+def _resolve_requirement_meta(contract: Dict[str, Any], col: str) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+    reqs = contract.get("data_requirements", [])
+    if not isinstance(reqs, list):
+        return {}
+    target = _norm_name(col)
+    for req in reqs:
+        if not isinstance(req, dict):
+            continue
+        name = req.get("canonical_name") or req.get("name") or req.get("column")
+        if name and _norm_name(name) == target:
+            return req
+    return {}
+
+def _is_optional_requirement(req: Dict[str, Any]) -> bool:
+    if not isinstance(req, dict):
+        return False
+    if req.get("required") is False:
+        return True
+    if req.get("nullable") is True:
+        return True
+    if req.get("optional") is True:
+        return True
+    return False
+
+def _sample_raw_null_stats(
+    csv_path: str,
+    dialect: Dict[str, Any],
+    raw_cols: List[str],
+    nrows: int = 500,
+) -> Dict[str, Dict[str, Any]]:
+    stats: Dict[str, Dict[str, Any]] = {}
+    sample_df = sample_raw_columns(csv_path, dialect, raw_cols, nrows=nrows, dtype=str)
+    if sample_df is None or getattr(sample_df, "empty", False):
+        return stats
+    for col in raw_cols:
+        if col not in sample_df.columns:
+            continue
+        series = sample_df[col]
+        try:
+            raw_str = series.astype(str).str.strip()
+            null_like = series.isna() | raw_str.eq("") | raw_str.str.lower().isin(["nan", "null", "none"])
+            null_frac = float(null_like.mean()) if len(series) else 0.0
+            stats[col] = {
+                "null_frac": null_frac,
+                "non_null_frac": float(1.0 - null_frac),
+                "sample_rows": int(len(series)),
+            }
+        except Exception:
+            stats[col] = {}
+    return stats
 
 def _build_required_sample_context(
     csv_path: str,
@@ -3196,6 +3250,7 @@ def run_steward(state: AgentState) -> AgentState:
     decimal = result.get('decimal', '.')
     write_manifest_partial(
         run_id=run_id,
+        manifest_path=os.path.join(run_dir, "run_manifest.json"),
         input_info={
             "path": csv_path,
             "sha256": _hash_file(csv_path),
@@ -3288,6 +3343,8 @@ def run_strategist(state: AgentState) -> AgentState:
     user_context = state.get("strategist_context_override") or state.get("business_objective", "")
     result = strategist.generate_strategies(state['data_summary'], user_context)
     run_id = state.get("run_id")
+    attempt_id = int(state.get("data_engineer_attempt", 0)) + 1
+    state["data_engineer_attempt"] = attempt_id
     if run_id:
         log_agent_snapshot(
             run_id,
@@ -3476,6 +3533,16 @@ def run_execution_planner(state: AgentState) -> AgentState:
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
     if run_id:
+        copy_run_contracts(
+            run_id,
+            [
+                "data/execution_contract.json",
+                "data/evaluation_spec.json",
+                "data/plan.json",
+                "data/contract_min.json",
+            ],
+        )
+    if run_id:
         log_run_event(
             run_id,
             "execution_planner_complete",
@@ -3541,8 +3608,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
     leakage_audit_summary = state.get("leakage_audit_summary", "")
     data_engineer_audit_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
     header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+    norm_map: Dict[str, str] = {}
     if header_cols:
-        norm_map = {}
         for col in header_cols:
             normed = _norm_name(col)
             if normed and normed not in norm_map:
@@ -3608,6 +3675,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             response=getattr(data_engineer, "last_response", None) or code,
             context=context_payload,
             script=code,
+            attempt=attempt_id,
         )
 
     plan_payload = None
@@ -3896,33 +3964,49 @@ def run_data_engineer(state: AgentState) -> AgentState:
             os.environ["E2B_API_KEY"] = api_key
     
             with Sandbox.create() as sandbox:
+                step_name = "data_engineer"
+                run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
                 # 1. Setup Environment
                 print("Installing dependencies in Sandbox...")
                 sandbox.commands.run("pip install pandas numpy")
-                sandbox.commands.run("mkdir -p data")
+                sandbox.commands.run(f"rm -rf {run_root}")
+                sandbox.commands.run(f"mkdir -p {run_root}/data")
                 
                 # 2. Upload Raw Data
+                remote_raw_path = f"{run_root}/data/raw.csv"
                 print(f"Uploading {csv_path} to sandbox...")
                 with open(csv_path, "rb") as f:
-                    sandbox.files.write("data/raw.csv", f)
+                    sandbox.files.write(remote_raw_path, f)
     
                 # 2.5 Upload Execution Contract (best-effort)
                 local_contract_path = "data/execution_contract.json"
                 if os.path.exists(local_contract_path):
                     try:
                         with open(local_contract_path, "rb") as f:
-                            sandbox.files.write("data/execution_contract.json", f)
+                            sandbox.files.write(f"{run_root}/data/execution_contract.json", f)
                     except Exception as contract_err:
                         print(f"Warning: failed to upload execution_contract.json: {contract_err}")
     
                 # 3. Execute Cleaning
+                code = code.replace("data/raw.csv", remote_raw_path)
+                code = code.replace("./data/raw.csv", remote_raw_path)
+                working_dir_injection = (
+                    "import os\n"
+                    f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
+                    f"os.chdir(r\"{run_root}\")\n"
+                )
+                code = working_dir_injection + code
                 print("Executing Cleaning Script in Sandbox...")
                 execution = sandbox.run_code(code)
                 
                 # Capture Output
+                stdout_text = "\n".join(execution.logs.stdout or [])
+                stderr_text = "\n".join(execution.logs.stderr or [])
                 output_log = ""
-                if execution.logs.stdout: output_log += "\n".join(execution.logs.stdout)
-                if execution.logs.stderr: output_log += "\n".join(execution.logs.stderr)
+                if stdout_text:
+                    output_log += stdout_text
+                if stderr_text:
+                    output_log += stderr_text
                 try:
                     os.makedirs("artifacts", exist_ok=True)
                     with open(os.path.join("artifacts", "data_engineer_sandbox_last.log"), "w", encoding="utf-8") as f_log:
@@ -4042,7 +4126,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 
                 # 4. Verification & Download
                 # Check if cleaned file exists
-                ls_check = sandbox.commands.run("ls data/cleaned_data.csv")
+                ls_check = sandbox.commands.run(f"ls {run_root}/data/cleaned_data.csv")
                 if ls_check.exit_code != 0:
                       return {
                          "cleaning_code": code,
@@ -4059,6 +4143,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 except Exception as art_err:
                     print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
     
+                downloaded_paths = []
+
                 # Download Result (CSV)
                 print("Downloading cleaned data...")
                 local_cleaned_path = "data/cleaned_data.csv"
@@ -4067,11 +4153,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 try:
                     # Try standard download
                     with open(local_cleaned_path, "wb") as f_local:
-                        remote_bytes = sandbox.files.read("data/cleaned_data.csv")
+                        remote_bytes = sandbox.files.read(f"{run_root}/data/cleaned_data.csv")
                         f_local.write(remote_bytes)
                 except Exception as dl_err:
                     print(f"Standard download failed ({dl_err}), trying Base64 fallback...")
-                    proc = sandbox.commands.run("base64 -w 0 data/cleaned_data.csv")
+                    proc = sandbox.commands.run(f"base64 -w 0 {run_root}/data/cleaned_data.csv")
                     if proc.exit_code == 0:
                         b64_content = proc.stdout.strip()
                         decoded = base64.b64decode(b64_content)
@@ -4084,6 +4170,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "error_message": f"Failed to download cleaned data: {proc.stderr}",
                             "budget_counters": counters,
                         }
+                if os.path.exists(local_cleaned_path):
+                    downloaded_paths.append(local_cleaned_path)
     
                 # Download Manifest (JSON) - Roundtrip Support
                 print("Downloading cleaning manifest...")
@@ -4091,11 +4179,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 try:
                     # Try standard download
                     with open(local_manifest_path, "wb") as f_local:
-                        remote_bytes = sandbox.files.read("data/cleaning_manifest.json")
+                        remote_bytes = sandbox.files.read(f"{run_root}/data/cleaning_manifest.json")
                         f_local.write(remote_bytes)
                 except Exception:
                     # Fallback Base64
-                    proc = sandbox.commands.run("base64 -w 0 data/cleaning_manifest.json")
+                    proc = sandbox.commands.run(f"base64 -w 0 {run_root}/data/cleaning_manifest.json")
                     if proc.exit_code == 0:
                         b64_content = proc.stdout.strip()
                         decoded = base64.b64decode(b64_content)
@@ -4111,6 +4199,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         }
                         with open(local_manifest_path, "w") as f_def:
                             json.dump(default_manifest, f_def)
+                if os.path.exists(local_manifest_path):
+                    downloaded_paths.append(local_manifest_path)
                 try:
                     os.makedirs("artifacts", exist_ok=True)
                     with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
@@ -4137,6 +4227,29 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
                     print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
                     return run_data_engineer(new_state)
+
+                outputs_listing = []
+                try:
+                    listing_proc = sandbox.commands.run(
+                        f"sh -lc 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+                    )
+                    if listing_proc.exit_code == 0:
+                        outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
+                except Exception:
+                    outputs_listing = []
+                if run_id:
+                    log_sandbox_attempt(
+                        run_id,
+                        step_name,
+                        attempt_id,
+                        code=code,
+                        stdout=stdout_text,
+                        stderr=stderr_text,
+                        outputs_listing=outputs_listing,
+                        downloaded_paths=downloaded_paths,
+                        exit_code=getattr(execution, "exit_code", None),
+                        error_tail=(execution.error.traceback if execution.error else None),
+                    )
 
                 required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
                 raw_rows = _count_raw_rows(csv_path, csv_encoding, csv_sep, csv_decimal)
@@ -4347,35 +4460,57 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
             empty_required = _find_empty_required_columns(df_mapped, required_cols)
             if empty_required:
-                if not state.get("de_empty_required_retry_done"):
-                    new_state = dict(state)
-                    new_state["de_empty_required_retry_done"] = True
-                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                    payload = "EMPTY_REQUIRED_COLUMNS:\n" + "\n".join(
-                        f"- {item['column']}: null_frac={item['null_frac']:.2%}, non_null_count={item['non_null_count']}"
-                        for item in empty_required
-                    )
+                required_issues = []
+                optional_issues = []
+                for item in empty_required:
+                    req_meta = _resolve_requirement_meta(contract, item.get("column", ""))
+                    is_optional = _is_optional_requirement(req_meta)
+                    item["required"] = not is_optional
+                    if is_optional:
+                        optional_issues.append(item)
+                    else:
+                        required_issues.append(item)
+                if optional_issues and not required_issues:
+                    warn_cols = [item.get("column") for item in optional_issues if item.get("column")]
+                    print(f"Warning: optional columns empty after cleaning: {warn_cols}")
+                else:
+                    required_cols_only = [item.get("column") for item in required_issues if item.get("column")]
+                    raw_map = _build_required_raw_map(required_cols_only, norm_map)
+                    raw_stats = _sample_raw_null_stats(csv_path, input_dialect, list(raw_map.values()))
+                    parse_lines = []
+                    has_raw_values = False
+                    for item in required_issues:
+                        col = item.get("column")
+                        raw_col = raw_map.get(col) if col else None
+                        stats = raw_stats.get(raw_col, {}) if raw_col else {}
+                        non_null_frac = stats.get("non_null_frac")
+                        if isinstance(non_null_frac, (int, float)) and non_null_frac > 0.01:
+                            has_raw_values = True
+                        parse_lines.append(
+                            f"- {col}: null_frac={item.get('null_frac'):.2%}, non_null_count={item.get('non_null_count')}, "
+                            f"raw_col={raw_col}, raw_non_null_frac={non_null_frac}"
+                        )
+                    payload = "EMPTY_REQUIRED_COLUMNS:\n" + "\n".join(parse_lines)
                     try:
-                        header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
-                        norm_map = {}
-                        for col in header_cols:
-                            normed = _norm_name(col)
-                            if normed and normed not in norm_map:
-                                norm_map[normed] = col
-                        empty_cols = [item["column"] for item in empty_required]
-                        sample_context = _build_required_sample_context(csv_path, input_dialect, empty_cols, norm_map, max_rows=200)
+                        sample_context = _build_required_sample_context(
+                            csv_path, input_dialect, required_cols_only, norm_map, max_rows=200
+                        )
                         if sample_context:
                             payload = f"{payload}\n\n{sample_context}"
                     except Exception:
                         pass
-                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-                    print("Empty required columns guard: retrying Data Engineer with evidence.")
-                    return run_data_engineer(new_state)
-                return {
-                    "cleaning_code": code,
-                    "cleaned_data_preview": "Error: Empty Required Columns",
-                    "error_message": "CRITICAL: Required input columns are empty after cleaning.",
-                }
+                    if has_raw_values and not state.get("de_empty_required_retry_done"):
+                        new_state = dict(state)
+                        new_state["de_empty_required_retry_done"] = True
+                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                        print("Empty required columns guard: retrying Data Engineer with evidence.")
+                        return run_data_engineer(new_state)
+                    return {
+                        "cleaning_code": code,
+                        "cleaned_data_preview": "Error: Empty Required Columns",
+                        "error_message": "CRITICAL: Required input columns are empty after cleaning.\n" + payload,
+                    }
 
             # --- CLEANING REVIEWER (LLM) ---
             if cleaning_reviewer:
@@ -5692,7 +5827,8 @@ def execute_code(state: AgentState) -> AgentState:
         os.environ["E2B_API_KEY"] = api_key 
         
         with Sandbox.create() as sandbox:
-            run_root = f"/home/user/run/{run_id}/attempt_{attempt_id}"
+            step_name = "ml_engineer"
+            run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
             print("Installing dependencies in Sandbox...")
             pkg_sets = get_sandbox_install_packages(required_deps)
             base_cmd = "pip install -q " + " ".join(pkg_sets["base"])
@@ -5779,6 +5915,8 @@ def execute_code(state: AgentState) -> AgentState:
             if execution.error:
                 output += f"\n\nEXECUTION ERROR:\n{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
 
+            downloaded_paths = []
+
             # Robust Artifact Download (P0 Fix)
             # Use shell command that always succeeds even if no files found
             ls_proc = sandbox.commands.run(f"sh -lc 'ls -1 {run_root}/static/plots/*.png 2>/dev/null || true'")
@@ -5801,8 +5939,10 @@ def execute_code(state: AgentState) -> AgentState:
                                     content = base64.b64decode(b64_content)
                                     if len(content) > 0:
                                         local_name = os.path.basename(remote_plot)
-                                        with open(os.path.join("static/plots", local_name), "wb") as f_local:
+                                        local_path = os.path.join("static/plots", local_name)
+                                        with open(local_path, "wb") as f_local:
                                             f_local.write(content)
+                                        downloaded_paths.append(local_path)
                                         print(f"Downloaded plot: {local_name}")
                             except Exception as e:
                                  print(f"Failed to download {remote_plot}: {e}")
@@ -5841,6 +5981,7 @@ def execute_code(state: AgentState) -> AgentState:
                                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                                 with open(local_path, "wb") as f_local:
                                     f_local.write(content)
+                                downloaded_paths.append(local_path)
                                 print(f"Downloaded required output: {local_path}")
                     except Exception as dl_err:
                         print(f"Warning: failed to download required output {remote_path}: {dl_err}")
@@ -5855,11 +5996,13 @@ def execute_code(state: AgentState) -> AgentState:
             if run_id:
                 log_sandbox_attempt(
                     run_id,
+                    step_name,
                     attempt_id,
                     code=code,
                     stdout=stdout_text,
                     stderr=stderr_text,
                     outputs_listing=outputs_listing,
+                    downloaded_paths=downloaded_paths,
                     exit_code=getattr(execution, "exit_code", None),
                     error_tail=(execution.error.traceback if execution.error else None),
                 )
@@ -6884,11 +7027,21 @@ def run_translator(state: AgentState) -> AgentState:
                     "analysis",
                     "models",
                     "plots",
-                    "report",
-                    "reports",
                     os.path.join("static", "plots"),
                 ],
             )
+            report_sources = ["report", "reports"]
+            pdf_path = state.get("pdf_path")
+            if pdf_path:
+                report_sources.append(pdf_path)
+            copy_run_reports(run_id, report_sources)
+            if pdf_path and state.get("run_bundle_dir"):
+                try:
+                    dest_path = os.path.join(state.get("run_bundle_dir"), "report", "final_report.pdf")
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    shutil.copy2(pdf_path, dest_path)
+                except Exception:
+                    pass
             status_final = normalize_status(summary.get("status") if isinstance(summary, dict) else None)
             finalize_run(run_id, status_final=status_final, state=state)
     except Exception:

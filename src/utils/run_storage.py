@@ -28,14 +28,21 @@ def init_run_dir(run_id: str, started_at: Optional[str] = None, runs_dir: str = 
     latest_dir = os.path.join(runs_dir, "latest")
     if os.path.exists(latest_dir):
         shutil.rmtree(latest_dir, ignore_errors=True)
-    for sub in ["contracts", "agents", "sandbox", "artifacts"]:
-        _ensure_dir(os.path.join(latest_dir, sub))
+    _ensure_dir(latest_dir)
+    try:
+        with open(os.path.join(latest_dir, "run_id.txt"), "w", encoding="utf-8") as f:
+            f.write(run_id)
+    except Exception:
+        pass
+    run_dir = os.path.join(runs_dir, run_id)
+    for sub in ["contracts", "agents", "sandbox", "artifacts", "report"]:
+        _ensure_dir(os.path.join(run_dir, sub))
     write_manifest_partial(
         run_id=run_id,
-        manifest_path=os.path.join(latest_dir, "run_manifest.json"),
+        manifest_path=os.path.join(run_dir, "run_manifest.json"),
         started_at=started_at,
     )
-    return latest_dir
+    return run_dir
 
 
 def write_manifest_partial(
@@ -92,7 +99,6 @@ def finalize_run(
     keep_last: int = 5,
     runs_dir: str = RUNS_DIR,
 ) -> None:
-    latest_dir = os.path.join(runs_dir, "latest")
     _ensure_dir(os.path.join(runs_dir, "archive"))
     status_final = normalize_status(status_final)
     ended_at = datetime.utcnow().isoformat()
@@ -104,19 +110,19 @@ def finalize_run(
         ended_at=ended_at,
     )
     if status_final != "PASS":
-        _archive_latest(run_id, latest_dir, os.path.join(runs_dir, "archive"))
+        run_dir = os.path.join(runs_dir, run_id)
+        _archive_run(run_id, run_dir, os.path.join(runs_dir, "archive"))
         apply_retention(keep_last=keep_last, archive_dir=os.path.join(runs_dir, "archive"))
 
-
-def _archive_latest(run_id: str, latest_dir: str, archive_dir: str) -> Optional[str]:
-    if not os.path.isdir(latest_dir):
+def _archive_run(run_id: str, run_dir: str, archive_dir: str) -> Optional[str]:
+    if not os.path.isdir(run_dir):
         return None
     _ensure_dir(archive_dir)
     zip_name = f"run_{run_id}.zip"
     zip_path = os.path.join(archive_dir, zip_name)
-    base_dir = os.path.abspath(os.path.dirname(latest_dir))
+    base_dir = os.path.abspath(os.path.dirname(run_dir))
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(latest_dir):
+        for root, _, files in os.walk(run_dir):
             for file in files:
                 path = os.path.join(root, file)
                 arcname = os.path.relpath(path, base_dir)
