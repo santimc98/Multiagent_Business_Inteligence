@@ -46,9 +46,8 @@ class MLEngineerAgent:
             self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
             if not self.api_key:
                 raise ValueError("Google API Key is required.")
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self.client = genai
+            from google import genai
+            self.client = genai.Client(api_key=self.api_key)
             self.model_name = os.getenv("ML_ENGINEER_MODEL", "gemini-3-flash-preview") or "gemini-3-flash-preview"
         else:
             raise ValueError(f"Unsupported ML_ENGINEER_PROVIDER: {self.provider}")
@@ -148,6 +147,9 @@ class MLEngineerAgent:
         2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
         3) NEVER generate synthetic/placeholder data. Always load from '$data_path' only.
         4) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
+        5) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
+        6) scored_rows.csv may include ONLY allowed columns per the contract. Any extra derived columns (e.g., price_delta) must be written to a separate artifact file.
+        7) Start the script with a short comment block labeled PLAN describing: detected columns, row_id construction, scored_rows columns, and where extra derived artifacts go.
 
         SECURITY / SANDBOX (VIOLATION = FAILURE)
         - Do NOT import sys.
@@ -382,10 +384,25 @@ class MLEngineerAgent:
 
 
         # Dynamic Configuration
+        def _env_float(name: str, default: float) -> float:
+            raw = os.getenv(name)
+            if raw is None or raw == "":
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                return default
+
+        base_temp = _env_float("ML_ENGINEER_TEMPERATURE", 0.1)
+        retry_temp = _env_float("ML_ENGINEER_TEMPERATURE_RETRY", 0.0)
         if previous_code and gate_context:
-            current_temp = 0.2
+            current_temp = retry_temp
         else:
-            current_temp = 0.1
+            current_temp = base_temp
+
+        thinking_level = (os.getenv("ML_ENGINEER_THINKING_LEVEL") or "high").strip().lower()
+        if thinking_level not in {"minimal", "low", "medium", "high"}:
+            thinking_level = "high"
 
         from src.utils.retries import call_with_retries
         if self.provider in {"google", "gemini"}:
@@ -411,26 +428,26 @@ class MLEngineerAgent:
                     )
                 content = response.choices[0].message.content
             elif self.provider in {"google", "gemini"}:
-                from google.generativeai.types import HarmCategory, HarmBlockThreshold
-                generation_config = {
-                    "temperature": temperature,
-                    "top_p": 0.9,
-                    "top_k": 40,
-                    "max_output_tokens": 8192,
-                }
-                safety_settings = {
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                }
-                model = self.client.GenerativeModel(
-                    model_name=self.model_name,
-                    generation_config=generation_config,
-                    safety_settings=safety_settings,
-                )
                 full_prompt = sys_prompt + "\n\nUSER INPUT:\n" + usr_prompt
-                response = model.generate_content(full_prompt)
+                from google.genai import types
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=temperature,
+                        top_p=0.9,
+                        top_k=40,
+                        max_output_tokens=8192,
+                        candidate_count=1,
+                        thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
+                        safety_settings=[
+                            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+                            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+                            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+                        ],
+                    ),
+                )
                 content = getattr(response, "text", "")
             else:
                 response = self.client.chat.completions.create(
