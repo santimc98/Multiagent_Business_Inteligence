@@ -38,6 +38,7 @@ data/cleaned_full.csv
 data/cleaning_manifest.json
 data/column_mapping_summary.json
 data/execution_contract.json
+data/evaluation_spec.json
 data/integrity_audit_report.json
 data/output_contract_report.json
 data/postmortem_decision.json
