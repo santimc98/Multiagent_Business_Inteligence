@@ -3164,6 +3164,7 @@ class AgentState(TypedDict):
     missing_repeat_count: int
     run_id: str
     run_start_ts: str
+    run_start_epoch: float
     dataset_fingerprint: str
     dataset_memory_context: str
     run_budget: Dict[str, Any]
@@ -3201,6 +3202,9 @@ def run_steward(state: AgentState) -> AgentState:
     run_start_ts = state.get("run_start_ts") if state else None
     if not run_start_ts:
         run_start_ts = datetime.utcnow().isoformat()
+    run_start_epoch = state.get("run_start_epoch") if state else None
+    if run_start_epoch is None:
+        run_start_epoch = time.time()
     csv_path = state.get("csv_path") if state else ""
     dataset_fingerprint = fingerprint_dataset(csv_path)
     memory_entries = load_dataset_memory()
@@ -3320,6 +3324,7 @@ def run_steward(state: AgentState) -> AgentState:
         "missing_repeat_count": 0,
         "run_id": run_id,
         "run_start_ts": run_start_ts,
+        "run_start_epoch": run_start_epoch,
         "dataset_fingerprint": dataset_fingerprint,
         "dataset_memory_context": memory_context,
         "run_budget": budget_state.get("run_budget", {}),
@@ -4895,7 +4900,17 @@ def check_data_success(state: AgentState):
     if not os.path.exists("data/cleaned_data.csv"):
         print("❌ Critical: cleaned_data.csv missing locally.")
         return "failed"
-        
+
+    run_start_epoch = state.get("run_start_epoch")
+    if run_start_epoch is not None:
+        try:
+            cleaned_mtime = os.path.getmtime("data/cleaned_data.csv")
+            if cleaned_mtime < float(run_start_epoch) - 1.0:
+                print("Data Engineer Failed: stale cleaned_data.csv detected.")
+                return "failed"
+        except Exception:
+            pass
+
     preview = state.get("cleaned_data_preview", "")
     if str(preview).startswith("Error") or "Error reading preview" in str(preview):
         print(f"❌ Data Engineer Failed (Preview Error): {preview}")
@@ -7020,6 +7035,7 @@ def run_translator(state: AgentState) -> AgentState:
                     "data/contract_min.json",
                 ],
             )
+            since_epoch = state.get("run_start_epoch")
             copy_run_artifacts(
                 run_id,
                 [
@@ -7029,12 +7045,13 @@ def run_translator(state: AgentState) -> AgentState:
                     "plots",
                     os.path.join("static", "plots"),
                 ],
+                since_epoch=since_epoch,
             )
             report_sources = ["report", "reports"]
             pdf_path = state.get("pdf_path")
             if pdf_path:
                 report_sources.append(pdf_path)
-            copy_run_reports(run_id, report_sources)
+            copy_run_reports(run_id, report_sources, since_epoch=since_epoch)
             if pdf_path and state.get("run_bundle_dir"):
                 try:
                     dest_path = os.path.join(state.get("run_bundle_dir"), "report", "final_report.pdf")

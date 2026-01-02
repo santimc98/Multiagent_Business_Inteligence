@@ -165,6 +165,10 @@ def clean_workspace_outputs() -> None:
         os.path.join("data", "scored_rows.csv"),
         os.path.join("data", "alignment_check.json"),
         os.path.join("data", "output_contract_report.json"),
+        os.path.join("data", "cleaned_data.csv"),
+        os.path.join("data", "cleaned_full.csv"),
+        os.path.join("data", "cleaning_manifest.json"),
+        os.path.join("data", "dataset_profile.json"),
     ]:
         try:
             if os.path.exists(path):

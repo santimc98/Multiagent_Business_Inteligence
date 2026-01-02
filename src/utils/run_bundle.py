@@ -118,6 +118,40 @@ def _scan_run_outputs(run_dir: str) -> List[str]:
     return produced
 
 
+def _normalize_rel_path(path: str) -> str:
+    return os.path.normpath(path).replace("\\", "/").lstrip("./")
+
+
+def _normalize_exclude_prefixes(exclude_prefixes: Optional[List[str]]) -> List[str]:
+    prefixes = []
+    for prefix in exclude_prefixes or []:
+        if not prefix:
+            continue
+        normalized = _normalize_rel_path(prefix)
+        if normalized:
+            prefixes.append(normalized.rstrip("/"))
+    return prefixes
+
+
+def _should_copy_file(
+    path: str,
+    rel_path: str,
+    since_epoch: Optional[float],
+    exclude_prefixes: Optional[List[str]],
+) -> bool:
+    rel_norm = _normalize_rel_path(rel_path)
+    for prefix in _normalize_exclude_prefixes(exclude_prefixes):
+        if rel_norm == prefix or rel_norm.startswith(prefix + "/"):
+            return False
+    if since_epoch is not None:
+        try:
+            if os.path.getmtime(path) < float(since_epoch):
+                return False
+        except Exception:
+            return False
+    return True
+
+
 def init_run_bundle(
     run_id: str,
     state: Optional[Dict[str, Any]] = None,
@@ -230,7 +264,12 @@ def log_sandbox_attempt(
     _RUN_ATTEMPTS.setdefault(run_id, []).append(record)
 
 
-def copy_run_artifacts(run_id: str, sources: List[str]) -> None:
+def copy_run_artifacts(
+    run_id: str,
+    sources: List[str],
+    since_epoch: Optional[float] = None,
+    exclude_prefixes: Optional[List[str]] = None,
+) -> None:
     run_dir = get_run_dir(run_id)
     if not run_dir:
         return
@@ -242,11 +281,21 @@ def copy_run_artifacts(run_id: str, sources: List[str]) -> None:
         try:
             if os.path.isdir(src):
                 base_name = os.path.basename(src.rstrip("/\\"))
-                dest = os.path.join(dest_root, base_name)
-                shutil.copytree(src, dest, dirs_exist_ok=True)
+                for root, _, files in os.walk(src):
+                    for name in files:
+                        path = os.path.join(root, name)
+                        rel = os.path.relpath(path, src)
+                        rel_path = os.path.join(base_name, rel)
+                        if not _should_copy_file(path, rel_path, since_epoch, exclude_prefixes):
+                            continue
+                        dest = os.path.join(dest_root, os.path.normpath(rel_path))
+                        _ensure_dir(os.path.dirname(dest))
+                        shutil.copy2(path, dest)
             else:
                 rel = src if not os.path.isabs(src) else os.path.basename(src)
-                dest = os.path.join(dest_root, rel)
+                if not _should_copy_file(src, rel, since_epoch, exclude_prefixes):
+                    continue
+                dest = os.path.join(dest_root, os.path.normpath(rel))
                 _ensure_dir(os.path.dirname(dest))
                 shutil.copy2(src, dest)
         except Exception:
@@ -269,7 +318,12 @@ def copy_run_contracts(run_id: str, sources: List[str]) -> None:
             pass
 
 
-def copy_run_reports(run_id: str, sources: List[str]) -> None:
+def copy_run_reports(
+    run_id: str,
+    sources: List[str],
+    since_epoch: Optional[float] = None,
+    exclude_prefixes: Optional[List[str]] = None,
+) -> None:
     run_dir = get_run_dir(run_id)
     if not run_dir:
         return
@@ -281,11 +335,21 @@ def copy_run_reports(run_id: str, sources: List[str]) -> None:
         try:
             if os.path.isdir(src):
                 base_name = os.path.basename(src.rstrip("/\\"))
-                dest = os.path.join(dest_root, base_name)
-                shutil.copytree(src, dest, dirs_exist_ok=True)
+                for root, _, files in os.walk(src):
+                    for name in files:
+                        path = os.path.join(root, name)
+                        rel = os.path.relpath(path, src)
+                        rel_path = os.path.join(base_name, rel)
+                        if not _should_copy_file(path, rel_path, since_epoch, exclude_prefixes):
+                            continue
+                        dest = os.path.join(dest_root, os.path.normpath(rel_path))
+                        _ensure_dir(os.path.dirname(dest))
+                        shutil.copy2(path, dest)
             else:
                 rel = src if not os.path.isabs(src) else os.path.basename(src)
-                dest = os.path.join(dest_root, rel)
+                if not _should_copy_file(src, rel, since_epoch, exclude_prefixes):
+                    continue
+                dest = os.path.join(dest_root, os.path.normpath(rel))
                 _ensure_dir(os.path.dirname(dest))
                 shutil.copy2(src, dest)
         except Exception:

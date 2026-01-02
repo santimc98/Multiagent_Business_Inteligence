@@ -1,7 +1,9 @@
 import json
+import os
+import time
 from pathlib import Path
 
-from src.utils.run_bundle import init_run_bundle, write_run_manifest
+from src.utils.run_bundle import init_run_bundle, write_run_manifest, copy_run_artifacts
 from src.utils.run_logger import init_run_log, log_run_event
 
 
@@ -73,3 +75,26 @@ def test_manifest_no_ml_outputs_without_artifacts(tmp_path, monkeypatch):
     manifest_path = write_run_manifest(run_id, state, status_final="FAIL")
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     assert "data/metrics.json" not in manifest["produced_outputs"]
+
+
+def test_copy_run_artifacts_filters_by_mtime(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run_id = "run2222"
+    run_dir = init_run_bundle(run_id, {}, base_dir=str(tmp_path / "runs"), enable_tee=False)
+    source_dir = tmp_path / "data"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    old_file = source_dir / "old.txt"
+    new_file = source_dir / "new.txt"
+    old_file.write_text("old", encoding="utf-8")
+    new_file.write_text("new", encoding="utf-8")
+
+    now = time.time()
+    os.utime(old_file, (now - 10, now - 10))
+    os.utime(new_file, (now + 2, now + 2))
+
+    copy_run_artifacts(run_id, [str(source_dir)], since_epoch=now - 1)
+
+    dest_old = Path(run_dir) / "artifacts" / "data" / "old.txt"
+    dest_new = Path(run_dir) / "artifacts" / "data" / "new.txt"
+    assert not dest_old.exists()
+    assert dest_new.exists()
