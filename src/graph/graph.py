@@ -61,6 +61,7 @@ from src.utils.run_bundle import (
     init_run_bundle,
     log_agent_snapshot,
     log_sandbox_attempt,
+    update_sandbox_attempt,
     copy_run_artifacts,
     copy_run_contracts,
     copy_run_reports,
@@ -1360,6 +1361,9 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "DATAFRAME_LITERAL_OVERWRITE": [
             "Do not overwrite df/data with pd.DataFrame literals; always load from the cleaned CSV.",
         ],
+        "SCORED_ROWS_SCHEMA_VIOLATION": [
+            "Keep scored_rows.csv limited to row-level scores/segments; write *_delta columns to a separate artifact.",
+        ],
         "ALIGNMENT_REQUIREMENTS_MISSING": [
             "Populate alignment_check.json with per-requirement status + evidence list.",
         ],
@@ -1898,6 +1902,25 @@ def ml_quality_preflight(
                 return True
         return False
 
+    def _scored_rows_has_delta() -> bool:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Subscript):
+                continue
+            target = node.value
+            if isinstance(target, ast.Name):
+                name = target.id
+            elif isinstance(target, ast.Attribute):
+                name = target.attr
+            else:
+                name = None
+            if name not in {"scored_rows", "scored_df", "scores_df"}:
+                continue
+            slice_node = node.slice
+            if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+                if "delta" in slice_node.value.lower():
+                    return True
+        return False
+
     baseline_required = True
     if flags["requires_target"] and baseline_required:
         if not _has_symbol({"DummyClassifier", "DummyRegressor"}):
@@ -1916,6 +1939,8 @@ def ml_quality_preflight(
         issues.append("SYNTHETIC_DATA_DETECTED")
     if _detect_dataframe_literal_overwrite(code):
         issues.append("DATAFRAME_LITERAL_OVERWRITE")
+    if _scored_rows_has_delta():
+        issues.append("SCORED_ROWS_SCHEMA_VIOLATION")
 
     return issues
 
@@ -5495,8 +5520,8 @@ def run_engineer(state: AgentState) -> AgentState:
             "csv_decimal": csv_decimal,
             "csv_encoding": csv_encoding,
             "error_message": "",
-            "ml_call_refund_pending": True,
-            "execution_call_refund_pending": True,
+            "ml_call_refund_pending": False,
+            "execution_call_refund_pending": False,
             "ml_context_snapshot": {
                 "cleaned_column_inventory": header_cols,
                 "cleaned_aliasing_collisions": aliasing if header_cols else {},
@@ -5774,6 +5799,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "ml_preflight")
     if abort_state:
         return abort_state
+    run_id = state.get("run_id")
     code = state.get("generated_code", "")
     evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec") or {}
     if code and not is_syntax_valid(code):
@@ -5835,6 +5861,8 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
     allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
     issues = ml_quality_preflight(code, evaluation_spec, allowed_columns, allowed_patterns)
+    if run_id and issues:
+        log_run_event(run_id, "ml_preflight_issues", {"issues": issues})
     if isinstance(evaluation_spec, dict):
         obj_type = str(evaluation_spec.get("objective_type") or "").lower()
         validation_policy = evaluation_spec.get("validation_policy") or {}
@@ -6054,6 +6082,30 @@ def execute_code(state: AgentState) -> AgentState:
 
     required_outputs = _resolve_required_outputs(contract)
     _purge_execution_outputs(required_outputs)
+
+    eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
+    allowed_columns = _resolve_allowed_columns_for_gate(state, contract, eval_spec)
+    allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
+    preflight_issues = ml_quality_preflight(code, eval_spec, allowed_columns, allowed_patterns)
+    fatal_preflight = {
+        "SYNTHETIC_DATA_DETECTED",
+        "DATAFRAME_LITERAL_OVERWRITE",
+        "UNKNOWN_COLUMNS_REFERENCED",
+    }
+    fatal_hits = [issue for issue in preflight_issues if issue in fatal_preflight]
+    if fatal_hits:
+        msg = f"ML_PREFLIGHT_BLOCK: {', '.join(fatal_hits)}"
+        fh = list(state.get("feedback_history", []))
+        fh.append(msg)
+        if run_id:
+            log_run_event(run_id, "ml_preflight_blocked", {"issues": fatal_hits})
+        return {
+            "error_message": msg,
+            "execution_output": msg,
+            "feedback_history": fh,
+            "ml_skipped_reason": "ML_PREFLIGHT_BLOCKED",
+            "budget_counters": counters,
+        }
 
     # 0b. Undefined name preflight (avoid sandbox NameError)
     undefined = detect_undefined_names(code)
@@ -6310,6 +6362,22 @@ def execute_code(state: AgentState) -> AgentState:
         or "EXECUTION ERROR" in output
         or sandbox_failed
     )
+
+    outputs_valid = not bool(artifact_issues or stale_outputs or error_in_output)
+    if not outputs_valid:
+        _purge_execution_outputs(required_outputs)
+        plots_local = []
+        fallback_plots_local = []
+        has_partial_visuals = False
+    if run_id:
+        update_sandbox_attempt(
+            run_id,
+            "ml_engineer",
+            attempt_id,
+            artifacts_valid=outputs_valid,
+            artifact_issues=artifact_issues,
+            stale_outputs=stale_outputs,
+        )
     
     runtime_tail = None
     ml_skipped_reason = state.get("ml_skipped_reason", None)
@@ -6322,18 +6390,6 @@ def execute_code(state: AgentState) -> AgentState:
         runtime_tail = tail
         if "DETERMINISTIC_TARGET_RELATION" in tail:
             ml_skipped_reason = "DETERMINISTIC_TARGET_RELATION"
-        if state.get("ml_call_refund_pending"):
-            refund_counters = dict(state.get("budget_counters") or {})
-            if refund_counters.get("ml_calls", 0) > 0:
-                refund_counters["ml_calls"] = max(0, refund_counters.get("ml_calls", 0) - 1)
-            counters = refund_counters
-            state["budget_counters"] = refund_counters
-        if state.get("execution_call_refund_pending"):
-            refund_counters = dict(state.get("budget_counters") or {})
-            if refund_counters.get("execution_calls", 0) > 0:
-                refund_counters["execution_calls"] = max(0, refund_counters.get("execution_calls", 0) - 1)
-            counters = refund_counters
-            state["budget_counters"] = refund_counters
         
     # Suppress fallback plots in successful executions (avoid reporting placeholders)
     if not error_in_output and not sandbox_failed and plots_local:
@@ -7312,6 +7368,7 @@ import uuid
 def generate_pdf_artifact(state: AgentState) -> AgentState:
     print("--- [7] System: Generating PDF Report ---")
     report = state['final_report']
+    import glob
     
     # Check for visualizations
     if "static/plots" not in report:
@@ -7339,13 +7396,37 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
         print(f"PDF generated at: {abs_pdf_path}")
         run_id = state.get("run_id")
         since_epoch = state.get("run_start_epoch")
+
+        latest_pdf = pdf_filename
+        try:
+            candidates = []
+            for path in glob.glob("final_report*.pdf"):
+                try:
+                    mtime = os.path.getmtime(path)
+                except Exception:
+                    continue
+                if since_epoch is None or mtime >= float(since_epoch) - 1.0:
+                    candidates.append((mtime, path))
+            if candidates:
+                candidates.sort(reverse=True)
+                latest_pdf = candidates[0][1]
+        except Exception:
+            latest_pdf = pdf_filename
+
         if run_id:
-            copy_run_reports(run_id, [pdf_filename], since_epoch=since_epoch)
-        if state.get("run_bundle_dir"):
+            copy_run_reports(run_id, [latest_pdf], since_epoch=None)
             try:
-                dest_path = os.path.join(state.get("run_bundle_dir"), "report", "final_report.pdf")
+                dest_root = os.path.join("runs", run_id, "report")
+                os.makedirs(dest_root, exist_ok=True)
+                shutil.copy2(latest_pdf, os.path.join(dest_root, "final_report.pdf"))
+            except Exception:
+                pass
+        run_bundle_dir = state.get("run_bundle_dir")
+        if run_bundle_dir:
+            try:
+                dest_path = os.path.join(run_bundle_dir, "report", "final_report.pdf")
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                shutil.copy2(pdf_filename, dest_path)
+                shutil.copy2(latest_pdf, dest_path)
             except Exception:
                 pass
         return {"final_report": state["final_report"], "pdf_path": pdf_filename}

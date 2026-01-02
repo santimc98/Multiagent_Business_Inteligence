@@ -264,6 +264,16 @@ def log_sandbox_attempt(
     _RUN_ATTEMPTS.setdefault(run_id, []).append(record)
 
 
+def update_sandbox_attempt(run_id: str, step: str, attempt: int, **updates: Any) -> None:
+    if not run_id or run_id not in _RUN_ATTEMPTS:
+        return
+    safe_step = step or "unknown"
+    for record in reversed(_RUN_ATTEMPTS.get(run_id, [])):
+        if record.get("step") == safe_step and record.get("attempt") == attempt:
+            record.update({k: v for k, v in updates.items() if v is not None})
+            break
+
+
 def copy_run_artifacts(
     run_id: str,
     sources: List[str],

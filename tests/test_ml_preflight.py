@@ -134,3 +134,44 @@ baseline = DummyClassifier()
 """
     issues = ml_quality_preflight(code)
     assert "IMPUTER_REQUIRED" in issues
+
+
+def test_ml_preflight_blocks_random_inside_function():
+    code = """
+import pandas as pd
+import numpy as np
+from sklearn.impute import SimpleImputer
+from sklearn.dummy import DummyClassifier
+print("Mapping Summary: ...")
+feature_cols = ["a", "b"]
+X = df[feature_cols]
+y = df["target"]
+if y.nunique() < 2:
+    raise ValueError("Target has no variance; cannot train meaningful model.")
+def sample_noise():
+    return np.random.randn(10)
+imputer = SimpleImputer()
+baseline = DummyClassifier()
+"""
+    issues = ml_quality_preflight(code, allowed_columns=["a", "b", "target"])
+    assert "SYNTHETIC_DATA_DETECTED" in issues
+
+
+def test_ml_preflight_flags_scored_rows_delta():
+    code = """
+import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.dummy import DummyClassifier
+print("Mapping Summary: ...")
+feature_cols = ["a", "b"]
+X = df[feature_cols]
+y = df["target"]
+if y.nunique() < 2:
+    raise ValueError("Target has no variance; cannot train meaningful model.")
+scored_rows = df.copy()
+scored_rows["price_delta"] = scored_rows["a"] - 1
+imputer = SimpleImputer()
+baseline = DummyClassifier()
+"""
+    issues = ml_quality_preflight(code, allowed_columns=["a", "b", "target"])
+    assert "SCORED_ROWS_SCHEMA_VIOLATION" in issues
