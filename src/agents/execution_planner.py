@@ -992,8 +992,7 @@ class ExecutionPlannerAgent:
             if decision_context:
                 allowed_patterns.extend(
                     [
-                        r"^expected_.*(revenue|value|price|profit|margin|cost).*",
-                        r".*_(revenue|value|price|profit|margin|cost)$",
+                        r"^(expected|optimal|recommended)_.*(revenue|value|price|profit|margin|cost).*",
                     ]
                 )
 
@@ -1004,6 +1003,48 @@ class ExecutionPlannerAgent:
                 "allowed_extra_columns": derived_cols,
                 "allowed_name_patterns": allowed_patterns,
             }
+
+        def _pattern_name(name: str) -> str:
+            return re.sub(r"[^0-9a-zA-Z]+", "_", str(name).lower()).strip("_")
+
+        def _sanitize_allowed_extras(
+            extras: List[str],
+            patterns: List[str],
+            allowlist: set[str],
+            max_count: int = 30,
+        ) -> List[str]:
+            if not extras:
+                return []
+            allowed = []
+            seen = set()
+            norm_allowlist = {_norm(item) for item in allowlist if item}
+            pattern_list = [str(pat) for pat in patterns if isinstance(pat, str) and pat.strip()]
+            for item in extras:
+                if not item:
+                    continue
+                raw = str(item)
+                norm = _norm(raw)
+                if not norm or norm in seen:
+                    continue
+                if norm in norm_allowlist:
+                    allowed.append(raw)
+                    seen.add(norm)
+                else:
+                    target = _pattern_name(raw)
+                    matched = False
+                    for pattern in pattern_list:
+                        try:
+                            if re.search(pattern, target):
+                                matched = True
+                                break
+                        except re.error:
+                            continue
+                    if matched:
+                        allowed.append(raw)
+                        seen.add(norm)
+                if len(allowed) >= max_count:
+                    break
+            return allowed
 
         def _apply_artifact_schemas(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
@@ -1027,6 +1068,12 @@ class ExecutionPlannerAgent:
                 merged["allowed_name_patterns"] = _merge_unique(
                     scored_schema.get("allowed_name_patterns", []),
                     merged.get("allowed_name_patterns", []) or [],
+                )
+                merged["allowed_extra_columns"] = _sanitize_allowed_extras(
+                    merged.get("allowed_extra_columns", []) or [],
+                    merged.get("allowed_name_patterns", []) or [],
+                    {"is_success", "success_probability", "client_segment"},
+                    max_count=30,
                 )
                 schemas["data/scored_rows.csv"] = merged
             if schemas:
