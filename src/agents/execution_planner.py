@@ -706,6 +706,10 @@ class ExecutionPlannerAgent:
                 "minimize",
                 "pricing",
                 "precio",
+                "optimal",
+                "optimo",
+                "revenue",
+                "expected value",
                 "recommend",
                 "allocation",
                 "decision",
@@ -719,6 +723,12 @@ class ExecutionPlannerAgent:
                 "regression",
                 "forecast",
                 "probability",
+                "probabilidad",
+                "clasific",
+                "conversion",
+                "convert",
+                "churn",
+                "contract",
                 "propensity",
                 "predictive",
             ]
@@ -736,6 +746,121 @@ class ExecutionPlannerAgent:
             if any(tok in signal_text for tok in causal_tokens):
                 return "causal"
             return "descriptive"
+
+        def _safe_column_name(name: str) -> str:
+            if not name:
+                return ""
+            return re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
+
+        def _collect_text_blob() -> str:
+            parts = []
+            if business_objective:
+                parts.append(business_objective)
+            if data_summary:
+                parts.append(data_summary)
+            if isinstance(strategy, dict):
+                parts.append(json.dumps(strategy, ensure_ascii=True))
+            return "\n".join(parts)
+
+        def _infer_segmentation_required() -> bool:
+            text = _collect_text_blob().lower()
+            tokens = ["segment", "segmentation", "cluster", "clustering", "typology", "tipolog"]
+            return any(tok in text for tok in tokens)
+
+        def _extract_summary_candidates(summary_text: str) -> List[str]:
+            if not summary_text:
+                return []
+            candidates: List[str] = []
+            label_tokens = ["status", "phase", "stage", "outcome", "result"]
+            for raw_line in summary_text.splitlines():
+                line = raw_line.strip()
+                line_lower = line.lower()
+                if not any(tok in line_lower for tok in label_tokens):
+                    continue
+                if ":" not in line:
+                    continue
+                _, cols = line.split(":", 1)
+                cols_list = [c.strip() for c in re.split(r"[;,]", cols) if c.strip()]
+                candidates.extend(cols_list)
+            return candidates
+
+        def _status_candidate_score(name: str) -> int:
+            if not name:
+                return -1
+            norm = _norm(name)
+            if not norm:
+                return -1
+            if any(tok in norm for tok in ["prob", "score", "pred"]):
+                return -1
+            tokens = [
+                "status",
+                "phase",
+                "stage",
+                "outcome",
+                "result",
+                "success",
+                "won",
+                "win",
+                "closed",
+                "churn",
+                "conversion",
+                "convert",
+                "approval",
+                "approved",
+            ]
+            score = 0
+            for idx, tok in enumerate(tokens):
+                if tok in norm:
+                    score += (len(tokens) - idx)
+            return score
+
+        def _find_status_candidate() -> str | None:
+            candidates: List[str] = []
+            for raw in column_inventory or []:
+                if raw is None:
+                    continue
+                raw_str = str(raw)
+                if _status_candidate_score(raw_str) > 0:
+                    candidates.append(raw_str)
+            for candidate in _extract_summary_candidates(data_summary):
+                resolved = _resolve_exact_header(candidate) or candidate
+                if _status_candidate_score(resolved) > 0:
+                    candidates.append(resolved)
+            best = None
+            best_score = -1
+            for cand in candidates:
+                score = _status_candidate_score(cand)
+                if score > best_score:
+                    best_score = score
+                    best = cand
+            return best
+
+        def _parse_label_list(text: str) -> List[str]:
+            if not text:
+                return []
+            parts = [p.strip() for p in re.split(r"[;,/|]", text) if p.strip()]
+            return [p for p in parts if p]
+
+        def _extract_positive_labels(summary_text: str) -> List[str]:
+            if not summary_text:
+                return []
+            for pattern in [
+                r"positive labels?\s*[:=]\s*([^\n]+)",
+                r"positive_values?\s*[:=]\s*([^\n]+)",
+                r"success labels?\s*[:=]\s*([^\n]+)",
+            ]:
+                match = re.search(pattern, summary_text, flags=re.IGNORECASE)
+                if match:
+                    labels = _parse_label_list(match.group(1))
+                    if labels:
+                        return labels
+            fallback_tokens = ["won", "success", "converted", "approved", "active", "yes", "true"]
+            found = []
+            lower = summary_text.lower()
+            for tok in fallback_tokens:
+                if tok in lower:
+                    found.append(tok)
+            return found
 
         def _deliverable_id_from_path(path: str) -> str:
             base = os.path.basename(str(path)) or str(path)
@@ -960,6 +1085,7 @@ class ExecutionPlannerAgent:
                 return None
             spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
             derived_cols: List[str] = []
+            required_cols: List[str] = []
             derived = spec.get("derived_columns")
             if isinstance(derived, list):
                 for entry in derived:
@@ -971,6 +1097,34 @@ class ExecutionPlannerAgent:
                         name = None
                     if name:
                         derived_cols.append(str(name))
+
+            canonical_cols = contract.get("canonical_columns") if isinstance(contract.get("canonical_columns"), list) else []
+            required_cols.extend([str(c) for c in canonical_cols if c])
+
+            target_name = _target_name_from_contract(contract, derived if isinstance(derived, list) else [])
+            if target_name:
+                required_cols.append(str(target_name))
+                safe_target = _safe_column_name(target_name)
+                if safe_target:
+                    required_cols.append(f"pred_{safe_target}")
+                else:
+                    required_cols.append("prediction")
+            else:
+                required_cols.append("prediction")
+
+            if _infer_segmentation_required():
+                required_cols.append("cluster_id")
+
+            decision_vars = contract.get("decision_variables") or []
+            if isinstance(decision_vars, list):
+                for var in decision_vars:
+                    if not var:
+                        continue
+                    safe_var = _safe_column_name(var)
+                    if safe_var:
+                        required_cols.append(f"recommended_{safe_var}")
+                if decision_vars:
+                    required_cols.append("expected_value_at_recommendation")
 
             objective_type = _infer_objective_type()
             allowed_patterns = [
@@ -1002,13 +1156,15 @@ class ExecutionPlannerAgent:
                 allowed_patterns.extend(
                     [
                         r"^(expected|optimal|recommended)_.*(revenue|value|price|profit|margin|cost).*",
+                        r"^recommended_.*",
+                        r"^expected_value_at_recommendation$",
                     ]
                 )
 
             return {
                 "rowcount": "match_cleaned",
                 "min_overlap": 1,
-                "required_columns": [],
+                "required_columns": _merge_unique(required_cols, []),
                 "allowed_extra_columns": derived_cols,
                 "allowed_name_patterns": allowed_patterns,
             }
@@ -1067,9 +1223,11 @@ class ExecutionPlannerAgent:
                 if not isinstance(existing, dict):
                     existing = {}
                 merged = dict(existing)
-                for key in ("rowcount", "min_overlap", "required_columns"):
+                for key in ("rowcount", "min_overlap"):
                     if key not in merged and key in scored_schema:
                         merged[key] = scored_schema[key]
+                if scored_schema.get("required_columns") and not merged.get("required_columns"):
+                    merged["required_columns"] = scored_schema.get("required_columns")
                 merged["allowed_extra_columns"] = _merge_unique(
                     scored_schema.get("allowed_extra_columns", []),
                     merged.get("allowed_extra_columns", []) or [],
@@ -1078,10 +1236,18 @@ class ExecutionPlannerAgent:
                     scored_schema.get("allowed_name_patterns", []),
                     merged.get("allowed_name_patterns", []) or [],
                 )
+                base_allowlist = {
+                    "is_success",
+                    "success_probability",
+                    "client_segment",
+                    "cluster_id",
+                    "expected_value_at_recommendation",
+                }
+                base_allowlist.update({str(c) for c in (merged.get("allowed_extra_columns") or []) if c})
                 merged["allowed_extra_columns"] = _sanitize_allowed_extras(
                     merged.get("allowed_extra_columns", []) or [],
                     merged.get("allowed_name_patterns", []) or [],
-                    {"is_success", "success_probability", "client_segment"},
+                    base_allowlist,
                     max_count=30,
                 )
                 schemas["data/scored_rows.csv"] = merged
@@ -1102,10 +1268,364 @@ class ExecutionPlannerAgent:
             spec["scoring_formula"] = spec.get("scoring_formula") if isinstance(spec.get("scoring_formula"), str) else None
             spec["target_type"] = spec.get("target_type") if isinstance(spec.get("target_type"), str) else None
             spec["leakage_policy"] = spec.get("leakage_policy") if isinstance(spec.get("leakage_policy"), str) else None
+            if not isinstance(spec.get("leakage_policy_detail"), dict):
+                spec["leakage_policy_detail"] = {}
             contract["spec_extraction"] = spec
             planner_self_check = contract.get("planner_self_check")
             if not isinstance(planner_self_check, list):
                 contract["planner_self_check"] = []
+            return contract
+
+        def _normalize_derived_columns(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+            derived = spec.get("derived_columns")
+            normalized: List[Dict[str, Any]] = []
+            if isinstance(derived, list):
+                for entry in derived:
+                    if isinstance(entry, dict):
+                        normalized.append(entry)
+                    elif isinstance(entry, str):
+                        normalized.append({"name": entry})
+            spec["derived_columns"] = normalized
+            return normalized
+
+        def _ensure_requirement(
+            reqs: List[Dict[str, Any]],
+            name: str,
+            role: str,
+            expected_kind: str | None = None,
+            source: str = "derived",
+            derived_owner: str = "ml_engineer",
+        ) -> None:
+            if not name:
+                return
+            norm_name = _norm(name)
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                existing = req.get("canonical_name") or req.get("name")
+                if existing and _norm(existing) == norm_name:
+                    if not req.get("source"):
+                        req["source"] = source
+                    if role and not req.get("role"):
+                        req["role"] = role
+                    if expected_kind and not req.get("expected_kind"):
+                        req["expected_kind"] = expected_kind
+                    if derived_owner and not req.get("derived_owner"):
+                        req["derived_owner"] = derived_owner
+                    return
+            payload = {
+                "name": name,
+                "role": role,
+                "expected_range": None,
+                "allowed_null_frac": None,
+                "source": source,
+                "expected_kind": expected_kind or "unknown",
+                "canonical_name": name,
+                "derived_owner": derived_owner,
+            }
+            reqs.append(payload)
+
+        def _target_name_from_contract(contract: Dict[str, Any], derived: List[Dict[str, Any]]) -> str | None:
+            reqs = contract.get("data_requirements", []) or []
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                role = str(req.get("role") or "").lower()
+                if "target" in role or "label" in role:
+                    return req.get("canonical_name") or req.get("name")
+            for entry in derived:
+                role = str(entry.get("role") or "").lower()
+                if "target" in role or "label" in role:
+                    return entry.get("name") or entry.get("canonical_name")
+            return None
+
+        def _ensure_derived_columns(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+            derived = _normalize_derived_columns(spec)
+            derived_keys = {_norm(entry.get("name") or entry.get("canonical_name") or "") for entry in derived}
+            reqs = contract.get("data_requirements", []) or []
+
+            objective_type = _infer_objective_type()
+            target_req = None
+            target_req_name = None
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                role = str(req.get("role") or "").lower()
+                if "target" in role or "label" in role:
+                    target_req = req
+                    target_req_name = req.get("canonical_name") or req.get("name")
+                    break
+            derived_has_target = False
+            for entry in derived:
+                if not isinstance(entry, dict):
+                    continue
+                role = str(entry.get("role") or "").lower()
+                if "target" in role or "label" in role:
+                    derived_has_target = True
+                    break
+            target_in_inventory = bool(_resolve_exact_header(target_req_name)) if target_req_name else False
+            target_explicit = derived_has_target or (
+                target_req
+                and str(target_req.get("source") or "input").lower() == "input"
+                and target_in_inventory
+            )
+            if objective_type in {"predictive", "prescriptive", "forecasting"} and not target_explicit:
+                status_col = _find_status_candidate()
+                if status_col:
+                    positive_labels = _extract_positive_labels(data_summary)
+                    original_target_name = target_req_name
+                    if target_req and str(target_req.get("source") or "").lower() == "derived":
+                        target_req["name"] = "is_success"
+                        target_req["canonical_name"] = "is_success"
+                        target_req["role"] = "target"
+                        if not target_req.get("expected_kind"):
+                            target_req["expected_kind"] = "categorical"
+                        if not target_req.get("derived_owner"):
+                            target_req["derived_owner"] = "ml_engineer"
+                        target_req_name = "is_success"
+                    entry = {
+                        "name": "is_success",
+                        "canonical_name": "is_success",
+                        "role": "target",
+                        "dtype": "boolean",
+                        "derived_from": status_col,
+                        "rule": "1 if status in positive_labels else 0",
+                        "positive_values": positive_labels,
+                    }
+                    if original_target_name:
+                        derived = [
+                            item
+                            for item in derived
+                            if _norm(item.get("name") or item.get("canonical_name") or "") != _norm(original_target_name)
+                            or str(item.get("role") or "").lower() == "target"
+                        ]
+                    derived.append(entry)
+                    derived_keys.add(_norm("is_success"))
+                    _ensure_requirement(reqs, "is_success", "target", expected_kind="categorical")
+                    if not positive_labels:
+                        checklist = contract.get("compliance_checklist")
+                        if not isinstance(checklist, list):
+                            checklist = []
+                        note = (
+                            "Infer positive_labels for is_success from unique values of the status column "
+                            f"('{status_col}') before training."
+                        )
+                        if note not in checklist:
+                            checklist.append(note)
+                        contract["compliance_checklist"] = checklist
+
+            if _infer_segmentation_required() and _norm("cluster_id") not in derived_keys:
+                derived.append(
+                    {
+                        "name": "cluster_id",
+                        "canonical_name": "cluster_id",
+                        "role": "segment",
+                        "dtype": "integer",
+                        "derived_from": "pre_decision_features",
+                        "rule": "Cluster rows using only pre-decision features.",
+                    }
+                )
+                derived_keys.add(_norm("cluster_id"))
+                _ensure_requirement(reqs, "cluster_id", "segment", expected_kind="categorical")
+
+            decision_vars = contract.get("decision_variables") or []
+            if isinstance(decision_vars, list):
+                for var in decision_vars:
+                    if not var:
+                        continue
+                    safe_var = _safe_column_name(var)
+                    if not safe_var:
+                        continue
+                    rec_name = f"recommended_{safe_var}"
+                    if _norm(rec_name) not in derived_keys:
+                        derived.append(
+                            {
+                                "name": rec_name,
+                                "canonical_name": rec_name,
+                                "role": "recommendation",
+                                "dtype": "float",
+                                "derived_from": str(var),
+                                "rule": "Optimize expected value over decision variable.",
+                            }
+                        )
+                        derived_keys.add(_norm(rec_name))
+                        _ensure_requirement(reqs, rec_name, "recommendation", expected_kind="numeric")
+                if decision_vars:
+                    ev_name = "expected_value_at_recommendation"
+                    if _norm(ev_name) not in derived_keys:
+                        derived.append(
+                            {
+                                "name": ev_name,
+                                "canonical_name": ev_name,
+                                "role": "expected_value",
+                                "dtype": "float",
+                                "derived_from": "recommended_decision",
+                                "rule": "Expected value at the recommended decision.",
+                            }
+                        )
+                        derived_keys.add(_norm(ev_name))
+                        _ensure_requirement(reqs, ev_name, "expected_value", expected_kind="numeric")
+
+            spec["derived_columns"] = derived
+            contract["spec_extraction"] = spec
+            contract["data_requirements"] = reqs
+            return contract
+
+        def _refresh_canonical_columns(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            reqs = contract.get("data_requirements", []) or []
+            derived = []
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                name = req.get("canonical_name") or req.get("name")
+                if name:
+                    derived.append(str(name))
+            existing = contract.get("canonical_columns") if isinstance(contract.get("canonical_columns"), list) else []
+            combined = []
+            seen = set()
+            for col in list(existing) + derived:
+                norm = _norm(col)
+                if not norm or norm in seen:
+                    continue
+                seen.add(norm)
+                combined.append(col)
+            if combined:
+                contract["canonical_columns"] = combined
+            return contract
+
+        def _infer_availability(name: str, role: str | None, decision_vars: List[str]) -> str:
+            norm = _norm(name)
+            role_lower = (role or "").lower()
+            decision_norms = {_norm(v) for v in decision_vars if v}
+            if norm in decision_norms or "decision" in role_lower:
+                return "decision"
+            if any(tok in norm for tok in ["pred", "prob", "score", "recommend", "optimal", "expectedvalue"]):
+                return "post_decision-audit_only"
+            if any(tok in norm for tok in ["post", "after"]):
+                return "post_decision-audit_only"
+            if "target" in role_lower or "label" in role_lower:
+                return "outcome"
+            if any(tok in norm for tok in ["status", "phase", "stage", "outcome", "result", "success", "churn", "conversion"]):
+                return "outcome"
+            if any(tok in norm for tok in ["segment", "cluster", "group"]):
+                return "pre_decision"
+            return "pre_decision"
+
+        def _ensure_feature_availability(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            canonical = contract.get("canonical_columns") if isinstance(contract.get("canonical_columns"), list) else []
+            reqs = contract.get("data_requirements", []) or []
+            availability = contract.get("feature_availability")
+            if not isinstance(availability, list):
+                availability = []
+            by_norm = { _norm(item.get("column")): item for item in availability if isinstance(item, dict) and item.get("column") }
+            decision_vars = contract.get("decision_variables") or []
+            role_map = {}
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                name = req.get("canonical_name") or req.get("name")
+                if name:
+                    role_map[_norm(name)] = req.get("role")
+            for col in canonical:
+                norm = _norm(col)
+                if not norm:
+                    continue
+                entry = by_norm.get(norm)
+                role = role_map.get(norm)
+                availability_label = _infer_availability(col, role, decision_vars if isinstance(decision_vars, list) else [])
+                if entry:
+                    if not entry.get("availability"):
+                        entry["availability"] = availability_label
+                    if not entry.get("rationale"):
+                        entry["rationale"] = "Availability inferred from contract context."
+                else:
+                    availability.append(
+                        {
+                            "column": col,
+                            "availability": availability_label,
+                            "rationale": "Availability inferred from contract context.",
+                        }
+                    )
+            contract["feature_availability"] = availability
+            if not contract.get("availability_summary"):
+                counts = {"pre_decision": 0, "decision": 0, "outcome": 0, "post_decision-audit_only": 0}
+                for item in availability:
+                    if not isinstance(item, dict):
+                        continue
+                    label = item.get("availability")
+                    if label in counts:
+                        counts[label] += 1
+                contract["availability_summary"] = (
+                    "Auto-generated availability summary: "
+                    f"pre_decision={counts['pre_decision']}, decision={counts['decision']}, "
+                    f"outcome={counts['outcome']}, post_decision-audit_only={counts['post_decision-audit_only']}."
+                )
+            return contract
+
+        def _attach_leakage_policy_detail(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+            feature_availability = contract.get("feature_availability") or []
+            audit_only: List[str] = []
+            forbidden: List[str] = []
+            for item in feature_availability:
+                if not isinstance(item, dict):
+                    continue
+                col = item.get("column")
+                availability = str(item.get("availability") or "").lower()
+                if not col:
+                    continue
+                if "post" in availability:
+                    audit_only.append(col)
+                    forbidden.append(col)
+                if availability == "outcome":
+                    forbidden.append(col)
+            if isinstance(strategy, dict):
+                for key in ("leakage_risk", "leakage_features", "leakage_columns", "leakage_risk_columns"):
+                    vals = strategy.get(key)
+                    if isinstance(vals, list):
+                        for col in vals:
+                            if col:
+                                audit_only.append(str(col))
+                                forbidden.append(str(col))
+            reqs = contract.get("data_requirements", []) or []
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                name = req.get("canonical_name") or req.get("name")
+                role = str(req.get("role") or "").lower()
+                if name and ("target" in role or "label" in role):
+                    forbidden.append(name)
+            canonical = contract.get("canonical_columns") if isinstance(contract.get("canonical_columns"), list) else []
+            for col in canonical:
+                norm = _norm(col)
+                if any(tok in norm for tok in ["prob", "score", "pred"]):
+                    audit_only.append(col)
+                    forbidden.append(col)
+            detail = {
+                "audit_only": list(dict.fromkeys([c for c in audit_only if c])),
+                "forbidden_as_feature": list(dict.fromkeys([c for c in forbidden if c])),
+            }
+            if detail["audit_only"] or detail["forbidden_as_feature"]:
+                spec["leakage_policy_detail"] = detail
+                contract["spec_extraction"] = spec
+            return contract
+
+        def _complete_contract_inference(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            contract = _ensure_derived_columns(contract)
+            contract = _refresh_canonical_columns(contract)
+            contract = _ensure_feature_availability(contract)
+            contract = _attach_leakage_policy_detail(contract)
             return contract
 
         def _attach_spec_extraction_issues(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -1950,6 +2470,7 @@ class ExecutionPlannerAgent:
             contract = _attach_business_alignment(contract)
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
+            contract = _complete_contract_inference(contract)
             contract = _assign_derived_owners(contract)
             contract = _attach_variable_semantics(contract)
             contract = _apply_artifact_schemas(contract)
@@ -2070,6 +2591,7 @@ Return the contract JSON.
             contract = _attach_business_alignment(contract)
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
+            contract = _complete_contract_inference(contract)
             contract = _assign_derived_owners(contract)
             contract = _attach_variable_semantics(contract)
             contract = _apply_artifact_schemas(contract)
@@ -2173,6 +2695,47 @@ Return the contract JSON.
             spec["requires_row_scoring"] = bool(requires_row_scoring)
             return _derive_target_spec(spec)
 
+        def _inject_contract_context(spec: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(spec, dict):
+                return spec
+            canonical_cols = contract.get("canonical_columns") if isinstance(contract, dict) else []
+            if canonical_cols and not spec.get("canonical_columns"):
+                spec["canonical_columns"] = canonical_cols
+            spec_extraction = contract.get("spec_extraction") if isinstance(contract, dict) else None
+            derived_cols = spec_extraction.get("derived_columns") if isinstance(spec_extraction, dict) else None
+            if derived_cols and not spec.get("derived_columns"):
+                spec["derived_columns"] = derived_cols
+            deliverables = (spec_extraction or {}).get("deliverables") if isinstance(spec_extraction, dict) else []
+            if isinstance(deliverables, list):
+                required_outputs = []
+                for item in deliverables:
+                    if isinstance(item, dict) and item.get("path") and item.get("required", True):
+                        required_outputs.append(item.get("path"))
+                    elif isinstance(item, str):
+                        required_outputs.append(item)
+                if required_outputs and not spec.get("required_outputs"):
+                    spec["required_outputs"] = required_outputs
+            if not spec.get("target"):
+                target_name = None
+                reqs = contract.get("data_requirements", []) if isinstance(contract, dict) else []
+                for req in reqs:
+                    if not isinstance(req, dict):
+                        continue
+                    role = str(req.get("role") or "").lower()
+                    if "target" in role or "label" in role:
+                        target_name = req.get("canonical_name") or req.get("name")
+                        break
+                if not target_name and isinstance(derived_cols, list):
+                    for entry in derived_cols:
+                        if isinstance(entry, dict):
+                            role = str(entry.get("role") or "").lower()
+                            if "target" in role or "label" in role:
+                                target_name = entry.get("name") or entry.get("canonical_name")
+                                break
+                if target_name:
+                    spec["target"] = {"name": target_name, "derive_from": None}
+            return spec
+
         def _fallback() -> Dict[str, Any]:
             # Reuse the heuristic builder inside generate_contract scope via a lightweight copy
             objective_text = (contract.get("business_objective") or business_objective or "").lower()
@@ -2180,12 +2743,14 @@ Return the contract JSON.
             objective_type = "descriptive"
             if any(tok in objective_text for tok in ["optimiz", "maximize", "optimal price", "precio", "revenue", "expected value"]):
                 objective_type = "prescriptive"
-            elif any(tok in objective_text for tok in ["predict", "classif", "regress", "forecast", "probability"]):
+            elif any(tok in objective_text for tok in ["predict", "classif", "clasific", "regress", "forecast", "probability", "probabilidad", "conversion", "churn", "contract"]):
                 objective_type = "predictive"
 
             decision_vars = contract.get("decision_variables") or []
             decision_var = decision_vars[0] if decision_vars else None
-            segmentation_required = any(tok in strategy_text for tok in ["segment", "cluster", "typology", "tipolog"])
+            segmentation_required = any(tok in strategy_text for tok in ["segment", "cluster", "typology", "tipolog"]) or any(
+                tok in objective_text for tok in ["segment", "cluster", "typology", "tipolog"]
+            )
             feature_availability = contract.get("feature_availability") or []
             pre_decision = [
                 item.get("column")
@@ -2269,7 +2834,7 @@ Return the contract JSON.
                 "confidence": 0.4,
                 "justification": "Fallback evaluation spec derived heuristically from contract and strategy."
             }
-            return _derive_flag_defaults(spec)
+            return _inject_contract_context(_derive_flag_defaults(spec))
 
         if not self.client:
             return _fallback()
@@ -2329,6 +2894,6 @@ Return the contract JSON.
             spec = json.loads(content) if content else {}
             if not isinstance(spec, dict):
                 return _fallback()
-            return _derive_flag_defaults(spec)
+            return _inject_contract_context(_derive_flag_defaults(spec))
         except Exception:
             return _fallback()
