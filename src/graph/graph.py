@@ -5120,6 +5120,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     # Try standard download
                     with open(local_cleaned_path, "wb") as f_local:
                         remote_bytes = sandbox.files.read(f"{run_root}/data/cleaned_data.csv")
+                        if isinstance(remote_bytes, str):
+                            remote_bytes = remote_bytes.encode("utf-8")
+                        elif isinstance(remote_bytes, memoryview):
+                            remote_bytes = remote_bytes.tobytes()
+                        elif isinstance(remote_bytes, bytearray):
+                            remote_bytes = bytes(remote_bytes)
                         f_local.write(remote_bytes)
                 except Exception as dl_err:
                     print(f"Standard download failed ({dl_err}), trying Base64 fallback...")
@@ -5146,6 +5152,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     # Try standard download
                     with open(local_manifest_path, "wb") as f_local:
                         remote_bytes = sandbox.files.read(f"{run_root}/data/cleaning_manifest.json")
+                        if isinstance(remote_bytes, str):
+                            remote_bytes = remote_bytes.encode("utf-8")
+                        elif isinstance(remote_bytes, memoryview):
+                            remote_bytes = remote_bytes.tobytes()
+                        elif isinstance(remote_bytes, bytearray):
+                            remote_bytes = bytes(remote_bytes)
                         f_local.write(remote_bytes)
                 except Exception:
                     # Fallback Base64
@@ -6402,17 +6414,21 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     current_history = list(state.get('feedback_history', []))
     try:
         # Run QA Audit
-        evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
+        contract = state.get("execution_contract", {}) or {}
+        evaluation_spec = state.get("evaluation_spec") or contract.get("evaluation_spec")
         if isinstance(evaluation_spec, dict):
             evaluation_spec = dict(evaluation_spec)
         else:
             evaluation_spec = {}
         evaluation_spec["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
+        if contract.get("canonical_columns") and not evaluation_spec.get("canonical_columns"):
+            evaluation_spec["canonical_columns"] = contract.get("canonical_columns")
+        if contract.get("data_requirements") and not evaluation_spec.get("data_requirements"):
+            evaluation_spec["data_requirements"] = contract.get("data_requirements")
         try:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
         except TypeError:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective)
-        contract = state.get("execution_contract", {}) or {}
         allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
         allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
         static_facts = collect_static_qa_facts(code)
@@ -7004,6 +7020,16 @@ def execute_code(state: AgentState) -> AgentState:
                     f_art.write(code)
             except Exception as artifact_err:
                 print(f"Warning: failed to persist ml_engineer_last.py: {artifact_err}")
+            if run_id:
+                run_dir = get_run_dir(run_id)
+                if run_dir:
+                    try:
+                        base = os.path.join(run_dir, "agents", "ml_engineer", f"iteration_{attempt_id}")
+                        os.makedirs(base, exist_ok=True)
+                        with open(os.path.join(base, "script_executed.py"), "w", encoding="utf-8") as f_exec:
+                            f_exec.write(code)
+                    except Exception:
+                        pass
 
             print("Running code in Sandbox...")
             execution = sandbox.run_code(code)

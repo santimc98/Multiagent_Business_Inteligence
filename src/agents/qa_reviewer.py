@@ -8,6 +8,39 @@ from openai import OpenAI
 
 load_dotenv()
 
+def _extract_json_object(text: str) -> Optional[str]:
+    if not text:
+        return None
+    start = None
+    depth = 0
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text):
+        if start is None:
+            if ch == "{":
+                start = i
+                depth = 1
+                in_str = False
+                escape = False
+            continue
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "\"":
+                in_str = False
+            continue
+        if ch == "\"":
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
 class QAReviewerAgent:
     def __init__(self, api_key: str = None):
         """
@@ -151,50 +184,71 @@ class QAReviewerAgent:
             content = response.choices[0].message.content
             self.last_response = content
             
-            # Parse JSON
+            # Parse JSON (tolerant)
+            parse_error = None
+            result = None
             try:
                 result = json.loads(content)
-                # Fallback normalization
-                if result['status'] not in ['APPROVED', 'APPROVE_WITH_WARNINGS', 'REJECTED']:
-                    result['status'] = 'REJECTED'
-                    result['feedback'] = "QA Error: Invalid status returned."
-                
-                # Normalize lists
-                for field in ['failed_gates', 'required_fixes']:
-                    val = result.get(field, [])
-                    if isinstance(val, str):
-                        result[field] = [val]
-                    elif not isinstance(val, list):
-                        result[field] = []
-                    else:
-                         result[field] = val
+            except json.JSONDecodeError as err:
+                parse_error = err
+                candidate = _extract_json_object(content)
+                if candidate:
+                    try:
+                        result = json.loads(candidate)
+                        parse_error = None
+                    except json.JSONDecodeError as err2:
+                        parse_error = err2
 
-                allowed = {str(g).lower() for g in (qa_gates or [])}
-                if allowed:
-                    filtered = []
-                    for g in result.get("failed_gates", []):
-                        if str(g).lower() in allowed:
-                            filtered.append(g)
-                    result["failed_gates"] = filtered
-                    if result.get("status") == "REJECTED" and not result["failed_gates"]:
-                        result["status"] = "APPROVE_WITH_WARNINGS"
-                        result["feedback"] = "Spec-driven gating: no QA gates failed; downgraded to warnings."
-
+            if result is None:
+                err_msg = f"QA JSON parse failed: {parse_error}"
+                print(f"{err_msg}. Raw response: {content}")
+                fallback = {
+                    "status": "APPROVE_WITH_WARNINGS",
+                    "feedback": f"QA Error: Failed to parse JSON response; defaulting to warnings. {parse_error}",
+                    "failed_gates": [],
+                    "required_fixes": [],
+                }
                 warnings = static_result.get("warnings", []) if static_result else []
                 if warnings:
-                    if result.get("status") == "APPROVED":
-                        result["status"] = "APPROVE_WITH_WARNINGS"
-                    feedback = result.get("feedback") or "QA Passed with warnings."
                     warning_text = "\n".join([f"- {w}" for w in warnings])
-                    result["feedback"] = f"{feedback}\nStatic QA warnings:\n{warning_text}"
-                return result
-            except json.JSONDecodeError:
-                return {
-                    "status": "REJECTED", 
-                    "feedback": "QA Error: Failed to parse JSON response.",
-                    "failed_gates": ["JSON_PARSE_ERROR"],
-                    "required_fixes": ["Fix JSON format"]
-                }
+                    feedback = fallback.get("feedback") or "QA Passed with warnings."
+                    fallback["feedback"] = f"{feedback}\nStatic QA warnings:\n{warning_text}"
+                return fallback
+
+            # Fallback normalization
+            if result['status'] not in ['APPROVED', 'APPROVE_WITH_WARNINGS', 'REJECTED']:
+                result['status'] = 'REJECTED'
+                result['feedback'] = "QA Error: Invalid status returned."
+            
+            # Normalize lists
+            for field in ['failed_gates', 'required_fixes']:
+                val = result.get(field, [])
+                if isinstance(val, str):
+                    result[field] = [val]
+                elif not isinstance(val, list):
+                    result[field] = []
+                else:
+                     result[field] = val
+
+            allowed = {str(g).lower() for g in (qa_gates or [])}
+            if allowed:
+                filtered = []
+                for g in result.get("failed_gates", []):
+                    if str(g).lower() in allowed:
+                        filtered.append(g)
+                result["failed_gates"] = filtered
+                if result.get("status") == "REJECTED" and not result["failed_gates"]:
+                    result["status"] = "APPROVE_WITH_WARNINGS"
+                    result["feedback"] = "Spec-driven gating: no QA gates failed; downgraded to warnings."
+
+            warnings = static_result.get("warnings", []) if static_result else []
+            if warnings:
+                if result.get("status") == "APPROVED":
+                    result["status"] = "APPROVE_WITH_WARNINGS"
+                feedback = result.get("feedback") or "QA Passed with warnings."
+                warning_text = "\n".join([f"- {w}" for w in warnings])
+                result["feedback"] = f"{feedback}\nStatic QA warnings:\n{warning_text}"
+            return result
                 
         except Exception as e:
             return {

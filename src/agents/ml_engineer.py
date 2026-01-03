@@ -92,6 +92,7 @@ class MLEngineerAgent:
             "business_objective",
             "required_columns",
             "required_outputs",
+            "data_requirements",
             "alignment_requirements",
             "business_alignment",
             "feature_semantics",
@@ -199,10 +200,12 @@ class MLEngineerAgent:
         rules_block = "\n".join(
             [
                 "- No synthetic/placeholder data. Load only the provided dataset.",
-                "- Never assign new columns on df; use df_work = df.copy() for derived columns or compute Series directly.",
+                "- Do not mutate df_in; use df_work = df_in.copy() and only assign contract-declared derived columns.",
                 "- Baseline model is required.",
                 "- Include SimpleImputer in preprocessing when NaNs may exist.",
                 "- Write all required outputs to exact paths.",
+                "- scored_rows may include canonical + contract-approved derived outputs only.",
+                "- Define CONTRACT_COLUMNS from the contract and print a MAPPING SUMMARY.",
             ]
         )
         return "\n".join(
@@ -287,10 +290,11 @@ class MLEngineerAgent:
         2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
         3) NEVER generate synthetic/placeholder data. Always load from '$data_path' only.
         4) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
-        5) NEVER assign columns to df or call df.assign(...). Do NOT use df["new_col"] = ... or df.assign(...). If you need derived columns, create df_work = df.copy() and assign there (or compute Series and use them directly for outputs). If a required column is missing, raise ValueError (no dummy values).
+        5) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (data_requirements with source='derived' or spec_extraction.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
         6) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
-        7) scored_rows.csv may include ONLY allowed columns per the contract. Any extra derived columns (e.g., price_delta) must be written to a separate artifact file.
+        7) scored_rows.csv may include canonical columns plus contract-approved derived outputs (target/prediction/probability/segment/optimal values) ONLY if explicitly declared in data_requirements or spec_extraction. Any other derived columns must go to a separate artifact file.
         8) Start the script with a short comment block labeled PLAN describing: detected columns, row_id construction, scored_rows columns, and where extra derived artifacts go.
+        9) Define CONTRACT_COLUMNS from the Execution Contract (prefer data_requirements source=input; else canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
 
         SECURITY / SANDBOX (VIOLATION = FAILURE)
         - Do NOT import sys.
@@ -340,6 +344,7 @@ class MLEngineerAgent:
         Step 1) Diagnose the dataset quickly:
         - Determine task type (classification/regression) and key risks:
         missingness, high-cardinality categoricals, suspected IDs, leakage/post-outcome features (use availability + semantics).
+        - If the contract marks any columns as post-decision/post-outcome/leakage_risk, never include them as model features; record them in a leakage audit note.
         - Use signal_summary to choose model complexity (avoid overfitting).
 
         Step 2) Decide validation correctly:
@@ -366,8 +371,7 @@ class MLEngineerAgent:
         - which columns to use (pre-decision vs post-outcome),
         - required artifacts,
         - derived targets/columns behavior.
-        - After mapping/selection, print:
-        - Mapping Summary: {...}
+        - Print a "MAPPING SUMMARY" block with canonical columns, selected features, and any derived outputs used.
         - Only enforce segmentation/weights/pricing logic IF deliverables require those outputs or decision_variables exist.
         (Example: if a required deliverable includes "data/weights.json" or execution_contract.decision_variables present -> run the corresponding logic; else skip.)
 
@@ -378,6 +382,7 @@ class MLEngineerAgent:
         - JSON writing: always json.dump(..., default=_json_default) with a small _json_default helper.
         - Write all required deliverables; write optional deliverables only if they materially support the objective.
         - Plotting: matplotlib.use('Agg') BEFORE pyplot; save at least one plot IF required deliverables include plots; otherwise skip gracefully.
+        - If computing optimal prices or using minimize_scalar, ensure the objective returns float and coerce optimal_price = float(optimal_price) before assignment.
 
         ALIGNMENT CHECK (contract-driven)
         - Write data/alignment_check.json with:
