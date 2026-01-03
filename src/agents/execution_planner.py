@@ -1331,6 +1331,8 @@ class ExecutionPlannerAgent:
                 if not isinstance(req, dict):
                     continue
                 role = str(req.get("role") or "").lower()
+                if "target_source" in role:
+                    continue
                 if "target" in role or "label" in role:
                     return req.get("canonical_name") or req.get("name")
             for entry in derived:
@@ -1367,11 +1369,15 @@ class ExecutionPlannerAgent:
                     derived_has_target = True
                     break
             target_in_inventory = bool(_resolve_exact_header(target_req_name)) if target_req_name else False
-            target_explicit = derived_has_target or (
+            target_role = str(target_req.get("role") or "").lower() if target_req else ""
+            target_source_like = any(tok in target_role for tok in ["target_source", "outcome", "status", "phase"])
+            target_is_input = (
                 target_req
                 and str(target_req.get("source") or "input").lower() == "input"
                 and target_in_inventory
+                and not target_source_like
             )
+            target_explicit = derived_has_target or target_is_input
             if objective_type in {"predictive", "prescriptive", "forecasting"} and not target_explicit:
                 status_col = _find_status_candidate()
                 if status_col:
@@ -1430,6 +1436,35 @@ class ExecutionPlannerAgent:
                 )
                 derived_keys.add(_norm("cluster_id"))
                 _ensure_requirement(reqs, "cluster_id", "segment", expected_kind="categorical")
+
+            status_col = _find_status_candidate()
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                role = str(req.get("role") or "").lower()
+                if "target" not in role and "label" not in role:
+                    continue
+                if str(req.get("source") or "input").lower() != "derived":
+                    continue
+                name = req.get("canonical_name") or req.get("name")
+                if not name:
+                    continue
+                norm_name = _norm(name)
+                if norm_name in derived_keys:
+                    continue
+                dtype = "boolean" if name.lower().startswith(("is_", "has_")) or "success" in name.lower() else "numeric"
+                entry = {
+                    "name": name,
+                    "canonical_name": name,
+                    "role": "target",
+                    "dtype": dtype,
+                    "derived_from": status_col or "source_status",
+                    "rule": "Derive target per contract instructions.",
+                }
+                if status_col and name.lower() == "is_success":
+                    entry["rule"] = "1 if status in positive_labels else 0"
+                derived.append(entry)
+                derived_keys.add(norm_name)
 
             decision_vars = contract.get("decision_variables") or []
             if isinstance(decision_vars, list):
@@ -2722,6 +2757,8 @@ Return the contract JSON.
                     if not isinstance(req, dict):
                         continue
                     role = str(req.get("role") or "").lower()
+                    if "target_source" in role:
+                        continue
                     if "target" in role or "label" in role:
                         target_name = req.get("canonical_name") or req.get("name")
                         break
