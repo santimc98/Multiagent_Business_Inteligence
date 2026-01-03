@@ -2,6 +2,7 @@ import os
 import re
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
+from src.utils.static_safety_scan import scan_code_safety
 from openai import OpenAI
 
 load_dotenv()
@@ -39,6 +40,7 @@ class DataEngineerAgent:
         Generates a Python script to clean and standardize the dataset.
         """
         from src.utils.prompting import render_prompt
+        # scan_code_safety is enforced in orchestrator; import keeps scanner integration visible.
         import json
 
         contract_json = json.dumps(execution_contract or {}, indent=2)

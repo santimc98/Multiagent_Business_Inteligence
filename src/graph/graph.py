@@ -27,7 +27,7 @@ from src.agents.business_translator import BusinessTranslatorAgent
 from src.agents.data_engineer import DataEngineerAgent
 from src.agents.cleaning_reviewer import CleaningReviewerAgent
 from src.agents.reviewer import ReviewerAgent
-from src.agents.qa_reviewer import QAReviewerAgent # New QA Gate
+from src.agents.qa_reviewer import QAReviewerAgent, collect_static_qa_facts # New QA Gate
 from src.agents.execution_planner import ExecutionPlannerAgent, build_execution_plan, build_dataset_profile
 from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
@@ -4741,21 +4741,21 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     pass
                 new_state["data_engineer_audit_override"] = override
                 print("Preflight guard: retrying Data Engineer with explainer context.")
-            return run_data_engineer(new_state)
-        if run_id:
-            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_preflight_failed"})
-        oc_report = _persist_output_contract_report(state, reason="data_engineer_preflight_failed")
-        return {
-            "cleaning_code": code,
-            "cleaned_data_preview": "Preflight Failed",
-            "error_message": msg,
-            "feedback_history": fh,
-            "last_gate_context": lgc,
-            "output_contract_report": oc_report,
-            "pipeline_aborted_reason": "data_engineer_preflight_failed",
-            "data_engineer_failed": True,
-            "budget_counters": counters,
-        }
+                return run_data_engineer(new_state)
+            if run_id:
+                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_preflight_failed"})
+            oc_report = _persist_output_contract_report(state, reason="data_engineer_preflight_failed")
+            return {
+                "cleaning_code": code,
+                "cleaned_data_preview": "Preflight Failed",
+                "error_message": msg,
+                "feedback_history": fh,
+                "last_gate_context": lgc,
+                "output_contract_report": oc_report,
+                "pipeline_aborted_reason": "data_engineer_preflight_failed",
+                "data_engineer_failed": True,
+                "budget_counters": counters,
+            }
 
     # 0a. Undefined name preflight for Data Engineer code
     if not is_plan:
@@ -6406,8 +6406,8 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         contract = state.get("execution_contract", {}) or {}
         allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
         allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
-        preflight_issues = ml_quality_preflight(code, evaluation_spec, allowed_columns, allowed_patterns)
-        has_variance_guard = "TARGET_VARIANCE_GUARD" not in preflight_issues
+        static_facts = collect_static_qa_facts(code)
+        has_variance_guard = bool(static_facts.get("has_variance_guard"))
 
         status = qa_result['status']
         feedback = qa_result['feedback']
@@ -6415,7 +6415,8 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         required_fixes = qa_result.get('required_fixes', [])
 
         # Override obvious false positives from QA LLM when deterministic facts disagree
-        if status == "REJECTED" and "TARGET_VARIANCE" in failed_gates and has_variance_guard:
+        qa_streak = int(state.get("qa_reject_streak", 0) or 0)
+        if status == "REJECTED" and "TARGET_VARIANCE" in failed_gates and has_variance_guard and qa_streak < 5:
             status = "APPROVE_WITH_WARNINGS"
             feedback = f"QA_LLM_FALSE_POSITIVE_OVERRIDDEN (variance guard detected statically). Original: {feedback}"
             failed_gates = []
@@ -6868,29 +6869,29 @@ def execute_code(state: AgentState) -> AgentState:
         "DF_COLUMN_ASSIGNMENT_FORBIDDEN",
     }
     fatal_hits = [issue for issue in preflight_issues if issue in fatal_preflight]
-        if fatal_hits:
-            msg = f"ML_PREFLIGHT_BLOCK: {', '.join(fatal_hits)}"
+    if fatal_hits:
+        msg = f"ML_PREFLIGHT_BLOCK: {', '.join(fatal_hits)}"
+        if unknown_cols:
+            preview = unknown_cols[:10]
+            msg += f" | Unknown columns ({len(unknown_cols)}): {preview}"
+        if forbidden_assignments:
+            preview = forbidden_assignments[:10]
+            msg += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}"
+        snippet_tokens = [f"'{col}'" for col in (unknown_cols + forbidden_assignments)[:10]]
+        snippets = _collect_violation_snippets(code, snippet_tokens)
+        if snippets:
+            msg += f" | Code refs: {snippets[:5]}"
+        fh = list(state.get("feedback_history", []))
+        fh.append(msg)
+        if run_id:
+            payload = {"issues": fatal_hits}
             if unknown_cols:
-                preview = unknown_cols[:10]
-                msg += f" | Unknown columns ({len(unknown_cols)}): {preview}"
+                payload["unknown_columns"] = unknown_cols
             if forbidden_assignments:
-                preview = forbidden_assignments[:10]
-                msg += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}"
-            snippet_tokens = [f"'{col}'" for col in (unknown_cols + forbidden_assignments)[:10]]
-            snippets = _collect_violation_snippets(code, snippet_tokens)
+                payload["forbidden_df_assignments"] = forbidden_assignments
             if snippets:
-                msg += f" | Code refs: {snippets[:5]}"
-            fh = list(state.get("feedback_history", []))
-            fh.append(msg)
-            if run_id:
-                payload = {"issues": fatal_hits}
-                if unknown_cols:
-                    payload["unknown_columns"] = unknown_cols
-                if forbidden_assignments:
-                    payload["forbidden_df_assignments"] = forbidden_assignments
-                if snippets:
-                    payload["snippets"] = snippets
-                log_run_event(run_id, "ml_preflight_blocked", payload)
+                payload["snippets"] = snippets
+            log_run_event(run_id, "ml_preflight_blocked", payload)
         return {
             "error_message": msg,
             "execution_output": msg,
