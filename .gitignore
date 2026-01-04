@@ -75,3 +75,8 @@ reports/
 
 # Run-produced artifact indexes
 data/produced_artifact_index.json
+
+# Run bundles
+run_*.zip
+runs/archive/run_*.zip
+
