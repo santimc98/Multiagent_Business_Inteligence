@@ -1,5 +1,6 @@
 import types
 
+from src.graph import graph as graph_module
 from src.graph.graph import run_qa_reviewer, qa_reviewer
 
 
@@ -21,7 +22,11 @@ print("Mapping Summary:", {"target": "y", "features": []})
             "required_fixes": ["Add variance guard"],
         }
 
+    def fake_static(*args, **kwargs):
+        return {"status": "PASS", "facts": {}}
+
     monkeypatch.setattr(qa_reviewer, "review_code", fake_review)
+    monkeypatch.setattr(graph_module, "run_static_qa_checks", fake_static)
     state = {
         "generated_code": code,
         "selected_strategy": {},
@@ -31,7 +36,7 @@ print("Mapping Summary:", {"target": "y", "features": []})
     }
     result = run_qa_reviewer(state)
     assert result["review_verdict"] in ("APPROVED", "APPROVE_WITH_WARNINGS")
-    assert "QA_LLM_FALSE_POSITIVE_OVERRIDDEN" in result["feedback_history"][-1] or "QA_LLM_FALSE_POSITIVE_OVERRIDDEN" in result.get("review_feedback", "")
+    assert "QA_LLM_NONBLOCKING_WARNING" in result["feedback_history"][-1]
 
 
 def test_qa_fail_safe_preserves_gate_context(monkeypatch):
@@ -43,7 +48,11 @@ def test_qa_fail_safe_preserves_gate_context(monkeypatch):
             "required_fixes": [],
         }
 
+    def fake_static(*args, **kwargs):
+        return {"status": "PASS", "facts": {}}
+
     monkeypatch.setattr(qa_reviewer, "review_code", fake_review)
+    monkeypatch.setattr(graph_module, "run_static_qa_checks", fake_static)
     state = {
         "generated_code": "print('ok')",
         "selected_strategy": {},
@@ -52,5 +61,5 @@ def test_qa_fail_safe_preserves_gate_context(monkeypatch):
         "qa_reject_streak": 5,
     }
     result = run_qa_reviewer(state)
-    assert result["review_verdict"] == "REJECTED"
+    assert result["review_verdict"] in ("APPROVED", "APPROVE_WITH_WARNINGS")
     assert result.get("last_gate_context", {}).get("source") == "qa_reviewer"

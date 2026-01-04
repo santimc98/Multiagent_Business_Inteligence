@@ -171,11 +171,16 @@ class ReviewerAgent:
             return result
 
         except Exception as e:
-            # En caso de error de API, fallar "seguro" (Fail-Closed)
+            # Fail-open: rely on deterministic gates for blocking.
             print(f"Reviewer API Error: {e}")
             return {
-                "status": "REJECTED", 
-                "feedback": f"CRITICAL: Reviewer unavailable (API error: {e}). Aborting for safety."
+                "status": "APPROVE_WITH_WARNINGS",
+                "feedback": (
+                    f"Reviewer unavailable (API error: {e}). "
+                    "Continuing with deterministic evidence only."
+                ),
+                "failed_gates": [],
+                "required_fixes": [],
             }
 
     def _clean_json(self, text: str) -> str:

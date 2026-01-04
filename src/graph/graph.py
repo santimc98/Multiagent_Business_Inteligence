@@ -27,7 +27,7 @@ from src.agents.business_translator import BusinessTranslatorAgent
 from src.agents.data_engineer import DataEngineerAgent
 from src.agents.cleaning_reviewer import CleaningReviewerAgent
 from src.agents.reviewer import ReviewerAgent
-from src.agents.qa_reviewer import QAReviewerAgent, collect_static_qa_facts # New QA Gate
+from src.agents.qa_reviewer import QAReviewerAgent, collect_static_qa_facts, run_static_qa_checks # New QA Gate
 from src.agents.execution_planner import ExecutionPlannerAgent, build_execution_plan, build_dataset_profile
 from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
@@ -3209,7 +3209,10 @@ def _normalize_alignment_check(
 ) -> tuple[Dict[str, Any], List[str]]:
     issues: List[str] = []
     normalized = dict(alignment_check or {})
-    status = str(normalized.get("status") or "").upper()
+    raw_status = normalized.get("status")
+    if not raw_status:
+        raw_status = normalized.get("overall_status") or normalized.get("overallStatus")
+    status = str(raw_status or "").upper()
     if status not in {"PASS", "WARN", "FAIL"}:
         status = "WARN"
         issues.append("alignment_status_invalid")
@@ -3306,7 +3309,7 @@ def _normalize_alignment_check(
 
     failure_mode = normalized.get("failure_mode")
     if not failure_mode and issues:
-        failure_mode = "method_choice"
+        failure_mode = "format"
 
     normalized["status"] = status
     normalized["failure_mode"] = failure_mode
@@ -6742,38 +6745,70 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             evaluation_spec["canonical_columns"] = contract.get("canonical_columns")
         if contract.get("data_requirements") and not evaluation_spec.get("data_requirements"):
             evaluation_spec["data_requirements"] = contract.get("data_requirements")
+        allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
+        allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
+        static_facts = collect_static_qa_facts(code)
+        static_result = run_static_qa_checks(code, evaluation_spec, static_facts)
+        if static_result and static_result.get("status") == "REJECTED":
+            status = "REJECTED"
+            feedback = static_result.get("feedback") or "Static QA gate failures detected."
+            failed_gates = static_result.get("failed_gates", [])
+            required_fixes = static_result.get("required_fixes", [])
+            current_history.append(f"QA_STATIC_REJECTED: {feedback}")
+            print(f"QA Verdict: {status}")
+            streak = int(state.get("qa_reject_streak", 0) or 0) + 1
+            gate_context = {
+                "source": "qa_reviewer",
+                "status": status,
+                "feedback": feedback,
+                "failed_gates": failed_gates,
+                "required_fixes": _expand_required_fixes(required_fixes, failed_gates),
+            }
+            fix_block = _build_fix_instructions(gate_context["required_fixes"])
+            if fix_block:
+                gate_context["edit_instructions"] = fix_block
+            if streak >= 5:
+                msg = f"CRITICAL: QA Rejected code {streak} times consecutively. Quality Standard not met."
+                return {
+                    "review_verdict": "REJECTED",
+                    "review_feedback": feedback,
+                    "feedback_history": current_history,
+                    "error_message": msg,
+                    "last_gate_context": gate_context,
+                    "qa_reject_streak": streak,
+                    "budget_counters": counters,
+                }
+            return {
+                "review_verdict": "REJECTED",
+                "review_feedback": feedback,
+                "feedback_history": current_history,
+                "last_gate_context": gate_context,
+                "qa_reject_streak": streak,
+                "budget_counters": counters,
+            }
+
         try:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
         except TypeError:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective)
-        allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
-        allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
-        static_facts = collect_static_qa_facts(code)
-        has_variance_guard = bool(static_facts.get("has_variance_guard"))
 
         status = qa_result['status']
         feedback = qa_result['feedback']
         failed_gates = qa_result.get('failed_gates', [])
         required_fixes = qa_result.get('required_fixes', [])
 
-        # Override obvious false positives from QA LLM when deterministic facts disagree
-        qa_streak = int(state.get("qa_reject_streak", 0) or 0)
-        if status == "REJECTED" and "TARGET_VARIANCE" in failed_gates and has_variance_guard and qa_streak < 5:
+        if status == "REJECTED":
+            feedback = f"QA_LLM_NONBLOCKING_WARNING: {feedback}"
+            current_history.append(feedback)
             status = "APPROVE_WITH_WARNINGS"
-            feedback = f"QA_LLM_FALSE_POSITIVE_OVERRIDDEN (variance guard detected statically). Original: {feedback}"
             failed_gates = []
             required_fixes = []
-            print(feedback)
-            current_history.append(f"QA_LLM_FALSE_POSITIVE_OVERRIDDEN: variance guard present; overriding rejection.")
         
         print(f"QA Verdict: {status}")
         
-        # Update QA Streak
+        # Update QA Streak (only deterministic rejects)
         streak = state.get('qa_reject_streak', 0)
-        if status == "REJECTED":
-            streak += 1
-            print(f"QA Feedback: {feedback}")
-        else:
+        if status in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
             streak = 0
         
         # Structured context for Patching
@@ -6788,31 +6823,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         if fix_block:
             gate_context["edit_instructions"] = fix_block
         
-        if status == "REJECTED":
-            current_history.append(f"QA TEAM FEEDBACK (Critical): {feedback}")
-            
-            # QA Fail Safe
-            if streak >= 5:
-                msg = f"CRITICAL: QA Rejected code {streak} times consecutively. Quality Standard not met."
-                return {
-                    "review_verdict": "REJECTED",
-                    "review_feedback": feedback,
-                    "feedback_history": current_history,
-                    "error_message": msg,
-                    "last_gate_context": gate_context,
-                    "qa_reject_streak": streak,
-                    "budget_counters": counters,
-                }
-            
-            return {
-                "review_verdict": "REJECTED", # Mark as rejected to trigger retry
-                "review_feedback": feedback,
-                "feedback_history": current_history,
-                "last_gate_context": gate_context,
-                "qa_reject_streak": streak,
-                "budget_counters": counters,
-            }
-            
+        review_verdict = status if status in {"APPROVED", "APPROVE_WITH_WARNINGS"} else "APPROVED"
         if run_id:
             log_run_event(run_id, "qa_reviewer_complete", {"status": status})
         if run_id:
@@ -6825,7 +6836,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                 verdicts=qa_result,
             )
         return {
-            "review_verdict": "APPROVED",
+            "review_verdict": review_verdict,
             "feedback_history": current_history,
             "last_gate_context": gate_context,
             "qa_reject_streak": streak,
@@ -7870,7 +7881,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             if alignment_issues and raw_status == "PASS":
                 raw_status = "WARN"
                 summary = f"{summary} Alignment evidence missing." if summary else "Alignment evidence missing."
-                failure_mode = failure_mode or "method_choice"
+                failure_mode = failure_mode or "format"
                 alignment_check["status"] = raw_status
                 alignment_check["summary"] = summary
                 alignment_check["failure_mode"] = failure_mode
@@ -7964,8 +7975,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     )
                 if qa_result and qa_result.get("status") == "REJECTED":
                     failed = qa_result.get("failed_gates", []) or []
-                    if any(str(g).lower() in hard_qa_gates for g in failed):
+                    is_static = (
+                        qa_result.get("feedback") == "Static QA gate failures detected."
+                        or qa_result.get("facts") is not None
+                    )
+                    if is_static and any(str(g).lower() in hard_qa_gates for g in failed):
                         hard_qa_gate_reject = True
+                        audit_rejected = True
             else:
                 review_warnings.append(f"QA_CODE_AUDIT_SKIPPED: {err_msg}")
                 state["qa_budget_exceeded"] = True
@@ -7975,11 +7991,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             warn_text = "\n".join(review_warnings)
             feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
             new_history.append(warn_text)
-            audit_rejected = any(
-                "REVIEWER_CODE_AUDIT[REJECTED]" in warn_text
-                or "QA_CODE_AUDIT[REJECTED]" in warn_text
-                for warn_text in review_warnings
-            )
         if state.get("qa_budget_exceeded"):
             warn_text = "QA_INCOMPLETE: QA budget exceeded; QA audit skipped."
             feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
@@ -7992,20 +8003,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         else:
             feedback = "CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes."
         new_history.append("CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes.")
-        if alignment_requirements:
-            if "alignment_method_choice" not in alignment_failed_gates:
-                alignment_failed_gates.append("alignment_method_choice")
-        if alignment_check:
-            try:
-                alignment_check["status"] = "FAIL"
-                alignment_check["failure_mode"] = "method_choice"
-                summary = alignment_check.get("summary") or ""
-                note = "Reviewer/QA rejection indicates method choice misalignment."
-                alignment_check["summary"] = f"{summary} {note}".strip()
-                with open("data/alignment_check.json", "w", encoding="utf-8") as f_align:
-                    json.dump(alignment_check, f_align, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
 
     hard_qa_retry_count = int(state.get("hard_qa_retry_count", 0))
     if status == "NEEDS_IMPROVEMENT" and hard_qa_gate_reject:

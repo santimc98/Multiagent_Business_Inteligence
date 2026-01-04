@@ -18,3 +18,16 @@ def test_alignment_check_normalizer_builds_requirements():
     assert status_map.get("req_1") == "PASS"
     assert status_map.get("req_2") == "FAIL"
     assert "alignment_missing_requirement_status" not in issues
+
+
+def test_alignment_check_normalizer_accepts_overall_status():
+    alignment_check = {
+        "overall_status": "PASS",
+        "checks": [
+            {"id": "req_alpha", "status": "PASS", "evidence": ["ok"]},
+        ],
+    }
+
+    normalized, issues = _normalize_alignment_check(alignment_check, [])
+    assert normalized.get("status") == "PASS"
+    assert "alignment_status_invalid" not in issues
