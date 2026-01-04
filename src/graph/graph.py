@@ -7970,16 +7970,18 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                         status = "APPROVE_WITH_WARNINGS"
                     new_history.append(msg)
                     feedback = f"{feedback}\n{msg}" if feedback else msg
-                elif failure_mode in method_modes or raw_status == "FAIL":
+                elif failure_mode in method_modes:
+                    if status != "NEEDS_IMPROVEMENT":
+                        status = "APPROVE_WITH_WARNINGS"
+                    new_history.append(msg)
+                    feedback = f"{feedback}\n{msg}" if feedback else msg
+                elif raw_status == "FAIL":
                     status = "NEEDS_IMPROVEMENT"
-                    alignment_failed_gates.append("alignment_method_choice")
+                    alignment_failed_gates.append("alignment_unknown")
                     new_history.append(msg)
                     feedback = f"{feedback}\n{msg}" if feedback else msg
                 else:
-                    if raw_status == "FAIL":
-                        status = "NEEDS_IMPROVEMENT"
-                        alignment_failed_gates.append("alignment_unknown")
-                    elif status != "NEEDS_IMPROVEMENT":
+                    if status != "NEEDS_IMPROVEMENT":
                         status = "APPROVE_WITH_WARNINGS"
                     new_history.append(msg)
                     feedback = f"{feedback}\n{msg}" if feedback else msg
