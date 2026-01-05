@@ -116,3 +116,78 @@ def validate_decision_variable_isolation(
         }
         
     return {"passed": True, "error_message": "", "violated_variables": []}
+
+
+def validate_model_metrics_consistency(
+    metrics: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Validates consistency between best_model_name and best_model_auc.
+    
+    UNIVERSAL CHECK for any ML task (classification/regression).
+    Ensures the metrics reported match the model actually selected.
+    
+    Args:
+        metrics: The metrics.json dict (usually from data/metrics.json)
+        
+    Returns:
+        {
+            "passed": bool,
+            "error_message": str,
+            "details": {...}
+        }
+    """
+    # 1. Access model_performance section
+    perf = metrics.get("model_performance", {})
+    if not perf:
+        return {"passed": True, "error_message": "", "details": {}}
+
+    # 2. Extract key fields
+    best_name = perf.get("best_model_name")
+    # Supports both AUC (classification) and R2/MSE (regression) if present
+    best_auc = perf.get("best_model_auc")
+    baseline_auc = perf.get("baseline_auc")
+    
+    # Generic mapping if AUC is missing but other metrics exist
+    if best_auc is None:
+        best_auc = perf.get("best_model_r2")
+    if baseline_auc is None:
+        baseline_auc = perf.get("baseline_r2")
+
+    if best_name is None:
+        return {"passed": True, "error_message": "", "details": {}}
+
+    # 3. Determine if best_name is a baseline model
+    baseline_keywords = ['logisticregression', 'linearregression', 'dummyclassifier', 'dummyregressor', 'baseline']
+    is_baseline = any(kw in str(best_name).lower() for kw in baseline_keywords)
+
+    details = {
+        "best_model_name": best_name,
+        "best_model_auc": best_auc,
+        "baseline_auc": baseline_auc,
+        "is_baseline_selected": is_baseline
+    }
+
+    # 4. Consistency logic
+    if best_auc is not None and baseline_auc is not None:
+        # Rounding tolerance
+        tolerance = 0.01
+        
+        if is_baseline:
+            # If baseline is selected, it must be the best (or equal)
+            if abs(best_auc - baseline_auc) > tolerance:
+                return {
+                    "passed": False,
+                    "error_message": f"Inconsistency: Selected best model is a baseline ({best_name}) but its performance ({best_auc}) differs from baseline_auc ({baseline_auc}).",
+                    "details": details
+                }
+        else:
+            # If advanced model is selected, it should be at least as good as baseline
+            if best_auc < (baseline_auc - tolerance):
+                return {
+                    "passed": False,
+                    "error_message": f"Inconsistency: Selected best model ({best_name}) has performance ({best_auc}) significantly worse than baseline_auc ({baseline_auc}).",
+                    "details": details
+                }
+
+    return {"passed": True, "error_message": "", "details": details}

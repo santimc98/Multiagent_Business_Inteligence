@@ -89,6 +89,7 @@ from src.utils.code_extract import is_syntax_valid
 from src.utils.visuals import generate_fallback_plots
 from src.utils.recommendations_preview import build_recommendations_preview
 from src.utils.label_enrichment import enrich_outputs
+from src.utils.ml_validation import validate_model_metrics_consistency
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -7899,6 +7900,21 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     json.dump(metrics_report, f_metrics, indent=2)
             except Exception as metrics_err:
                 print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
+
+    # 5.6) Model Metrics Consistency Validation (Informative helper)
+    if metrics_report:
+        try:
+            consistency_result = validate_model_metrics_consistency(metrics_report)
+            if not consistency_result["passed"]:
+                consistency_msg = f"METRIC_CONSISTENCY_WARNING: {consistency_result['error_message']}"
+                print(f"Advice: {consistency_msg}")
+                new_history.append(consistency_msg)
+                if not feedback:
+                    feedback = consistency_msg
+                else:
+                    feedback = f"{feedback}\n{consistency_msg}"
+        except Exception as consistency_err:
+            print(f"Warning: model metrics consistency validation failed: {consistency_err}")
     iter_id = int(state.get("iteration_count", 0)) + 1
     saved_iter_artifacts = _persist_iteration_artifacts(iter_id)
 
