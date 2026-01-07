@@ -506,6 +506,14 @@ class MLEngineerAgent:
         - os.makedirs('static/plots', exist_ok=True)
         - JSON writing: always json.dump(..., default=_json_default) with a small _json_default helper.
         - Write all required deliverables; write optional deliverables only if they materially support the objective.
+        - metrics.json RULES:
+          - MUST include top-level key: "model_performance".
+          - Populate "model_performance" with standard technical metrics RELEVANT TO THE TASK:
+            * Classification: AUC, F1, Accuracy, LogLoss.
+            * Regression: RMSE, R2, MAE.
+            * Clustering: Silhouette Score, Inertia.
+            * Descriptive/Rule-based: Coverage %, Rule Hit Rate.
+          - Never leave "model_performance" empty for a modeling task.
         - Plotting: matplotlib.use('Agg') BEFORE pyplot; save at least one plot IF required deliverables include plots; otherwise skip gracefully.
         - If computing optimal prices or using minimize_scalar, ensure the objective returns float and coerce optimal_price = float(optimal_price) before assignment.
         - scored_rows.csv must include canonical columns plus derived outputs required by the contract

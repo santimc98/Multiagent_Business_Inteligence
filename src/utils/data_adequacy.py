@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+from src.utils.contract_v41 import get_outcome_columns, get_column_roles
+
 
 def _safe_load_json(path: str) -> Dict[str, Any]:
     try:
@@ -194,15 +196,17 @@ def _align_quality_gates(
 
 
 def _find_target_column(contract: Dict[str, Any], df: pd.DataFrame | None) -> str | None:
-    reqs = contract.get("data_requirements", []) or []
-    target_candidates = []
-    target_roles = {"derived_label", "target_label", "target", "target_regression", "target_classification"}
-    for req in reqs:
-        role = str(req.get("role", "")).lower()
-        if role in target_roles:
-            name = req.get("canonical_name") or req.get("name")
-            if name:
-                target_candidates.append(str(name))
+    # V4.1: Use get_outcome_columns first
+    target_candidates = get_outcome_columns(contract)
+    
+    # Fallback: check column_roles for target-like roles
+    if not target_candidates:
+        roles = get_column_roles(contract)
+        target_roles = {"target", "outcome", "target_label", "derived_label"}
+        for role in target_roles:
+            if role in roles:
+                target_candidates.extend(roles[role])
+    
     for candidate in target_candidates:
         if df is not None and candidate in df.columns:
             return candidate
@@ -415,14 +419,12 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
 
     feature_cols: List[str] = []
     if isinstance(contract, dict):
-        for req in contract.get("data_requirements", []) or []:
-            if not isinstance(req, dict):
-                continue
-            role = str(req.get("role") or "").lower()
-            if "feature" in role or role in {"predictor", "driver"}:
-                name = req.get("canonical_name") or req.get("name")
-                if name:
-                    feature_cols.append(str(name))
+        # V4.1: Extract features from column_roles
+        roles = get_column_roles(contract)
+        feature_role_names = {"feature", "pre_decision", "predictor", "driver"}
+        for role, cols in roles.items():
+            if role.lower() in feature_role_names or "feature" in role.lower():
+                feature_cols.extend(cols)
     if cleaned is not None and (not feature_cols):
         if target_col:
             feature_cols = [col for col in cleaned.columns if col != target_col]

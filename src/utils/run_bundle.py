@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from src.utils.run_logger import register_run_log
+from src.utils.contract_v41 import get_required_outputs
 
 RUNS_DIR = "runs"
 
@@ -81,20 +82,10 @@ def _git_commit() -> Optional[str]:
 
 
 def _normalize_required_outputs(contract: Dict[str, Any]) -> List[str]:
+    """V4.1: Use get_required_outputs accessor instead of spec_extraction."""
     if not isinstance(contract, dict):
         return []
-    spec = contract.get("spec_extraction") or {}
-    deliverables = spec.get("deliverables") if isinstance(spec, dict) else None
-    if isinstance(deliverables, list) and deliverables:
-        required = []
-        for item in deliverables:
-            if isinstance(item, dict):
-                if item.get("required") and item.get("path"):
-                    required.append(str(item.get("path")))
-            elif isinstance(item, str):
-                required.append(item)
-        return required
-    return contract.get("required_outputs", []) or []
+    return get_required_outputs(contract)
 
 
 def _scan_run_outputs(run_dir: str) -> List[str]:

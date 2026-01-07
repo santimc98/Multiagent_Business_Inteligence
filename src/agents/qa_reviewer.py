@@ -660,23 +660,28 @@ def resolve_qa_gates(evaluation_spec: Dict[str, Any] | None) -> tuple[list[str],
 
 
 def _resolve_contract_columns_for_qa(evaluation_spec: Dict[str, Any] | None) -> List[str]:
+    """V4.1: Extract columns from canonical_columns, column_roles, etc."""
     columns: List[str] = []
     if isinstance(evaluation_spec, dict):
+        # V4.1 primary keys
         for key in ("canonical_columns", "contract_columns", "required_columns", "allowed_columns"):
             vals = evaluation_spec.get(key)
             if isinstance(vals, list):
                 columns.extend([str(c) for c in vals if c])
-        data_reqs = evaluation_spec.get("data_requirements")
-        if isinstance(data_reqs, list):
-            for req in data_reqs:
-                if not isinstance(req, dict):
-                    continue
-                name = req.get("canonical_name") or req.get("name")
-                if name:
-                    columns.append(str(name))
+        
+        # V4.1: Extract from column_roles (role -> list[str] mapping)
+        column_roles = evaluation_spec.get("column_roles")
+        if isinstance(column_roles, dict):
+            for role, cols in column_roles.items():
+                if isinstance(cols, list):
+                    columns.extend([str(c) for c in cols if c])
+                elif isinstance(cols, str):
+                    columns.append(cols)
+    
     if not columns:
         return []
-    return columns
+    # Remove duplicates while preserving order
+    return list(dict.fromkeys(columns))
 
 
 def _code_mentions_columns(code: str, columns: List[str], tree: ast.AST | None = None) -> bool:

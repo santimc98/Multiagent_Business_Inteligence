@@ -1,14 +1,31 @@
+"""
+Integrity Audit Tests - V4.1 Compatible
+
+Tests for integrity_audit using V4.1 contract schema:
+- canonical_columns for input columns
+- column_roles for role mappings  
+- validation_requirements.column_validations for validation rules
+- preprocessing_requirements.expected_kinds for type expectations
+"""
+
 import pandas as pd
 
 from src.utils.integrity_audit import run_integrity_audit
 
 
 def test_percent_scale_suspected():
+    """V4.1: Test percent scale detection using column_roles and validation_requirements."""
     df = pd.DataFrame({"col_pct": [50, 100, None]})
     contract = {
-        "data_requirements": [
-            {"name": "col_pct", "role": "percentage", "expected_range": [0, 1], "allowed_null_frac": 0.5}
-        ]
+        "canonical_columns": ["col_pct"],
+        "column_roles": {
+            "percentage": ["col_pct"]
+        },
+        "validation_requirements": {
+            "column_validations": [
+                {"column": "col_pct", "expected_range": [0, 1], "allowed_null_frac": 0.5}
+            ]
+        }
     }
     issues, stats = run_integrity_audit(df, contract)
     types = {i["type"] for i in issues}
@@ -17,12 +34,13 @@ def test_percent_scale_suspected():
 
 
 def test_categorical_destroyed_and_aliasing():
+    """V4.1: Test categorical detection using column_roles."""
     df = pd.DataFrame({"col_a": [None] * 10 + ["x"]})
     contract = {
-        "data_requirements": [
-            {"name": "Col_A", "role": "categorical"},
-            {"name": "col_a", "role": "categorical"},
-        ]
+        "canonical_columns": ["Col_A", "col_a"],
+        "column_roles": {
+            "categorical": ["Col_A", "col_a"]
+        }
     }
     issues, stats = run_integrity_audit(df, contract)
     types = {i["type"] for i in issues}
@@ -31,11 +49,18 @@ def test_categorical_destroyed_and_aliasing():
 
 
 def test_percent_scale_suspected_high_values():
+    """V4.1: Test percent scale detection with high values."""
     df = pd.DataFrame({"pct": [10, 20, 30, 40, 50]})
     contract = {
-        "data_requirements": [
-            {"name": "pct", "role": "percentage", "expected_range": [0, 1]}
-        ],
+        "canonical_columns": ["pct"],
+        "column_roles": {
+            "percentage": ["pct"]
+        },
+        "validation_requirements": {
+            "column_validations": [
+                {"column": "pct", "expected_range": [0, 1]}
+            ]
+        },
         "validations": [],
     }
     issues, _ = run_integrity_audit(df, contract)

@@ -25,7 +25,7 @@ def get_output_dialect_from_manifest(
             manifest = json.load(f)
         output = manifest.get("output_dialect") if isinstance(manifest, dict) else None
         if isinstance(output, dict):
-            sep = output.get("sep", sep)
+            sep = output.get("sep") or output.get("separator") or sep
             decimal = output.get("decimal", decimal)
             encoding = output.get("encoding", encoding)
             updated = True

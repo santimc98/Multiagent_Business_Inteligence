@@ -6,6 +6,8 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
+from src.utils.contract_v41 import get_required_outputs, get_artifact_requirements
+
 
 def _safe_load_json(path: str) -> Any:
     try:
@@ -51,35 +53,43 @@ def _normalize_reporting_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _normalize_deliverables(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """V4.1: Use get_required_outputs and get_artifact_requirements instead of spec_extraction."""
     required_paths: List[str] = []
     optional_paths: List[str] = []
     kinds_by_path: Dict[str, str] = {}
-    spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
-    deliverables = spec.get("deliverables") if isinstance(spec, dict) else None
-    if isinstance(deliverables, list) and deliverables:
-        for item in deliverables:
-            if isinstance(item, dict):
-                path = item.get("path") or item.get("output") or item.get("artifact")
-                if not path:
-                    continue
+    
+    # V4.1: Get deliverables from artifact_requirements and required_outputs
+    artifact_reqs = get_artifact_requirements(contract)
+    required_files = artifact_reqs.get("required_files", []) or []
+    required_plots = artifact_reqs.get("required_plots", []) or []
+    
+    # Add required files
+    for item in required_files:
+        if isinstance(item, dict):
+            path = item.get("path") or item.get("output") or item.get("artifact")
+            if path:
+                required_paths.append(str(path))
                 kind = item.get("kind")
-                if not kind:
-                    lower = str(path).lower()
-                    if lower.startswith("static/plots/") or lower.endswith((".png", ".jpg", ".jpeg", ".svg")):
-                        kind = "plot"
                 if kind:
                     kinds_by_path[str(path)] = str(kind)
-                is_required = item.get("required")
-                if is_required is None:
-                    is_required = True
-                if is_required:
-                    required_paths.append(str(path))
-                else:
-                    optional_paths.append(str(path))
-            elif isinstance(item, str):
-                required_paths.append(item)
-    else:
-        required_paths.extend(contract.get("required_outputs", []) or [])
+        elif isinstance(item, str):
+            required_paths.append(item)
+    
+    # Add required plots
+    for item in required_plots:
+        if isinstance(item, dict):
+            path = item.get("path") or item.get("output") or item.get("artifact")
+            if path:
+                required_paths.append(str(path))
+                kinds_by_path[str(path)] = "plot"
+        elif isinstance(item, str):
+            required_paths.append(item)
+            kinds_by_path[item] = "plot"
+    
+    # Fallback to get_required_outputs
+    if not required_paths:
+        required_paths.extend(get_required_outputs(contract))
+    
     requires_plots = any(str(kind).lower() == "plot" for kind in kinds_by_path.values())
     return {
         "required_paths": required_paths,

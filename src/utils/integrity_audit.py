@@ -1,8 +1,21 @@
-import json
+"""
+Integrity Audit - V4.1 Compatible.
+
+This module provides integrity auditing functionality for cleaned datasets
+using the V4.1 contract schema (canonical_columns, column_roles, validation_requirements).
+"""
+
 import difflib
 from typing import Dict, List, Tuple, Any
 
 import pandas as pd
+
+from src.utils.contract_v41 import (
+    get_canonical_columns,
+    get_column_roles,
+    get_validation_requirements,
+    get_preprocessing_requirements,
+)
 
 
 def _normalize_name(name: str) -> str:
@@ -60,17 +73,98 @@ def _column_stats(series: pd.Series) -> Dict[str, Any]:
     return stats
 
 
+def _build_requirements_from_v41(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Build a list of column requirements from V4.1 contract keys:
+    - canonical_columns (required input columns)
+    - column_roles (role -> columns mapping)
+    - validation_requirements.column_validations
+    - preprocessing_requirements.expected_kinds
+    """
+    requirements: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    
+    # From canonical_columns
+    canonical = get_canonical_columns(contract)
+    for col in canonical:
+        if col not in seen:
+            seen.add(col)
+            requirements.append({
+                "name": col,
+                "canonical_name": col,
+                "source": "input",
+            })
+    
+    # From column_roles - add role info
+    roles = get_column_roles(contract)
+    for role, columns in roles.items():
+        for col in columns:
+            if col not in seen:
+                seen.add(col)
+                requirements.append({
+                    "name": col,
+                    "canonical_name": col,
+                    "role": role,
+                })
+            else:
+                # Update existing with role
+                for req in requirements:
+                    if req.get("canonical_name") == col or req.get("name") == col:
+                        req["role"] = role
+                        break
+    
+    # From validation_requirements.column_validations
+    val_reqs = get_validation_requirements(contract)
+    column_validations = val_reqs.get("column_validations")
+    if isinstance(column_validations, list):
+        for item in column_validations:
+            if isinstance(item, dict):
+                col = item.get("column") or item.get("name")
+                if col and col not in seen:
+                    seen.add(col)
+                    requirements.append({
+                        "name": col,
+                        "canonical_name": col,
+                        "expected_range": item.get("expected_range"),
+                        "allowed_null_frac": item.get("allowed_null_frac"),
+                    })
+                elif col:
+                    # Update existing
+                    for req in requirements:
+                        if req.get("canonical_name") == col or req.get("name") == col:
+                            if item.get("expected_range"):
+                                req["expected_range"] = item.get("expected_range")
+                            if item.get("allowed_null_frac") is not None:
+                                req["allowed_null_frac"] = item.get("allowed_null_frac")
+                            break
+    
+    # From preprocessing_requirements.expected_kinds
+    prep_reqs = get_preprocessing_requirements(contract)
+    expected_kinds = prep_reqs.get("expected_kinds")
+    if isinstance(expected_kinds, dict):
+        for col, kind in expected_kinds.items():
+            for req in requirements:
+                if req.get("canonical_name") == col or req.get("name") == col:
+                    req["expected_kind"] = kind
+                    break
+    
+    return requirements
+
+
 def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """
     Generic integrity audit against an optional execution contract.
     Returns (issues, stats_by_column).
     Issues are descriptive only; no mutations happen here.
+    
+    V4.1: Uses canonical_columns, column_roles, validation_requirements instead of
+    the legacy data_requirements key.
     """
     if not isinstance(contract, dict):
         contract = {}
-    else:
-        contract = contract or {}
-    data_requirements = contract.get("data_requirements", []) or []
+    
+    # V4.1: Build requirements from V4.1 keys
+    requirements = _build_requirements_from_v41(contract)
     validations = contract.get("validations", []) or []
 
     stats: Dict[str, Dict[str, Any]] = {}
@@ -83,7 +177,7 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
     # Map requirements
     requirement_to_actual: Dict[str, Tuple[str, bool]] = {}
     used_actuals: Dict[str, List[Tuple[str, bool]]] = {}
-    for req in data_requirements:
+    for req in requirements:
         name = req.get("name")
         canonical = req.get("canonical_name")
         req_label = canonical or name
@@ -123,7 +217,7 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
             )
 
     # Checks per requirement
-    for req in data_requirements:
+    for req in requirements:
         name = req.get("name")
         canonical = req.get("canonical_name")
         req_label = canonical or name
@@ -155,7 +249,7 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
             )
 
         # Low variance target
-        if role == "target" and nunique <= 1:
+        if role in {"target", "outcome"} and nunique <= 1:
             issues.append(
                 {
                     "type": "LOW_VARIANCE_TARGET",

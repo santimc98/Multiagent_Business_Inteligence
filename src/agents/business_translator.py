@@ -589,7 +589,26 @@ class BusinessTranslatorAgent:
         VISUALS CONTEXT (JSON):
         $visuals_context_json
 
-        IF ERROR: 
+        ERROR LOGIC (HIGHEST PRIORITY):
+        check: Is "$error_condition" != "No critical errors." OR does Run Summary say "FAIL"?
+        
+        IF ERROR DETECTED: 
+        1. Title: "EXECUTION FAILURE REPORT" (in the target language).
+        2. Status Line: START with "⛔ BLOCKED / FALLO CRÍTICO".
+        3. Explain the failure based on error_condition and run_summary.
+        4. PROHIBITION: DO NOT generate "Evidence & Metrics", "Business Impact", or "Visual Insights" if the run failed. Do NOT hallucinate success.
+        
+        IF SUCCESS (Only if NO Error):
+        Produce a senior-level executive report with these required sections:
+        1) Executive Decision: ONE line with readiness (GO / GO_WITH_LIMITATIONS / NO_GO) and why.
+        2) Objective & Approach: What we set out to do and the approach used.
+        3) Evidence & Metrics: Cite 3+ concrete numbers from Fact Cards or snapshots, with source file names.
+           If a number is unavailable, write "No disponible" and state which artifact is missing.
+        4) Business Impact: Translate metrics into business implications and expected value.
+        5) Risks & Limitations: Call out data risks, gate failures, or misalignment with the objective.
+        6) Metric Ceiling (if applicable): State whether a ceiling was detected and why.
+        7) Recommended Next Actions: 2-5 specific actions (short-term + data improvements).
+        8) Visual Insights: Explain what each plot shows using Plot Insights; do not describe only the chart type.
         Explain clearly what went wrong in non-technical terms and suggest next steps.
         CRITICAL: If "has_partial_visuals" is true, you MUST state: "Despite individual errors, partial visualizations were generated." and refer to the plots listed in "plots_list". Do NOT say "No visualizations created" if they exist.
         

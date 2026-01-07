@@ -79,6 +79,8 @@ class DataEngineerAgent:
         - Read input using the provided dialect (sep/decimal/encoding).
         - Save cleaned CSV to data/cleaned_data.csv.
         - Save manifest to data/cleaning_manifest.json (json.dump(..., default=_json_default)).
+        - CRITICAL: Manifest MUST include "output_dialect": {"sep": "...", "decimal": "...", "encoding": "..."} matching the saved file.
+        - Use standard CSV (sep=',', decimal='.', encoding='utf-8') for output unless forbidden.
         - Use canonical_name from the contract for all column references.
         - Derive required columns using clear, deterministic logic.
         - Build a header map for lookup (normalize only for matching), but preserve canonical_name exactly (including spaces/symbols) in the output.

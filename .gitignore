@@ -32,6 +32,9 @@ analysis/
 diff.patch
 run_bundle.zip
 runs/
+# Temporary exception for validation analysis
+!runs/ddc6cb05/
+!runs/ddc6cb05/**
 
 
 

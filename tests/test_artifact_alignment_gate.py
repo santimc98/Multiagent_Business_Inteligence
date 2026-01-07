@@ -21,7 +21,7 @@ def test_artifact_alignment_gate_allows_expected_revenue(tmp_path):
         "artifact_schemas": {
             "data/scored_rows.csv": {"allowed_extra_columns": ["expected_revenue"]}
         },
-        "spec_extraction": {"derived_columns": [{"name": "is_success"}]},
+        "feature_engineering_plan": {"derived_columns": [{"name": "is_success"}]},
     }
     issues = _artifact_alignment_gate(
         str(cleaned_path),

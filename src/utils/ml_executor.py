@@ -6,6 +6,14 @@ import numpy as np
 import pandas as pd
 from scipy import optimize, stats
 
+from src.utils.contract_v41 import (
+    get_column_roles,
+    get_canonical_columns,
+    get_outcome_columns,
+    get_derived_column_names,
+    get_optimization_specification,
+)
+
 
 def _ensure_dir(path: str) -> None:
     folder = os.path.dirname(path)
@@ -58,6 +66,7 @@ def _load_manifest_dialect(manifest_path: str, fallback: Dict[str, str]) -> Dict
 
 
 def _resolve_feature_columns(plan: Dict[str, Any], contract: Dict[str, Any]) -> List[str]:
+    """V4.1: Use column_roles to get feature columns."""
     features_cfg = plan.get("features") or {}
     plan_cols = features_cfg.get("columns")
     use_contract = features_cfg.get("use_contract_features", True)
@@ -65,63 +74,52 @@ def _resolve_feature_columns(plan: Dict[str, Any], contract: Dict[str, Any]) -> 
         return [str(c) for c in plan_cols]
     if not use_contract:
         return []
-    reqs = contract.get("data_requirements", []) or []
+    # V4.1: Get features from column_roles
+    roles = get_column_roles(contract)
     cols = []
-    for req in reqs:
-        if not isinstance(req, dict):
-            continue
-        if req.get("role") != "feature":
-            continue
-        name = req.get("canonical_name") or req.get("name")
-        if name:
-            cols.append(name)
+    for role in ["feature", "pre_decision", "predictor"]:
+        cols.extend(roles.get(role, []))
     return cols
 
 
 def _resolve_target(plan: Dict[str, Any], contract: Dict[str, Any]) -> Tuple[str | None, str | None]:
+    """V4.1: Use get_outcome_columns and objective_analysis for target."""
     target_cfg = plan.get("target") or {}
     if target_cfg.get("name"):
         return str(target_cfg.get("name")), str(target_cfg.get("type") or "")
-    reqs = contract.get("data_requirements", []) or []
-    target_name = None
-    target_type = ""
-    for role in ("target", "target_benchmark", "baseline_metric"):
-        for req in reqs:
-            if not isinstance(req, dict):
-                continue
-            if req.get("role") != role:
-                continue
-            target_name = req.get("canonical_name") or req.get("name")
-            target_type = str(contract.get("spec_extraction", {}).get("target_type", "")) or ""
-            if target_name:
-                return target_name, target_type
-    return None, target_type
+    
+    # V4.1: Get from outcome columns
+    outcome_cols = get_outcome_columns(contract)
+    if outcome_cols:
+        target_name = outcome_cols[0]
+        obj_analysis = contract.get("objective_analysis", {})
+        target_type = str(obj_analysis.get("task_type", "")) or ""
+        return target_name, target_type
+    
+    # Fallback: check column_roles for target-like roles
+    roles = get_column_roles(contract)
+    for role in ["target", "outcome", "target_benchmark", "baseline_metric"]:
+        cols = roles.get(role, [])
+        if cols:
+            return cols[0], ""
+    
+    return None, ""
 
 
 def _resolve_baseline_column(contract: Dict[str, Any]) -> str | None:
-    reqs = contract.get("data_requirements", []) or []
-    for role in ("baseline_metric", "target_benchmark"):
-        for req in reqs:
-            if not isinstance(req, dict):
-                continue
-            if req.get("role") != role:
-                continue
-            return req.get("canonical_name") or req.get("name")
+    """V4.1: Use column_roles for baseline column."""
+    roles = get_column_roles(contract)
+    for role in ["baseline_metric", "target_benchmark", "benchmark"]:
+        cols = roles.get(role, [])
+        if cols:
+            return cols[0]
     return None
 
 
 def _resolve_id_columns(contract: Dict[str, Any]) -> List[str]:
-    reqs = contract.get("data_requirements", []) or []
-    ids = []
-    for req in reqs:
-        if not isinstance(req, dict):
-            continue
-        if req.get("role") != "id":
-            continue
-        name = req.get("canonical_name") or req.get("name")
-        if name:
-            ids.append(name)
-    return ids
+    """V4.1: Use column_roles for id columns."""
+    roles = get_column_roles(contract)
+    return roles.get("id", [])
 
 
 def _map_columns(df: pd.DataFrame, columns: List[str]) -> Dict[str, str]:
@@ -251,11 +249,8 @@ def execute_ml_plan(plan: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str,
 
     require_derived = bool(plan.get("require_derived", True))
     if require_derived:
-        derived_reqs = [
-            (req.get("canonical_name") or req.get("name"))
-            for req in (contract.get("data_requirements", []) or [])
-            if isinstance(req, dict) and req.get("source") == "derived"
-        ]
+        # V4.1: Use get_derived_column_names
+        derived_reqs = get_derived_column_names(contract)
         derived_missing = [col for col in derived_reqs if col and col not in df.columns]
         if derived_missing:
             raise ValueError(f"missing derived columns in cleaned data: {derived_missing}")
@@ -284,12 +279,16 @@ def execute_ml_plan(plan: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str,
         optional_cols.append(baseline_col)
     id_cols = _resolve_id_columns(contract)
     optional_cols.extend(id_cols)
+    # V4.1: Check column_roles for metadata/case columns
+    roles = get_column_roles(contract)
     case_col = None
-    for req in contract.get("data_requirements", []) or []:
-        if isinstance(req, dict) and req.get("canonical_name") and req.get("role") == "metadata":
-            if req.get("canonical_name") in {"caso", "case_id", "case"}:
-                case_col = req.get("canonical_name")
+    for role in ["metadata", "case", "id"]:
+        for col in roles.get(role, []):
+            if col.lower() in {"caso", "case_id", "case"}:
+                case_col = col
                 break
+        if case_col:
+            break
     case_col = case_col or ("caso" if "caso" in df.columns else None)
     if case_col:
         optional_cols.append(case_col)
@@ -324,9 +323,14 @@ def execute_ml_plan(plan: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str,
     y_values = y_values[mask]
 
     score_scale = 1.0
-    scoring_formula = str((contract.get("spec_extraction") or {}).get("scoring_formula", ""))
-    if "100" in scoring_formula and "*" in scoring_formula:
-        score_scale = 100.0
+    # V4.1: Check optimization_specification for score scale
+    opt_spec = get_optimization_specification(contract)
+    if isinstance(opt_spec, dict) and opt_spec.get("score_scale"):
+        score_scale = float(opt_spec.get("score_scale", 1.0))
+    elif isinstance(opt_spec, dict) and opt_spec.get("scoring_formula"):
+        scoring_formula = str(opt_spec.get("scoring_formula", ""))
+        if "100" in scoring_formula and "*" in scoring_formula:
+            score_scale = 100.0
     if isinstance(plan.get("score_scale"), (int, float)):
         score_scale = float(plan.get("score_scale"))
 

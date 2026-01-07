@@ -1,3 +1,10 @@
+"""
+Contract Validation Utilities - V4.1 Compatible.
+
+This module provides default runbook configurations for data engineer and ML engineer agents.
+These are used as defaults when contracts don't specify custom runbooks.
+"""
+
 import copy
 from typing import Any, Dict, List
 
@@ -13,7 +20,7 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Respect expected_kind: numeric -> pd.to_numeric; datetime -> pd.to_datetime; categorical -> keep as string.",
         "Canonical columns must contain the cleaned values; do not leave raw strings in canonical columns while writing cleaned_* shadows.",
         "If you create cleaned_* helper columns, overwrite the canonical column with cleaned values before saving.",
-        "Derive required columns from spec_extraction and ensure they exist in the output.",
+        "Derive required columns from preprocessing_requirements and ensure they exist in the output.",
         "Perform a post-cleaning self-audit: for each required column report dtype, null_frac, and basic range checks vs expected_range.",
         "Do not import sys.",
         "Preserve exact canonical_name strings (including spaces/symbols); do not normalize away punctuation.",
@@ -66,11 +73,10 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Train/evaluate models aligned to the strategy and execution contract.",
         "Produce interpretable outputs and required artifacts without leakage.",
     ],
-    "spec_extraction": {},
     "must": [
         "Use dialect/output_dialect from manifest when loading data.",
         "Honor allowlist dependencies; do not import banned packages (pulp/cvxpy/fuzzywuzzy/torch/tensorflow/etc.).",
-        "If contract.spec_extraction is present, treat it as source-of-truth for formulas, constraints, cases, and deliverables.",
+        "If contract contains column_roles/artifact_requirements, treat them as source-of-truth for outputs.",
         "Include variance guard: if y.nunique() <= 1 raise ValueError.",
         "Print Mapping Summary and build X only from contract feature columns.",
         "Ensure output dirs exist (data/, static/plots/) before saving artifacts.",
@@ -94,7 +100,7 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
     ],
     "reasoning_checklist": [
         "Use canonical_name (if provided) for consistent references across agents.",
-        "Treat spec_extraction as source-of-truth; do not invent formulas, cases, or constraints.",
+        "Treat column_roles and artifact_requirements as source-of-truth; do not invent outputs.",
         "If target_type is ordinal/ranking, avoid predictive regression as the primary objective.",
         "Validate weight constraints and explain any regularization choices.",
         "Ensure outputs satisfy the explicitly requested deliverables.",
@@ -116,94 +122,3 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "optional": ["data/weights.json", "static/plots/*.png", "data/scored_rows.csv", "data/alignment_check.json"],
     },
 }
-
-
-def _ensure_list_of_str(val: Any, default: List[str]) -> List[str]:
-    if isinstance(val, list) and all(isinstance(x, str) for x in val) and val:
-        return val
-    return list(default)
-
-
-def ensure_role_runbooks(contract: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure the contract contains role_runbooks with minimal schema.
-    If missing or malformed, inject sensible defaults.
-    """
-    if not isinstance(contract, dict):
-        return {"role_runbooks": {"data_engineer": copy.deepcopy(DEFAULT_DATA_ENGINEER_RUNBOOK), "ml_engineer": copy.deepcopy(DEFAULT_ML_ENGINEER_RUNBOOK)}}
-
-    runbooks = contract.get("role_runbooks")
-    if not isinstance(runbooks, dict):
-        runbooks = {}
-
-    def _normalize(rb: Dict[str, Any], default: Dict[str, Any]) -> Dict[str, Any]:
-        out = copy.deepcopy(default)
-        if not isinstance(rb, dict):
-            return out
-        out["version"] = str(rb.get("version", default.get("version", "1")))
-        if "spec_extraction" in default:
-            spec = rb.get("spec_extraction", default.get("spec_extraction", {}))
-            out["spec_extraction"] = spec if isinstance(spec, dict) else copy.deepcopy(default.get("spec_extraction", {}))
-        out["goals"] = _ensure_list_of_str(rb.get("goals"), default.get("goals", []))
-        out["must"] = _ensure_list_of_str(rb.get("must"), default.get("must", []))
-        out["must_not"] = _ensure_list_of_str(rb.get("must_not"), default.get("must_not", []))
-        out["safe_idioms"] = _ensure_list_of_str(rb.get("safe_idioms"), default.get("safe_idioms", []))
-        out["reasoning_checklist"] = _ensure_list_of_str(rb.get("reasoning_checklist"), default.get("reasoning_checklist", []))
-        if default.get("reasoning_checklist") and out.get("reasoning_checklist") is not None:
-            merged = list(out["reasoning_checklist"])
-            for item in default.get("reasoning_checklist", []):
-                if item not in merged:
-                    merged.append(item)
-            out["reasoning_checklist"] = merged
-        out["validation_checklist"] = _ensure_list_of_str(rb.get("validation_checklist"), default.get("validation_checklist", []))
-        mr = rb.get("manifest_requirements", default.get("manifest_requirements", {}))
-        out["manifest_requirements"] = mr if isinstance(mr, dict) else copy.deepcopy(default.get("manifest_requirements", {}))
-        meth = rb.get("methodology", default.get("methodology", {}))
-        out["methodology"] = meth if isinstance(meth, dict) else copy.deepcopy(default.get("methodology", {}))
-        outs = rb.get("outputs", default.get("outputs", {}))
-        out["outputs"] = outs if isinstance(outs, dict) else copy.deepcopy(default.get("outputs", {}))
-        return out
-
-    runbooks["data_engineer"] = _normalize(runbooks.get("data_engineer", {}), DEFAULT_DATA_ENGINEER_RUNBOOK)
-    runbooks["ml_engineer"] = _normalize(runbooks.get("ml_engineer", {}), DEFAULT_ML_ENGINEER_RUNBOOK)
-    contract["role_runbooks"] = runbooks
-    return contract
-
-
-def validate_spec_extraction_structure(contract: Dict[str, Any]) -> List[str]:
-    """
-    Deterministic, structure-only validation for spec_extraction.
-    Returns a list of issues; empty list means structure is acceptable.
-    """
-    issues: List[str] = []
-    if not isinstance(contract, dict):
-        return ["contract_not_dict"]
-    spec = contract.get("spec_extraction")
-    if not isinstance(spec, dict):
-        return ["spec_extraction_missing_or_not_dict"]
-
-    list_fields = ["derived_columns", "case_taxonomy", "constraints", "deliverables"]
-    for field in list_fields:
-        val = spec.get(field)
-        if val is None:
-            continue
-        if not isinstance(val, list):
-            issues.append(f"spec_extraction.{field}_not_list")
-            continue
-        if field in {"derived_columns", "case_taxonomy"}:
-            for idx, item in enumerate(val):
-                if not isinstance(item, dict):
-                    issues.append(f"spec_extraction.{field}[{idx}]_not_object")
-        else:
-            for idx, item in enumerate(val):
-                if not isinstance(item, (str, dict)):
-                    issues.append(f"spec_extraction.{field}[{idx}]_invalid_type")
-
-    for field in ["scoring_formula", "target_type", "leakage_policy"]:
-        val = spec.get(field)
-        if val is None:
-            continue
-        if not isinstance(val, str):
-            issues.append(f"spec_extraction.{field}_not_string")
-
-    return issues

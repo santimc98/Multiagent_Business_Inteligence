@@ -18,7 +18,7 @@ def test_artifact_alignment_gate_accepts_list_schemas(tmp_path):
     )
     contract = {
         "required_outputs": ["data/scored_rows.csv"],
-        "spec_extraction": {"derived_columns": [{"name": "is_success"}]},
+        "feature_engineering_plan": {"derived_columns": [{"name": "is_success"}]},
         "artifact_schemas": [
             {
                 "path": "data/scored_rows.csv",

@@ -11,10 +11,8 @@ from src.agents.prompts import SENIOR_PLANNER_PROMPT
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from src.utils.contract_validation import (
-    ensure_role_runbooks,
     DEFAULT_DATA_ENGINEER_RUNBOOK,
     DEFAULT_ML_ENGINEER_RUNBOOK,
-    validate_spec_extraction_structure,
 )
 
 load_dotenv()
@@ -25,11 +23,13 @@ def _create_v41_skeleton(
     business_objective: str,
     column_inventory: List[str] | None = None,
     output_dialect: Dict[str, str] | None = None,
-    reason: str = "LLM failure"
+    reason: str = "LLM failure",
+    data_summary: str = ""
 ) -> Dict[str, Any]:
     """
     Returns a complete, safe V4.1 schema skeleton with all required fields.
     Used as fallback when LLM fails or for validation.
+    Now respects basic strategy inputs (target, problem_type) to support testing.
     """
     strategy_title = strategy.get("title", "Unknown") if isinstance(strategy, dict) else "Unknown"
     required_cols = strategy.get("required_columns", []) if isinstance(strategy, dict) else []
@@ -40,14 +40,17 @@ def _create_v41_skeleton(
     missing_cols = []
     fuzzy_matches = {}
     
+    inventory_map = {re.sub(r"[^0-9a-zA-Z]+", "", str(c).lower()): c for c in available_cols}
+    
+    def _find_in_inventory(name: str) -> str | None:
+        return inventory_map.get(re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower()))
+
     if required_cols and available_cols:
-        inv_norm = {re.sub(r"[^0-9a-zA-Z]+", "", str(c).lower()): c for c in available_cols}
         for req in required_cols:
-            req_norm = re.sub(r"[^0-9a-zA-Z]+", "", str(req).lower())
-            if req_norm in inv_norm:
-                canonical_cols.append(inv_norm[req_norm])
+            found = _find_in_inventory(req)
+            if found:
+                canonical_cols.append(found)
             else:
-                # Column missing from inventory, try fuzzy matching
                 missing_cols.append(str(req))
                 # Use difflib to find close matches
                 close_matches = difflib.get_close_matches(
@@ -57,15 +60,56 @@ def _create_v41_skeleton(
                     cutoff=0.6
                 )
                 if close_matches:
-                    # Map back to original case
                     matched_originals = [
                         c for c in available_cols 
                         if str(c).lower() in close_matches
                     ]
                     fuzzy_matches[str(req)] = matched_originals[:3]
     
-    n_rows = 0  # Unknown without data profile parsing
+    # Smart Fallback: Infer roles from strategy if present
+    target_col = strategy.get("target_column") if isinstance(strategy, dict) else None
+    col_roles_outcome = []
+    derived_cols_list = []
     
+    if target_col:
+        real_target = _find_in_inventory(target_col)
+        if real_target:
+            col_roles_outcome.append(real_target)
+        else:
+            # Assume derived target
+            col_roles_outcome.append(target_col)
+            derived_cols_list.append(target_col)
+
+    # Everything else in unknown for now
+    available_set = set(available_cols)
+    outcome_set = set(col_roles_outcome)
+    unknown_cols = [c for c in available_cols if c not in outcome_set] # canonical might be in unknown
+
+    # Parse types from summary for tests/fallback utility
+    type_distribution = {}
+    if data_summary:
+        for line in data_summary.splitlines():
+            clean_line = line.strip().strip("- ")
+            if ":" not in clean_line: continue
+            lbl, cols_txt = clean_line.split(":", 1)
+            lbl = lbl.lower()
+            kind = "unknown"
+            if "date" in lbl: kind = "datetime"
+            elif "num" in lbl: kind = "numeric"
+            elif "cat" in lbl or "bool" in lbl: kind = "categorical"
+            elif "text" in lbl: kind = "text"
+            
+            if kind != "unknown":
+                if kind not in type_distribution: type_distribution[kind] = []
+                for c_raw in re.split(r"[;,]", cols_txt):
+                    if not c_raw.strip(): continue
+                    real = _find_in_inventory(c_raw.strip()) or c_raw.strip()
+                    type_distribution[kind].append(real)
+
+    n_rows = 0 
+    
+    problem_type = strategy.get("problem_type", "unknown") if isinstance(strategy, dict) else "unknown"
+
     return {
         "contract_version": 2,
         "strategy_title": strategy_title,
@@ -91,7 +135,7 @@ def _create_v41_skeleton(
         },
         
         "objective_analysis": {
-            "problem_type": "unknown",
+            "problem_type": problem_type,
             "decision_variable": None,
             "business_decision": "unknown",
             "success_criteria": "unknown",
@@ -101,7 +145,7 @@ def _create_v41_skeleton(
         "data_analysis": {
             "dataset_size": n_rows,
             "features_with_nulls": [],
-            "type_distribution": {},
+            "type_distribution": type_distribution,
             "risk_features": [],
             "data_sufficiency": "unknown"
         },
@@ -109,15 +153,15 @@ def _create_v41_skeleton(
         "column_roles": {
             "pre_decision": [],
             "decision": [],
-            "outcome": [],
+            "outcome": col_roles_outcome,
             "post_decision_audit_only": [],
-            "unknown": available_cols
+            "unknown": unknown_cols
         },
         
         "preprocessing_requirements": {},
         
         "feature_engineering_plan": {
-            "derived_columns": []
+            "derived_columns": derived_cols_list
         },
         
         "validation_requirements": {
@@ -173,7 +217,7 @@ def _create_v41_skeleton(
         
         "available_columns": available_cols,
         "canonical_columns": canonical_cols,
-        "derived_columns": [],
+        "derived_columns": derived_cols_list,
         "required_outputs": ["data/cleaned_data.csv", "data/metrics.json", "data/alignment_check.json"],
         
         "iteration_policy": {
@@ -505,7 +549,8 @@ class ExecutionPlannerAgent:
         business_objective: str = "",
         column_inventory: list[str] | None = None,
         output_dialect: Dict[str, str] | None = None,
-        env_constraints: Dict[str, Any] | None = None
+        env_constraints: Dict[str, Any] | None = None,
+        domain_expert_critique: str = ""
     ) -> Dict[str, Any]:
         def _norm(name: str) -> str:
             return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -2783,13 +2828,17 @@ class ExecutionPlannerAgent:
 
             segment_required = False
 
-        def _fallback() -> Dict[str, Any]:
+        def _fallback(reason: str = "Planner LLM Failed") -> Dict[str, Any]:
+            d_sum = data_summary
+            if isinstance(d_sum, dict):
+                 d_sum = json.dumps(d_sum)
             return _create_v41_skeleton(
                 strategy=strategy,
                 business_objective=business_objective,
                 column_inventory=column_inventory,
                 output_dialect=output_dialect,
-                reason="Planner LLM Failed"
+                reason=reason,
+                data_summary=str(d_sum)
             )
 
         if not self.client:
@@ -2824,6 +2873,9 @@ output_dialect:
 
 env_constraints:
 {json.dumps(env_constraints or {"forbid_inplace_column_creation": True})}
+
+domain_expert_critique:
+{domain_expert_critique or "None"}
 """
         full_prompt = SENIOR_PLANNER_PROMPT + "\n\nINPUTS:\n" + user_input
         self.last_prompt = full_prompt

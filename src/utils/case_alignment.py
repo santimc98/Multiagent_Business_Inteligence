@@ -6,6 +6,8 @@ from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from src.utils.contract_v41 import get_outcome_columns
+
 
 def _safe_load_json(path: str) -> Optional[Dict[str, Any]]:
     try:
@@ -214,12 +216,11 @@ def build_case_alignment_report(
     }
     thresholds = {**defaults, **{k: v for k, v in gates.items() if v is not None}}
 
-    # Identify target name from contract
+    # V4.1: Identify target name from outcome columns
     target_name = None
-    for req in contract.get("data_requirements", []) or []:
-        if isinstance(req, dict) and (req.get("role") or "").lower() == "target":
-            target_name = req.get("name")
-            break
+    outcome_cols = get_outcome_columns(contract)
+    if outcome_cols:
+        target_name = outcome_cols[0]
 
     weights_obj = _safe_load_json(weights_path) or {}
     weights = _extract_weights(weights_obj)

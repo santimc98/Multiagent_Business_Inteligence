@@ -7,6 +7,11 @@ import pandas as pd
 
 from src.utils.missing import is_effectively_missing_series
 from src.utils.type_inference import safe_convert_numeric_currency
+from src.utils.contract_v41 import (
+    get_canonical_columns,
+    get_column_roles,
+    get_preprocessing_requirements,
+)
 
 
 def _canonicalize_name(name: str) -> str:
@@ -240,18 +245,26 @@ def _normalize_percentage(series: pd.Series) -> pd.Series:
 
 def _merge_conversions(plan_conversions: List[Dict[str, Any]], contract: Dict[str, Any], dialect: Dict[str, str]) -> List[Dict[str, Any]]:
     existing = {c.get("column"): c for c in plan_conversions if isinstance(c, dict)}
-    reqs = contract.get("data_requirements", []) or []
-    for req in reqs:
-        if not isinstance(req, dict):
+    
+    # V4.1: Build requirements from canonical_columns, column_roles, and preprocessing_requirements
+    canonical = get_canonical_columns(contract)
+    roles = get_column_roles(contract)
+    prep_reqs = get_preprocessing_requirements(contract)
+    expected_kinds = prep_reqs.get("expected_kinds", {}) if isinstance(prep_reqs, dict) else {}
+    
+    # Create a role lookup: column -> role
+    col_to_role: Dict[str, str] = {}
+    for role, cols in roles.items():
+        for col in cols:
+            col_to_role[col] = role
+    
+    for name in canonical:
+        if name in existing:
             continue
-        if req.get("source", "input") != "input":
-            continue
-        name = req.get("canonical_name") or req.get("name")
-        if not name or name in existing:
-            continue
-        expected_kind = (req.get("expected_kind") or "").lower()
+        expected_kind = expected_kinds.get(name, "").lower() if isinstance(expected_kinds, dict) else ""
+        role = col_to_role.get(name, "").lower()
+        
         if expected_kind == "numeric":
-            role = (req.get("role") or "").lower()
             conversion = {
                 "column": name,
                 "kind": "numeric",

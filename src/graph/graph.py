@@ -23,7 +23,7 @@ from src.agents.steward import StewardAgent
 from src.agents.strategist import StrategistAgent
 from src.agents.ml_engineer import MLEngineerAgent
 from src.agents.business_translator import BusinessTranslatorAgent
-# from src.agents.selector import SelectorAgent # DEPRECATED
+
 from src.agents.data_engineer import DataEngineerAgent
 from src.agents.cleaning_reviewer import CleaningReviewerAgent
 from src.agents.reviewer import ReviewerAgent
@@ -54,8 +54,19 @@ from src.utils.sandbox_deps import (
     get_sandbox_install_packages,
 )
 from src.utils.case_alignment import build_case_alignment_report
-from src.utils.contract_validation import ensure_role_runbooks
+# REMOVED: from src.utils.contract_validation import ensure_role_runbooks  # V4.1 cutover
 from src.utils.data_engineer_preflight import data_engineer_preflight
+from src.utils.contract_v41 import (
+    get_canonical_columns,
+    get_artifact_requirements,
+    get_derived_column_names,
+    get_outcome_columns,
+    get_required_outputs,
+    get_column_roles,
+    get_validation_requirements,
+    get_qa_gates,
+    get_reviewer_gates,
+)
 from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
 from src.utils.cleaning_executor import execute_cleaning_plan
 from src.utils.run_logger import init_run_log, log_run_event, finalize_run_log
@@ -173,8 +184,8 @@ def _persist_output_contract_report(
     path: str = "data/output_contract_report.json",
 ) -> Dict[str, Any]:
     contract = state.get("execution_contract", {}) if isinstance(state, dict) else {}
-    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
-    output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
+    # V4.1: Use get_required_outputs accessor
+    output_contract = get_required_outputs(contract)
     report = check_required_outputs(output_contract)
     if reason:
         report["reason"] = reason
@@ -203,15 +214,17 @@ def _stage_illustrative_assets(
     deliverable_lookup: Dict[str, Dict[str, Any]] = {}
     schema_paths: set[str] = set()
     if isinstance(contract, dict):
-        spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
-        deliverables = spec.get("deliverables") if isinstance(spec, dict) else None
-        if isinstance(deliverables, list):
-            for item in deliverables:
-                if isinstance(item, dict) and item.get("path"):
-                    deliverable_lookup[str(item["path"])] = item
+        # V4.1: Use artifact_requirements instead of spec_extraction
+        artifacts = get_artifact_requirements(contract)
+        required_files = artifacts.get("required_files", [])
+        if isinstance(required_files, list):
+            for path in required_files:
+                if path:
+                    deliverable_lookup[str(path)] = {"path": str(path), "required": True}
         schema = contract.get("artifact_schemas")
-        if not isinstance(schema, dict) and isinstance(spec, dict):
-            schema = spec.get("artifact_schemas")
+        file_schemas = artifacts.get("file_schemas")
+        if not isinstance(schema, dict) and isinstance(file_schemas, dict):
+            schema = file_schemas
         if isinstance(schema, dict):
             schema_paths = {str(path) for path in schema.keys() if path}
 
@@ -534,27 +547,51 @@ def _find_empty_required_columns(df, required_cols: List[str], threshold: float 
     return issues
 
 def _resolve_requirement_meta(contract: Dict[str, Any], col: str) -> Dict[str, Any]:
+    """
+    V4.1: Resolve metadata for a column used for determining if it is optional.
+    Constructs a synthetic requirement dict from V4.1 sources.
+    """
     if not isinstance(contract, dict):
         return {}
+        
+    norm_col = _norm_name(col)
+    
+    # Check V4.1 canonical columns (Strictly required usually)
+    from src.utils.contract_v41 import get_canonical_columns, get_artifact_requirements
+    canonical = get_canonical_columns(contract)
+    for c in canonical:
+        if _norm_name(c) == norm_col:
+            return {"name": c, "required": True, "nullable": False}
+            
+    # Check optional passthrough
+    artifact_reqs = get_artifact_requirements(contract)
+    schema = artifact_reqs.get("schema_binding", {})
+    optional = schema.get("optional_passthrough_columns", [])
+    for c in optional:
+        if _norm_name(c) == norm_col:
+            return {"name": c, "required": False, "nullable": True}
+
+    # Fallback to legacy data_requirements for backwards compatibility
     reqs = contract.get("data_requirements", [])
-    if not isinstance(reqs, list):
-        return {}
-    target = _norm_name(col)
-    for req in reqs:
-        if not isinstance(req, dict):
-            continue
-        name = req.get("canonical_name") or req.get("name") or req.get("column")
-        if name and _norm_name(name) == target:
-            return req
+    if isinstance(reqs, list):
+        for req in reqs:
+            if not isinstance(req, dict):
+                continue
+            name = req.get("canonical_name") or req.get("name") or req.get("column")
+            if name and _norm_name(name) == norm_col:
+                return req
+                
+    # Default: if not found in canonical, assume it might be optional or extra
     return {}
 
 def _is_optional_requirement(req: Dict[str, Any]) -> bool:
     if not isinstance(req, dict):
-        return False
+        return True # If semantics not found, don't block
     if req.get("required") is False:
         return True
     if req.get("nullable") is True:
         return True
+    return False
     if req.get("optional") is True:
         return True
     return False
@@ -790,43 +827,52 @@ def _build_required_raw_map(
     return mapping
 
 def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a shallow copy of contract with data_requirements limited to source=='input'."""
+    """
+    V4.1: Canonical columns ARE inputs. Returns contract ready for input processing.
+    Legacy: Filter data_requirements to source='input'.
+    """
     if not isinstance(contract, dict):
         return {}
-    reqs = contract.get("data_requirements", []) or []
-    filtered = [r for r in reqs if isinstance(r, dict) and r.get("source", "input") == "input"]
     new_contract = dict(contract)
-    new_contract["data_requirements"] = filtered
+    
+    # Legacy cleanup
+    reqs = contract.get("data_requirements", []) or []
+    if reqs:
+        filtered = [r for r in reqs if isinstance(r, dict) and r.get("source", "input") == "input"]
+        new_contract["data_requirements"] = filtered
+        
     return new_contract
 
 def _filter_contract_for_data_engineer(contract: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a shallow copy of contract without model output-only requirements."""
+    """
+    V4.1: Data Engineer uses canonical_columns (inputs) and dialect.
+    """
     if not isinstance(contract, dict):
         return {}
-    reqs = contract.get("data_requirements", []) or []
-    filtered = []
-    canonical_cols: List[str] = []
-    for req in reqs:
-        if not isinstance(req, dict):
-            continue
-        role = (req.get("role") or "").lower()
-        owner = (req.get("derived_owner") or "").lower()
-        if role == "output":
-            continue
-        if req.get("source") == "derived" and owner == "ml_engineer":
-            continue
-        filtered.append(req)
-        name = req.get("canonical_name") or req.get("name")
-        if name:
-            canonical_cols.append(name)
+        
+    # In V4.1, contract is already structured by role ownership (DataEng owns loading/cleaning)
+    # We just return the contract; the agent runbook handles the rest.
     new_contract = dict(contract)
-    new_contract["data_requirements"] = filtered
-    if canonical_cols:
-        new_contract["canonical_columns"] = canonical_cols
+    
+    # Legacy legacy cleanup
+    reqs = contract.get("data_requirements", []) or []
+    if reqs:
+        filtered = [r for r in reqs if isinstance(r, dict) and r.get("source", "input") == "input"]
+        new_contract["data_requirements"] = filtered
+        
     return new_contract
 
+
+
 def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str, Any]) -> List[str]:
+    """V4.1: Prefer canonical_columns, fallback to data_requirements for backwards compatibility."""
     if contract and isinstance(contract, dict):
+        # V4.1: Try canonical_columns first
+        canonical = get_canonical_columns(contract)
+        if canonical:
+            return canonical
+        
+        # Legacy fallback: data_requirements with source='input'
         contract_reqs = contract.get("data_requirements", []) or []
         if contract_reqs:
             resolved = []
@@ -838,12 +884,46 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
                 name = req.get("canonical_name") or req.get("name")
                 if name:
                     resolved.append(name)
-            return resolved
+            if resolved:
+                return resolved
     return strategy.get("required_columns", []) if strategy else []
 
+def _resolve_contract_deliverables(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    V4.1 compatible deliverables resolver.
+    Returns a list of dicts [{'path': str, 'required': bool, ...}]
+    """
+    from src.utils.contract_v41 import get_required_outputs
+    
+    # V4.1: get_required_outputs returns List[str]
+    outputs = get_required_outputs(contract)
+    if outputs:
+        # Convert to list of dicts for compatibility with existing graph logic
+        return [{"path": p, "required": True} for p in outputs]
+        
+    # Legacy Fallback
+    spec = contract.get("spec_extraction") or {}
+    deliverables = spec.get("deliverables")
+    if isinstance(deliverables, list):
+        return deliverables
+    return []
+
 def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
+    """V4.1: Use available_columns/canonical_columns instead of data_requirements source filtering."""
     if not contract or not isinstance(contract, dict):
         return []
+
+    # If sources contains 'input', valid V4.1 sources are canonical_columns
+    if sources and 'input' in sources:
+        from src.utils.contract_v41 import get_canonical_columns
+        return get_canonical_columns(contract)
+
+    # If asking for 'derived', check derived_columns
+    if sources and 'derived' in sources:
+        from src.utils.contract_v41 import get_derived_column_names
+        return get_derived_column_names(contract)
+        
+    # Legacy Fallback
     reqs = contract.get("data_requirements", []) or []
     out: List[str] = []
     for req in reqs:
@@ -855,6 +935,7 @@ def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None
         source = req.get("source", "input") or "input"
         if sources is None or source in sources:
             out.append(name)
+    return out
     return out
 
 def _resolve_allowed_columns_for_gate(
@@ -879,29 +960,17 @@ def _resolve_allowed_columns_for_gate(
             pass
 
     if isinstance(contract, dict):
-        derived_cols: List[str] = []
+        from src.utils.contract_v41 import get_derived_column_names
+        derived_cols = get_derived_column_names(contract)
+        allowed.extend([str(c) for c in derived_cols if c])
+        
+        # Minimal legacy fallback for data_requirements
         data_reqs = contract.get("data_requirements", []) or []
         if isinstance(data_reqs, list):
             for req in data_reqs:
-                if not isinstance(req, dict):
-                    continue
-                source = req.get("source")
-                owner = (req.get("derived_owner") or "").lower()
-                if source == "derived" and owner == "ml_engineer":
-                    name = req.get("canonical_name") or req.get("name")
-                    if name:
-                        derived_cols.append(str(name))
-        spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
-        spec_derived = spec.get("derived_columns") if isinstance(spec, dict) else None
-        if isinstance(spec_derived, list):
-            for item in spec_derived:
-                if isinstance(item, dict):
-                    name = item.get("column") or item.get("name")
-                    if name:
-                        derived_cols.append(str(name))
-                elif isinstance(item, str):
-                    derived_cols.append(item)
-        allowed.extend([col for col in derived_cols if col])
+                if isinstance(req, dict) and req.get("source") == "derived":
+                     name = req.get("canonical_name") or req.get("name")
+                     if name: allowed.append(str(name))
 
     if not allowed:
         profile = state.get("profile") or state.get("dataset_profile")
@@ -923,11 +992,12 @@ def _resolve_allowed_columns_for_gate(
 def _resolve_allowed_patterns_for_gate(contract: Dict[str, Any]) -> List[str]:
     patterns: List[str] = []
     if isinstance(contract, dict):
-        schema = contract.get("artifact_schemas")
+        # V4.1 Priority
+        schema = contract.get("artifact_requirements", {}).get("file_schemas")
         if not isinstance(schema, dict):
-            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else None
-            if isinstance(spec, dict):
-                schema = spec.get("artifact_schemas")
+             # Legacy Fallback
+             spec = contract.get("spec_extraction") or {}
+             schema = spec.get("artifact_schemas") or contract.get("artifact_schemas")
         if isinstance(schema, dict):
             scored_schema = schema.get("data/scored_rows.csv")
             if isinstance(scored_schema, dict):
@@ -1541,10 +1611,18 @@ def _ensure_alignment_check_output(contract: Dict[str, Any]) -> Dict[str, Any]:
     return contract
 
 def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    V4.1 CUTOVER: Minimal normalization only.
+    
+    Contract is now IMMUTABLE after Execution Planner generates it.
+    We only normalize quality_gates structure for backward compatibility.
+    All other fields are preserved as-is from V4.1 schema.
+    """
     if not isinstance(contract, dict):
         return {}
     normalized = dict(contract)
 
+    # Only normalize quality_gates structure (for backward compat)
     quality_gates = normalized.get("quality_gates")
     if isinstance(quality_gates, list):
         normalized["quality_gates_raw"] = quality_gates
@@ -1552,86 +1630,10 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     elif not isinstance(quality_gates, dict):
         normalized["quality_gates"] = {}
 
-    spec = normalized.get("spec_extraction")
-    if spec is None or not isinstance(spec, dict):
-        normalized["spec_extraction"] = {}
-        spec = normalized["spec_extraction"]
-
-    derived = spec.get("derived_columns")
-    if isinstance(derived, list) and derived:
-        if all(isinstance(item, str) for item in derived):
-            spec["derived_columns"] = [
-                {"name": name, "formula": None, "depends_on": [], "constraints": []}
-                for name in derived
-                if name
-            ]
-
-    deliverables = spec.get("deliverables")
-    normalized_deliverables: List[Dict[str, Any]] = []
-    if isinstance(deliverables, list) and deliverables:
-        for item in deliverables:
-            if isinstance(item, dict):
-                path = item.get("path") or item.get("output") or item.get("artifact")
-                if not path:
-                    continue
-                normalized_deliverables.append(
-                    {
-                        "id": item.get("id") or _deliverable_id_from_path(path),
-                        "path": path,
-                        "required": bool(item.get("required", True)),
-                        "kind": item.get("kind") or _infer_deliverable_kind(path),
-                        "description": item.get("description") or "Requested deliverable.",
-                    }
-                )
-            elif isinstance(item, str):
-                normalized_deliverables.append(
-                    {
-                        "id": _deliverable_id_from_path(item),
-                        "path": item,
-                        "required": True,
-                        "kind": _infer_deliverable_kind(item),
-                        "description": "Requested deliverable.",
-                    }
-                )
-    if not normalized_deliverables:
-        legacy_outputs = normalized.get("required_outputs", []) or []
-        for path in legacy_outputs:
-            if not path:
-                continue
-            normalized_deliverables.append(
-                {
-                    "id": _deliverable_id_from_path(path),
-                    "path": path,
-                    "required": True,
-                    "kind": _infer_deliverable_kind(path),
-                    "description": "Requested deliverable.",
-                }
-            )
-    spec["deliverables"] = normalized_deliverables
-    if normalized_deliverables:
-        normalized["required_outputs"] = [item["path"] for item in normalized_deliverables if item.get("required")]
-
-    if not spec.get("scoring_formula"):
-        formulas = spec.get("formulas")
-        if isinstance(formulas, list) and formulas:
-            chosen = None
-            for formula in formulas:
-                if isinstance(formula, str) and "score_nuevo" in formula.lower():
-                    chosen = formula
-                    break
-            if not chosen:
-                first = formulas[0]
-                chosen = first if isinstance(first, str) else None
-            if chosen:
-                spec["scoring_formula"] = chosen
-
-    ba = normalized.get("business_alignment")
-    if not isinstance(ba, dict):
-        ba = {}
-    normalized["business_alignment"] = ba
-
-    iteration_policy = normalized.get("iteration_policy")
-    if not isinstance(iteration_policy, dict):
+    # Ensure basic required structures exist (non-invasive)
+    if not isinstance(normalized.get("business_alignment"), dict):
+        normalized["business_alignment"] = {}
+    if not isinstance(normalized.get("iteration_policy"), dict):
         normalized["iteration_policy"] = {}
     if not isinstance(normalized.get("compliance_checklist"), list):
         normalized["compliance_checklist"] = []
@@ -1640,6 +1642,9 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(normalized.get("evaluation_spec"), dict):
         normalized["evaluation_spec"] = {}
 
+    # V4.1: DO NOT touch spec_extraction, data_requirements, or role_runbooks
+    # The contract comes from Execution Planner with V4.1 schema already populated
+    
     return normalized
 
 def _normalize_required_fixes(items: List[Any] | None) -> List[str]:
@@ -2743,8 +2748,12 @@ def _collect_derived_targets(contract: Dict[str, Any]) -> List[str]:
         name = req.get("canonical_name") or req.get("name")
         if name and name not in derived_targets:
             derived_targets.append(name)
-    spec = contract.get("spec_extraction") or {}
-    derived_cols = spec.get("derived_columns") or []
+    # V4.1 Priority
+    fep = contract.get("feature_engineering_plan") or {}
+    derived_cols = fep.get("derived_columns") or []
+    if not derived_cols:
+        spec = contract.get("spec_extraction") or {}
+        derived_cols = spec.get("derived_columns") or []
     derived_names: List[str] = []
     for col in derived_cols:
         if isinstance(col, dict):
@@ -3549,7 +3558,7 @@ def _artifact_alignment_gate(
     required_outputs = contract.get("required_outputs", []) if isinstance(contract, dict) else []
     if "data/scored_rows.csv" in (required_outputs or []):
         requires_row_scoring = True
-    deliverables = (contract.get("spec_extraction") or {}).get("deliverables") if isinstance(contract, dict) else None
+    deliverables = _resolve_contract_deliverables(contract) if isinstance(contract, dict) else []
     if isinstance(deliverables, list):
         for item in deliverables:
             if isinstance(item, dict) and item.get("path") == "data/scored_rows.csv":
@@ -3607,30 +3616,21 @@ def _artifact_alignment_gate(
 
     schema = {}
     if isinstance(contract, dict):
-        schema = _normalize_schema(contract.get("artifact_schemas"))
+        # V4.1 Priority first
+        reqs = contract.get("artifact_requirements") or {}
+        schema = _normalize_schema(reqs.get("file_schemas"))
         if not schema:
-            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
-            if isinstance(spec, dict):
-                schema = _normalize_schema(spec.get("artifact_schemas"))
+             schema = _normalize_schema(contract.get("artifact_schemas"))
+        if not schema:
+            spec = contract.get("spec_extraction") or {}
+            schema = _normalize_schema(spec.get("artifact_schemas"))
     scored_schema = schema.get("data/scored_rows.csv") if isinstance(schema, dict) else {}
     allowed_extra = scored_schema.get("allowed_extra_columns") if isinstance(scored_schema, dict) else None
     allowed_patterns = scored_schema.get("allowed_name_patterns") if isinstance(scored_schema, dict) else None
 
     allowed_cols: List[str] = list(cleaned_cols)
     allowed_cols.extend(_resolve_contract_columns(contract, sources={"derived", "output"}))
-    spec = contract.get("spec_extraction") if isinstance(contract, dict) else None
-    if isinstance(spec, dict):
-        derived_cols = spec.get("derived_columns")
-        if isinstance(derived_cols, list):
-            for col in derived_cols:
-                if isinstance(col, dict):
-                    name = col.get("name") or col.get("canonical_name")
-                elif isinstance(col, str):
-                    name = col
-                else:
-                    name = None
-                if name:
-                    allowed_cols.append(str(name))
+    # Legacy spec_extraction removed (covered by _resolve_contract_columns V4.1 + data_requirements)
 
     if isinstance(evaluation_spec, dict):
         target = evaluation_spec.get("target")
@@ -4848,13 +4848,16 @@ def run_execution_planner(state: AgentState) -> AgentState:
         # Prepare env_constraints (conservative default)
         env_constraints = {"forbid_inplace_column_creation": True}
         
+        domain_expert_critique = state.get("selection_reason", "")
+
         contract = execution_planner.generate_contract(
             strategy=strategy,
             data_summary=data_summary,
             business_objective=business_objective,
             column_inventory=column_inventory,
             output_dialect=output_dialect,
-            env_constraints=env_constraints
+            env_constraints=env_constraints,
+            domain_expert_critique=domain_expert_critique
         )
     except Exception as e:
         print(f"Warning: execution planner failed ({e}); using fallback contract.")
@@ -4868,7 +4871,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
             reason=f"Execution planner exception: {e}"
         )
     contract = _normalize_execution_contract(contract)
-    contract = ensure_role_runbooks(contract)
+    # REMOVED: contract = ensure_role_runbooks(contract)  # V4.1 cutover: contract is immutable
     contract = _ensure_alignment_check_output(contract)
     strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
     objective_type = None
@@ -7663,15 +7666,7 @@ def execute_code(state: AgentState) -> AgentState:
     plots_local = glob.glob("static/plots/*.png")
     
     fallback_plots_local = []
-    if not plots_local:
-        fallback_csv = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
-        fallback_plots_local = generate_fallback_plots(
-            fallback_csv,
-            output_dir="static/plots",
-            sep=state.get("csv_sep", ","),
-            decimal=state.get("csv_decimal", "."),
-            encoding=state.get("csv_encoding", "utf-8"),
-        )
+    # Fallback plots removed per user request (User prefers no plots over generic ones)
              
     has_partial_visuals = len(plots_local) > 0
     
@@ -7809,7 +7804,7 @@ def execute_code(state: AgentState) -> AgentState:
 
     # Validate required outputs early
     contract = state.get("execution_contract", {}) or {}
-    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
+    deliverables = _resolve_contract_deliverables(contract)
     output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
     oc_report = check_required_outputs(output_contract)
     try:
@@ -7845,7 +7840,7 @@ def execute_code(state: AgentState) -> AgentState:
             seen.add(item)
             deduped.append(item)
     artifact_paths = deduped
-    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
+    deliverables = _resolve_contract_deliverables(contract)
     artifact_index = _build_artifact_index(artifact_paths, deliverables if isinstance(deliverables, list) else None)
     try:
         os.makedirs("data", exist_ok=True)
@@ -8093,7 +8088,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
 
     # Output contract validation
     contract = state.get("execution_contract", {}) or {}
-    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
+    deliverables = _resolve_contract_deliverables(contract)
     output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
     oc_report = check_required_outputs(output_contract)
     try:
@@ -8757,7 +8752,7 @@ def run_translator(state: AgentState) -> AgentState:
     report_state.setdefault("execution_error", state.get("execution_error", False))
     report_state.setdefault("sandbox_failed", state.get("sandbox_failed", False))
     contract = report_state.get("execution_contract", {}) or {}
-    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
+    deliverables = _resolve_contract_deliverables(contract)
     has_preview_deliverable = False
     if isinstance(deliverables, list):
         for item in deliverables:

@@ -11,9 +11,7 @@ def test_preflight_allowed_columns_from_cleaned_header(tmp_path, monkeypatch):
     state = {"csv_sep": ",", "csv_decimal": ".", "csv_encoding": "utf-8"}
     contract = {
         "canonical_columns": ["Size", "Debtors", "is_success"],
-        "data_requirements": [
-            {"name": "is_success", "source": "derived"},
-        ],
+        "data_requirements": [],
     }
     allowed = _resolve_allowed_columns_for_gate(state, contract, {})
     assert "Size" in allowed

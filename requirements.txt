@@ -43,3 +43,5 @@ altair
 fpdf
 reportlab
 tabulate
+Markdown
+xhtml2pdf
