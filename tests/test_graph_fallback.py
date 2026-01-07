@@ -1,8 +1,6 @@
-
 import pytest
 from unittest.mock import MagicMock, patch
 import os
-import shutil
 import pandas as pd
 from src.graph.graph import execute_code
 
@@ -24,16 +22,19 @@ def mock_sandbox_env(tmp_path):
     yield tmp_path
     os.chdir(old_cwd)
 
-def test_execute_code_triggers_fallback(mock_sandbox_env):
+def test_execute_code_skips_fallback(mock_sandbox_env):
     """
-    Test that execute_code generates fallback plots when sandbox returns none.
+    Test that execute_code DOES NOT generate fallback plots (Senior behavior).
     """
     # Mock State
     state = {
         'generated_code': 'print("Hello")',
         'execution_output': '',
         'plots_local': [],
-        'has_partial_visuals': False
+        'has_partial_visuals': False,
+        'csv_sep': ',',
+        'csv_decimal': '.',
+        'csv_encoding': 'utf-8'
     }
 
     # Mock Sandbox and Safety Scan
@@ -56,5 +57,5 @@ def test_execute_code_triggers_fallback(mock_sandbox_env):
          
          # Assert
          assert result['has_partial_visuals'] is False
-         assert len(result['plots_local']) == 0
-         assert any('fallback_' in p for p in os.listdir('static/plots'))
+         # Ensure no fallback plots were generated
+         assert not any('fallback_' in p for p in os.listdir('static/plots'))

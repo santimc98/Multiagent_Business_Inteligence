@@ -342,13 +342,15 @@ class MLEngineerAgent:
         HARD CONSTRAINTS (VIOLATION = FAILURE)
         1) OUTPUT VALID PYTHON CODE ONLY (no markdown, no code fences, no JSON-only plans).
         2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
-        3) NEVER generate synthetic/placeholder data. Always load from '$data_path' only.
+        3) ALWAYS read input data from 'data.csv' (or provided $data_path). DO NOT try to read 'data/cleaned_data.csv' or other artifacts as input (unless created within the script). The sandbox injects data at the root.
         4) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
         5) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (data_requirements with source='derived' or spec_extraction.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
         6) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
         7) scored_rows.csv may include canonical columns plus contract-approved derived outputs (target/prediction/probability/segment/optimal values) ONLY if explicitly declared in data_requirements or spec_extraction. Any other derived columns must go to a separate artifact file.
         8) Start the script with a short comment block labeled PLAN describing: detected columns, row_id construction, scored_rows columns, and where extra derived artifacts go.
         9) Define CONTRACT_COLUMNS from the Execution Contract (prefer data_requirements source=input; else canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
+        10) LEAKAGE ZERO-TOLERANCE: Check 'allowed_feature_sets' in the contract. Any column listed as 'audit_only_features' or 'forbidden_for_modeling' MUST be excluded from X (features). Use them ONLY for audit/metrics calculation. Violation = REJECTION.
+        11) OUTPUT DIALECT OBEDIENCE: When using .to_csv(), YOU MUST explicitly use the separators provided in 'output_dialect' (sep, decimal, encoding). DO NOT rely on defaults. Example: df.to_csv(path, sep=output_dialect['sep'], decimal=output_dialect['decimal'], index=False).
 
         SECURITY / SANDBOX (VIOLATION = FAILURE)
         - Do NOT import sys.

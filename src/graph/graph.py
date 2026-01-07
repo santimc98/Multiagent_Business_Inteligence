@@ -2751,8 +2751,8 @@ def _collect_derived_targets(contract: Dict[str, Any]) -> List[str]:
     # V4.1 Priority
     fep = contract.get("feature_engineering_plan") or {}
     derived_cols = fep.get("derived_columns") or []
+    spec = contract.get("spec_extraction") or {}
     if not derived_cols:
-        spec = contract.get("spec_extraction") or {}
         derived_cols = spec.get("derived_columns") or []
     derived_names: List[str] = []
     for col in derived_cols:

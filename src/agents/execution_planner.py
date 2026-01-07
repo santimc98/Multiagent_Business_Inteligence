@@ -521,7 +521,7 @@ class ExecutionPlannerAgent:
         else:
             genai.configure(api_key=self.api_key)
             generation_config = {
-                "temperature": 0.2,
+                "temperature": 0.0,
                 "top_p": 0.9,
                 "top_k": 40,
                 "max_output_tokens": 8192,
