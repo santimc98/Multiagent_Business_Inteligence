@@ -20,7 +20,7 @@ class MLEngineerAgent:
         """
         Initializes the ML Engineer Agent with the configured provider.
         """
-        self.provider = (os.getenv("ML_ENGINEER_PROVIDER", "google") or "google").strip().lower()
+        self.provider = (os.getenv("ML_ENGINEER_PROVIDER", "openrouter") or "openrouter").strip().lower()
         self.fallback_model_name = None
         self.last_model_used = None
         self.last_fallback_reason = None
@@ -338,6 +338,12 @@ class MLEngineerAgent:
         - Produce ONE robust, runnable Python SCRIPT that loads the cleaned dataset from $data_path, trains/evaluates according to the Execution Contract, and writes the required artifacts.
         - Adapt to each dataset and objective. Do not follow a rigid recipe; follow the contract + data.
         - If Evaluation Spec says requires_target=false, DO NOT train a supervised model. Produce descriptive/segmentation insights and still write data/metrics.json with model_trained=false.
+
+        ML BEST PRACTICES CHECKLIST (Quality Assurance):
+        [ ] NAN HYGIENE: Before .fit(), you MUST check for NaNs in X and impute (SimpleImputer) or drop them. Scikit-learn models crash on NaNs.
+        [ ] INPUT SOURCE: Explicitly load from 'data.csv' (or $data_path). Do not assume other files exist.
+        [ ] VARIABLE DEFINITION: Define all metric variables (e.g., auc, f1, precision) locally before trying to save them to metrics.json.
+        [ ] CASTING SAFEGUARDS: When converting columns, handle non-numeric values gracefully (coerce).
 
         HARD CONSTRAINTS (VIOLATION = FAILURE)
         1) OUTPUT VALID PYTHON CODE ONLY (no markdown, no code fences, no JSON-only plans).
