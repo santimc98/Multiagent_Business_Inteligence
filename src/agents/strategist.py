@@ -49,22 +49,61 @@ class StrategistAgent:
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Chief Data Strategist inside a multi-agent system. Your goal is to craft ONE optimal strategy
         that downstream AI engineers can execute successfully.
-        
+
         *** DATASET SUMMARY ***
         $data_summary
-        
+
         *** USER REQUEST ***
         "$user_request"
-        
+
         *** YOUR TASK ***
-        - Provide ONE strategy that maximizes business alignment AND is feasible for the AI engineers to execute.
-        - Think about the capabilities/constraints of the system (cleaning, mapping, optimization, reporting).
-        - State which variables are required and which data science techniques should be used.
-        - In your reasoning, explicitly assess feature availability timing (pre-decision vs post-outcome),
-          leakage risk, and signal sufficiency. If you see risk, propose a fallback approach (e.g., descriptive
-          segmentation instead of predictive modeling). This is reasoning guidance, not a rigid rule.
-        
-        *** TEAM CAPABILITIES & CONSTRAINTS ***
+        Design a strategy using FIRST PRINCIPLES REASONING. Do not classify the problem into pre-defined categories.
+        Instead, reason through WHAT the business is trying to achieve and HOW data science can help.
+
+        CRITICAL: Your reasoning must be universal and adaptable to ANY objective, not hardcoded to specific problem types.
+
+        *** STEP 1: UNDERSTAND THE BUSINESS QUESTION (First Principles) ***
+        Before proposing techniques, answer these fundamental questions:
+
+        1. **WHAT is the business trying to LEARN or ACHIEVE?**
+           - Are they trying to UNDERSTAND patterns? (descriptive/exploratory)
+           - Are they trying to PREDICT future outcomes? (predictive)
+           - Are they trying to OPTIMIZE a decision? (prescriptive)
+           - Are they trying to EXPLAIN why something happens? (causal/diagnostic)
+           - Are they trying to RANK/PRIORITIZE items? (comparative)
+
+        2. **WHAT is the DECISION or ACTION that follows from this analysis?**
+           - Will the business change prices? (optimization)
+           - Will they target specific customers? (classification/segmentation)
+           - Will they forecast demand? (time series prediction)
+           - Will they adjust a process? (causal inference)
+
+        3. **WHAT is the SUCCESS METRIC from the business perspective?**
+           - Maximizing revenue/profit? (optimization metric)
+           - Minimizing error in prediction? (accuracy metric)
+           - Understanding customer segments? (descriptive metric)
+           - Identifying causal relationships? (statistical significance)
+
+        *** STEP 2: TRANSLATE TO DATA SCIENCE OBJECTIVE ***
+        Based on your answers above, explicitly state:
+        - **objective_type**: One of [descriptive, predictive, prescriptive, causal, comparative]
+        - **objective_reasoning**: WHY you chose this type (2-3 sentences connecting business goal to objective type)
+        - **success_metric**: What metric best captures business success (not generic ML metrics)
+
+        Examples of objective_reasoning (DO NOT COPY, USE AS REFERENCE):
+        - "The business wants to find the optimal price point to maximize expected revenue (Price × Success Probability).
+           This is a PRESCRIPTIVE objective because the goal is not just to predict success, but to recommend the best
+           price per customer segment. Success metric: Expected Revenue."
+
+        - "The business wants to predict customer churn in the next 30 days to enable proactive retention.
+           This is a PREDICTIVE objective because the goal is forecasting a future binary outcome.
+           Success metric: Precision at top 20% (cost of false positives is high)."
+
+        - "The business wants to understand what customer segments exist based on behavior patterns.
+           This is a DESCRIPTIVE objective because the goal is pattern discovery, not prediction.
+           Success metric: Segment interpretability and separation quality (silhouette score)."
+
+        *** STEP 3: DESIGN STRATEGY WITH TEAM CAPABILITIES IN MIND ***
         You are designing a plan for AI engineers (Data Engineer, ML Engineer) with specific strengths and limitations.
         Consider dataset size and complexity when proposing strategies.
         
@@ -111,12 +150,40 @@ class StrategistAgent:
         3. **TARGET CLARITY:**
            - What exactly are we solving for? (e.g. Price Optimization -> Target = "Success Probability" given Price).
            
+        *** STEP 4: EVALUATE APPROPRIATE METRICS ***
+        Based on your objective_type, reason through what metrics best measure success.
+        DO NOT use pre-defined metric lists. Instead, think:
+        - What does the business care about? (revenue, accuracy, interpretability, coverage)
+        - What are the risks? (false positives costly? false negatives worse?)
+        - What validates the approach? (cross-validation, time split, holdout)
+
+        Examples (DO NOT COPY LITERALLY):
+        - Prescriptive (optimization): Expected Value, Revenue Lift, Opportunity Cost
+        - Predictive (classification): Precision@K, ROC-AUC, F1 (depends on cost asymmetry)
+        - Predictive (regression): MAE, RMSE, MAPE (depends on scale sensitivity)
+        - Descriptive (segmentation): Silhouette Score, Segment Size Distribution, Interpretability
+        - Causal: ATE (Average Treatment Effect), Statistical Significance, Confidence Intervals
+
         *** CRITICAL OUTPUT RULES ***
         - RETURN ONLY RAW JSON. NO MARKDOWN. NO COMMENTS.
         - The output must be a dictionary with a single key "strategies" containing a LIST of 1 object.
-        - The object keys: "title", "analysis_type", "hypothesis", "required_columns" (list of strings),
-          "techniques" (list of strings), "estimated_difficulty", "reasoning".
-        - "required_columns": Use EXACT column names from the summary.
+        - The object must include these keys:
+          {
+            "title": "Strategy name",
+            "objective_type": "One of: descriptive, predictive, prescriptive, causal, comparative",
+            "objective_reasoning": "2-3 sentences explaining WHY this objective_type fits the business goal",
+            "success_metric": "Primary business metric (not generic ML metric)",
+            "recommended_evaluation_metrics": ["list", "of", "metrics", "to", "track"],
+            "validation_strategy": "cross_validation | time_split | holdout | bootstrap (with reasoning)",
+            "analysis_type": "Brief label (e.g. 'Price Optimization', 'Churn Prediction')",
+            "hypothesis": "What you expect to find or achieve",
+            "required_columns": ["exact", "column", "names", "from", "summary"],
+            "techniques": ["list", "of", "data science techniques"],
+            "estimated_difficulty": "Low | Medium | High",
+            "reasoning": "Why this strategy is optimal for the data and objective"
+          }
+        - "required_columns": Use EXACT column names from the dataset summary.
+        - "objective_reasoning" is MANDATORY and must connect business goal → objective_type.
         """
         
         system_prompt = render_prompt(
@@ -132,16 +199,23 @@ class StrategistAgent:
             self.last_response = content
             cleaned_content = self._clean_json(content)
             single_strategy = json.loads(cleaned_content)
-            strategy_spec = self._build_strategy_spec(single_strategy, data_summary, user_request)
+
+            # Build strategy_spec from LLM reasoning (not hardcoded inference)
+            strategy_spec = self._build_strategy_spec_from_llm(single_strategy, data_summary, user_request)
             if isinstance(single_strategy, dict):
                 single_strategy["strategy_spec"] = strategy_spec
             return single_strategy
-            
+
         except Exception as e:
             print(f"Strategist Error: {e}")
             # Fallback simple strategy
             fallback = {"strategies": [{
                 "title": "Error Fallback Strategy",
+                "objective_type": "descriptive",
+                "objective_reasoning": "API error occurred. Defaulting to descriptive analysis as safest fallback.",
+                "success_metric": "Data quality summary",
+                "recommended_evaluation_metrics": ["completeness", "consistency"],
+                "validation_strategy": "manual_review",
                 "analysis_type": "statistical",
                 "hypothesis": "Could not generate complex strategy. Analyzing basic correlations.",
                 "required_columns": [],
@@ -149,7 +223,8 @@ class StrategistAgent:
                 "estimated_difficulty": "Low",
                 "reasoning": f"Gemini API Failed: {e}"
             }]}
-            fallback["strategy_spec"] = self._build_strategy_spec(fallback, data_summary, user_request)
+            strategy_spec = self._build_strategy_spec_from_llm(fallback, data_summary, user_request)
+            fallback["strategy_spec"] = strategy_spec
             return fallback
 
     def _clean_json(self, text: str) -> str:
@@ -157,92 +232,76 @@ class StrategistAgent:
         text = re.sub(r'```', '', text)
         return text.strip()
 
-    def _infer_objective_type(self, data_summary: str, user_request: str, strategy: Dict[str, Any] | None) -> str:
-        combined = " ".join([
-            str(data_summary or "").lower(),
-            str(user_request or "").lower(),
-            str((strategy or {}).get("analysis_type") or "").lower(),
-            " ".join([str(t) for t in ((strategy or {}).get("techniques") or [])]).lower(),
-        ])
-        if any(tok in combined for tok in ["forecast", "time series", "temporal", "series", "seasonal"]):
-            return "forecasting"
-        if any(tok in combined for tok in ["rank", "ranking", "priority", "prioritize", "score"]):
-            return "ranking"
-        if any(tok in combined for tok in ["classif", "churn", "binary", "categorical target"]):
-            return "classification"
-        if any(tok in combined for tok in ["regress", "continuous target", "price", "amount", "value"]):
-            return "regression"
-        if any(tok in combined for tok in ["causal", "uplift", "treatment", "impact"]):
-            return "causal"
-        if any(tok in combined for tok in ["optimiz", "maximize", "minimize", "prescriptive", "recommend"]):
-            return "prescriptive"
-        return "descriptive"
+    def _build_strategy_spec_from_llm(self, strategy_payload: Dict[str, Any], data_summary: str, user_request: str) -> Dict[str, Any]:
+        """
+        Build strategy_spec using LLM-generated reasoning instead of hardcoded inference.
 
-    def _build_strategy_spec(self, strategy_payload: Dict[str, Any], data_summary: str, user_request: str) -> Dict[str, Any]:
+        The LLM now provides:
+        - objective_type (reasoned, not inferred)
+        - objective_reasoning (explicit connection to business goal)
+        - success_metric (business metric, not generic ML metric)
+        - recommended_evaluation_metrics (reasoned, not mapped from dict)
+        - validation_strategy (reasoned, not mapped from dict)
+        """
         strategies = []
         if isinstance(strategy_payload, dict):
             strategies = strategy_payload.get("strategies", []) or []
         primary = strategies[0] if strategies else {}
-        objective_type = self._infer_objective_type(data_summary, user_request, primary if isinstance(primary, dict) else {})
 
-        metrics_map = {
-            "classification": ["accuracy", "f1", "roc_auc"],
-            "regression": ["mae", "rmse", "r2"],
-            "forecasting": ["mae", "rmse", "mape"],
-            "ranking": ["spearman", "ndcg"],
-        }
-        validation_map = {
-            "forecasting": "time_split",
-            "classification": "cross_validation",
-            "regression": "cross_validation",
-            "ranking": "cross_validation",
-        }
+        # Use LLM-generated objective_type (with fallback to heuristic if missing)
+        objective_type = primary.get("objective_type", "descriptive")
+
+        # If LLM didn't provide objective_type (backward compatibility), use simple heuristic
+        if not objective_type or objective_type == "descriptive":
+            combined = " ".join([str(user_request or "").lower()])
+            if any(tok in combined for tok in ["optimiz", "maximize", "minimize", "optimal", "best price"]):
+                objective_type = "prescriptive"
+            elif any(tok in combined for tok in ["predict", "forecast", "estimate future"]):
+                objective_type = "predictive"
+            elif any(tok in combined for tok in ["explain", "why", "cause", "impact of"]):
+                objective_type = "causal"
+            else:
+                objective_type = "descriptive"
+
+        # Use LLM-generated metrics (with sensible defaults if missing)
+        metrics = primary.get("recommended_evaluation_metrics", [])
+        if not metrics:
+            # Sensible defaults based on objective_type
+            if objective_type == "prescriptive":
+                metrics = ["expected_value", "revenue_lift"]
+            elif objective_type == "predictive":
+                metrics = ["accuracy", "roc_auc"]
+            else:
+                metrics = ["summary_statistics"]
+
+        validation_strategy = primary.get("validation_strategy", "cross_validation")
+
         evaluation_plan = {
             "objective_type": objective_type,
-            "metrics": metrics_map.get(objective_type, ["summary"]),
+            "metrics": metrics,
             "validation": {
-                "strategy": validation_map.get(objective_type, "holdout"),
+                "strategy": validation_strategy,
                 "notes": "Adjust validation to data volume and temporal ordering.",
             },
         }
 
+        # Keep simple leakage heuristics (universal)
         leakage_risks: List[str] = []
         combined = " ".join([str(data_summary or "").lower(), str(user_request or "").lower()])
-        if any(tok in combined for tok in ["post", "after", "outcome", "label"]):
+        if any(tok in combined for tok in ["post", "after", "outcome", "result"]):
             leakage_risks.append("Potential post-outcome fields may leak target information.")
         if "target" in combined:
             leakage_risks.append("Exclude target or target-derived fields from features.")
 
+        # Universal recommended artifacts (not hardcoded to objective_type)
         recommended_artifacts = [
             {"artifact_type": "clean_dataset", "required": True, "rationale": "Base dataset for modeling."},
             {"artifact_type": "metrics", "required": True, "rationale": "Objective evaluation results."},
+            {"artifact_type": "predictions_or_scores", "required": True, "rationale": "Primary output (predictions, scores, or recommendations)."},
+            {"artifact_type": "explainability", "required": False, "rationale": "Feature importances or model explanations."},
+            {"artifact_type": "diagnostics", "required": False, "rationale": "Error analysis or quality diagnostics."},
+            {"artifact_type": "visualizations", "required": False, "rationale": "Plots for interpretability."},
         ]
-        if objective_type == "classification":
-            recommended_artifacts.extend([
-                {"artifact_type": "predictions", "required": True, "rationale": "Predicted class/probability outputs."},
-                {"artifact_type": "confusion_matrix", "required": False, "rationale": "Class error analysis."},
-            ])
-        elif objective_type == "regression":
-            recommended_artifacts.extend([
-                {"artifact_type": "predictions", "required": True, "rationale": "Predicted numeric outputs."},
-                {"artifact_type": "residuals", "required": False, "rationale": "Error distribution analysis."},
-            ])
-        elif objective_type == "forecasting":
-            recommended_artifacts.extend([
-                {"artifact_type": "forecast", "required": True, "rationale": "Forward-looking predictions."},
-                {"artifact_type": "backtest", "required": False, "rationale": "Historical forecast validation."},
-            ])
-        elif objective_type == "ranking":
-            recommended_artifacts.extend([
-                {"artifact_type": "ranking_scores", "required": True, "rationale": "Ranked list or scoring output."},
-                {"artifact_type": "ranking_report", "required": False, "rationale": "Ranking quality diagnostics."},
-            ])
-
-        recommended_artifacts.extend([
-            {"artifact_type": "feature_importances", "required": False, "rationale": "Explainability and auditability."},
-            {"artifact_type": "error_analysis", "required": False, "rationale": "Failure mode insights."},
-            {"artifact_type": "plots", "required": False, "rationale": "Diagnostic visuals when helpful."},
-        ])
 
         return {
             "objective_type": objective_type,
