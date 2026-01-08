@@ -84,8 +84,14 @@ class MLEngineerAgent:
         self.last_response = None
 
     def _compact_execution_contract(self, contract: Dict[str, Any] | None) -> Dict[str, Any]:
+        """
+        Extract relevant V4.1 fields for ML Engineer prompt.
+        Excludes legacy spec_extraction and role_runbooks.
+        """
         if not isinstance(contract, dict):
             return {}
+        
+        # V4.1 keys relevant for ML Engineer
         keep_keys = [
             "contract_version",
             "strategy_title",
@@ -100,18 +106,36 @@ class MLEngineerAgent:
             "feature_availability",
             "availability_summary",
             "required_dependencies",
-            "spec_extraction",
-            "role_runbooks",
             "compliance_checklist",
+            # V4.1 specific
+            "artifact_requirements",
+            "qa_gates",
+            "reviewer_gates",
+            "allowed_feature_sets",
+            "leakage_execution_plan",
+            "data_limited_mode",
+            "ml_engineer_runbook",
+            "derived_columns",
         ]
+        
         compact: Dict[str, Any] = {}
         for key in keep_keys:
             if key in contract:
                 compact[key] = contract.get(key)
+        
+        # Truncate large lists
         for key in ["canonical_columns", "column_mapping_rules", "column_mapping"]:
             vals = contract.get(key)
             if isinstance(vals, list) and vals:
                 compact[key] = vals[:80]
+        
+        # Ensure ml_engineer_runbook is present (V4.1 priority)
+        if "ml_engineer_runbook" not in compact or not compact.get("ml_engineer_runbook"):
+            # Fallback: try role_runbooks.ml_engineer (legacy shim)
+            role_runbooks = contract.get("role_runbooks")
+            if isinstance(role_runbooks, dict):
+                compact["ml_engineer_runbook"] = role_runbooks.get("ml_engineer", {})
+        
         return compact
 
     def _resolve_allowed_columns_for_prompt(self, contract: Dict[str, Any] | None) -> List[str]:
@@ -357,6 +381,22 @@ class MLEngineerAgent:
         9) Define CONTRACT_COLUMNS from the Execution Contract (prefer data_requirements source=input; else canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
         10) LEAKAGE ZERO-TOLERANCE: Check 'allowed_feature_sets' in the contract. Any column listed as 'audit_only_features' or 'forbidden_for_modeling' MUST be excluded from X (features). Use them ONLY for audit/metrics calculation. Violation = REJECTION.
         11) OUTPUT DIALECT OBEDIENCE: When using .to_csv(), YOU MUST explicitly use the separators provided in 'output_dialect' (sep, decimal, encoding). DO NOT rely on defaults. Example: df.to_csv(path, sep=output_dialect['sep'], decimal=output_dialect['decimal'], index=False).
+        
+        UNIVERSAL FEATURE USAGE RULE (CONTRACT-DRIVEN):
+        - Each phase (segmentation/modeling/optimization) MUST use ONLY features allowed by the contract.
+        - If 'allowed_feature_sets' exists in contract, validate features per phase:
+          * segmentation_features: for clustering/segment assignment
+          * modeling_features: for predictive model training
+          * optimization_features: for optimization decisions
+        - If 'allowed_feature_sets' is missing, derive constraints from: canonical_columns + derived_columns + leakage_execution_plan.
+        - NEVER invent features or use columns not in the contract.
+        
+        TECHNICAL HELPERS (use these patterns):
+        - JSON serialization with numpy: Before json.dump(), convert numpy types to native Python:
+          def _safe_json(obj): return int(obj) if hasattr(obj, 'item') else (obj.tolist() if hasattr(obj, 'tolist') else obj)
+          Then: json.dump({k: _safe_json(v) for k,v in metrics.items()}, f)
+        - Sklearn scoring: Use string scorers ('accuracy', 'roc_auc', 'neg_mean_squared_error') instead of custom scorers.
+          Avoid 'needs_proba' parameter issues by using cross_val_score with scoring='accuracy' for classification.
 
         SECURITY / SANDBOX (VIOLATION = FAILURE)
         - Do NOT import sys.
@@ -442,11 +482,15 @@ class MLEngineerAgent:
           ✅ OK: Outcome ~ [F1, F2]; then model effect of decision_variable within segments.
           ❌ FAIL: features = [F1, F2, decision_variable].
 
-        DIALECT CONTRACT (must follow)
-        - Prefer reading 'data/cleaning_manifest.json' to get output_dialect (sep, encoding, decimal). Default: Enc='$csv_encoding', Sep='$csv_sep', Decimal='$csv_decimal'.
+        DIALECT CONTRACT (MANDATORY - DO NOT SKIP)
+        - ALWAYS read 'data/cleaning_manifest.json' first to get output_dialect (sep, encoding, decimal).
+        - Use: dialect = json.load(open('data/cleaning_manifest.json')).get('output_dialect', {})
+        - Apply: pd.read_csv('data/cleaned_data.csv', sep=dialect.get('sep', ','), decimal=dialect.get('decimal', '.'), encoding=dialect.get('encoding', 'utf-8'))
+        - Fallback ONLY if manifest doesn't exist: Enc='$csv_encoding', Sep='$csv_sep', Decimal='$csv_decimal'.
+        - DO NOT hardcode sep=';' or decimal=',' - these vary per dataset!
         - After loading:
-        - If df is empty: raise ValueError including the dialect used.
-        - If df has 1 column and the column name contains ',', ';', or '\\t' AND length>20: raise ValueError("Delimiter/Dialect mismatch: ...") including the dialect used.
+          - If df is empty: raise ValueError including the dialect used.
+          - If df has 1 column and the column name contains ',', ';', or '\\t' AND length>20: raise ValueError("Delimiter/Dialect mismatch: ...") including the dialect used.
         - Do NOT attempt to split columns.
 
         SENIOR WORKFLOW (do this, not a checklist)

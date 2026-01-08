@@ -1,29 +1,74 @@
 import os
 import re
+import ast
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 from src.utils.static_safety_scan import scan_code_safety
+from src.utils.code_extract import extract_code_block
 from openai import OpenAI
 
 load_dotenv()
 
+
 class DataEngineerAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Data Engineer Agent with DeepSeek Reasoner.
+        Initializes the Data Engineer Agent with DeepSeek Reasoner (primary) and OpenRouter fallback.
         """
+        # --- PRIMARY: DeepSeek ---
         self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DeepSeek API Key is required.")
 
+        # Configurable base_url and timeout (Fix CAUSA RAÍZ 1)
+        deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+        deepseek_timeout = float(os.getenv("DEEPSEEK_TIMEOUT", "60"))
+
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url="https://api.deepseek.com",
-            timeout=None,
+            base_url=deepseek_base_url,
+            timeout=deepseek_timeout,
         )
-        self.model_name = "deepseek-reasoner"
+        # Configurable model name
+        self.model_name = os.getenv("DEEPSEEK_DE_PRIMARY_MODEL", "deepseek-reasoner")
+
+        # --- FALLBACK: OpenRouter ---
+        self.fallback_client = None
+        self.fallback_model_name = None
+        or_key = os.getenv("OPENROUTER_API_KEY")
+        if or_key:
+            fallback_timeout = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "120"))
+            self.fallback_client = OpenAI(
+                api_key=or_key,
+                base_url="https://openrouter.ai/api/v1",
+                timeout=fallback_timeout,
+                default_headers={"HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "")},
+            )
+            self.fallback_model_name = os.getenv("OPENROUTER_DE_FALLBACK_MODEL") or os.getenv("OPENROUTER_ML_PRIMARY_MODEL") or "z-ai/glm-4.7"
+
         self.last_prompt = None
         self.last_response = None
+
+    def _extract_nonempty(self, response) -> str:
+        """
+        Extracts non-empty content from LLM response.
+        Raises ValueError("EMPTY_COMPLETION") if content is empty (CAUSA RAÍZ 2).
+        This triggers retry logic in call_with_retries.
+        """
+        msg = response.choices[0].message
+        content = (msg.content or "").strip()
+
+        # Fallback: some models expose reasoning separately
+        if not content:
+            reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
+            if isinstance(reasoning, str) and reasoning.strip():
+                content = reasoning.strip()
+
+        if not content:
+            print("ERROR: LLM returned EMPTY_COMPLETION. Will retry.")
+            raise ValueError("EMPTY_COMPLETION")
+
+        return content
 
     def generate_cleaning_script(
         self,
@@ -40,16 +85,19 @@ class DataEngineerAgent:
         Generates a Python script to clean and standardize the dataset.
         """
         from src.utils.prompting import render_prompt
-        # scan_code_safety is enforced in orchestrator; import keeps scanner integration visible.
         import json
 
-        contract_json = json.dumps(execution_contract or {}, indent=2)
-        de_runbook_json = json.dumps(
-            (execution_contract or {}).get("role_runbooks", {}).get("data_engineer", {}),
-            indent=2,
-        )
-        
-        # SYSTEM TEMPLATE (Static, Safe, No F-Strings)
+        contract = execution_contract or {}
+        contract_json = json.dumps(contract, indent=2)
+
+        # --- FIX CAUSA RAÍZ 1: Leer runbook correcto V4.1 ---
+        # Primero intentar clave canónica V4.1, luego fallback a legacy
+        de_runbook = contract.get("data_engineer_runbook")
+        if not de_runbook:
+            de_runbook = (contract.get("role_runbooks") or {}).get("data_engineer", {})
+        de_runbook_json = json.dumps(de_runbook, indent=2)
+
+        # SYSTEM TEMPLATE with PYTHON SYNTAX GOTCHAS (Fix CAUSA RAÍZ 3)
         SYSTEM_TEMPLATE = """
         You are a Senior Data Engineer. Produce a robust cleaning SCRIPT for downstream ML.
         
@@ -63,6 +111,12 @@ class DataEngineerAgent:
         7. Never call int(series) or float(series). For boolean masks use int(mask.sum()).
            If you fill NaN with a sentinel (e.g., 'Unknown'), log nulls via original_nulls = int(col.isna().sum());
            nulls_before = original_nulls; nulls_after_na = int(cleaned.isna().sum()); filled_nulls = original_nulls.
+
+        *** PYTHON SYNTAX GOTCHAS (CRITICAL) ***
+        - Column names starting with a digit (e.g., '1stYearAmount') are NOT valid Python identifiers.
+        - NEVER use: df.assign(1stYearAmount=...) - This causes SyntaxError!
+        - ALWAYS use: df.assign(**{'1stYearAmount': ...}) or df['1stYearAmount'] = ...
+        - For Probability column: if max > 1 and max <= 100, divide by 100 to normalize to 0-1 range.
         
         *** INPUT PARAMETERS ***
         - Input: '$input_path'
@@ -90,10 +144,9 @@ class DataEngineerAgent:
         - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
         - If a derived column has derived_owner='ml_engineer', do NOT create placeholders; leave it absent and document in the manifest.
         """
-        
-        # USER TEMPLATE (Static)
+
         USER_TEMPLATE = "Generate the cleaning script following Principles."
-        
+
         # Rendering
         system_prompt = render_prompt(
             SYSTEM_TEMPLATE,
@@ -108,6 +161,10 @@ class DataEngineerAgent:
             data_engineer_runbook=de_runbook_json,
         )
         self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE
+        print(f"DEBUG: DE System Prompt Len: {len(system_prompt)}")
+        print(f"DEBUG: DE System Prompt Preview: {system_prompt[:300]}...")
+        if len(system_prompt) < 100:
+            print("CRITICAL: System Prompt is suspiciously short!")
 
         from src.utils.retries import call_with_retries
 
@@ -121,11 +178,12 @@ class DataEngineerAgent:
                 ],
                 temperature=0.1
             )
-
-            content = response.choices[0].message.content
+            # Use _extract_nonempty to handle EMPTY_COMPLETION (CAUSA RAÍZ 2)
+            content = self._extract_nonempty(response)
+            print(f"DEBUG: Primary DE Response Preview: {content[:200]}...")
             self.last_response = content
-            
-             # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
+
+            # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
             if "504 Gateway Time-out" in content or "<html" in content.lower():
                 raise ConnectionError("LLM Server Timeout (504 Received)")
 
@@ -136,36 +194,98 @@ class DataEngineerAgent:
                     import json
                     json_content = json.loads(content_stripped)
                     if isinstance(json_content, dict):
-                        # Standard error formats
                         if "error" in json_content or "errorMessage" in json_content:
                             raise ConnectionError(f"API Error Detected (JSON): {content_stripped}")
                 except Exception:
-                    pass # Not valid JSON, proceed
-            
+                    pass
+
             # Text based fallback for Error/Overloaded keywords
             content_lower = content.lower()
             if "error" in content_lower and ("overloaded" in content_lower or "rate limit" in content_lower or "429" in content_lower):
-                 raise ConnectionError(f"API Error Detected (Text): {content_stripped}")
-            
+                raise ConnectionError(f"API Error Detected (Text): {content_stripped}")
+
+            return content
+
+        def _call_fallback():
+            if not self.fallback_client:
+                raise ValueError("No fallback client configured.")
+            print(f"DEBUG: Data Engineer calling Fallback Model ({self.fallback_model_name})...")
+            response = self.fallback_client.chat.completions.create(
+                model=self.fallback_model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": USER_TEMPLATE}
+                ],
+                temperature=0.1
+            )
+            # Use _extract_nonempty to handle EMPTY_COMPLETION (CAUSA RAÍZ 2)
+            content = self._extract_nonempty(response)
+            print(f"DEBUG: Fallback DE Response Preview: {content[:200]}...")
             return content
 
         try:
             content = call_with_retries(_call_model, max_retries=5, backoff_factor=2, initial_delay=2)
             print("DEBUG: DeepSeek response received.")
-            
+
             code = self._clean_code(content)
-            return code
-            
+
+            # INFRASTRUCTURE INJECTION: Ensure data dir exists
+            injection = "import os\nos.makedirs('data', exist_ok=True)\n"
+            return injection + code
+
         except Exception as e:
-            error_msg = f"Data Engineer Failed (Max Retries): {str(e)}"
+            print(f"WARNING: Primary Data Engineer Model (DeepSeek) failed: {str(e)}")
+            if self.fallback_client:
+                print(f"DEBUG: Attempting Fallback to {self.fallback_model_name}...")
+                try:
+                    content = call_with_retries(_call_fallback, max_retries=3, backoff_factor=2, initial_delay=2)
+                    print("DEBUG: Fallback response received.")
+                    code = self._clean_code(content)
+                    injection = "import os\nos.makedirs('data', exist_ok=True)\n"
+                    return injection + code
+                except Exception as e_bk:
+                    error_msg = f"Data Engineer Failed (Primary & Fallback): {str(e)} | Backup: {str(e_bk)}"
+            else:
+                error_msg = f"Data Engineer Failed (Max Retries, No Fallback): {str(e)}"
+
             print(f"CRITICAL: {error_msg}")
-            # Return sentinel for graph.py to handle cleanly
             return f"# Error: {error_msg}"
 
     def _clean_code(self, code: str) -> str:
         """
-        Removes markdown formatting and artifacts from the generated code.
+        Extracts code from markdown blocks, validates syntax, and applies auto-fixes.
+        Raises ValueError if code is empty or has unfixable syntax errors (CAUSA RAÍZ 2 & 3).
         """
-        code = re.sub(r'```python', '', code)
-        code = re.sub(r'```', '', code)
-        return code.strip()
+        # Step 1: Extract code from markdown
+        cleaned = (extract_code_block(code) or "").strip()
+
+        if not cleaned:
+            print("ERROR: EMPTY_CODE_AFTER_EXTRACTION")
+            raise ValueError("EMPTY_CODE_AFTER_EXTRACTION")
+
+        # Step 2: Validate syntax
+        try:
+            ast.parse(cleaned)
+            return cleaned
+        except SyntaxError as e:
+            print(f"DEBUG: SyntaxError detected: {e}. Attempting auto-fix...")
+
+        # Step 3: Auto-fix common pattern: .assign(1stYearAmount=...) -> .assign(**{'1stYearAmount': ...})
+        # Pattern: .assign(DIGIT_START_IDENT=VALUE)
+        pattern = r'\.assign\(\s*([0-9][a-zA-Z0-9_]*)\s*=\s*([^)]+)\)'
+        
+        def fix_assign(match):
+            col_name = match.group(1)
+            value = match.group(2)
+            return f".assign(**{{'{col_name}': {value}}})"
+
+        fixed = re.sub(pattern, fix_assign, cleaned)
+
+        # Step 4: Validate fixed code
+        try:
+            ast.parse(fixed)
+            print("DEBUG: Auto-fix successful.")
+            return fixed
+        except SyntaxError as e2:
+            print(f"ERROR: Auto-fix failed. Syntax still invalid: {e2}")
+            raise ValueError(f"UNFIXABLE_SYNTAX_ERROR: {e2}")

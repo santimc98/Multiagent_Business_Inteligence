@@ -1030,37 +1030,56 @@ def _is_glob_pattern(path: str) -> bool:
         return False
     return any(ch in path for ch in ["*", "?", "["]) or path.endswith(("/", "\\"))
 
+def _normalize_output_path(path: str) -> str:
+    """Normalize output paths to data/ prefix for consistency."""
+    if not path:
+        return path
+    # Known files that should be in data/
+    known_files = ["metrics.json", "alignment_check.json", "scored_rows.csv", "cleaned_data.csv"]
+    basename = os.path.basename(path)
+    if basename in known_files and not path.startswith("data/"):
+        return f"data/{basename}"
+    return path
+
+
 def _resolve_required_outputs(contract: Dict[str, Any]) -> List[str]:
+    """
+    Resolve required outputs from V4.1 contract structure.
+    Priority:
+      1. evaluation_spec.required_outputs
+      2. contract.required_outputs
+      3. artifact_requirements.required_files
+      4. Sensible fallback
+    NO LONGER uses spec_extraction.deliverables (legacy).
+    """
     if not isinstance(contract, dict):
         return []
-    spec = contract.get("spec_extraction") or {}
-    deliverables = spec.get("deliverables") if isinstance(spec, dict) else None
-    if isinstance(deliverables, list) and deliverables:
-        required: List[str] = []
-        for item in deliverables:
-            if isinstance(item, dict):
-                if item.get("required") and item.get("path"):
-                    required.append(str(item.get("path")))
-            elif isinstance(item, str):
-                required.append(item)
-        return required
-    return contract.get("required_outputs", []) or []
+    
+    # Priority 1: evaluation_spec.required_outputs
+    eval_spec = contract.get("evaluation_spec")
+    if isinstance(eval_spec, dict):
+        eval_outputs = eval_spec.get("required_outputs")
+        if isinstance(eval_outputs, list) and eval_outputs:
+            return [_normalize_output_path(str(p)) for p in eval_outputs if p]
+    
+    # Priority 2: contract.required_outputs
+    req_outputs = contract.get("required_outputs")
+    if isinstance(req_outputs, list) and req_outputs:
+        return [_normalize_output_path(str(p)) for p in req_outputs if p]
+    
+    # Priority 3: artifact_requirements.required_files
+    artifact_reqs = contract.get("artifact_requirements")
+    if isinstance(artifact_reqs, dict):
+        req_files = artifact_reqs.get("required_files")
+        if isinstance(req_files, list) and req_files:
+            return [_normalize_output_path(str(p)) for p in req_files if p]
+    
+    # Fallback: minimal required outputs for a valid ML run
+    return ["data/scored_rows.csv", "data/metrics.json", "data/alignment_check.json"]
 
 def _resolve_expected_output_paths(contract: Dict[str, Any]) -> List[str]:
-    if not isinstance(contract, dict):
-        return []
-    spec = contract.get("spec_extraction") or {}
-    deliverables = spec.get("deliverables") if isinstance(spec, dict) else None
-    expected: List[str] = []
-    if isinstance(deliverables, list) and deliverables:
-        for item in deliverables:
-            if isinstance(item, dict) and item.get("path"):
-                expected.append(str(item.get("path")))
-            elif isinstance(item, str):
-                expected.append(str(item))
-    else:
-        expected.extend(contract.get("required_outputs", []) or [])
-    return expected
+    """V4.1-only: delegates to _resolve_required_outputs."""
+    return _resolve_required_outputs(contract)
 
 
 def _purge_execution_outputs(required_outputs: List[str], keep_outputs: List[str] | None = None) -> None:
@@ -1173,30 +1192,45 @@ def _find_stale_outputs(required_outputs: List[str], start_ts: float) -> List[st
     return stale
 
 def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any] | None) -> Dict[str, Any]:
+    """
+    Build a minimal contract for ML Engineer prompt (V4.1-only).
+    Excludes legacy spec_extraction; uses normalized required_outputs.
+    """
     if not isinstance(contract, dict):
         contract = {}
-    spec = contract.get("spec_extraction")
-    if not isinstance(spec, dict):
-        spec = {}
+    
     eval_spec = evaluation_spec if isinstance(evaluation_spec, dict) else contract.get("evaluation_spec") or {}
     alignment = contract.get("alignment_requirements") or (eval_spec.get("alignment_requirements") if isinstance(eval_spec, dict) else []) or []
+    
+    # Get derived_columns from V4.1 location (feature_engineering_plan or direct)
+    fep = contract.get("feature_engineering_plan")
+    derived_cols = []
+    if isinstance(fep, dict):
+        derived_cols = fep.get("derived_columns", [])
+    if not derived_cols:
+        derived_cols = contract.get("derived_columns", [])
+    
     return {
         "contract_version": contract.get("contract_version"),
         "strategy_title": contract.get("strategy_title"),
         "business_objective": contract.get("business_objective"),
-        "required_outputs": contract.get("required_outputs", []) or [],
+        # Use normalized required_outputs
+        "required_outputs": _resolve_required_outputs(contract),
         "data_requirements": contract.get("data_requirements", []) or [],
         "alignment_requirements": alignment,
         "canonical_columns": contract.get("canonical_columns", []) or [],
+        "derived_columns": derived_cols if isinstance(derived_cols, list) else [],
         "feature_availability": contract.get("feature_availability", []) or [],
         "availability_summary": contract.get("availability_summary", ""),
         "evaluation_spec": eval_spec,
-        "spec_extraction": {
-            "derived_columns": spec.get("derived_columns") if isinstance(spec.get("derived_columns"), list) else [],
-            "scoring_formula": spec.get("scoring_formula") if isinstance(spec.get("scoring_formula"), str) else None,
-            "target_type": spec.get("target_type") if isinstance(spec.get("target_type"), str) else None,
-            "deliverables": spec.get("deliverables") if isinstance(spec.get("deliverables"), list) else [],
-        },
+        # V4.1 fields
+        "artifact_requirements": contract.get("artifact_requirements", {}),
+        "qa_gates": eval_spec.get("qa_gates", []) if isinstance(eval_spec, dict) else [],
+        "reviewer_gates": eval_spec.get("reviewer_gates", []) if isinstance(eval_spec, dict) else [],
+        "allowed_feature_sets": contract.get("allowed_feature_sets", {}),
+        "leakage_execution_plan": contract.get("leakage_execution_plan", {}),
+        "data_limited_mode": contract.get("data_limited_mode", False),
+        "ml_engineer_runbook": contract.get("ml_engineer_runbook", {}),
     }
 
 def _infer_artifact_type(path: str, deliverable_kind: str | None = None) -> str:
@@ -1472,17 +1506,23 @@ def _ensure_contract_deliverable(
     spec["deliverables"] = deliverables
     contract["spec_extraction"] = spec
 
-    required_outputs: List[str] = []
-    seen: set[str] = set()
-    for item in deliverables:
-        if not item.get("required"):
-            continue
-        out_path = item.get("path")
-        if not out_path or out_path in seen:
-            continue
-        seen.add(out_path)
-        required_outputs.append(out_path)
-    contract["required_outputs"] = required_outputs
+    # --- FIX: DO NOT OVERWRITE required_outputs ---
+    # Treat existing required_outputs as source-of-truth.
+    # Only ADD new required paths (dedupe).
+    existing_outputs = contract.get("required_outputs")
+    if not isinstance(existing_outputs, list):
+        existing_outputs = []
+    
+    seen: set[str] = set(_normalize_output_path(p) for p in existing_outputs if p)
+    merged_outputs = [_normalize_output_path(p) for p in existing_outputs if p]
+    
+    # Add new required deliverables not already in required_outputs
+    if required:
+        norm_path = _normalize_output_path(path)
+        if norm_path not in seen:
+            merged_outputs.append(norm_path)
+    
+    contract["required_outputs"] = merged_outputs
     return contract
 
 def _ensure_scored_rows_output(
@@ -2749,9 +2789,16 @@ def _collect_derived_targets(contract: Dict[str, Any]) -> List[str]:
         if name and name not in derived_targets:
             derived_targets.append(name)
     # V4.1 Priority
-    fep = contract.get("feature_engineering_plan") or {}
+    # V4.1 Priority
+    fep = contract.get("feature_engineering_plan")
+    if not isinstance(fep, dict):
+        fep = {}
     derived_cols = fep.get("derived_columns") or []
-    spec = contract.get("spec_extraction") or {}
+    
+    spec = contract.get("spec_extraction")
+    if not isinstance(spec, dict):
+        spec = {}
+    
     if not derived_cols:
         derived_cols = spec.get("derived_columns") or []
     derived_names: List[str] = []
@@ -5019,21 +5066,21 @@ def run_data_engineer(state: AgentState) -> AgentState:
         sample_context = _build_required_sample_context(csv_path, input_dialect, required_cols, norm_map)
         if sample_context:
             data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, sample_context)
-    state["data_engineer_audit_override"] = data_engineer_audit_override
-    
-    # Inject Raw Snippet for Dialect Grounding
-    try:
-        raw_lines = []
-        with open(csv_path, "r", encoding=csv_encoding, errors="replace") as f:
-            for _ in range(5):
-                line = f.readline()
-                if not line: break
-                raw_lines.append(line.rstrip())
-        raw_snippet = "\n".join(raw_lines)
-        raw_context = f"\n*** RAW FILE SNIPPET (First 5 lines) ***\n{raw_snippet}\n"
-        data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, raw_context)
-    except Exception as e:
-        print(f"Warning: could not read raw snippet for DE: {e}")
+    # Inject Raw Snippet for Dialect Grounding (DISABLED: Causing GLM-4.7 Empty Response / Safety Trigger)
+    # try:
+    #     raw_lines = []
+    #     with open(csv_path, "r", encoding=csv_encoding, errors="replace") as f:
+    #         for _ in range(5):
+    #             line = f.readline()
+    #             if not line: break
+    #             # Sanitize: keeps only printable characters to avoid breaking LLM JSON prompts
+    #             clean_line = "".join(c for c in line.rstrip() if c.isprintable())
+    #             raw_lines.append(clean_line)
+    #     raw_snippet = "\n".join(raw_lines)
+    #     raw_context = f"\n*** RAW FILE SNIPPET (First 5 lines) ***\n{raw_snippet}\n"
+    #     data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, raw_context)
+    # except Exception as e:
+    #     print(f"Warning: could not read raw snippet for DE: {e}")
         
     state["data_engineer_audit_override"] = data_engineer_audit_override
     de_contract = _filter_contract_for_data_engineer(state.get("execution_contract", {}))
@@ -5194,7 +5241,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "snippets": snippets,
                 "auto_fixes_applied": auto_fixes,
             }
-            payload = "STATIC_SCAN_VIOLATIONS:\n" + json.dumps(context_payload, indent=2, ensure_ascii=False)
+            payload = "ENVIRONMENT_FEEDBACK (Please Adjust Code):\n" + json.dumps(context_payload, indent=2, ensure_ascii=False)
             new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
             if run_id:
                 log_run_event(run_id, "static_scan_retry", {"attempt": attempt_id, "violations": violations})

@@ -51,17 +51,17 @@ def scan_code_safety(code: str) -> Tuple[bool, List[str]]:
             for alias in node.names:
                 base_module = alias.name.split('.')[0]
                 if base_module in BLOCKED_MODULES:
-                    self.errors.append(f"Importing '{alias.name}' is PROHIBITED.")
+                    self.errors.append(f"Importing '{alias.name}' is not allowed.")
             self.generic_visit(node)
 
         def visit_ImportFrom(self, node):
             if node.module:
                 base_module = node.module.split('.')[0]
                 if base_module in BLOCKED_MODULES:
-                    self.errors.append(f"Importing from '{node.module}' is PROHIBITED.")
+                    self.errors.append(f"Importing from '{node.module}' is not allowed.")
                 # Check for `from pandas import io`
                 if base_module == "pandas" and "io" in [n.name for n in node.names]:
-                     self.errors.append("Importing 'pandas.io' is PROHIBITED.")
+                     self.errors.append("Importing 'pandas.io' is not allowed.")
             self.generic_visit(node)
             
         def visit_Call(self, node):
@@ -74,11 +74,12 @@ def scan_code_safety(code: str) -> Tuple[bool, List[str]]:
                             "Likely bug: int(...) returns scalar; .sum() here indicates you meant int((...).sum())."
                         )
             if func_name in BLOCKED_CALLS:
-                self.errors.append(f"Calling '{func_name}' is PROHIBITED.")
+                self.errors.append(f"Calling '{func_name}' is not allowed.")
             
             # Check for os.listdir/walk explicitly (filesystem recon)
+            # Check for os.listdir/walk explicitly (filesystem recon)
             if func_name in ["os.listdir", "os.walk", "os.scandir"]:
-                self.errors.append(f"Filesystem exploration ('{func_name}') is PROHIBITED.")
+                self.errors.append(f"Filesystem exploration ('{func_name}') is not allowed.")
                 
             self.generic_visit(node)
 
@@ -89,7 +90,7 @@ def scan_code_safety(code: str) -> Tuple[bool, List[str]]:
                  # We allow if it's just checking existence, but blocking execution is done in visit_Call.
                  # However, `pd.io` is an attribute usage we want to block entirely.
                  if attr_name in BLOCKED_ATTRS:
-                     self.errors.append(f"Usage of '{attr_name}' is PROHIBITED ({BLOCKED_ATTRS[attr_name]}).")
+                     self.errors.append(f"Usage of '{attr_name}' is not allowed ({BLOCKED_ATTRS[attr_name]}).")
             self.generic_visit(node)
 
         def _get_func_name(self, node):
@@ -106,9 +107,9 @@ def scan_code_safety(code: str) -> Tuple[bool, List[str]]:
     # 2. Regex Fallbacks (for dynamic things AST might miss or string injection)
     # ParserBase
     if re.search(r'\bParserBase\b', code):
-        violations.append("Usage of 'ParserBase' is PROHIBITED.")
+        violations.append("Usage of 'ParserBase' is not allowed.")
 
     if re.search(r"\bnp\.bool(?!_)\b", code) or re.search(r"\bnumpy\.bool(?!_)\b", code):
-        violations.append("Usage of 'np.bool' is PROHIBITED. Use 'np.bool_' instead.")
+        violations.append("Usage of 'np.bool' is not allowed. Use 'np.bool_' instead.")
         
     return (len(violations) == 0, violations)

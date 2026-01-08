@@ -1641,7 +1641,26 @@ class ExecutionPlannerAgent:
             deliverables = _ensure_unique_deliverable_ids(deliverables)
             spec["deliverables"] = deliverables
             contract["spec_extraction"] = spec
-            contract["required_outputs"] = [item["path"] for item in deliverables if item.get("required")]
+            
+            # Build required_outputs from deliverables
+            req_outputs = [item["path"] for item in deliverables if item.get("required")]
+            
+            # Ensure core ML outputs are always included (V4.1 completeness)
+            core_outputs = ["data/scored_rows.csv", "data/metrics.json", "data/alignment_check.json"]
+            for core in core_outputs:
+                if core not in req_outputs:
+                    req_outputs.append(core)
+            
+            # Normalize paths: ensure data/ prefix
+            def _normalize_path(p: str) -> str:
+                known = ["metrics.json", "alignment_check.json", "scored_rows.csv", "cleaned_data.csv"]
+                import os
+                base = os.path.basename(p)
+                if base in known and not p.startswith("data/"):
+                    return f"data/{base}"
+                return p
+            
+            contract["required_outputs"] = [_normalize_path(p) for p in req_outputs]
             return contract
 
         def _merge_unique(values: List[str], extras: List[str]) -> List[str]:
@@ -2899,6 +2918,48 @@ domain_expert_critique:
             
             # Ensure V4.1 schema completeness
             contract = ensure_v41_schema(contract)
+            
+            # --- SANITIZE RUNBOOKS: Remove hardcoded dialect instructions ---
+            def _sanitize_runbook_text(text: str) -> str:
+                """Replace hardcoded dialect instructions with dynamic manifest reference."""
+                if not isinstance(text, str):
+                    return text
+                import re
+                # Replace patterns like "sep=';'" or "decimal=','" with dynamic reference
+                patterns = [
+                    (r"sep\s*=\s*['\"]?[;,\\t]['\"]?", "sep from cleaning_manifest.json"),
+                    (r"decimal\s*=\s*['\"]?[.,]['\"]?", "decimal from cleaning_manifest.json"),
+                    (r"Load.*CSV.*using.*sep.*=.*[;,]", "Load CSV using dialect from data/cleaning_manifest.json"),
+                ]
+                for pattern, replacement in patterns:
+                    text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+                return text
+            
+            def _sanitize_runbook(runbook: Any) -> Any:
+                """Recursively sanitize runbook dict or string."""
+                if isinstance(runbook, str):
+                    return _sanitize_runbook_text(runbook)
+                if isinstance(runbook, dict):
+                    return {k: _sanitize_runbook(v) for k, v in runbook.items()}
+                if isinstance(runbook, list):
+                    return [_sanitize_runbook(item) for item in runbook]
+                return runbook
+            
+            # Sanitize V4.1 runbooks
+            if contract.get("data_engineer_runbook"):
+                contract["data_engineer_runbook"] = _sanitize_runbook(contract["data_engineer_runbook"])
+            if contract.get("ml_engineer_runbook"):
+                contract["ml_engineer_runbook"] = _sanitize_runbook(contract["ml_engineer_runbook"])
+            
+            # --- SHIM: Backward compatibility for role_runbooks (V4.1 -> legacy) ---
+            # V4.1 uses flat keys: data_engineer_runbook, ml_engineer_runbook
+            # Legacy agents may read: role_runbooks.data_engineer, role_runbooks.ml_engineer
+            if "role_runbooks" not in contract or not isinstance(contract.get("role_runbooks"), dict):
+                contract["role_runbooks"] = {}
+            if contract.get("data_engineer_runbook"):
+                contract["role_runbooks"]["data_engineer"] = contract["data_engineer_runbook"]
+            if contract.get("ml_engineer_runbook"):
+                contract["role_runbooks"]["ml_engineer"] = contract["ml_engineer_runbook"]
             
             return contract
 

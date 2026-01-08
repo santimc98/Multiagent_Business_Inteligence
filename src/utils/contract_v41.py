@@ -432,9 +432,28 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
       - artifact_requirements.required_files
       - required_outputs (top-level)
     
+    Normalizes paths:
+      - Backslash to forward slash
+      - Known basenames (metrics.json, etc.) get data/ prefix
+    
     Returns:
-        Unique list of required output paths.
+        Unique list of required output paths (normalized).
     """
+    import os
+    
+    def _normalize_path(path: str) -> str:
+        """Normalize output path for consistency."""
+        if not path:
+            return path
+        # Backslash to forward slash
+        path = path.replace("\\", "/")
+        # Known files that should be in data/
+        known_files = ["metrics.json", "alignment_check.json", "scored_rows.csv", "cleaned_data.csv", "cleaning_manifest.json"]
+        basename = os.path.basename(path)
+        if basename in known_files and not path.startswith("data/"):
+            return f"data/{basename}"
+        return path
+    
     if not isinstance(contract, dict):
         return []
     
@@ -454,11 +473,12 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     if isinstance(top_level, list):
         outputs.extend([str(o) for o in top_level if o])
     
-    # Deduplicate preserving order
+    # Normalize and deduplicate
     seen = set()
     result = []
     for o in outputs:
-        if o not in seen:
-            seen.add(o)
-            result.append(o)
+        norm = _normalize_path(o)
+        if norm and norm not in seen:
+            seen.add(norm)
+            result.append(norm)
     return result
