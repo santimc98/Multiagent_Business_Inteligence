@@ -22,6 +22,9 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Claude Code local settings
+.claude/
+
 # Runtime artifacts
 artifacts/
 static/plots/*.png
