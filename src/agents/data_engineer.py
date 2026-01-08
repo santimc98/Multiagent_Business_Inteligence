@@ -18,7 +18,7 @@ class DataEngineerAgent:
 
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url="https://api.deepseek.com/v1",
+            base_url="https://api.deepseek.com",
             timeout=None,
         )
         self.model_name = "deepseek-reasoner"
