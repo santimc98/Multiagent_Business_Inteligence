@@ -20,9 +20,11 @@ class DataEngineerAgent:
         if not self.api_key:
             raise ValueError("DeepSeek API Key is required.")
 
-        # Configurable base_url and timeout (Fix CAUSA RAÍZ 1)
+        # Configurable base_url and timeout
+        # DeepSeek Reasoner is slow by design (chain-of-thought reasoning)
+        # Data cleaning scripts are complex: 300s (5 min) provides adequate margin
         deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-        deepseek_timeout = float(os.getenv("DEEPSEEK_TIMEOUT", "60"))
+        deepseek_timeout = float(os.getenv("DEEPSEEK_TIMEOUT", "300"))
 
         self.client = OpenAI(
             api_key=self.api_key,
