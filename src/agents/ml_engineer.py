@@ -392,9 +392,24 @@ class MLEngineerAgent:
         - NEVER invent features or use columns not in the contract.
         
         TECHNICAL HELPERS (use these patterns):
-        - JSON serialization with numpy: Before json.dump(), convert numpy types to native Python:
-          def _safe_json(obj): return int(obj) if hasattr(obj, 'item') else (obj.tolist() if hasattr(obj, 'tolist') else obj)
-          Then: json.dump({k: _safe_json(v) for k,v in metrics.items()}, f)
+        - JSON serialization with numpy (CRITICAL): Use this helper function to handle ALL numpy types:
+          ```python
+          def _json_default(obj):
+              if isinstance(obj, (np.integer, np.int64)):
+                  return int(obj)
+              elif isinstance(obj, (np.floating, np.float64)):
+                  return float(obj)
+              elif isinstance(obj, (np.bool_, bool)):
+                  return bool(obj)
+              elif isinstance(obj, np.ndarray):
+                  return obj.tolist()
+              elif isinstance(obj, pd.Series):
+                  return obj.tolist()
+              elif pd.isna(obj):
+                  return None
+              raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+          ```
+          Then: json.dump(data, f, indent=2, default=_json_default)
         - Sklearn scoring: Use string scorers ('accuracy', 'roc_auc', 'neg_mean_squared_error') instead of custom scorers.
           Avoid 'needs_proba' parameter issues by using cross_val_score with scoring='accuracy' for classification.
 

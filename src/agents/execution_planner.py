@@ -3001,19 +3001,27 @@ domain_expert_critique:
             response = self.client.generate_content(full_prompt)
             content = response.text
             self.last_response = content
+
+            # Check for truncated response (common Gemini issue)
+            if len(content) < 500 or not content.strip().endswith("}"):
+                print(f"WARNING: Execution Planner response appears truncated (len={len(content)})")
+                print(f"Last 100 chars: ...{content[-100:]}")
+                return _fallback("Truncated LLM Response")
+
             # Clean markdown
             content = content.replace("```json", "").replace("```", "").strip()
             # Handle potential preamble text if model is chatty (though V4.1 says JSON only)
             if "{" in content:
                 content = content[content.find("{"):content.rfind("}")+1]
-                
+
             contract = json.loads(content)
-            
+
             # Validate structure
             if not isinstance(contract, dict):
                 # Fallback if output is not a dict
-                return _fallback()
-            
+                print("WARNING: Execution Planner returned non-dict")
+                return _fallback("Non-dict Response")
+
             # Ensure V4.1 schema completeness
             contract = ensure_v41_schema(contract)
 
@@ -3035,7 +3043,7 @@ domain_expert_critique:
                 for pattern, replacement in patterns:
                     text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
                 return text
-            
+
             def _sanitize_runbook(runbook: Any) -> Any:
                 """Recursively sanitize runbook dict or string."""
                 if isinstance(runbook, str):
@@ -3045,13 +3053,13 @@ domain_expert_critique:
                 if isinstance(runbook, list):
                     return [_sanitize_runbook(item) for item in runbook]
                 return runbook
-            
+
             # Sanitize V4.1 runbooks
             if contract.get("data_engineer_runbook"):
                 contract["data_engineer_runbook"] = _sanitize_runbook(contract["data_engineer_runbook"])
             if contract.get("ml_engineer_runbook"):
                 contract["ml_engineer_runbook"] = _sanitize_runbook(contract["ml_engineer_runbook"])
-            
+
             # --- SHIM: Backward compatibility for role_runbooks (V4.1 -> legacy) ---
             # V4.1 uses flat keys: data_engineer_runbook, ml_engineer_runbook
             # Legacy agents may read: role_runbooks.data_engineer, role_runbooks.ml_engineer
@@ -3061,11 +3069,17 @@ domain_expert_critique:
                 contract["role_runbooks"]["data_engineer"] = contract["data_engineer_runbook"]
             if contract.get("ml_engineer_runbook"):
                 contract["role_runbooks"]["ml_engineer"] = contract["ml_engineer_runbook"]
-            
+
             return contract
 
-        except Exception:
-            return _fallback()
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Execution Planner JSON parse failed: {e}")
+            print(f"Response length: {len(self.last_response) if self.last_response else 0}")
+            print(f"Response preview: {self.last_response[:200] if self.last_response else 'None'}...")
+            return _fallback("JSON Parse Error")
+        except Exception as e:
+            print(f"ERROR: Execution Planner unexpected error: {type(e).__name__}: {str(e)}")
+            return _fallback(f"Unexpected Error: {type(e).__name__}")
 
     def generate_evaluation_spec(
         self,
