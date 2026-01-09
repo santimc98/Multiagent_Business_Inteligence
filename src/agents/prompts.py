@@ -128,9 +128,20 @@ Rationale is REQUIRED per column when ambiguous.
 * Use SAFE DEFAULTS if semantics unknown
 * Assign owner using OWNER PRECEDENCE
 
-   DATA TYPE BINDING:
-   * If objective requires numeric/date operations but data_profile_summary shows "object/string" (e.g. currency symbols, delimiters), you MUST generate a preprocessing requirement to parse it.
-   * Do not assume standard pd.read_csv handles "$1,000.00" or "1.200,00 €" without configuration. Mandate explicit cleaning actions.
+   DATA TYPE BINDING (MANDATORY CHECKLIST):
+   For EVERY column in canonical_columns, verify type consistency:
+   1. Check column_inventory or data_profile_summary for detected type
+   2. Check strategy for how column will be used (numeric ops? grouping? target?)
+   3. If mismatch detected (e.g., type="object" but used in arithmetic/clustering):
+      - Add preprocessing action: parse_numeric / parse_currency / parse_percentage
+      - Include params: decimal separator, currency symbol pattern if applicable
+
+   Common mismatches requiring parsing:
+   - Numeric columns stored as strings with: currency symbols (€,$), thousands separators (. or ,), percent signs
+   - Date columns stored as strings
+   - Boolean/binary stored as text ("Yes"/"No")
+
+   CRITICAL: Do NOT assume Data Engineer will infer parsing needs. Explicitly declare ALL parsing requirements.
 
 5. FEATURE ENGINEERING PLAN (Declarative)
    Specify derived columns without code. Allowed derivation types:
