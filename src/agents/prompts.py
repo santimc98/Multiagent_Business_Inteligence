@@ -233,6 +233,13 @@ Rules:
     "rationale": "<brief>"
     }
 
+    CRITICAL CONSISTENCY RULE:
+    - If derived_columns includes a segmentation column (e.g., customer_segment, cluster_id),
+      AND the strategy uses that segment for modeling/optimization,
+      THEN model_features MUST include that derived column.
+    - Logic: If you create segments to group similar cases, the model must use those segments as features.
+    - Example: derived_columns=["is_success", "customer_segment"] → model_features must include "customer_segment"
+
 13. DESIGN GATES
     QA and Reviewer gates MUST reference contract fields, not literals. Examples of references:
 
@@ -241,7 +248,12 @@ Rules:
 * allowed_feature_sets.*
 * artifact_requirements.required_files
 
-If inplace policy is "unknown_or_forbidden", gate should require preferred_patterns rather than absolute prohibition.
+CRITICAL CONSISTENCY RULES:
+* DO NOT hardcode dialect values (sep, decimal, encoding) in gate descriptions.
+  WRONG: "Verify output uses sep=';', decimal=','."
+  CORRECT: "Verify output dialect matches output_dialect specification."
+* DO NOT reference derived columns that are not in derived_columns list.
+* If inplace policy is "unknown_or_forbidden", gate should require preferred_patterns rather than absolute prohibition.
 
 14. ENGINEER RUNBOOKS
     Task-specific guidance referencing contract specs:
