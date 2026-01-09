@@ -105,10 +105,14 @@ class DataEngineerAgent:
         1. OUTPUT VALID PYTHON CODE ONLY (no markdown/code fences).
         2. Do NOT output JSON plans or pseudo-code.
         3. NO NETWORK/FS OPS: Do NOT use requests/subprocess/os.system and do not access filesystem outside declared input/output paths.
-        4. BAN pandas private APIs: do not use pandas.io.* or pd.io.parsers.*.
-        5. If the audit includes RUNTIME_ERROR_CONTEXT, fix the root cause and regenerate the full script.
-        6. Do NOT use np.bool (deprecated). Use bool or np.bool_ if needed.
-        7. Never call int(series) or float(series). For boolean masks use int(mask.sum()).
+        4. NO SYS MODULE: Do NOT use 'import sys' or 'sys.exit()'. Your code runs in a controlled sandbox, not as a standalone script.
+           - For error handling, use: raise ValueError("descriptive error message") or print("ERROR: ...") and return early.
+           - Example (WRONG): sys.exit(1)
+           - Example (CORRECT): raise FileNotFoundError(f"Input file '{input_path}' not found")
+        5. BAN pandas private APIs: do not use pandas.io.* or pd.io.parsers.*.
+        6. If the audit includes RUNTIME_ERROR_CONTEXT, fix the root cause and regenerate the full script.
+        7. Do NOT use np.bool (deprecated). Use bool or np.bool_ if needed.
+        8. Never call int(series) or float(series). For boolean masks use int(mask.sum()).
            If you fill NaN with a sentinel (e.g., 'Unknown'), log nulls via original_nulls = int(col.isna().sum());
            nulls_before = original_nulls; nulls_after_na = int(cleaned.isna().sum()); filled_nulls = original_nulls.
 
