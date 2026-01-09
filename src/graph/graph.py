@@ -1728,7 +1728,9 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
             "Load the cleaned dataset using pd.read_csv with the detected dialect before processing.",
         ],
         "DATA_PATH_NOT_USED": [
-            "Read from data/cleaned_data.csv or data/cleaned_full.csv (or data.csv in sandbox) using pd.read_csv.",
+            "CRITICAL: Use the EXACT path provided in context via $data_path variable (e.g., INPUT_FILE = '$data_path').",
+            "DO NOT hardcode arbitrary paths like 'input.csv', 'data.csv', 'raw_data.csv', 'cleaned.csv', etc.",
+            "The system will substitute $data_path with the correct path (usually 'data/cleaned_data.csv').",
         ],
         "REQUIRED_OUTPUTS_MISSING": [
             "Write all required outputs to the exact contract paths before exiting.",
@@ -1737,7 +1739,11 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
             "Use the required business columns from the contract (e.g., Size, Debtors, Sector) in mapping/processing.",
         ],
         "SYNTHETIC_DATA_DETECTED": [
-            "Remove synthetic data generation; load and use the provided cleaned dataset only.",
+            "CRITICAL: Remove ALL synthetic data generation logic. Common violations:",
+            "- Fallback patterns: 'if not os.path.exists(filepath): generate dummy data'",
+            "- Random generation: np.random, random.randint, faker, pd.DataFrame with literals",
+            "- Dummy datasets: pd.DataFrame({'col': [val1, val2, ...]}) when input is missing",
+            "The cleaned dataset WILL exist at $data_path. Trust it. If missing, let pd.read_csv() raise FileNotFoundError.",
         ],
         "DATAFRAME_LITERAL_OVERWRITE": [
             "Do not overwrite df/data with pd.DataFrame literals; always load from the cleaned CSV.",

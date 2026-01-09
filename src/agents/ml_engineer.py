@@ -340,14 +340,21 @@ class MLEngineerAgent:
         Post-processing safety check: If LLM generated code with incorrect INPUT_FILE path,
         inject the correct one. This is NOT hardcoding business logic - it's infrastructure.
 
-        Common wrong paths: 'input.csv', 'data.csv', 'data/input_data.csv', 'data/data.csv'
+        Common wrong paths: 'input.csv', 'data.csv', 'data/input_data.csv', 'data/data.csv', 'raw_data.csv'
         Correct path: provided by system (usually 'data/cleaned_data.csv')
+
+        This catches common variable naming patterns that LLMs use for input paths.
         """
         import re
 
-        # Pattern: INPUT_FILE = 'some_wrong_path.csv' or INPUT_PATH = '...' or DATA_PATH = '...'
+        # Comprehensive pattern: Capture common variable name patterns for input data paths
+        # Matches: INPUT_FILE(NAME), DATA_FILE(NAME), INPUT_PATH, DATA_PATH, CLEANED_(DATA_)PATH, etc.
+        # Negative lookahead ensures we don't replace if path is already correct
         wrong_patterns = [
-            r"(INPUT_FILE|INPUT_PATH|DATA_FILE|DATA_PATH)\s*=\s*['\"](?!data/cleaned_data\.csv)[^'\"]+\.csv['\"]",
+            # Pattern 1: (INPUT|DATA|CLEANED)_(FILE|FILENAME|PATH|DATA_PATH) = 'wrong.csv'
+            r"(INPUT_FILE(?:NAME)?|DATA_FILE(?:NAME)?|INPUT_PATH|DATA_PATH|CLEANED_(?:DATA_)?PATH|CLEANED_FILE)\s*=\s*['\"](?!{})(?!['\"]?\s*\+)[^'\"]+\.csv['\"]".format(
+                re.escape(correct_path)
+            ),
         ]
 
         for pattern in wrong_patterns:
@@ -402,11 +409,14 @@ class MLEngineerAgent:
         2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
         3) CRITICAL - INPUT PATH: You MUST read data from the EXACT path '$data_path' provided in the context.
            - CORRECT: INPUT_FILE = '$data_path' then df = pd.read_csv(INPUT_FILE, ...)
-           - WRONG: Using hardcoded paths like 'data.csv', 'input.csv', 'data/input_data.csv', etc.
+           - WRONG: Using hardcoded paths like 'data.csv', 'input.csv', 'raw_data.csv', 'data/input_data.csv', etc.
            - The $data_path variable will be substituted with the actual path (e.g., 'data/cleaned_data.csv').
+           - ABSOLUTE PROHIBITION: Do NOT implement fallback logic like "if not os.path.exists(filepath): generate dummy data".
+             The file WILL exist. If it doesn't, let pd.read_csv() raise FileNotFoundError. NO synthetic fallbacks.
         4) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
         5) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (data_requirements with source='derived' or spec_extraction.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
         6) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
+           ABSOLUTE PROHIBITION: NO synthetic data generation under ANY circumstance (not even as "demonstration" or "example").
         7) scored_rows.csv may include canonical columns plus contract-approved derived outputs (target/prediction/probability/segment/optimal values) ONLY if explicitly declared in data_requirements or spec_extraction. Any other derived columns must go to a separate artifact file.
         8) Start the script with a short comment block labeled PLAN describing: detected columns, row_id construction, scored_rows columns, and where extra derived artifacts go.
         9) Define CONTRACT_COLUMNS from the Execution Contract (prefer data_requirements source=input; else canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
