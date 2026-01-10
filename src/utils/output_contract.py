@@ -20,6 +20,23 @@ def _split_deliverables(deliverables: List[Any]) -> Tuple[List[str], List[str]]:
                 optional.append(path)
         else:
             path = str(item)
+            if not path:
+                continue
+
+            # CRITICAL FIX: Handle stringified dicts like "{'path': 'data/scored_rows.csv', ...}"
+            # These come from execution_contract when artifact schemas are included in required_outputs
+            # Extract just the path value and ignore schema metadata
+            if path.startswith("{") and "'path':" in path:
+                import ast
+                try:
+                    # Parse as Python literal to extract path
+                    parsed = ast.literal_eval(path)
+                    if isinstance(parsed, dict) and "path" in parsed:
+                        path = parsed["path"]
+                except Exception:
+                    # If parsing fails, skip this entry (it's malformed)
+                    continue
+
             if path:
                 required.append(path)
     return required, optional

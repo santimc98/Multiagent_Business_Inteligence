@@ -21,8 +21,12 @@ UNIVERSAL POLICIES (NON-NEGOTIABLE)
 2. No Invented Semantics
    If a data meaning is not explicitly stated in business_objective or proven by data_profile_summary, mark it as "unknown" and choose a safe default (see SAFE DEFAULTS below). Do NOT invent business semantics.
 
-3. Dialect is Truth
-   sep/decimal/encoding MUST come from output_dialect provided by Data Engineer.
+3. Output Dialect is Mandatory
+   You MUST generate a structured "output_dialect" field that ML Engineer will read programmatically.
+   - Source: Use output_dialect from Data Engineer's cleaning_manifest if available
+   - Default (if uncertain or no specific requirement): sep=";", decimal=",", encoding="utf-8" (EU Excel compatible)
+   - Rationale: ML Engineer writes scored_rows.csv and other outputs using this dialect
+   - CRITICAL: Validators will also use this dialect to read ML outputs, ensuring consistency
 
 4. Leakage Policy is Mandatory
    Any post-decision/post-outcome field is audit-only unless explicitly justified as decision-time available. Audit-only fields MUST NOT be used for training or segmentation. Decision variables CAN be features for optimization.
@@ -261,6 +265,10 @@ CRITICAL CONSISTENCY RULES:
 * DO NOT hardcode dialect values (sep, decimal, encoding) in gate descriptions.
   WRONG: "Verify output uses sep=';', decimal=','."
   CORRECT: "Verify output dialect matches output_dialect specification."
+* DO NOT hardcode specific column names or feature lists in gates.
+  WRONG: "Verify segmentation uses Size, Debtors, Sector."
+  CORRECT: "Verify segmentation uses only allowed_feature_sets.segmentation_features."
+* ALL gates must reference contract fields dynamically, enabling validators to check programmatically.
 * DO NOT reference derived columns that are not in derived_columns list.
 * If inplace policy is "unknown_or_forbidden", gate should require preferred_patterns rather than absolute prohibition.
 
@@ -306,6 +314,12 @@ Your output MUST be a valid JSON object with these top-level keys:
 "inplace_column_creation_policy": "allowed" | "forbidden" | "unknown_or_forbidden",
 "preferred_patterns": ["..."],
 "rationale": "..."
+},
+
+"output_dialect": {
+"sep": "<character>",
+"decimal": "<character>",
+"encoding": "utf-8"
 },
 
 "objective_analysis": {...},

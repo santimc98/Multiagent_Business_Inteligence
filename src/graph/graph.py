@@ -2317,7 +2317,13 @@ def ml_quality_preflight(
             issues.append("BASELINE_REQUIRED")
 
     if flags["requires_target"] or flags["requires_supervised_split"]:
-        if not _has_symbol({"SimpleImputer"}):
+        # Enhanced NaN hygiene check: Detect sklearn models without imputation
+        has_imputer = _has_symbol({"SimpleImputer", "KNNImputer", "IterativeImputer"})
+        has_nan_robust_model = _has_symbol({"HistGradientBoostingClassifier", "HistGradientBoostingRegressor"})
+        has_dropna = ".dropna(" in code
+
+        # If using models that DON'T handle NaN natively and NO imputation/dropna found
+        if not (has_imputer or has_nan_robust_model or has_dropna):
             issues.append("IMPUTER_REQUIRED")
 
     if allowed_columns:
@@ -7742,14 +7748,22 @@ def execute_code(state: AgentState) -> AgentState:
     print(f"Execution finished. Plots generated: {len(plots_local)}")
 
     eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
+
+    # CRITICAL: Use output_dialect from contract (ML outputs) not input dialect from state
+    # This ensures validator reads files with same dialect that ML Engineer wrote them
+    contract_output_dialect = contract.get("output_dialect", {}) if isinstance(contract, dict) else {}
+    csv_sep = contract_output_dialect.get("sep") or state.get("csv_sep", ",")
+    csv_decimal = contract_output_dialect.get("decimal") or state.get("csv_decimal", ".")
+    csv_encoding = contract_output_dialect.get("encoding") or state.get("csv_encoding", "utf-8")
+
     artifact_issues = _artifact_alignment_gate(
         cleaned_path="data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv",
         scored_path="data/scored_rows.csv",
         contract=contract,
         evaluation_spec=eval_spec,
-        csv_sep=state.get("csv_sep", ","),
-        csv_decimal=state.get("csv_decimal", "."),
-        csv_encoding=state.get("csv_encoding", "utf-8"),
+        csv_sep=csv_sep,
+        csv_decimal=csv_decimal,
+        csv_encoding=csv_encoding,
     )
     
     # ← NEW: UNIVERSAL soft-warn logic for artifact alignment issues

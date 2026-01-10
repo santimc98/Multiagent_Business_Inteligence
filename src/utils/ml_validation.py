@@ -3,49 +3,76 @@ import re
 from typing import Dict, Any, List
 
 def validate_decision_variable_isolation(
-    code: str, 
+    code: str,
     execution_contract: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Validates that decision variables are not used as model features.
-    
-    This is a UNIVERSAL check for ANY optimization problem.
-    It uses the execution_contract to dynamically identify decision variables.
-    
+    Validates appropriate use of decision variables based on problem type.
+
+    CONTEXT-AWARE VALIDATION (reads from execution_contract):
+    - For PRICE OPTIMIZATION (maximize revenue = price × P(success|price)):
+      Decision variable MUST be in features to model price sensitivity
+    - For RESOURCE ALLOCATION (assign X units to maximize outcome):
+      Decision variable should NOT be in features (not causal)
+
     Args:
         code: Generated Python code to validate
-        execution_contract: Contract with feature_availability metadata
-        
+        execution_contract: Contract with objective_analysis and column_roles
+
     Returns:
         {
             "passed": bool,
             "error_message": str,  # Empty if passed
-            "violated_variables": List[str]  # Decision vars found in features
+            "violated_variables": List[str]  # Decision vars found in features (if violation)
         }
     """
-    # 1. Identify if it is an optimization/prescriptive problem
-    obj_type = str(execution_contract.get("objective_type", "")).lower()
-    biz_obj = str(execution_contract.get("business_objective", "")).lower()
-    
-    # Optimization/Prescriptive keywords
-    is_optimization = (obj_type in ["prescriptive", "optimization"]) or \
-                      any(kw in biz_obj for kw in ["optimize", "maximize", "minimize"])
-    
-    if not is_optimization:
+    # 1. Identify problem type from contract
+    obj_analysis = execution_contract.get("objective_analysis", {})
+    problem_type = str(obj_analysis.get("problem_type", "")).lower()
+    decision_var = obj_analysis.get("decision_variable")
+    success_criteria = str(obj_analysis.get("success_criteria", "")).lower()
+
+    # If not an optimization problem, skip this check
+    if problem_type != "optimization":
         return {"passed": True, "error_message": "", "violated_variables": []}
 
-    # 2. Extract decision variables from feature_availability
+    # 2. Determine if decision variable SHOULD be in features (context-aware)
+    # For PRICE/DISCOUNT optimization where we model elasticity (price → probability),
+    # decision variable MUST be in features
+    is_price_optimization = any(kw in success_criteria for kw in [
+        "price *", "revenue", "expected value", "elasticity", "conversion probability"
+    ])
+
+    if is_price_optimization and decision_var:
+        # For price optimization, decision variable SHOULD be in model_features
+        # We're modeling P(success | price, ...) so price must be a feature
+        # This is NOT leakage - it's the causal mechanism we're modeling
+        return {"passed": True, "error_message": "", "violated_variables": []}
+
+    # 3. For other optimization types, extract decision variables from contract
+    # Use column_roles (v4.1) or fallback to feature_availability (legacy)
     decision_vars = []
-    feature_availability = execution_contract.get("feature_availability", [])
-    if isinstance(feature_availability, list):
-        for item in feature_availability:
-            if isinstance(item, dict):
-                avail = str(item.get("availability", "")).lower()
-                if avail in ["decision", "post-decision"]:
-                    col = item.get("column")
-                    if col:
-                        decision_vars.append(col)
-                        
+
+    column_roles = execution_contract.get("column_roles", {})
+    if isinstance(column_roles, dict):
+        for col_name, col_info in column_roles.items():
+            if isinstance(col_info, dict):
+                role = str(col_info.get("role", "")).lower()
+                if role == "decision":
+                    decision_vars.append(col_name)
+
+    # Fallback to legacy feature_availability if column_roles not found
+    if not decision_vars:
+        feature_availability = execution_contract.get("feature_availability", [])
+        if isinstance(feature_availability, list):
+            for item in feature_availability:
+                if isinstance(item, dict):
+                    avail = str(item.get("availability", "")).lower()
+                    if avail in ["decision", "post-decision"]:
+                        col = item.get("column")
+                        if col:
+                            decision_vars.append(col)
+
     if not decision_vars:
         return {"passed": True, "error_message": "", "violated_variables": []}
 
