@@ -1759,6 +1759,29 @@ class ExecutionPlannerAgent:
                 return p
             
             contract["required_outputs"] = [_normalize_path(p) for p in req_outputs]
+
+            # CRITICAL FIX: Sync visualization_requirements with required_outputs
+            # If visualization_requirements defines plots, add them to required_outputs
+            # so ML Engineer knows to generate them (not just skip gracefully)
+            viz_reqs = contract.get("visualization_requirements", {})
+            if isinstance(viz_reqs, dict):
+                required_plots = viz_reqs.get("required_plots", [])
+                if required_plots:
+                    for plot in required_plots:
+                        if not isinstance(plot, dict):
+                            continue
+                        plot_name = plot.get("name", "")
+                        if not plot_name:
+                            continue
+                        # Convert "Price-Response Curves" -> "price_response_curves.png"
+                        safe_name = plot_name.lower().replace(" ", "_").replace("-", "_")
+                        safe_name = "".join(c for c in safe_name if c.isalnum() or c == "_")
+                        plot_path = f"static/plots/{safe_name}.png"
+
+                        # Add to required_outputs if not already present
+                        if plot_path not in contract["required_outputs"]:
+                            contract["required_outputs"].append(plot_path)
+
             return contract
 
         def _merge_unique(values: List[str], extras: List[str]) -> List[str]:
