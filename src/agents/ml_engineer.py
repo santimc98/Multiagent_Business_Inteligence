@@ -215,11 +215,14 @@ class MLEngineerAgent:
         iteration_memory: List[Dict[str, Any]] | None,
         feedback_history: List[str] | None,
         gate_context: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None = None,
     ) -> str:
         contract_min = self._compact_execution_contract(execution_contract or {})
         allowed_columns = self._resolve_allowed_columns_for_prompt(execution_contract or {})
         allowed_patterns = self._resolve_allowed_name_patterns_for_prompt(execution_contract or {})
         feedback_blocks = self._select_feedback_blocks(feedback_history, gate_context, max_blocks=2)
+        ml_view = ml_view or {}
+        ml_view_json = json.dumps(ml_view, indent=2)
         
         # STRUCTURED CRITICAL ERRORS SECTION
         critical_errors: List[str] = []
@@ -290,6 +293,8 @@ class MLEngineerAgent:
         return "\n".join(
             [
                 critical_section,
+                "ML_VIEW_CONTEXT:",
+                ml_view_json,
                 "CONTRACT_MIN_CONTEXT:",
                 json.dumps(contract_min, indent=2),
                 "REQUIRED OUTPUTS:",
@@ -385,6 +390,7 @@ class MLEngineerAgent:
         data_audit_context: str = "",
         business_objective: str = "",
         execution_contract: Dict[str, Any] | None = None,
+        ml_view: Dict[str, Any] | None = None,
         feature_availability: List[Dict[str, Any]] | None = None,
         availability_summary: str = "",
         signal_summary: Dict[str, Any] | None = None,
@@ -535,6 +541,8 @@ class MLEngineerAgent:
         INPUT CONTEXT (authoritative)
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title ($analysis_type)
+        - ML_VIEW_CONTEXT (json): $ml_view_context
+        - CONTRACT_MIN_CONTEXT (json): $contract_min_context
         - Execution Contract (json): $execution_contract_json
         - Deliverables: $deliverables_json
         - Canonical Columns: $canonical_columns
@@ -681,7 +689,8 @@ class MLEngineerAgent:
 
         """
 
-        required_outputs = (execution_contract or {}).get("required_outputs", []) or []
+        ml_view = ml_view or {}
+        required_outputs = ml_view.get("required_outputs") or (execution_contract or {}).get("required_outputs", []) or []
         raw_deliverables = (execution_contract or {}).get("spec_extraction", {}).get("deliverables", [])
         deliverables: List[Dict[str, Any]] = []
         if isinstance(raw_deliverables, list):
@@ -712,6 +721,7 @@ class MLEngineerAgent:
             indent=2,
         )
         execution_contract_compact = self._compact_execution_contract(execution_contract or {})
+        ml_view_json = json.dumps(ml_view, indent=2)
         evaluation_spec_json = json.dumps((execution_contract or {}).get("evaluation_spec", {}), indent=2)
         # Safe Rendering for System Prompt
         system_prompt = render_prompt(
@@ -735,6 +745,8 @@ class MLEngineerAgent:
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
             execution_contract_json=json.dumps(execution_contract_compact, indent=2),
+            contract_min_context=json.dumps(execution_contract_compact, indent=2),
+            ml_view_context=ml_view_json,
             evaluation_spec_json=evaluation_spec_json,
             spec_extraction_json=spec_extraction_json,
             ml_engineer_runbook=ml_runbook_json,
@@ -993,6 +1005,7 @@ class MLEngineerAgent:
                     iteration_memory=iteration_memory,
                     feedback_history=feedback_history,
                     gate_context=gate_context,
+                    ml_view=ml_view,
                 )
                 completion_system = (
                     "You are a senior ML engineer. Return a COMPLETE runnable Python script. "

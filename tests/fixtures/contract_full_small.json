@@ -1,0 +1,53 @@
+{
+  "contract_version": 2,
+  "strategy_title": "Test Strategy",
+  "strategy_rationale": "Long rationale that should not leak into DE view.",
+  "canonical_columns": ["col_a", "col_b"],
+  "column_roles": {
+    "pre_decision": ["col_a"],
+    "decision": ["decision"],
+    "outcome": ["target"],
+    "post_decision_audit_only": ["audit"]
+  },
+  "evaluation_spec": {
+    "objective_type": "classification",
+    "reviewer_gates": ["metrics_present"],
+    "qa_gates": ["no_synthetic_data"],
+    "validation_requirements": {
+      "method": "holdout",
+      "test_size": 0.2
+    }
+  },
+  "artifact_requirements": {
+    "clean_dataset": {
+      "required_columns": ["col_a", "col_b"],
+      "output_path": "data/cleaned_data.csv",
+      "manifest_path": "data/cleaning_manifest.json"
+    },
+    "required_files": [
+      "data/cleaned_data.csv",
+      "data/metrics.json",
+      "data/alignment_check.json"
+    ]
+  },
+  "required_outputs": [
+    "data/cleaned_data.csv",
+    "data/metrics.json",
+    "data/alignment_check.json"
+  ],
+  "output_dialect": {
+    "sep": ",",
+    "decimal": ".",
+    "encoding": "utf-8"
+  },
+  "reporting_policy": {
+    "sections": ["Executive Decision", "Evidence"],
+    "slots": [
+      {
+        "id": "model_metrics",
+        "mode": "required",
+        "sources": ["data/metrics.json"]
+      }
+    ]
+  }
+}

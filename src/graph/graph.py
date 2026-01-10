@@ -67,6 +67,15 @@ from src.utils.contract_v41 import (
     get_qa_gates,
     get_reviewer_gates,
 )
+from src.utils.contract_views import (
+    build_de_view,
+    build_ml_view,
+    build_reviewer_view,
+    build_translator_view,
+    build_results_advisor_view,
+    persist_views,
+    sanitize_contract_min_for_de,
+)
 from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
 from src.utils.cleaning_executor import execute_cleaning_plan
 from src.utils.run_logger import init_run_log, log_run_event, finalize_run_log
@@ -1466,6 +1475,53 @@ def _merge_artifact_index_entries(
         if path:
             merged[path] = item
     return list(merged.values())
+
+
+def _build_contract_views(
+    state: Dict[str, Any],
+    contract: Dict[str, Any],
+    contract_min: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    artifact_index = (
+        state.get("artifact_index")
+        or _load_json_any("data/produced_artifact_index.json")
+        or []
+    )
+    if not artifact_index:
+        required_outputs = []
+        if isinstance(contract_min, dict):
+            required_outputs = contract_min.get("required_outputs") or []
+        if not required_outputs:
+            required_outputs = _resolve_required_outputs(contract)
+        deliverables = _resolve_contract_deliverables(contract)
+        artifact_index = _build_artifact_index(required_outputs, deliverables)
+    de_view = build_de_view(contract, contract_min or {}, artifact_index)
+    ml_view = build_ml_view(contract, contract_min or {}, artifact_index)
+    reviewer_view = build_reviewer_view(contract, contract_min or {}, artifact_index)
+    translator_view = build_translator_view(contract, contract_min or {}, artifact_index)
+    results_advisor_view = build_results_advisor_view(contract, contract_min or {}, artifact_index)
+    views = {
+        "de_view": de_view,
+        "ml_view": ml_view,
+        "reviewer_view": reviewer_view,
+        "translator_view": translator_view,
+        "results_advisor_view": results_advisor_view,
+    }
+    view_paths = persist_views(
+        views,
+        base_dir="data",
+        run_bundle_dir=state.get("run_bundle_dir"),
+    )
+    return {
+        "contract_views": views,
+        "contract_view_paths": view_paths,
+        "artifact_index": artifact_index,
+        "de_view": de_view,
+        "ml_view": ml_view,
+        "reviewer_view": reviewer_view,
+        "translator_view": translator_view,
+        "results_advisor_view": results_advisor_view,
+    }
 
 def _deliverable_id_from_path(path: str) -> str:
     base = os.path.basename(str(path)) or str(path)
@@ -4917,6 +4973,14 @@ class AgentState(TypedDict):
     leakage_audit_summary: str
     ml_skipped_reason: str
     execution_contract: Dict[str, Any]
+    execution_contract_min: Dict[str, Any]
+    contract_views: Dict[str, Any]
+    contract_view_paths: Dict[str, str]
+    de_view: Dict[str, Any]
+    ml_view: Dict[str, Any]
+    reviewer_view: Dict[str, Any]
+    translator_view: Dict[str, Any]
+    results_advisor_view: Dict[str, Any]
     restrategize_count: int
     strategist_context_override: str
     missing_repeat_count: int
@@ -5342,6 +5406,18 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 "data/contract_min.json",
             ],
         )
+    view_payload = _build_contract_views(state if isinstance(state, dict) else {}, contract, contract_min)
+    if view_payload.get("contract_views"):
+        try:
+            de_len = len(json.dumps(view_payload["contract_views"].get("de_view", {}), ensure_ascii=True))
+            ml_len = len(json.dumps(view_payload["contract_views"].get("ml_view", {}), ensure_ascii=True))
+            print(f"Using DE_VIEW_CONTEXT length={de_len}")
+            print(f"Using ML_VIEW_CONTEXT length={ml_len}")
+            if run_id:
+                log_run_event(run_id, "de_view_context", {"length": de_len})
+                log_run_event(run_id, "ml_view_context", {"length": ml_len})
+        except Exception:
+            pass
     if run_id:
         log_run_event(
             run_id,
@@ -5354,6 +5430,10 @@ def run_execution_planner(state: AgentState) -> AgentState:
         result["execution_plan"] = execution_plan
     if evaluation_spec:
         result["evaluation_spec"] = evaluation_spec
+    if isinstance(contract_min, dict) and contract_min:
+        result["execution_contract_min"] = contract_min
+    if view_payload:
+        result.update(view_payload)
     if isinstance(policy, dict) and policy:
         result["iteration_policy"] = policy
         runtime_fix_max = policy.get("runtime_fix_max")
@@ -5461,8 +5541,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
     #     print(f"Warning: could not read raw snippet for DE: {e}")
         
     state["data_engineer_audit_override"] = data_engineer_audit_override
-    de_contract = _filter_contract_for_data_engineer(state.get("execution_contract", {}))
-    de_objective = build_de_objective(de_contract or state.get("execution_contract", {}))
+    contract_min = state.get("execution_contract_min") or _load_json_safe("data/contract_min.json") or {}
+    de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+    if not isinstance(de_view, dict) or not de_view:
+        de_view = build_de_view(state.get("execution_contract", {}) or {}, contract_min or {}, state.get("artifact_index") or [])
+    de_contract_min = sanitize_contract_min_for_de(contract_min if isinstance(contract_min, dict) else {})
+    de_objective = build_de_objective(de_contract_min or {})
+    try:
+        de_view_len = len(json.dumps(de_view, ensure_ascii=True))
+        print(f"Using DE_VIEW_CONTEXT length={de_view_len}")
+        if run_id:
+            log_run_event(run_id, "de_view_context", {"length": de_view_len})
+    except Exception:
+        pass
     try:
         os.makedirs("artifacts", exist_ok=True)
         context_payload = {
@@ -5472,10 +5563,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "csv_decimal": csv_decimal,
             "header_cols": header_cols,
             "required_input_columns": _resolve_required_input_columns(state.get("execution_contract", {}), selected),
-            "required_all_columns": _resolve_contract_columns_for_cleaning(de_contract),
+            "required_all_columns": _resolve_contract_columns_for_cleaning(state.get("execution_contract", {})),
             "required_raw_header_map": required_raw_map,
             "raw_required_sample_context": sample_context,
             "data_engineer_audit_override": data_engineer_audit_override,
+            "de_view": de_view,
+            "execution_contract_min": de_contract_min,
         }
         with open(os.path.join("artifacts", "data_engineer_context.json"), "w", encoding="utf-8") as f_ctx:
             json.dump(context_payload, f_ctx, indent=2, ensure_ascii=False)
@@ -5491,7 +5584,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
         csv_encoding=csv_encoding,
         csv_sep=csv_sep,
         csv_decimal=csv_decimal,
-        execution_contract=de_contract,
+        execution_contract=de_contract_min,
+        contract_min=de_contract_min,
+        de_view=de_view,
     )
     try:
         os.makedirs("artifacts", exist_ok=True)
@@ -6896,6 +6991,9 @@ def run_engineer(state: AgentState) -> AgentState:
     
     # Pass input context
     data_path = "data/cleaned_data.csv"
+    de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+    if isinstance(de_view, dict) and de_view.get("output_path"):
+        data_path = str(de_view.get("output_path"))
     feedback_history = state.get('feedback_history', [])
     leakage_summary = state.get("leakage_audit_summary", "")
     data_audit_context = state.get('data_summary', '')
@@ -6996,7 +7094,19 @@ def run_engineer(state: AgentState) -> AgentState:
         )
         sig = inspect.signature(ml_engineer.generate_code)
         if "execution_contract" in sig.parameters:
-            kwargs["execution_contract"] = execution_contract or contract_min
+            kwargs["execution_contract"] = contract_min or execution_contract
+        if "ml_view" in sig.parameters:
+            ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
+            if not isinstance(ml_view, dict) or not ml_view:
+                ml_view = build_ml_view(execution_contract or {}, contract_min or {}, state.get("artifact_index") or [])
+            kwargs["ml_view"] = ml_view
+            try:
+                ml_view_len = len(json.dumps(ml_view, ensure_ascii=True))
+                print(f"Using ML_VIEW_CONTEXT length={ml_view_len}")
+                if run_id:
+                    log_run_event(run_id, "ml_view_context", {"length": ml_view_len})
+            except Exception:
+                pass
         aliasing = {}
         derived_present = []
         sample_context = ""
@@ -7017,6 +7127,11 @@ def run_engineer(state: AgentState) -> AgentState:
         if contract_min:
             context_ops_blocks.append(
                 "CONTRACT_MIN_CONTEXT:\n" + json.dumps(contract_min, ensure_ascii=True)
+            )
+        ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
+        if isinstance(ml_view, dict) and ml_view:
+            context_ops_blocks.append(
+                "ML_VIEW_CONTEXT:\n" + json.dumps(ml_view, ensure_ascii=True)
             )
         if header_cols:
             norm_map = {}
@@ -7128,6 +7243,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "required_features": strategy.get("required_columns", []),
                 "execution_contract": execution_contract,
                 "execution_contract_min": contract_min,
+                "ml_view": state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view"),
                 "data_audit_context": data_audit_context,
                 "ml_engineer_audit_override": ml_audit_override,
                 "feature_availability": feature_availability,
@@ -7275,12 +7391,33 @@ def run_reviewer(state: AgentState) -> AgentState:
     # Context Construction
     strategy = state.get('selected_strategy', {})
     evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
-    analysis_type = strategy.get('analysis_type', 'predictive')
-    strategy_context = f"Strategy: {strategy.get('title')}\nType: {strategy.get('analysis_type')}\nRules: {strategy.get('reasoning')}"
-    business_objective = state.get('business_objective', 'Analyze data.')
+    reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
+    if not isinstance(reviewer_view, dict) or not reviewer_view:
+        reviewer_view = build_reviewer_view(
+            state.get("execution_contract", {}) or {},
+            _load_json_safe("data/contract_min.json") or {},
+            state.get("artifact_index") or [],
+        )
+    analysis_type = reviewer_view.get("objective_type") or strategy.get('analysis_type', 'predictive')
+    strategy_context = reviewer_view.get("strategy_summary") or ""
+    business_objective = ""
+    try:
+        reviewer_view_len = len(json.dumps(reviewer_view, ensure_ascii=True))
+        print(f"Using REVIEWER_VIEW_CONTEXT length={reviewer_view_len}")
+        if run_id:
+            log_run_event(run_id, "reviewer_view_context", {"length": reviewer_view_len})
+    except Exception:
+        pass
     
     try:
-        review = reviewer.review_code(code, analysis_type, business_objective, strategy_context, evaluation_spec)
+        review = reviewer.review_code(
+            code,
+            analysis_type,
+            business_objective,
+            strategy_context,
+            evaluation_spec,
+            reviewer_view=reviewer_view,
+        )
         print(f"Verdict: {review['status']}")
         
         # Update Streak
@@ -8698,7 +8835,21 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             ok, counters, err_msg = _consume_budget(state, "reviewer_calls", "max_reviewer_calls", "Reviewer")
             review_counters = counters
             if ok:
-                review_result = reviewer.review_code(code, analysis_type, business_objective, strategy_context, evaluation_spec)
+                reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
+                if not isinstance(reviewer_view, dict) or not reviewer_view:
+                    reviewer_view = build_reviewer_view(
+                        contract,
+                        _load_json_safe("data/contract_min.json") or {},
+                        state.get("artifact_index") or [],
+                    )
+                review_result = reviewer.review_code(
+                    code,
+                    analysis_type,
+                    "",
+                    reviewer_view.get("strategy_summary") if isinstance(reviewer_view, dict) else "",
+                    evaluation_spec,
+                    reviewer_view=reviewer_view,
+                )
                 if review_result and review_result.get("status") != "APPROVED":
                     review_warnings.append(
                         f"REVIEWER_CODE_AUDIT[{review_result.get('status')}]: {review_result.get('feedback')}"
@@ -9236,6 +9387,21 @@ def run_translator(state: AgentState) -> AgentState:
         report_error = None
     report_state.setdefault("execution_error", state.get("execution_error", False))
     report_state.setdefault("sandbox_failed", state.get("sandbox_failed", False))
+    translator_view = state.get("translator_view") or (state.get("contract_views") or {}).get("translator_view")
+    if not isinstance(translator_view, dict) or not translator_view:
+        translator_view = build_translator_view(
+            report_state.get("execution_contract", {}) or {},
+            _load_json_safe("data/contract_min.json") or {},
+            report_state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json") or [],
+        )
+    report_state["translator_view"] = translator_view
+    try:
+        translator_view_len = len(json.dumps(translator_view, ensure_ascii=True))
+        print(f"Using TRANSLATOR_VIEW_CONTEXT length={translator_view_len}")
+        if run_id:
+            log_run_event(run_id, "translator_view_context", {"length": translator_view_len})
+    except Exception:
+        pass
     contract = report_state.get("execution_contract", {}) or {}
     deliverables = _resolve_contract_deliverables(contract)
     has_preview_deliverable = False
@@ -9367,7 +9533,8 @@ def run_translator(state: AgentState) -> AgentState:
             report_state,
             error_message=report_error,
             has_partial_visuals=report_has_partial,
-            plots=report_plots
+            plots=report_plots,
+            translator_view=translator_view,
         )
     except Exception as e:
         print(f"CRITICAL: Translator crashed in host: {e}")

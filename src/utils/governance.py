@@ -118,6 +118,25 @@ def _detect_metric_ceiling(
     return {"metric_ceiling_detected": ceiling_detected, "ceiling_reason": reason}
 
 
+def _collect_contract_views(base_dir: str = "data") -> Dict[str, Any]:
+    views_dir = os.path.join(base_dir, "contracts", "views")
+    view_names = [
+        "de_view",
+        "ml_view",
+        "reviewer_view",
+        "translator_view",
+        "results_advisor_view",
+    ]
+    paths = {}
+    present = []
+    for name in view_names:
+        path = os.path.join(views_dir, f"{name}.json")
+        if os.path.exists(path):
+            paths[name] = path
+            present.append(name)
+    return {"paths": paths, "present": present}
+
+
 def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
     output_contract = _safe_load_json("data/output_contract_report.json")
@@ -279,4 +298,5 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
             "summary": alignment_check.get("summary"),
         } if isinstance(alignment_check, dict) and alignment_check else {},
         "integrity_critical_count": integrity_critical_count,
+        "contract_views": _collect_contract_views(),
     }

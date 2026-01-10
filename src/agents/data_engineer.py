@@ -82,6 +82,8 @@ class DataEngineerAgent:
         csv_sep: str = ",",
         csv_decimal: str = ".",
         execution_contract: Optional[Dict[str, Any]] = None,
+        contract_min: Optional[Dict[str, Any]] = None,
+        de_view: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Generates a Python script to clean and standardize the dataset.
@@ -89,8 +91,10 @@ class DataEngineerAgent:
         from src.utils.prompting import render_prompt
         import json
 
-        contract = execution_contract or {}
+        contract = contract_min or execution_contract or {}
         contract_json = json.dumps(contract, indent=2)
+        de_view = de_view or {}
+        de_view_json = json.dumps(de_view, indent=2)
 
         # --- FIX CAUSA RAÍZ 1: Leer runbook correcto V4.1 ---
         # Primero intentar clave canónica V4.1, luego fallback a legacy
@@ -135,8 +139,9 @@ class DataEngineerAgent:
         - Input: '$input_path'
         - Encoding: '$csv_encoding' | Sep: '$csv_sep' | Decimal: '$csv_decimal'
         - DE Cleaning Objective: "$business_objective"
-        - Required Columns (Strategy): $required_columns
-        - Execution Contract (json): $execution_contract_json (for reasoning only)
+        - Required Columns (DE View): $required_columns
+        - DE_VIEW_CONTEXT (json): $de_view_context
+        - CONTRACT_MIN_CONTEXT (json): $contract_min_context
         - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
 
         *** DATA AUDIT ***
@@ -167,9 +172,10 @@ class DataEngineerAgent:
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
             business_objective=business_objective,
-            required_columns=str(strategy.get('required_columns', [])),
+            required_columns=json.dumps(de_view.get("required_columns") or strategy.get("required_columns", [])),
             data_audit=data_audit,
-            execution_contract_json=contract_json,
+            contract_min_context=contract_json,
+            de_view_context=de_view_json,
             data_engineer_runbook=de_runbook_json,
         )
         self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE

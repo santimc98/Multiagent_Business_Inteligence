@@ -214,7 +214,14 @@ class BusinessTranslatorAgent:
         self.last_prompt = None
         self.last_response = None
 
-    def generate_report(self, state: Dict[str, Any], error_message: Optional[str] = None, has_partial_visuals: bool = False, plots: Optional[List[str]] = None) -> str:
+    def generate_report(
+        self,
+        state: Dict[str, Any],
+        error_message: Optional[str] = None,
+        has_partial_visuals: bool = False,
+        plots: Optional[List[str]] = None,
+        translator_view: Optional[Dict[str, Any]] = None,
+    ) -> str:
         if not isinstance(state, dict):
             state = {"execution_output": str(state), "business_objective": str(error_message or "")}
             error_message = None
@@ -225,6 +232,12 @@ class BusinessTranslatorAgent:
         artifact_index = _normalize_artifact_index(
             state.get("artifact_index") or _safe_load_json("data/produced_artifact_index.json") or []
         )
+        translator_view = translator_view or state.get("translator_view") or {}
+        view_policy = translator_view.get("reporting_policy") if isinstance(translator_view, dict) else None
+        view_inventory = translator_view.get("evidence_inventory") if isinstance(translator_view, dict) else None
+        view_constraints = translator_view.get("constraints") if isinstance(translator_view, dict) else None
+        if not isinstance(view_inventory, list) or not view_inventory:
+            view_inventory = artifact_index
 
         def _artifact_available(path: str) -> bool:
             if artifact_index:
@@ -531,8 +544,11 @@ class BusinessTranslatorAgent:
         data_adequacy_context = _summarize_data_adequacy()
         model_metrics_context = _summarize_model_metrics()
         facts_context = _facts_from_insights(insights) or _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
-        artifacts_context = artifact_index if artifact_index else []
-        reporting_policy_context = contract.get("reporting_policy", {}) if isinstance(contract, dict) else {}
+        artifacts_context = view_inventory if view_inventory else []
+        reporting_policy_context = view_policy if isinstance(view_policy, dict) else {}
+        if not reporting_policy_context:
+            reporting_policy_context = contract.get("reporting_policy", {}) if isinstance(contract, dict) else {}
+        translator_view_context = translator_view if isinstance(translator_view, dict) else {}
         slot_payloads = {}
         if isinstance(insights, dict):
             slot_payloads = insights.get("slot_payloads") or {}
@@ -611,6 +627,7 @@ class BusinessTranslatorAgent:
         - Artifacts Available: $artifacts_context
         - Recommendations Preview: $recommendations_preview_context
         - Reporting Policy: $reporting_policy_context
+        - Translator View: $translator_view_context
         - Slot Payloads: $slot_payloads_context
         - Slot Coverage: $slot_coverage_context
 
@@ -719,6 +736,7 @@ class BusinessTranslatorAgent:
             artifacts_context=json.dumps(artifacts_context, ensure_ascii=False),
             recommendations_preview_context=json.dumps(recommendations_preview, ensure_ascii=False),
             reporting_policy_context=json.dumps(reporting_policy_context, ensure_ascii=False),
+            translator_view_context=json.dumps(translator_view_context, ensure_ascii=False),
             slot_payloads_context=json.dumps(slot_payloads, ensure_ascii=False),
             slot_coverage_context=json.dumps(slot_coverage_context, ensure_ascii=False),
         )

@@ -47,6 +47,7 @@ class ReviewerAgent:
         business_objective: str = "",
         strategy_context: str = "",
         evaluation_spec: Dict[str, Any] | None = None,
+        reviewer_view: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         
         output_format_instructions = """
@@ -61,10 +62,14 @@ class ReviewerAgent:
 
         from src.utils.prompting import render_prompt
 
+        reviewer_view = reviewer_view or {}
         eval_spec_json = json.dumps(evaluation_spec or {}, indent=2)
         reviewer_gates = []
         if isinstance(evaluation_spec, dict):
             reviewer_gates = evaluation_spec.get("reviewer_gates") or evaluation_spec.get("gates") or []
+        view_gates = reviewer_view.get("reviewer_gates")
+        if isinstance(view_gates, list) and view_gates:
+            reviewer_gates = view_gates
         allowed_columns = []
         if isinstance(evaluation_spec, dict):
             for key in ("allowed_columns", "canonical_columns", "required_columns", "contract_columns"):
@@ -72,17 +77,23 @@ class ReviewerAgent:
                 if isinstance(cols, list) and cols:
                     allowed_columns = [str(c) for c in cols if c]
                     break
+        if isinstance(reviewer_view.get("required_outputs"), list) and reviewer_view.get("required_outputs"):
+            allowed_columns = allowed_columns or []
+        strategy_summary = reviewer_view.get("strategy_summary") or strategy_context
+        objective_type = reviewer_view.get("objective_type") or analysis_type
+        expected_metrics = reviewer_view.get("expected_metrics") or []
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Technical Lead and Security Auditor.
         
         CONTEXT: 
-        - Analysis Type: "$analysis_type"
-        - Business Objective: "$business_objective"
-        - Strategy Context: "$strategy_context"
+        - Objective Type: "$analysis_type"
+        - Strategy Summary: "$strategy_context"
         - Evaluation Spec (JSON): $evaluation_spec_json
+        - Reviewer View (JSON): $reviewer_view_json
         - Reviewer Gates (only these can fail): $reviewer_gates
         - Allowed Columns (if provided): $allowed_columns_json
+        - Expected Metrics (if provided): $expected_metrics_json
         
         ### CRITERIA FOR APPROVAL (QUALITY FIRST PRINCIPLES)
 
@@ -126,12 +137,14 @@ class ReviewerAgent:
         
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
-            analysis_type=analysis_type.upper(),
+            analysis_type=str(objective_type).upper(),
             business_objective=business_objective,
-            strategy_context=strategy_context,
+            strategy_context=strategy_summary,
             evaluation_spec_json=eval_spec_json,
+            reviewer_view_json=json.dumps(reviewer_view, indent=2),
             reviewer_gates=reviewer_gates,
             allowed_columns_json=json.dumps(allowed_columns, indent=2),
+            expected_metrics_json=json.dumps(expected_metrics, indent=2),
             output_format_instructions=output_format_instructions,
         )
         
