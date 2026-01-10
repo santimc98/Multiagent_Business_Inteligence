@@ -65,3 +65,19 @@ def test_percent_scale_suspected_high_values():
     }
     issues, _ = run_integrity_audit(df, contract)
     assert any(i.get("type") == "PERCENT_SCALE_SUSPECTED" for i in issues)
+
+
+def test_unknown_column_roles_not_enforced():
+    """Unknown column_roles should not trigger missing-column issues."""
+    df = pd.DataFrame({"req": [1, 2, 3], "extra": [5, 6, 7]})
+    unknown_columns = [f"col_unknown_{i}" for i in range(50)]
+    contract = {
+        "canonical_columns": ["req"],
+        "column_roles": {
+            "pre_decision": ["req"],
+            "unknown": unknown_columns
+        }
+    }
+    issues, _ = run_integrity_audit(df, contract)
+    missing = [issue for issue in issues if issue.get("type") == "MISSING_COLUMN"]
+    assert not missing, "Unknown column_roles should not enforce requirements"

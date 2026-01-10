@@ -80,10 +80,14 @@ def _create_v41_skeleton(
             col_roles_outcome.append(target_col)
             derived_cols_list.append(target_col)
 
-    # Everything else in unknown for now
+    # Everything else in unknown for now (inventory metadata only - don't force requirements on them)
     available_set = set(available_cols)
     outcome_set = set(col_roles_outcome)
-    unknown_cols = [c for c in available_cols if c not in outcome_set] # canonical might be in unknown
+    unknown_cols = [c for c in available_cols if c not in outcome_set]  # canonical might be in unknown
+    unknown_summary = {
+        "count": len(unknown_cols),
+        "sample": unknown_cols[:25],
+    }
 
     # Parse types from summary for tests/fallback utility
     type_distribution = {}
@@ -155,8 +159,9 @@ def _create_v41_skeleton(
             "decision": [],
             "outcome": col_roles_outcome,
             "post_decision_audit_only": [],
-            "unknown": unknown_cols
+            "unknown": []
         },
+        "column_roles_unknown_summary": unknown_summary,
         
         "preprocessing_requirements": {},
         
@@ -355,13 +360,21 @@ def validate_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(artifact_requirements, dict):
         return contract
 
-    schema_binding = artifact_requirements.get("schema_binding", {})
+    schema_binding = artifact_requirements.get("schema_binding")
     if not isinstance(schema_binding, dict):
-        return contract
+        schema_binding = {}
+        artifact_requirements["schema_binding"] = schema_binding
 
-    required_columns = schema_binding.get("required_columns", [])
-    if not isinstance(required_columns, list):
-        return contract
+    required_columns = schema_binding.get("required_columns")
+    if not isinstance(required_columns, list) or not required_columns:
+        # Fallback to canonical_columns if available, else strategy-level required_columns (legacy)
+        fallback_columns = canonical_columns or contract.get("required_columns") or []
+        if isinstance(fallback_columns, list) and fallback_columns:
+            schema_binding["required_columns"] = [str(col) for col in fallback_columns if col]
+            required_columns = schema_binding["required_columns"]
+        else:
+            schema_binding["required_columns"] = []
+            required_columns = []
 
     # Validate required_columns
     valid_required = []

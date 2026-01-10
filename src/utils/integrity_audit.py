@@ -95,8 +95,10 @@ def _build_requirements_from_v41(contract: Dict[str, Any]) -> List[Dict[str, Any
                 "source": "input",
             })
     
-    # From column_roles - add role info
-    roles = get_column_roles(contract)
+    # From column_roles - add role info for binding roles only
+    binding_roles = {"pre_decision", "decision", "outcome", "post_decision_audit_only"}
+    roles = {r: cols for r, cols in get_column_roles(contract).items() if r in binding_roles}
+    # column_roles.unknown is inventory metadata; it should NOT enforce requirements or trigger missing-column errors.
     for role, columns in roles.items():
         for col in columns:
             if col not in seen:

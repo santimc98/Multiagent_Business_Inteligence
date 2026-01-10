@@ -16,3 +16,22 @@ def test_run_summary_outcome_with_limitations(tmp_path, monkeypatch):
     summary = build_run_summary({"review_verdict": "APPROVED"})
     assert summary.get("run_outcome") == "GO_WITH_LIMITATIONS"
     assert summary.get("metric_ceiling_detected") is True
+
+
+def test_run_summary_integrity_critical_forces_no_go(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open("data/metrics.json", "w", encoding="utf-8") as f:
+        json.dump({"auc": 0.6}, f)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"missing": []}, f)
+    with open("data/integrity_audit_report.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {"issues": [{"type": "MISSING_COLUMN", "severity": "critical"}]},
+            f,
+        )
+
+    summary = build_run_summary({"review_verdict": "APPROVED"})
+    assert summary.get("run_outcome") == "NO_GO"
+    assert "integrity_critical" in summary.get("failed_gates", [])
+    assert summary.get("integrity_critical_count") == 1

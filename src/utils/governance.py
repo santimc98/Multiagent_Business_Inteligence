@@ -121,9 +121,10 @@ def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
     output_contract = _safe_load_json("data/output_contract_report.json")
     case_alignment = _safe_load_json("data/case_alignment_report.json")
     alignment_check = _safe_load_json("data/alignment_check.json")
+    integrity_report = _safe_load_json("data/integrity_audit_report.json")
     integrity = _safe_load_json("data/integrity_audit_report.json")
 
-    issues = integrity.get("issues", []) if isinstance(integrity, dict) else []
+    issues = integrity_report.get("issues", []) if isinstance(integrity_report, dict) else []
     severity_counts = {}
     for issue in issues:
         sev = str(issue.get("severity", "unknown"))
@@ -164,6 +165,7 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     output_contract = _safe_load_json("data/output_contract_report.json")
     data_adequacy = _safe_load_json("data/data_adequacy_report.json")
     alignment_check = _safe_load_json("data/alignment_check.json")
+    integrity = _safe_load_json("data/integrity_audit_report.json")
     status = state.get("last_successful_review_verdict") or state.get("review_verdict") or "UNKNOWN"
     failed_gates = []
     gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context")
@@ -176,6 +178,17 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     pipeline_aborted = state.get("pipeline_aborted_reason")
     if pipeline_aborted:
         failed_gates.append(f"pipeline_aborted:{pipeline_aborted}")
+    integrity_issues = integrity.get("issues", []) if isinstance(integrity, dict) else []
+    integrity_critical_count = sum(
+        1
+        for issue in integrity_issues
+        if str(issue.get("severity", "")).strip().lower() == "critical"
+    )
+    if integrity_critical_count > 0:
+        failed_gates.append("integrity_critical")
+        integrity_flagged = True
+    else:
+        integrity_flagged = False
     adequacy_summary = {}
     if isinstance(data_adequacy, dict):
         alignment = data_adequacy.get("quality_gates_alignment", {}) if isinstance(data_adequacy, dict) else {}
@@ -227,7 +240,14 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     ]
     critical_hit = any(any(tok in gate for tok in critical_tokens) for gate in failed_gates_lower)
     output_missing = bool(isinstance(output_contract, dict) and output_contract.get("missing"))
-    if output_missing or critical_hit or status in {"REJECTED", "FAIL", "CRASH"} or pipeline_aborted or state.get("data_engineer_failed"):
+    if (
+        output_missing
+        or critical_hit
+        or integrity_flagged
+        or status in {"REJECTED", "FAIL", "CRASH"}
+        or pipeline_aborted
+        or state.get("data_engineer_failed")
+    ):
         run_outcome = "NO_GO"
     else:
         counterfactual_policy = ""
@@ -257,4 +277,5 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
             "failure_mode": alignment_check.get("failure_mode"),
             "summary": alignment_check.get("summary"),
         } if isinstance(alignment_check, dict) and alignment_check else {},
+        "integrity_critical_count": integrity_critical_count,
     }
