@@ -2120,6 +2120,8 @@ def manifest_dump_missing_default(code: str) -> bool:
     Returns True if a risky call is found.
     """
     import ast
+    if "_safe_dump_json" in code and "json.dump = _safe_dump_json" in code:
+        return False
     try:
         tree = ast.parse(code)
     except Exception:
@@ -5312,6 +5314,20 @@ def run_data_engineer(state: AgentState) -> AgentState:
             script=code,
             attempt=attempt_id,
         )
+
+    raw_response = getattr(data_engineer, "last_response", "") or ""
+    if "```" in raw_response:
+        if not state.get("de_code_fence_retry_done"):
+            new_state = dict(state)
+            new_state["de_code_fence_retry_done"] = True
+            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+            payload = "CODE_FENCE_GUARD: Output python only, no fences, no markdown."
+            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+            if run_id:
+                log_run_event(run_id, "data_engineer_code_fence_retry", {"attempt": attempt_id})
+            print("Code fence guard: retrying Data Engineer with no-fence instruction.")
+            return run_data_engineer(new_state)
+        print("Warning: code fences detected after retry; proceeding with cleaned code.")
 
     plan_payload = None
     is_plan = False

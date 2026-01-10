@@ -544,6 +544,7 @@ def build_contract_min(
             "Parse numeric/date fields conservatively; document conversions.",
             "If a canonical column is missing, report and stop (no fabrication).",
             "Do not derive targets or train models.",
+            "Avoid advanced validation metrics (MAE/correlation); report only dtype and null counts.",
             "Write cleaning_manifest.json with input/output dialect details.",
         ]
     )

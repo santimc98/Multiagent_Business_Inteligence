@@ -23,3 +23,15 @@ def main():
 """
     issues = data_engineer_preflight(code)
     assert issues == []
+
+
+def test_data_engineer_preflight_flags_dict_before_init():
+    code = """
+def main(cols):
+    stats = {}
+    for col in cols:
+        stats[col]["normalization_mae"] = 0.1
+        stats[col] = {}
+"""
+    issues = data_engineer_preflight(code)
+    assert any("Initialize per-column dict entries" in issue for issue in issues)

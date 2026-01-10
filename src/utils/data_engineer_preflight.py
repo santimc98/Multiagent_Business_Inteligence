@@ -1,4 +1,5 @@
 import ast
+import re
 from typing import List
 
 
@@ -88,6 +89,41 @@ def data_engineer_preflight(code: str) -> List[str]:
                     "parse_numeric should strip non-numeric symbols (currency/letters) before conversion (e.g., re.sub(r\"[^0-9,\\.\\-+()%\\s]\", \"\", s))."
                 )
                 break
+    except Exception:
+        pass
+
+    # Guard against dict usage before init inside loops (stats[col]["x"] before stats[col] = {}).
+    try:
+        loop_stack: List[dict] = []
+        for line in code.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip())
+            while loop_stack and indent <= loop_stack[-1]["indent"]:
+                loop_stack.pop()
+            loop_match = re.match(r"^\s*for\s+(\w+)\s+in\b", line)
+            if loop_match:
+                loop_stack.append({"indent": indent, "var": loop_match.group(1), "inited": set()})
+                continue
+            if not loop_stack:
+                continue
+            for loop in loop_stack:
+                if indent <= loop["indent"]:
+                    continue
+                var = loop["var"]
+                init_match = re.search(rf"(\w+)\s*\[\s*{var}\s*\]\s*=", line)
+                if init_match:
+                    loop["inited"].add(init_match.group(1))
+                setdefault_match = re.search(rf"(\w+)\.setdefault\(\s*{var}\s*,", line)
+                if setdefault_match:
+                    loop["inited"].add(setdefault_match.group(1))
+                use_match = re.search(rf"(\w+)\s*\[\s*{var}\s*\]\s*\[", line)
+                if use_match and use_match.group(1) not in loop["inited"]:
+                    issues.append(
+                        "Initialize per-column dict entries before nested assignments (e.g., stats[col] = {} before stats[col]['x'])."
+                    )
+                    return issues
     except Exception:
         pass
     return issues

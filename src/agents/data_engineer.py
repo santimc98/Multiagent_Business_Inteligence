@@ -139,15 +139,14 @@ class DataEngineerAgent:
         *** CLEANING OUTPUT REQUIREMENTS ***
         - CRITICAL: Read input with pd.read_csv(..., sep='$csv_sep', decimal='$csv_decimal', encoding='$csv_encoding'). DO NOT rely on defaults.
         - Save cleaned CSV to data/cleaned_data.csv.
-        - Save manifest to data/cleaning_manifest.json (json.dump(..., default=_json_default)).
+        - Save manifest to data/cleaning_manifest.json (use _safe_dump_json if present; otherwise json.dump(..., default=_json_default)).
         - CRITICAL: Manifest MUST include "output_dialect": {"sep": "...", "decimal": "...", "encoding": "..."} matching the saved file.
         - Use standard CSV (sep=',', decimal='.', encoding='utf-8') for output unless forbidden.
         - Use canonical_name from the contract for all column references.
         - Derive required columns using clear, deterministic logic.
         - Build a header map for lookup (normalize only for matching), but preserve canonical_name exactly (including spaces/symbols) in the output.
         - Canonical columns must contain cleaned values (do not leave raw strings in canonical columns while writing cleaned_* shadows).
-        - Print a CLEANING_VALIDATION section that reports dtype/null_frac and basic range checks for each required column.
-        - When reporting min/max, only use numeric series (e.g., cleaned_vals) and skip object dtype to avoid col_data.max() crashes.
+        - Print a CLEANING_VALIDATION section that reports dtype and null_frac for each required column (no advanced metrics).
         - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
         - If a derived column has derived_owner='ml_engineer', do NOT create placeholders; leave it absent and document in the manifest.
         """
@@ -228,7 +227,79 @@ class DataEngineerAgent:
             # Use _extract_nonempty to handle EMPTY_COMPLETION (CAUSA RAÍZ 2)
             content = self._extract_nonempty(response)
             print(f"DEBUG: Fallback DE Response Preview: {content[:200]}...")
+            self.last_response = content
             return content
+
+        injection = "\n".join(
+            [
+                "import os",
+                "import json",
+                "from datetime import date, datetime",
+                "try:",
+                "    import numpy as np",
+                "except Exception:",
+                "    np = None",
+                "try:",
+                "    import pandas as pd",
+                "except Exception:",
+                "    pd = None",
+                "",
+                "os.makedirs('data', exist_ok=True)",
+                "",
+                "def _to_jsonable(value):",
+                "    if value is None:",
+                "        return None",
+                "    if isinstance(value, (str, int, bool)):",
+                "        return value",
+                "    if isinstance(value, float):",
+                "        return None if value != value else value",
+                "    if isinstance(value, (datetime, date)):",
+                "        return value.isoformat()",
+                "    if isinstance(value, (list, tuple, set)):",
+                "        return [_to_jsonable(item) for item in value]",
+                "    if isinstance(value, dict):",
+                "        return {str(k): _to_jsonable(v) for k, v in value.items()}",
+                "    if isinstance(value, (bytes, bytearray)):",
+                "        return value.decode('utf-8', errors='replace')",
+                "    if np is not None:",
+                "        if isinstance(value, np.bool_):",
+                "            return bool(value)",
+                "        if isinstance(value, np.integer):",
+                "            return int(value)",
+                "        if isinstance(value, np.floating):",
+                "            return float(value)",
+                "        if isinstance(value, np.ndarray):",
+                "            return [_to_jsonable(item) for item in value.tolist()]",
+                "    if pd is not None:",
+                "        if value is pd.NA:",
+                "            return None",
+                "        if isinstance(value, pd.Timestamp):",
+                "            return value.isoformat()",
+                "        try:",
+                "            if pd.isna(value) is True:",
+                "                return None",
+                "        except Exception:",
+                "            pass",
+                "    return str(value)",
+                "",
+                "_ORIG_JSON_DUMP = json.dump",
+                "_ORIG_JSON_DUMPS = json.dumps",
+                "",
+                "def _safe_dump_json(obj, fp, **kwargs):",
+                "    payload = _to_jsonable(obj)",
+                "    kwargs.pop('default', None)",
+                "    return _ORIG_JSON_DUMP(payload, fp, **kwargs)",
+                "",
+                "def _safe_dumps_json(obj, **kwargs):",
+                "    payload = _to_jsonable(obj)",
+                "    kwargs.pop('default', None)",
+                "    return _ORIG_JSON_DUMPS(payload, **kwargs)",
+                "",
+                "json.dump = _safe_dump_json",
+                "json.dumps = _safe_dumps_json",
+                "",
+            ]
+        ) + "\n"
 
         try:
             content = call_with_retries(_call_model, max_retries=5, backoff_factor=2, initial_delay=2)
@@ -236,8 +307,6 @@ class DataEngineerAgent:
 
             code = self._clean_code(content)
 
-            # INFRASTRUCTURE INJECTION: Ensure data dir exists
-            injection = "import os\nos.makedirs('data', exist_ok=True)\n"
             return injection + code
 
         except Exception as e:
@@ -248,7 +317,6 @@ class DataEngineerAgent:
                     content = call_with_retries(_call_fallback, max_retries=3, backoff_factor=2, initial_delay=2)
                     print("DEBUG: Fallback response received.")
                     code = self._clean_code(content)
-                    injection = "import os\nos.makedirs('data', exist_ok=True)\n"
                     return injection + code
                 except Exception as e_bk:
                     error_msg = f"Data Engineer Failed (Primary & Fallback): {str(e)} | Backup: {str(e_bk)}"
