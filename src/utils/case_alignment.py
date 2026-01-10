@@ -106,6 +106,30 @@ def _pick_case_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def _pick_group_column(df: pd.DataFrame) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+    for col in df.columns:
+        norm = _normalize(col)
+        if any(tok in norm for tok in ["case", "group", "segment", "bucket", "cluster"]):
+            return col
+    return None
+
+
+def _pick_score_column(df: pd.DataFrame, exclude: Optional[str] = None) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+    for col in df.columns:
+        norm = _normalize(col)
+        if exclude and _normalize(exclude) == norm:
+            continue
+        if "ref" in norm or "target" in norm:
+            continue
+        if any(tok in norm for tok in ["score", "pred", "prob", "rank"]):
+            return col
+    return None
+
+
 def _compute_adjacent_violations(ref: pd.Series, score: pd.Series) -> int:
     df = pd.DataFrame({"ref": ref, "score": score}).dropna()
     if df.empty:
@@ -198,6 +222,7 @@ def build_case_alignment_report(
     case_summary_path: str = "data/case_summary.csv",
     weights_path: str = "data/weights.json",
     data_paths: Optional[list[str]] = None,
+    scored_rows_path: str = "data/scored_rows.csv",
 ) -> Dict[str, Any]:
     data_paths = data_paths or []
     contract = contract or {}
@@ -230,6 +255,76 @@ def build_case_alignment_report(
     score_series = None
 
     dialect = _load_output_dialect()
+
+    # Try group alignment from scored_rows if available
+    if os.path.exists(scored_rows_path):
+        try:
+            sr = pd.read_csv(
+                scored_rows_path,
+                sep=dialect["sep"],
+                decimal=dialect["decimal"],
+                encoding=dialect["encoding"],
+            )
+        except Exception:
+            sr = None
+        if sr is not None and not sr.empty:
+            group_col = _pick_group_column(sr)
+            ref_col = _pick_column(sr, target_name, "target")
+            score_col = _pick_score_column(sr, exclude=ref_col)
+            if group_col and score_col:
+                group_df = sr[[group_col, score_col] + ([ref_col] if ref_col else [])].copy()
+                group_df[score_col] = pd.to_numeric(group_df[score_col], errors="coerce")
+                if ref_col:
+                    group_df[ref_col] = pd.to_numeric(group_df[ref_col], errors="coerce")
+                grouped = group_df.groupby(group_col)
+                summary = grouped.agg(
+                    n=(score_col, "size"),
+                    score_mean=(score_col, "mean"),
+                    score_median=(score_col, "median"),
+                    ref_mean=(ref_col, "mean") if ref_col else (score_col, "mean"),
+                ).reset_index()
+                ref_series = pd.to_numeric(summary["ref_mean"], errors="coerce")
+                score_series = pd.to_numeric(summary["score_mean"], errors="coerce")
+                spearman = None
+                kendall = None
+                try:
+                    if ref_col:
+                        spearman = float(ref_series.corr(score_series, method="spearman"))
+                        kendall = float(ref_series.corr(score_series, method="kendall"))
+                except Exception:
+                    pass
+                adjacent_violations = _compute_adjacent_violations(ref_series, score_series) if ref_col else 0
+                metrics = {
+                    "spearman_case_means": spearman,
+                    "kendall_case_means": kendall,
+                    "adjacent_refscore_violations": int(adjacent_violations),
+                    "case_count": int(summary.shape[0]),
+                }
+                failures = []
+                if metrics["case_count"] < 2:
+                    failures.append("insufficient_case_variation")
+                if spearman is not None and thresholds["spearman_min"] is not None and spearman < thresholds["spearman_min"]:
+                    failures.append("spearman_case_means")
+                if kendall is not None and thresholds["kendall_min"] is not None and kendall < thresholds["kendall_min"]:
+                    failures.append("kendall_case_means")
+                if thresholds["violations_max"] is not None and adjacent_violations > thresholds["violations_max"]:
+                    failures.append("adjacent_refscore_violations")
+                if not gates:
+                    status = "PASS" if not failures else "FAIL"
+                    explanation = "Group alignment computed from scored_rows; no explicit gates provided."
+                else:
+                    status = "PASS" if not failures else "FAIL"
+                    explanation = "Group alignment gate passed." if status == "PASS" else f"Failed gates: {', '.join(failures)}"
+                return {
+                    "status": status,
+                    "mode": "group_from_scored_rows",
+                    "metrics": metrics,
+                    "thresholds": thresholds,
+                    "failures": failures,
+                    "explanation": explanation,
+                    "group_summary": summary.to_dict(orient="records"),
+                    "source": "computed_from_scored_rows",
+                }
 
     # Try row_level if data available and weights exist
     if weights and data_paths:

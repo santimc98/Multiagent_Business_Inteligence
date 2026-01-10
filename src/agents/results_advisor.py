@@ -106,18 +106,22 @@ class ResultsAdvisorAgent:
         error_payload = self._safe_load_json(error_artifacts[0]) if error_artifacts else {}
         importances_payload = self._safe_load_json(importances_artifacts[0]) if importances_artifacts else {}
         alignment_payload = self._safe_load_json("data/alignment_check.json") or {}
+        case_alignment_payload = self._safe_load_json("data/case_alignment_report.json") or {}
 
-        metrics_summary = self._extract_metrics_summary(metrics_payload)
+        metrics_summary = self._extract_metrics_summary(metrics_payload, objective_type)
         if not metrics_summary and isinstance(metrics_payload, dict):
             nested = metrics_payload.get("metrics")
-            metrics_summary = self._extract_metrics_summary(nested)
+            metrics_summary = self._extract_metrics_summary(nested, objective_type)
         risks = []
         recommendations = []
         summary_lines: List[str] = []
 
-        if not metrics_summary:
+        metrics_present = bool(metrics_artifacts) and isinstance(metrics_payload, dict)
+        if not metrics_summary and not metrics_present:
             risks.append("Metrics artifact missing or empty; evaluation confidence is limited.")
             recommendations.append("Generate a metrics artifact aligned to the objective type.")
+        elif not metrics_summary and metrics_present:
+            recommendations.append("Metrics artifact present but no numeric metrics detected; populate key metrics.")
         if predictions_summary:
             summary_lines.append(
                 f"Predictions preview includes {predictions_summary.get('row_count', 0)} rows."
@@ -153,6 +157,8 @@ class ResultsAdvisorAgent:
 
         segment_pricing_summary = self._build_segment_pricing_summary(predictions_artifacts[0]) if predictions_artifacts else []
         leakage_audit = self._extract_leakage_audit(alignment_payload)
+        validation_summary = self._extract_validation_summary(alignment_payload)
+        case_or_bucket_summary = self._extract_case_alignment_summary(case_alignment_payload)
 
         slot_payloads = {}
         if metrics_summary:
@@ -163,6 +169,10 @@ class ResultsAdvisorAgent:
             slot_payloads["segment_pricing"] = segment_pricing_summary
         if leakage_audit:
             slot_payloads["alignment_risks"] = leakage_audit
+        if validation_summary:
+            slot_payloads["validation_summary"] = validation_summary
+        if case_or_bucket_summary:
+            slot_payloads["case_or_bucket_summary"] = case_or_bucket_summary
         if allowed_slots:
             slot_payloads = {k: v for k, v in slot_payloads.items() if k in allowed_slots}
 
@@ -316,10 +326,16 @@ class ResultsAdvisorAgent:
                 numeric_cols.append(col)
         return numeric_cols
 
-    def _extract_metrics_summary(self, metrics: Dict[str, Any], max_items: int = 8) -> List[Dict[str, Any]]:
+    def _extract_metrics_summary(
+        self,
+        metrics: Dict[str, Any],
+        objective_type: str = "unknown",
+        max_items: int = 8,
+    ) -> List[Dict[str, Any]]:
         if not isinstance(metrics, dict):
             return []
         items: List[Dict[str, Any]] = []
+        objective = str(objective_type or "unknown").lower()
         model_perf = metrics.get("model_performance") if isinstance(metrics.get("model_performance"), dict) else {}
         seg_stats = metrics.get("segmentation_stats") if isinstance(metrics.get("segmentation_stats"), dict) else {}
         priority_keys = [
@@ -346,15 +362,52 @@ class ResultsAdvisorAgent:
                     items.append({"metric": f"segmentation_stats.{key}", "value": num})
         if len(items) >= max_items:
             return items[:max_items]
+        flat_metrics = self._flatten_numeric_metrics(metrics)
+        priority_tokens = self._objective_metric_priority(objective)
+        used_keys = {item["metric"] for item in items if isinstance(item, dict) and item.get("metric")}
+        for token in priority_tokens:
+            for key, value in flat_metrics.items():
+                norm = key.lower()
+                if token in norm and key not in used_keys:
+                    items.append({"metric": key, "value": value})
+                    used_keys.add(key)
+                    if len(items) >= max_items:
+                        return items
+        if len(items) >= max_items:
+            return items[:max_items]
+        for key, value in flat_metrics.items():
+            if key in used_keys:
+                continue
+            items.append({"metric": key, "value": value})
+            if len(items) >= max_items:
+                break
+        return items
+
+    def _flatten_numeric_metrics(self, metrics: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
+        if not isinstance(metrics, dict):
+            return {}
+        flat: Dict[str, float] = {}
         for key, value in metrics.items():
+            metric_key = f"{prefix}{key}" if prefix else str(key)
             if isinstance(value, dict):
+                flat.update(self._flatten_numeric_metrics(value, f"{metric_key}."))
                 continue
             num = self._coerce_number(value, ".")
             if num is not None:
-                items.append({"metric": str(key), "value": num})
-                if len(items) >= max_items:
-                    break
-        return items
+                flat[str(metric_key)] = float(num)
+        return flat
+
+    def _objective_metric_priority(self, objective_type: str) -> List[str]:
+        objective = str(objective_type or "unknown").lower()
+        if objective == "classification":
+            return ["roc_auc", "auc", "f1", "precision", "recall", "accuracy", "balanced_accuracy", "pr_auc"]
+        if objective == "regression":
+            return ["rmse", "mae", "mse", "r2", "mape", "smape"]
+        if objective == "forecasting":
+            return ["mape", "smape", "rmse", "mae", "coverage", "pinball"]
+        if objective == "ranking":
+            return ["spearman", "kendall", "ndcg", "map", "mrr", "gini"]
+        return ["roc_auc", "f1", "rmse", "mae", "r2", "spearman"]
 
     def _pick_column(self, columns: List[str], candidates: List[str]) -> Optional[str]:
         lower_map = {col.lower(): col for col in columns}
@@ -523,6 +576,27 @@ class ResultsAdvisorAgent:
                     return normalized
 
         return None
+
+    def _extract_validation_summary(self, alignment_payload: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(alignment_payload, dict) or not alignment_payload:
+            return None
+        status = alignment_payload.get("status") or alignment_payload.get("overall_status")
+        failure_mode = alignment_payload.get("failure_mode")
+        summary = alignment_payload.get("summary") or alignment_payload.get("notes")
+        if status is None and failure_mode is None and summary is None:
+            return None
+        return {"status": status, "failure_mode": failure_mode, "summary": summary}
+
+    def _extract_case_alignment_summary(self, payload: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(payload, dict) or not payload:
+            return None
+        status = payload.get("status")
+        mode = payload.get("mode")
+        metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+        summary = {"status": status, "mode": mode}
+        if metrics:
+            summary["metrics"] = metrics
+        return summary if status or metrics else None
 
     def _normalize_artifact_index(self, entries: List[Any]) -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []

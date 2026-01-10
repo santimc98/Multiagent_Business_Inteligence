@@ -13,6 +13,8 @@ import json
 import numpy as np
 from typing import Any, Dict, List, Set
 
+from src.utils.json_sanitize import dump_json, to_jsonable
+
 
 def safe_json_convert(obj: Any) -> Any:
     """
@@ -28,26 +30,7 @@ def safe_json_convert(obj: Any) -> Any:
     Usage:
         json.dump(safe_json_convert(data), f)
     """
-    if isinstance(obj, dict):
-        return {str(k): safe_json_convert(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [safe_json_convert(item) for item in obj]
-    elif isinstance(obj, tuple):
-        return tuple(safe_json_convert(item) for item in obj)
-    elif isinstance(obj, np.ndarray):
-        return safe_json_convert(obj.tolist())
-    elif isinstance(obj, (np.integer, np.int32, np.int64)):
-        return int(obj)
-    elif isinstance(obj, (np.floating, np.float32, np.float64)):
-        return float(obj)
-    elif isinstance(obj, (np.bool_, bool)):
-        return bool(obj)
-    elif obj is np.nan or (isinstance(obj, float) and np.isnan(obj)):
-        return None
-    elif hasattr(obj, 'item'):  # Generic numpy scalar
-        return obj.item()
-    else:
-        return obj
+    return to_jsonable(obj)
 
 
 def safe_json_dump(data: Any, file_path: str, **kwargs) -> None:
@@ -57,9 +40,7 @@ def safe_json_dump(data: Any, file_path: str, **kwargs) -> None:
     Usage:
         safe_json_dump(metrics, 'data/metrics.json', indent=2)
     """
-    converted = safe_json_convert(data)
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(converted, f, **kwargs)
+    dump_json(file_path, data)
 
 
 def safe_json_dumps(data: Any, **kwargs) -> str:

@@ -3,6 +3,8 @@ import os
 from datetime import datetime
 from typing import Any, Dict
 
+from src.utils.json_sanitize import dump_json
+
 
 def _safe_load_json(path: str) -> Dict[str, Any]:
     try:
@@ -154,8 +156,7 @@ def write_governance_report(state: Dict[str, Any], path: str = "data/governance_
     os.makedirs(os.path.dirname(path), exist_ok=True)
     report = build_governance_report(state)
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+        dump_json(path, report)
     except Exception:
         pass
 

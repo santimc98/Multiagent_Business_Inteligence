@@ -118,6 +118,12 @@ class DataEngineerAgent:
            If you fill NaN with a sentinel (e.g., 'Unknown'), log nulls via original_nulls = int(col.isna().sum());
            nulls_before = original_nulls; nulls_after_na = int(cleaned.isna().sum()); filled_nulls = original_nulls.
 
+        *** SCOPE OF WORK (NON-NEGOTIABLE) ***
+        - Output ONLY: data/cleaned_data.csv and data/cleaning_manifest.json.
+        - MUST NOT: compute scores, case assignment, weight fitting, regression/optimization, correlations, rank checks.
+        - MUST: parse types, normalize numeric formats, preserve canonical column names.
+        - Manifest MUST include: output_dialect, row_counts, conversions.
+
         *** PYTHON SYNTAX GOTCHAS (CRITICAL) ***
         - Column names starting with a digit (e.g., '1stYearAmount') are NOT valid Python identifiers.
         - NEVER use: df.assign(1stYearAmount=...) - This causes SyntaxError!
@@ -128,7 +134,7 @@ class DataEngineerAgent:
         *** INPUT PARAMETERS ***
         - Input: '$input_path'
         - Encoding: '$csv_encoding' | Sep: '$csv_sep' | Decimal: '$csv_decimal'
-        - Business Objective: "$business_objective"
+        - DE Cleaning Objective: "$business_objective"
         - Required Columns (Strategy): $required_columns
         - Execution Contract (json): $execution_contract_json (for reasoning only)
         - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)

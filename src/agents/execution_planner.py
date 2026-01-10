@@ -429,57 +429,53 @@ def build_contract_min(
         canon_set = set(canonical_columns)
         return [col for col in cols if col in canon_set]
 
-    outcome_candidates = []
-    decision_candidates = []
-    audit_candidates = []
-
-    outcome_candidates.extend(_coerce_list(strategy_dict.get("outcome_columns")))
-    outcome_candidates.extend(_coerce_list(strategy_dict.get("target_column")))
-    outcome_candidates.extend(_coerce_list(strategy_dict.get("target_columns")))
-    outcome_candidates.extend(_coerce_list(contract.get("outcome_columns")))
-    decision_candidates.extend(_coerce_list(strategy_dict.get("decision_columns")))
-    decision_candidates.extend(_coerce_list(strategy_dict.get("decision_variables")))
-    decision_candidates.extend(_coerce_list(contract.get("decision_columns")))
-    decision_candidates.extend(_coerce_list(contract.get("decision_variables")))
-    audit_candidates.extend(_coerce_list(strategy_dict.get("audit_only_columns")))
-
     roles = contract.get("column_roles", {}) if isinstance(contract.get("column_roles"), dict) else {}
+    roles_present = any(
+        _coerce_list(roles.get(key))
+        for key in ("pre_decision", "decision", "outcome", "post_decision_audit_only")
+    )
     role_pre = _filter_to_canonical(_coerce_list(roles.get("pre_decision"))) if roles else []
     role_decision = _filter_to_canonical(_coerce_list(roles.get("decision"))) if roles else []
     role_outcome = _filter_to_canonical(_coerce_list(roles.get("outcome"))) if roles else []
     role_audit = _filter_to_canonical(_coerce_list(roles.get("post_decision_audit_only"))) if roles else []
 
-    if roles:
-        outcome_candidates.extend(_coerce_list(roles.get("outcome")))
-        decision_candidates.extend(_coerce_list(roles.get("decision")))
-        audit_candidates.extend(_coerce_list(roles.get("post_decision_audit_only")))
+    outcome_cols: List[str] = []
+    decision_cols: List[str] = []
+    audit_only_cols: List[str] = []
+    identifiers: List[str] = []
+    time_columns: List[str] = []
 
-    outcome_cols = role_outcome or _filter_to_canonical([col for col in outcome_candidates if col])
-    decision_cols = role_decision or _filter_to_canonical([col for col in decision_candidates if col])
-    audit_only_cols = role_audit or _filter_to_canonical([col for col in audit_candidates if col])
+    if roles_present:
+        outcome_cols = list(role_outcome)
+        decision_cols = list(role_decision)
+        audit_only_cols = list(role_audit)
+    else:
+        outcome_candidates = []
+        decision_candidates = []
+        audit_candidates = []
+        outcome_candidates.extend(_coerce_list(strategy_dict.get("outcome_columns")))
+        outcome_candidates.extend(_coerce_list(strategy_dict.get("target_column")))
+        outcome_candidates.extend(_coerce_list(strategy_dict.get("target_columns")))
+        outcome_candidates.extend(_coerce_list(contract.get("outcome_columns")))
+        decision_candidates.extend(_coerce_list(strategy_dict.get("decision_columns")))
+        decision_candidates.extend(_coerce_list(strategy_dict.get("decision_variables")))
+        decision_candidates.extend(_coerce_list(contract.get("decision_columns")))
+        decision_candidates.extend(_coerce_list(contract.get("decision_variables")))
+        audit_candidates.extend(_coerce_list(strategy_dict.get("audit_only_columns")))
+        outcome_cols = _filter_to_canonical([col for col in outcome_candidates if col])
+        decision_cols = _filter_to_canonical([col for col in decision_candidates if col])
+        audit_only_cols = _filter_to_canonical([col for col in audit_candidates if col])
 
     token_patterns = {
-        "target_like": re.compile(r"\b(target|label|outcome|success|converted)\b"),
-        "decision_like": re.compile(r"\b(price|amount|offer|quote|cost)\b"),
-        "audit_like": re.compile(r"\b(prob|score|prediction|model)\b"),
         "id_like": re.compile(r"\b(id|uuid|key)\b"),
         "time_like": re.compile(r"\b(date|time|timestamp)\b"),
     }
-
-    identifiers: List[str] = []
-    time_columns: List[str] = []
     for col in canonical_columns:
         tokenized = _tokenize_name(col)
         if token_patterns["id_like"].search(tokenized):
             identifiers.append(col)
         if token_patterns["time_like"].search(tokenized):
             time_columns.append(col)
-        if not outcome_cols and token_patterns["target_like"].search(tokenized):
-            outcome_cols.append(col)
-        if not decision_cols and token_patterns["decision_like"].search(tokenized):
-            decision_cols.append(col)
-        if token_patterns["audit_like"].search(tokenized):
-            audit_only_cols.append(col)
 
     outcome_cols = list(dict.fromkeys(outcome_cols))
     decision_cols = list(dict.fromkeys(decision_cols))
@@ -488,8 +484,8 @@ def build_contract_min(
     time_columns = list(dict.fromkeys(time_columns))
 
     assigned = set(outcome_cols + decision_cols + audit_only_cols + identifiers + time_columns)
-    if role_pre:
-        pre_decision = role_pre
+    if roles_present:
+        pre_decision = list(role_pre)
     else:
         pre_decision = [col for col in canonical_columns if col not in assigned]
 
@@ -555,6 +551,7 @@ def build_contract_min(
             "Produce data/scored_rows.csv, data/metrics.json, data/alignment_check.json.",
             "Respect output_dialect from cleaning_manifest.json.",
             "Document leakage checks and any data_limited_mode fallback.",
+            "Include feature_usage in alignment_check.json (used_features, target_columns, excluded_features).",
         ]
     )
 

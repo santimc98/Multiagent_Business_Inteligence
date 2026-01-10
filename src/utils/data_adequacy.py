@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+from src.utils.json_sanitize import dump_json
+
 from src.utils.contract_v41 import get_outcome_columns, get_column_roles
 
 
@@ -376,27 +378,105 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     cleaned = _safe_load_csv("data/cleaned_data.csv")
     case_summary = _safe_load_csv("data/case_summary.csv")
     base_missing = cleaned is None or (not metrics_report and not weights)
+    objective_type = (
+        state.get("objective_type")
+        or (contract.get("evaluation_spec") or {}).get("objective_type")
+        or contract.get("objective_type")
+        or ""
+    )
+    objective_key = str(objective_type or "unknown").lower()
+    objective_map = {
+        "classification": "classification",
+        "classifier": "classification",
+        "regression": "regression",
+        "forecasting": "forecasting",
+        "forecast": "forecasting",
+        "ranking": "ranking",
+        "prioritization": "ranking",
+        "calibration": "ranking",
+    }
+    objective_family = objective_map.get(objective_key, "unknown")
+
+    if objective_family == "unknown":
+        output_report = _safe_load_json("data/output_contract_report.json")
+        missing_outputs = output_report.get("missing", []) if isinstance(output_report, dict) else []
+        canonical_cols = contract.get("canonical_columns", []) if isinstance(contract, dict) else []
+        row_count = int(cleaned.shape[0]) if cleaned is not None else None
+        valid_row_fraction = None
+        missingness_summary = {}
+        if cleaned is not None and canonical_cols:
+            cols = [c for c in canonical_cols if c in cleaned.columns]
+            if cols:
+                subset = cleaned[cols]
+                valid_row_fraction = float(subset.notna().all(axis=1).mean()) if len(subset) else None
+                missingness_summary = {
+                    col: float(subset[col].isna().mean()) for col in cols if col in subset.columns
+                }
+        reasons: List[str] = []
+        if cleaned is None:
+            reasons.append("cleaned_data_missing")
+        if missing_outputs:
+            reasons.append("required_outputs_missing")
+        if valid_row_fraction is not None and valid_row_fraction < 0.8:
+            reasons.append("low_valid_row_fraction")
+        if any(val > 0.5 for val in missingness_summary.values() if isinstance(val, float)):
+            reasons.append("high_missingness")
+        status = "insufficient_signal" if reasons else "sufficient_signal"
+        threshold = int(state.get("data_adequacy_threshold", 3) or 3)
+        consecutive = int(state.get("data_adequacy_consecutive", 0) or 0)
+        return {
+            "status": status,
+            "objective_type": objective_family,
+            "reasons": reasons,
+            "recommendations": [],
+            "signals": {
+                "row_count": row_count,
+                "valid_row_fraction": valid_row_fraction,
+                "missing_outputs_count": len(missing_outputs) if isinstance(missing_outputs, list) else None,
+                "missingness_summary": missingness_summary,
+            },
+            "quality_gates_alignment": {},
+            "consecutive_data_limited": consecutive,
+            "data_limited_threshold": threshold,
+            "threshold_reached": consecutive >= threshold,
+        }
 
     metric_pool = _extract_metric_pool(weights, metrics_report)
+    use_classification = objective_family == "classification"
+    use_regression = objective_family in {"regression", "forecasting"}
+    use_ranking = objective_family == "ranking"
+
     cls_preference = ["f1", "roc_auc", "auc", "pr_auc", "average_precision", "accuracy", "precision", "recall"]
     reg_preference = ["mae", "rmse", "mse", "mape", "smape", "r2"]
-    cls_metric_name, cls_metric = _select_metric(metric_pool, "classification", cls_preference, baseline_only=False)
-    cls_baseline_name, cls_baseline = _select_metric(metric_pool, "classification", cls_preference, baseline_only=True)
-    reg_metric_name, reg_metric = _select_metric(metric_pool, "regression", reg_preference, baseline_only=False)
-    reg_baseline_name, reg_baseline = _select_metric(metric_pool, "regression", reg_preference, baseline_only=True)
+    rank_preference = ["spearman", "kendall", "ndcg", "map", "mrr", "gini"]
+
+    cls_metric_name, cls_metric = (None, None)
+    cls_baseline_name, cls_baseline = (None, None)
+    reg_metric_name, reg_metric = (None, None)
+    reg_baseline_name, reg_baseline = (None, None)
+    rank_metric_name, rank_metric = (None, None)
+
+    if use_classification:
+        cls_metric_name, cls_metric = _select_metric(metric_pool, "classification", cls_preference, baseline_only=False)
+        cls_baseline_name, cls_baseline = _select_metric(metric_pool, "classification", cls_preference, baseline_only=True)
+    if use_regression:
+        reg_metric_name, reg_metric = _select_metric(metric_pool, "regression", reg_preference, baseline_only=False)
+        reg_baseline_name, reg_baseline = _select_metric(metric_pool, "regression", reg_preference, baseline_only=True)
+    if use_ranking:
+        rank_metric_name, rank_metric = _select_metric(metric_pool, "ranking", rank_preference, baseline_only=False)
 
     cls_higher = _metric_higher_is_better(cls_metric_name) if cls_metric_name else True
     reg_higher = _metric_higher_is_better(reg_metric_name) if reg_metric_name else False
-    cls_lift = _calc_lift(cls_baseline, cls_metric, higher_is_better=cls_higher)
-    reg_lift = _calc_lift(reg_baseline, reg_metric, higher_is_better=reg_higher)
+    cls_lift = _calc_lift(cls_baseline, cls_metric, higher_is_better=cls_higher) if use_classification else None
+    reg_lift = _calc_lift(reg_baseline, reg_metric, higher_is_better=reg_higher) if use_regression else None
 
     f1 = cls_metric if cls_metric_name and "f1" in _normalize_key(cls_metric_name) else None
     f1_baseline = cls_baseline if cls_baseline_name and "f1" in _normalize_key(cls_baseline_name) else None
     mae = reg_metric if reg_metric_name and "mae" in _normalize_key(reg_metric_name) else None
     mae_baseline = reg_baseline if reg_baseline_name and "mae" in _normalize_key(reg_baseline_name) else None
 
-    f1_lift = _calc_lift(f1_baseline, f1, higher_is_better=True)
-    mae_lift = _calc_lift(mae_baseline, mae, higher_is_better=False)
+    f1_lift = _calc_lift(f1_baseline, f1, higher_is_better=True) if use_classification else None
+    mae_lift = _calc_lift(mae_baseline, mae, higher_is_better=False) if use_regression else None
 
     row_count = int(cleaned.shape[0]) if cleaned is not None else None
     feature_count = None
@@ -411,7 +491,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
 
     target_col = _find_target_column(contract, cleaned)
     class_balance = None
-    if cleaned is not None and target_col and target_col in cleaned.columns:
+    if use_classification and cleaned is not None and target_col and target_col in cleaned.columns:
         try:
             class_balance = float(cleaned[target_col].mean())
         except Exception:
@@ -432,10 +512,10 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
             feature_cols = list(cleaned.columns)
 
     target_series = cleaned[target_col] if cleaned is not None and target_col in cleaned.columns else None
-    target_kind = _infer_target_kind(target_series) if target_series is not None else "unknown"
+    target_kind = _infer_target_kind(target_series) if (target_series is not None and (use_classification or use_regression)) else "unknown"
     auc_proxy = {"best_auc": None, "best_feature": None}
     reg_proxy = {"best_abs_spearman": None, "best_feature": None, "best_r2_proxy": None}
-    if cleaned is not None and target_series is not None:
+    if cleaned is not None and target_series is not None and (use_classification or use_regression):
         if target_kind == "binary":
             auc_proxy = _best_auc_proxy(cleaned, target_series, feature_cols)
         else:
@@ -458,6 +538,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         metric_pool = {}
         cls_metric_name = cls_metric = cls_baseline_name = cls_baseline = None
         reg_metric_name = reg_metric = reg_baseline_name = reg_baseline = None
+        rank_metric_name = rank_metric = None
         cls_lift = reg_lift = None
         f1 = f1_baseline = f1_lift = None
         mae = mae_baseline = mae_lift = None
@@ -475,6 +556,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     if base_missing:
         reasons.append("pipeline_aborted_before_metrics")
     signals: Dict[str, Any] = {
+        "objective_type": objective_family,
         "row_count": row_count,
         "feature_count": feature_count,
         "rows_per_feature": rows_per_feature,
@@ -503,36 +585,40 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "regression_baseline_name": reg_baseline_name,
         "regression_baseline": reg_baseline,
         "regression_lift": reg_lift,
+        "ranking_metric_name": rank_metric_name,
+        "ranking_metric": rank_metric,
         "available_metrics": sorted(metric_pool.keys()),
     }
 
-    if not base_missing and cls_metric is None:
+    if use_classification and not base_missing and cls_metric is None:
         reasons.append("classification_metric_missing")
-    if not base_missing and reg_metric is None:
+    if use_regression and not base_missing and reg_metric is None:
         reasons.append("regression_metric_missing")
-    if not base_missing and cls_metric is not None and cls_baseline is None:
+    if use_ranking and not base_missing and rank_metric is None:
+        reasons.append("ranking_metric_missing")
+    if use_classification and not base_missing and cls_metric is not None and cls_baseline is None:
         reasons.append("classification_baseline_missing")
-    if not base_missing and reg_metric is not None and reg_baseline is None:
+    if use_regression and not base_missing and reg_metric is not None and reg_baseline is None:
         reasons.append("regression_baseline_missing")
 
-    if not base_missing and cls_lift is not None and cls_lift < 0.05:
+    if use_classification and not base_missing and cls_lift is not None and cls_lift < 0.05:
         reasons.append("classification_lift_low")
-    if not base_missing and reg_lift is not None and reg_lift < 0.1:
+    if use_regression and not base_missing and reg_lift is not None and reg_lift < 0.1:
         reasons.append("regression_lift_low")
     if not base_missing and rows_per_feature is not None and rows_per_feature < 10:
         reasons.append("high_dimensionality_low_sample")
-    if not base_missing and class_balance is not None and (class_balance < 0.1 or class_balance > 0.9):
+    if use_classification and not base_missing and class_balance is not None and (class_balance < 0.1 or class_balance > 0.9):
         reasons.append("class_imbalance")
     if not base_missing and small_segment_frac is not None and small_segment_frac > 0.3:
         reasons.append("segments_too_small")
 
-    if auc_proxy.get("best_auc") is not None:
+    if use_classification and auc_proxy.get("best_auc") is not None:
         if auc_proxy["best_auc"] < 0.6:
             reasons.append("signal_ceiling_low")
         if cls_metric is not None and cls_metric_name and "auc" in _normalize_key(cls_metric_name):
             if auc_proxy["best_auc"] is not None and cls_metric >= 0.95 * auc_proxy["best_auc"]:
                 reasons.append("signal_ceiling_reached")
-    if reg_proxy.get("best_r2_proxy") is not None:
+    if use_regression and reg_proxy.get("best_r2_proxy") is not None:
         if reg_proxy["best_r2_proxy"] < 0.05:
             reasons.append("signal_ceiling_low")
         if reg_metric_name and "r2" in _normalize_key(reg_metric_name):
@@ -564,7 +650,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         recommendations.append("Increase feature richness or improve data capture to raise the achievable signal ceiling.")
     if "signal_ceiling_reached" in reasons:
         recommendations.append("Current performance is near the data signal ceiling; improvements likely require better data, not tuning.")
-    if "classification_metric_missing" in reasons or "regression_metric_missing" in reasons:
+    if "classification_metric_missing" in reasons or "regression_metric_missing" in reasons or "ranking_metric_missing" in reasons:
         recommendations.append("Persist model performance metrics alongside weights.json for data adequacy checks.")
     if "classification_baseline_missing" in reasons or "regression_baseline_missing" in reasons:
         recommendations.append("Include baseline metrics (dummy/naive) to quantify lift over trivial models.")
@@ -573,7 +659,11 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         status = "insufficient_signal"
     else:
         status = "data_limited" if data_limited else "sufficient_signal"
-        if cls_metric is None or reg_metric is None:
+        if use_classification and cls_metric is None:
+            status = "insufficient_signal"
+        if use_regression and reg_metric is None:
+            status = "insufficient_signal"
+        if use_ranking and rank_metric is None:
             status = "insufficient_signal"
     threshold = int(state.get("data_adequacy_threshold", 3) or 3)
     consecutive = int(state.get("data_adequacy_consecutive", 0) or 0)
@@ -594,7 +684,6 @@ def write_data_adequacy_report(state: Dict[str, Any], path: str = "data/data_ade
     os.makedirs(os.path.dirname(path), exist_ok=True)
     report = build_data_adequacy_report(state)
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+        dump_json(path, report)
     except Exception:
         pass

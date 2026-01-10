@@ -92,38 +92,90 @@ def data_engineer_preflight(code: str) -> List[str]:
     except Exception:
         pass
 
-    # Guard against dict usage before init inside loops (stats[col]["x"] before stats[col] = {}).
+    # Guard against nested dict assignment without initialization.
+    try:
+        base_dict_like: set[str] = set()
+        base_defaultdicts: set[str] = set()
+        base_inited: dict[str, set[str]] = {}
+
+        def _norm(expr: str) -> str:
+            return re.sub(r"\s+", "", expr or "")
+
+        for line in code.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = re.search(r"^(\w+)\s*=\s*\{\s*\}\s*$", stripped)
+            if match:
+                base_dict_like.add(match.group(1))
+                continue
+            match = re.search(r"^(\w+)\s*=\s*dict\(\s*\)\s*$", stripped)
+            if match:
+                base_dict_like.add(match.group(1))
+                continue
+            match = re.search(r"^(\w+)\s*=\s*defaultdict\(\s*dict\s*\)", stripped)
+            if match:
+                base = match.group(1)
+                base_dict_like.add(base)
+                base_defaultdicts.add(base)
+                continue
+            match = re.search(r"(\w+)\s*\[\s*([^\]]+)\s*\]\s*=\s*(\{|\bdict\s*\()", stripped)
+            if match:
+                base = match.group(1)
+                key = _norm(match.group(2))
+                base_dict_like.add(base)
+                base_inited.setdefault(base, set()).add(key)
+                continue
+            match = re.search(r"(\w+)\.setdefault\(\s*([^,]+)\s*,", stripped)
+            if match:
+                base = match.group(1)
+                key = _norm(match.group(2))
+                base_dict_like.add(base)
+                base_inited.setdefault(base, set()).add(key)
+                continue
+            match = re.search(r"(\w+)\s*\[\s*([^\]]+)\s*\]\s*\[\s*[^]]+\s*\]\s*=", stripped)
+            if match:
+                base = match.group(1)
+                key = _norm(match.group(2))
+                if base in base_defaultdicts:
+                    continue
+                if base not in base_dict_like:
+                    continue
+                if key in base_inited.get(base, set()):
+                    continue
+                issues.append(
+                    "Initialize per-column dict entries before nested assignments (e.g., stats[col] = {} before stats[col]['x'])."
+                )
+                return issues
+    except Exception:
+        pass
+
+    # Guard against stats shadowing: update inside loop, nested access outside.
     try:
         loop_stack: List[dict] = []
+        stats_update_in_loop = False
         for line in code.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
             indent = len(line) - len(line.lstrip())
             while loop_stack and indent <= loop_stack[-1]["indent"]:
-                loop_stack.pop()
-            loop_match = re.match(r"^\s*for\s+(\w+)\s+in\b", line)
+                ended = loop_stack.pop()
+                if ended.get("stats_update"):
+                    stats_update_in_loop = True
+            loop_match = re.match(r"^\s*for\s+\w+\s+in\b", line)
             if loop_match:
-                loop_stack.append({"indent": indent, "var": loop_match.group(1), "inited": set()})
+                loop_stack.append({"indent": indent, "stats_update": False})
                 continue
-            if not loop_stack:
+            if loop_stack:
+                if "stats.update(" in stripped:
+                    loop_stack[-1]["stats_update"] = True
                 continue
-            for loop in loop_stack:
-                if indent <= loop["indent"]:
-                    continue
-                var = loop["var"]
-                init_match = re.search(rf"(\w+)\s*\[\s*{var}\s*\]\s*=", line)
-                if init_match:
-                    loop["inited"].add(init_match.group(1))
-                setdefault_match = re.search(rf"(\w+)\.setdefault\(\s*{var}\s*,", line)
-                if setdefault_match:
-                    loop["inited"].add(setdefault_match.group(1))
-                use_match = re.search(rf"(\w+)\s*\[\s*{var}\s*\]\s*\[", line)
-                if use_match and use_match.group(1) not in loop["inited"]:
-                    issues.append(
-                        "Initialize per-column dict entries before nested assignments (e.g., stats[col] = {} before stats[col]['x'])."
-                    )
-                    return issues
+            if stats_update_in_loop and re.search(r"\bstats\s*\[.*\]\s*\[", stripped):
+                issues.append(
+                    "Avoid reusing stats after stats.update() inside a loop; initialize a per-column dict instead."
+                )
+                return issues
     except Exception:
         pass
     return issues

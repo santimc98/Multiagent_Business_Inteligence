@@ -668,8 +668,10 @@ class MLEngineerAgent:
 
         ALIGNMENT CHECK (contract-driven)
         - Write data/alignment_check.json with:
-        status (PASS|WARN|FAIL), failure_mode (data_limited|method_choice|unknown), summary,
-        and per-requirement statuses with evidence.
+          status (PASS|WARN|FAIL), failure_mode (data_limited|method_choice|unknown), summary,
+          and per-requirement statuses with evidence.
+        - Include feature_usage in alignment_check.json:
+          {used_features: [...], target_columns: [...], excluded_features: [...], reason_exclusions: {...}}.
         - If there are no alignment requirements provided, write WARN with failure_mode=data_limited and explain.
 
         FINAL SELF-CHECK

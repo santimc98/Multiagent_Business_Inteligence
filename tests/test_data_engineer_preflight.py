@@ -25,13 +25,48 @@ def main():
     assert issues == []
 
 
-def test_data_engineer_preflight_flags_dict_before_init():
+def test_data_engineer_preflight_allows_init_before_nested():
+    code = """
+def main(cols):
+    stats = {}
+    for key in cols:
+        stats[key] = {}
+        stats[key]['x'] = 1
+"""
+    issues = data_engineer_preflight(code)
+    assert issues == []
+
+
+def test_data_engineer_preflight_allows_setdefault_nested():
+    code = """
+def main(cols):
+    stats = {}
+    for key in cols:
+        stats.setdefault(key, {})['x'] = 1
+"""
+    issues = data_engineer_preflight(code)
+    assert issues == []
+
+
+def test_data_engineer_preflight_flags_nested_without_init():
+    code = """
+def main(cols):
+    stats = {}
+    for key in cols:
+        stats[key]['x'] = 1
+"""
+    issues = data_engineer_preflight(code)
+    assert any("Initialize per-column dict entries" in issue for issue in issues)
+
+
+def test_data_engineer_preflight_flags_stats_shadowing():
     code = """
 def main(cols):
     stats = {}
     for col in cols:
-        stats[col]["normalization_mae"] = 0.1
-        stats[col] = {}
+        stats.update({'a': col})
+    stats['RIIM10 Norm'] = {}
+    stats['RIIM10 Norm']['x'] = 1
 """
     issues = data_engineer_preflight(code)
-    assert any("Initialize per-column dict entries" in issue for issue in issues)
+    assert any("stats.update" in issue for issue in issues)

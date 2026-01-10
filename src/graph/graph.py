@@ -96,11 +96,12 @@ from src.utils.dataset_memory import (
 )
 from src.utils.governance import write_governance_report, build_run_summary
 from src.utils.data_adequacy import build_data_adequacy_report, write_data_adequacy_report
-from src.utils.code_extract import is_syntax_valid
+from src.utils.code_extract import extract_code_block, is_syntax_valid
 from src.utils.visuals import generate_fallback_plots
 from src.utils.recommendations_preview import build_recommendations_preview
 from src.utils.label_enrichment import enrich_outputs
 from src.utils.ml_validation import validate_model_metrics_consistency
+from src.utils.json_sanitize import dump_json
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -138,6 +139,44 @@ def _apply_static_autofixes(code: str) -> tuple[str, List[Dict[str, Any]]]:
         return code, []
     fixes: List[Dict[str, Any]] = []
     updated = code
+
+    def _autofix_nested_dict_assignments(text: str) -> tuple[str, int]:
+        bases = ["stats", "cleaning_stats", "manifest_stats", "quality_stats", "validation_stats"]
+        base_pattern = "|".join(re.escape(base) for base in bases)
+        pattern = re.compile(
+            rf"(?P<base>\b(?:{base_pattern})\b)\s*\[\s*(?P<key>'[^']+'|\"[^\"]+\")\s*\]\s*"
+            rf"\[\s*(?P<inner>'[^']+'|\"[^\"]+\")\s*\]\s*="
+        )
+        base_inits = {
+            base
+            for base in bases
+            if re.search(rf"\b{re.escape(base)}\s*=\s*(\{{\s*\}}|dict\(\)|defaultdict\(\s*dict\s*\))", text)
+        }
+        lines = text.splitlines()
+        changed = False
+        count = 0
+        for idx, line in enumerate(lines):
+            match = pattern.search(line)
+            if not match:
+                continue
+            base = match.group("base")
+            if base not in base_inits:
+                continue
+            key = match.group("key")
+            if "setdefault" in line:
+                continue
+            if re.search(rf"{base}\.setdefault\(\s*{re.escape(key)}\s*,", text):
+                continue
+            if re.search(rf"{base}\s*\[\s*{re.escape(key)}\s*\]\s*=", text):
+                continue
+            replacement = f"{base}.setdefault({key}, {{}})[{match.group('inner')}] ="
+            lines[idx] = pattern.sub(replacement, line, count=1)
+            changed = True
+            count += 1
+        if not changed:
+            return text, 0
+        return "\n".join(lines), count
+
     for pattern, replacement, label in [
         (r"\bnp\.bool\b", "np.bool_", "np.bool->np.bool_"),
     ]:
@@ -150,8 +189,19 @@ def _apply_static_autofixes(code: str) -> tuple[str, List[Dict[str, Any]]]:
                     "count": int(count),
                     "before_hash": before_hash,
                     "after_hash": _hash_text(updated),
-                }
-            )
+                  }
+              )
+    before_hash = _hash_text(updated)
+    updated, nested_count = _autofix_nested_dict_assignments(updated)
+    if nested_count:
+        fixes.append(
+            {
+                "rule": "nested_dict_setdefault",
+                "count": int(nested_count),
+                "before_hash": before_hash,
+                "after_hash": _hash_text(updated),
+            }
+        )
     return updated, fixes
 
 
@@ -191,8 +241,7 @@ def _persist_output_contract_report(
         report["reason"] = reason
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+        dump_json(path, report)
     except Exception:
         pass
     return report
@@ -918,6 +967,19 @@ def _filter_contract_for_data_engineer(contract: Dict[str, Any]) -> Dict[str, An
         new_contract["data_requirements"] = filtered
         
     return new_contract
+
+
+def build_de_objective(contract: Dict[str, Any]) -> str:
+    objective = (
+        "Clean dataset to satisfy contract canonical_columns; ensure numeric/date parsing; "
+        "produce cleaned_data + manifest."
+    )
+    if not isinstance(contract, dict):
+        return objective
+    canonical = get_canonical_columns(contract) or []
+    if canonical:
+        return f"{objective} Canonical columns count: {len(canonical)}."
+    return objective
 
 
 
@@ -1711,9 +1773,26 @@ def _case_alignment_skip_reason(
     if isinstance(evaluation_spec, dict):
         case_key = case_key or evaluation_spec.get("case_key")
         case_columns = case_columns or evaluation_spec.get("case_columns")
+
+    def _scored_rows_has_group_signals(scored_path: str = "data/scored_rows.csv") -> bool:
+        if not os.path.exists(scored_path):
+            return False
+        dialect = _load_output_dialect_local()
+        header = _read_csv_header(scored_path, dialect.get("encoding", "utf-8"), dialect.get("sep", ","))
+        if not header:
+            return False
+        normed = [_norm_name(col) for col in header]
+        has_group = any(any(tok in name for tok in ["case", "group", "segment", "bucket", "cluster"]) for name in normed)
+        has_score = any(any(tok in name for tok in ["score", "pred", "prob", "rank"]) for name in normed)
+        return bool(has_group and has_score)
+
     if not case_taxonomy:
+        if _scored_rows_has_group_signals():
+            return ""
         return "case_taxonomy missing or empty"
     if not case_key and not case_columns:
+        if _scored_rows_has_group_signals():
+            return ""
         return "case_key/case_columns missing"
     return ""
 
@@ -3492,16 +3571,14 @@ def _promote_best_attempt(state: Dict[str, Any]) -> Dict[str, Any]:
                 updated["produced_artifact_index"] = meta.get("artifact_index")
                 try:
                     os.makedirs("data", exist_ok=True)
-                    with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
-                        json.dump(meta.get("artifact_index"), f_idx, indent=2, ensure_ascii=False)
+                    dump_json("data/produced_artifact_index.json", meta.get("artifact_index"))
                 except Exception:
                     pass
             if meta.get("output_contract_report") is not None:
                 updated["output_contract_report"] = meta.get("output_contract_report")
                 try:
                     os.makedirs("data", exist_ok=True)
-                    with open("data/output_contract_report.json", "w", encoding="utf-8") as f_oc:
-                        json.dump(meta.get("output_contract_report"), f_oc, indent=2, ensure_ascii=False)
+                    dump_json("data/output_contract_report.json", meta.get("output_contract_report"))
                 except Exception:
                     pass
             if meta.get("execution_output"):
@@ -3682,6 +3759,122 @@ def _normalize_alignment_check(
         issue_text = ", ".join(sorted(set(issues)))
         normalized["summary"] = f"{summary} Alignment issues: {issue_text}".strip()
     return normalized, issues
+
+
+def _resolve_forbidden_features(
+    contract: Dict[str, Any] | None,
+    contract_min: Dict[str, Any] | None,
+) -> List[str]:
+    forbidden: set[str] = set()
+
+    def _coerce_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value if item]
+        if isinstance(value, str):
+            return [value]
+        return []
+
+    for source in (contract_min, contract):
+        if not isinstance(source, dict):
+            continue
+        allowed = source.get("allowed_feature_sets") or {}
+        if isinstance(allowed, dict):
+            forbidden |= set(_coerce_list(allowed.get("forbidden_features")))
+            forbidden |= set(_coerce_list(allowed.get("forbidden_for_modeling")))
+            forbidden |= set(_coerce_list(allowed.get("audit_only_features")))
+        if forbidden:
+            break
+
+    if not forbidden:
+        roles = get_column_roles(contract_min or contract or {})
+        if isinstance(roles, dict):
+            forbidden |= set(_coerce_list(roles.get("outcome")))
+            forbidden |= set(_coerce_list(roles.get("post_decision_audit_only")))
+
+    return sorted({item for item in forbidden if item})
+
+
+def _ensure_feature_usage(
+    alignment_check: Dict[str, Any],
+    code: str,
+    contract: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    alignment_check = dict(alignment_check or {})
+    feature_usage = alignment_check.get("feature_usage")
+    if not isinstance(feature_usage, dict):
+        feature_usage = {}
+    used_features = feature_usage.get("used_features")
+    if not isinstance(used_features, list) or not used_features:
+        model_features = _extract_named_string_list(code or "", ["MODEL_FEATURES", "model_features"])
+        segment_features = _extract_named_string_list(code or "", ["SEGMENT_FEATURES", "segment_features"])
+        used_features = list(dict.fromkeys((model_features or []) + (segment_features or [])))
+    def _coerce_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value if item]
+        if isinstance(value, str):
+            return [value]
+        return []
+
+    target_columns: List[str] = []
+    if isinstance(contract, dict):
+        target_columns.extend(_coerce_list(contract.get("outcome_columns") or []))
+        target_columns.extend(_coerce_list(contract.get("decision_columns") or []))
+    feature_usage.setdefault("excluded_features", [])
+    feature_usage.setdefault("reason_exclusions", {})
+    feature_usage["used_features"] = used_features or []
+    feature_usage["target_columns"] = [col for col in target_columns if col]
+    alignment_check["feature_usage"] = feature_usage
+    return alignment_check
+
+
+def _apply_forbidden_feature_gate(
+    alignment_check: Dict[str, Any],
+    contract: Dict[str, Any] | None,
+    contract_min: Dict[str, Any] | None,
+    code: str,
+) -> tuple[Dict[str, Any], List[str]]:
+    alignment_check = _ensure_feature_usage(alignment_check, code, contract)
+    forbidden = _resolve_forbidden_features(contract, contract_min)
+    usage = alignment_check.get("feature_usage") if isinstance(alignment_check.get("feature_usage"), dict) else {}
+    used_features = usage.get("used_features") if isinstance(usage, dict) else []
+    used_set = {str(item) for item in used_features if item}
+    violations = sorted({item for item in forbidden if item in used_set})
+    requirements = alignment_check.get("requirements")
+    if not isinstance(requirements, list):
+        requirements = []
+    if violations:
+        alignment_check["status"] = "FAIL"
+        alignment_check["failure_mode"] = alignment_check.get("failure_mode") or "leakage"
+        alignment_check["summary"] = (
+            alignment_check.get("summary")
+            or "Forbidden features detected in model usage."
+        )
+        alignment_check["forbidden_features_used"] = violations
+        requirements.append(
+            {
+                "id": "forbidden_features",
+                "status": "FAIL",
+                "evidence": [f"forbidden_used={violations}"],
+            }
+        )
+    elif used_set:
+        requirements.append(
+            {
+                "id": "forbidden_features",
+                "status": "PASS",
+                "evidence": ["no_forbidden_features_used"],
+            }
+        )
+    else:
+        requirements.append(
+            {
+                "id": "feature_usage",
+                "status": "WARN",
+                "evidence": ["feature_usage_missing_or_empty"],
+            }
+        )
+    alignment_check["requirements"] = requirements
+    return alignment_check, violations
 
 def _coerce_alignment_requirements(reqs: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -4089,13 +4282,19 @@ def _compute_metrics_from_scored_rows(
         )
     except Exception:
         return {}
-    score_candidates = ["Score_nuevo", "ScoreNuevo", "score_nuevo", "Score_Nuevo"]
-    ref_candidates = ["RefScore", "refscore", "Ref_Score"]
-    case_candidates = ["Case_ID", "Case", "case_id", "caso", "caso_id"]
+    def _pick_column(cols: List[str], tokens: List[str], exclude: List[str] | None = None) -> str | None:
+        for col in cols:
+            norm = _norm_name(col)
+            if exclude and any(tok in norm for tok in exclude):
+                continue
+            if any(tok in norm for tok in tokens):
+                return col
+        return None
 
-    score_col = next((c for c in score_candidates if c in df.columns), None)
-    ref_col = next((c for c in ref_candidates if c in df.columns), None)
-    case_col = next((c for c in case_candidates if c in df.columns), None)
+    cols = list(df.columns)
+    score_col = _pick_column(cols, ["score", "pred", "prediction", "prob", "probability", "rank"], ["ref", "target"])
+    ref_col = _pick_column(cols, ["ref", "reference", "target", "label", "actual", "rank"], [])
+    case_col = _pick_column(cols, ["case", "group", "segment", "bucket", "cluster"], [])
     if not score_col or not ref_col:
         return {}
 
@@ -4953,7 +5152,7 @@ def run_domain_expert(state: AgentState) -> AgentState:
     
     strategies_wrapper = state.get('strategies', {})
     strategies_list = strategies_wrapper.get('strategies', [])
-    business_objective = state.get('business_objective', '')
+    business_objective = state.get("business_objective", "")
     data_summary = state.get('data_summary', '')
     
     # Deliberation Step
@@ -5125,17 +5324,12 @@ def run_execution_planner(state: AgentState) -> AgentState:
         contract_min["reporting_policy"] = reporting_policy
     try:
         os.makedirs("data", exist_ok=True)
-        with open("data/execution_contract.json", "w", encoding="utf-8") as f:
-            import json
-            json.dump(contract, f, indent=2)
-        with open("data/plan.json", "w", encoding="utf-8") as f_plan:
-            json.dump(execution_plan, f_plan, indent=2)
+        dump_json("data/execution_contract.json", contract)
+        dump_json("data/plan.json", execution_plan)
         if evaluation_spec:
-            with open("data/evaluation_spec.json", "w", encoding="utf-8") as f_spec:
-                json.dump(evaluation_spec, f_spec, indent=2, ensure_ascii=False)
+            dump_json("data/evaluation_spec.json", evaluation_spec)
         if contract_min:
-            with open("data/contract_min.json", "w", encoding="utf-8") as f_min:
-                json.dump(contract_min, f_min, indent=2, ensure_ascii=False)
+            dump_json("data/contract_min.json", contract_min)
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
     if run_id:
@@ -5268,6 +5462,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         
     state["data_engineer_audit_override"] = data_engineer_audit_override
     de_contract = _filter_contract_for_data_engineer(state.get("execution_contract", {}))
+    de_objective = build_de_objective(de_contract or state.get("execution_contract", {}))
     try:
         os.makedirs("artifacts", exist_ok=True)
         context_payload = {
@@ -5292,7 +5487,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         data_engineer_audit_override,
         selected,
         input_path="data/raw.csv", # Remote Sandbox Path
-        business_objective=business_objective,
+        business_objective=de_objective,
         csv_encoding=csv_encoding,
         csv_sep=csv_sep,
         csv_decimal=csv_decimal,
@@ -5327,7 +5522,13 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 log_run_event(run_id, "data_engineer_code_fence_retry", {"attempt": attempt_id})
             print("Code fence guard: retrying Data Engineer with no-fence instruction.")
             return run_data_engineer(new_state)
-        print("Warning: code fences detected after retry; proceeding with cleaned code.")
+        if run_id:
+            log_run_event(run_id, "data_engineer_code_fence_strip", {"attempt": attempt_id})
+        stripped = extract_code_block(raw_response)
+        if stripped and stripped in code:
+            prefix = code.split(stripped, 1)[0]
+            code = prefix + stripped
+        print("Warning: code fences detected after retry; stripped fences and continuing.")
 
     plan_payload = None
     is_plan = False
@@ -6712,14 +6913,13 @@ def run_engineer(state: AgentState) -> AgentState:
     if isinstance(execution_contract, dict) and evaluation_spec and not execution_contract.get("evaluation_spec"):
         execution_contract["evaluation_spec"] = evaluation_spec
     contract_min = _load_json_safe("data/contract_min.json")
-    if not isinstance(contract_min, dict) or not contract_min:
-        contract_min = _build_contract_min(execution_contract, evaluation_spec)
-        try:
-            os.makedirs("data", exist_ok=True)
-            with open("data/contract_min.json", "w", encoding="utf-8") as f_min:
-                json.dump(contract_min, f_min, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+        if not isinstance(contract_min, dict) or not contract_min:
+            contract_min = _build_contract_min(execution_contract, evaluation_spec)
+            try:
+                os.makedirs("data", exist_ok=True)
+                dump_json("data/contract_min.json", contract_min)
+            except Exception:
+                pass
     if not execution_contract:
         data_audit_context = _merge_de_audit_override(
             data_audit_context,
@@ -8082,8 +8282,7 @@ def execute_code(state: AgentState) -> AgentState:
     oc_report = check_required_outputs(output_contract)
     try:
         os.makedirs("data", exist_ok=True)
-        with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
-            json.dump(oc_report, f, indent=2)
+        dump_json("data/output_contract_report.json", oc_report)
     except Exception as oc_err:
         print(f"Warning: failed to persist output_contract_report.json: {oc_err}")
 
@@ -8117,8 +8316,7 @@ def execute_code(state: AgentState) -> AgentState:
     artifact_index = _build_artifact_index(artifact_paths, deliverables if isinstance(deliverables, list) else None)
     try:
         os.makedirs("data", exist_ok=True)
-        with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
-            json.dump(artifact_index, f_idx, indent=2)
+          dump_json("data/produced_artifact_index.json", artifact_index)
     except Exception as idx_err:
         print(f"Warning: failed to persist produced_artifact_index.json: {idx_err}")
 
@@ -8273,11 +8471,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             data_paths.append("data/cleaned_full.csv")
         if os.path.exists("data/cleaned_data.csv"):
             data_paths.append("data/cleaned_data.csv")
+        if os.path.exists("data/scored_rows.csv"):
+            data_paths.append("data/scored_rows.csv")
         case_report = build_case_alignment_report(
             contract=contract,
             case_summary_path="data/case_summary.csv",
             weights_path="data/weights.json",
             data_paths=data_paths,
+            scored_rows_path="data/scored_rows.csv",
         )
         try:
             metrics = case_report.get("metrics", {}) if isinstance(case_report, dict) else {}
@@ -8286,12 +8487,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 case_history.append(float(violations))
         except Exception:
             pass
-    try:
-        os.makedirs("data", exist_ok=True)
-        with open("data/case_alignment_report.json", "w", encoding="utf-8") as f:
-            json.dump(case_report, f, indent=2)
-    except Exception as err:
-        print(f"Warning: failed to persist case_alignment_report.json: {err}")
+      try:
+          os.makedirs("data", exist_ok=True)
+          dump_json("data/case_alignment_report.json", case_report)
+      except Exception as err:
+          print(f"Warning: failed to persist case_alignment_report.json: {err}")
 
     # Detect stale metrics file across iterations (diagnostic for ML)
     metrics_report = _load_json_safe("data/metrics.json")
@@ -8330,12 +8530,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             new_history.append(
                 "METRICS_FALLBACK: metrics synthesized from weights/scored_rows due to missing or stale metrics.json."
             )
-            try:
-                os.makedirs("data", exist_ok=True)
-                with open("data/metrics.json", "w", encoding="utf-8") as f_metrics:
-                    json.dump(metrics_report, f_metrics, indent=2)
-            except Exception as metrics_err:
-                print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
+              try:
+                  os.makedirs("data", exist_ok=True)
+                  dump_json("data/metrics.json", metrics_report)
+              except Exception as metrics_err:
+                  print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
 
     # 5.6) Model Metrics Consistency Validation (Informative helper)
     if metrics_report:
@@ -8366,8 +8565,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     oc_report = check_required_outputs(output_contract)
     try:
         os.makedirs("data", exist_ok=True)
-        with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
-            json.dump(oc_report, f, indent=2)
+        dump_json("data/output_contract_report.json", oc_report)
     except Exception as oc_err:
         print(f"Warning: failed to persist output_contract_report.json: {oc_err}")
     if oc_report.get("missing"):
@@ -8396,26 +8594,43 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             normalized_alignment, alignment_issues = _normalize_alignment_check(
                 alignment_check, alignment_requirements
             )
-            if normalized_alignment != alignment_check:
-                alignment_check = normalized_alignment
-                try:
-                    with open("data/alignment_check.json", "w", encoding="utf-8") as f_align:
-                        json.dump(alignment_check, f_align, indent=2, ensure_ascii=False)
-                except Exception:
-                    pass
+                if normalized_alignment != alignment_check:
+                    alignment_check = normalized_alignment
+                    try:
+                        dump_json("data/alignment_check.json", alignment_check)
+                    except Exception:
+                        pass
             raw_status = str(alignment_check.get("status", "")).upper()
             failure_mode = str(alignment_check.get("failure_mode", "")).lower()
             summary = alignment_check.get("summary") or alignment_check.get("notes") or ""
-            if alignment_issues and raw_status == "PASS":
-                raw_status = "WARN"
-                summary = f"{summary} Alignment evidence missing." if summary else "Alignment evidence missing."
-                failure_mode = failure_mode or "format"
-                alignment_check["status"] = raw_status
-                alignment_check["summary"] = summary
-                alignment_check["failure_mode"] = failure_mode
-            data_modes = {"data_limited", "data", "insufficient_data", "data_limitations"}
-            method_modes = {"method_choice", "method", "strategy", "approach"}
-            msg = f"ALIGNMENT_CHECK_{raw_status}: failure_mode={failure_mode}; summary={summary}"
+              if alignment_issues and raw_status == "PASS":
+                  raw_status = "WARN"
+                  summary = f"{summary} Alignment evidence missing." if summary else "Alignment evidence missing."
+                  failure_mode = failure_mode or "format"
+                  alignment_check["status"] = raw_status
+                  alignment_check["summary"] = summary
+                  alignment_check["failure_mode"] = failure_mode
+              contract_min = _load_json_safe("data/contract_min.json")
+              alignment_check, forbidden_violations = _apply_forbidden_feature_gate(
+                  alignment_check,
+                  contract,
+                  contract_min,
+                  state.get("generated_code") or state.get("last_generated_code") or "",
+              )
+              if forbidden_violations:
+                  alignment_failed_gates.append("forbidden_features_used")
+                  msg = f"FORBIDDEN_FEATURES_USED: {forbidden_violations}"
+                  if status != "NEEDS_IMPROVEMENT":
+                      status = "NEEDS_IMPROVEMENT"
+                  new_history.append(msg)
+                  feedback = f"{feedback}\n{msg}" if feedback else msg
+                  try:
+                      dump_json("data/alignment_check.json", alignment_check)
+                  except Exception:
+                      pass
+              data_modes = {"data_limited", "data", "insufficient_data", "data_limitations"}
+              method_modes = {"method_choice", "method", "strategy", "approach"}
+              msg = f"ALIGNMENT_CHECK_{raw_status}: failure_mode={failure_mode}; summary={summary}"
             if raw_status in {"WARN", "FAIL"}:
                 if failure_mode in data_modes:
                     if status != "NEEDS_IMPROVEMENT":
@@ -8450,14 +8665,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         else:
             adequacy_consecutive = 0
         data_adequacy_report["consecutive_data_limited"] = adequacy_consecutive
-        data_adequacy_report["data_limited_threshold"] = adequacy_threshold
-        data_adequacy_report["threshold_reached"] = adequacy_consecutive >= adequacy_threshold
-        try:
-            os.makedirs("data", exist_ok=True)
-            with open("data/data_adequacy_report.json", "w", encoding="utf-8") as f_adequacy:
-                json.dump(data_adequacy_report, f_adequacy, indent=2, ensure_ascii=False)
-        except Exception as adequacy_err:
-            print(f"Warning: failed to persist data_adequacy_report.json: {adequacy_err}")
+            data_adequacy_report["data_limited_threshold"] = adequacy_threshold
+            data_adequacy_report["threshold_reached"] = adequacy_consecutive >= adequacy_threshold
+            try:
+                os.makedirs("data", exist_ok=True)
+                dump_json("data/data_adequacy_report.json", data_adequacy_report)
+            except Exception as adequacy_err:
+                print(f"Warning: failed to persist data_adequacy_report.json: {adequacy_err}")
     except Exception as adequacy_err:
         print(f"Warning: data adequacy evaluation failed: {adequacy_err}")
 
@@ -8693,20 +8907,18 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     response=getattr(results_advisor, "last_response", None) or insights,
                     context=insights_context,
                 )
-            try:
-                os.makedirs("data", exist_ok=True)
-                with open("data/insights.json", "w", encoding="utf-8") as f_insights:
-                    json.dump(insights, f_insights, indent=2, ensure_ascii=False)
-                existing_index = _load_json_any("data/produced_artifact_index.json")
-                normalized_existing = existing_index if isinstance(existing_index, list) else []
-                additions = _build_artifact_index(["data/insights.json"], None)
-                merged_index = _merge_artifact_index_entries(normalized_existing, additions)
-                with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
-                    json.dump(merged_index, f_idx, indent=2)
-                result_state["artifact_index"] = merged_index
-                result_state["produced_artifact_index"] = merged_index
-            except Exception as ins_err:
-                print(f"Warning: failed to persist insights.json: {ins_err}")
+              try:
+                  os.makedirs("data", exist_ok=True)
+                  dump_json("data/insights.json", insights)
+                  existing_index = _load_json_any("data/produced_artifact_index.json")
+                  normalized_existing = existing_index if isinstance(existing_index, list) else []
+                  additions = _build_artifact_index(["data/insights.json"], None)
+                  merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+                  dump_json("data/produced_artifact_index.json", merged_index)
+                  result_state["artifact_index"] = merged_index
+                  result_state["produced_artifact_index"] = merged_index
+              except Exception as ins_err:
+                  print(f"Warning: failed to persist insights.json: {ins_err}")
     except Exception as ins_err:
         print(f"Warning: results advisor insights failed: {ins_err}")
 
@@ -9012,8 +9224,7 @@ def run_translator(state: AgentState) -> AgentState:
             _persist_output_contract_report(state, reason=reason)
         summary = build_run_summary(state)
         os.makedirs("data", exist_ok=True)
-        with open("data/run_summary.json", "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
+        dump_json("data/run_summary.json", summary)
     except Exception:
         summary = None
     report_error = error_msg
@@ -9109,8 +9320,7 @@ def run_translator(state: AgentState) -> AgentState:
             normalized_existing = existing_index if isinstance(existing_index, list) else []
             additions = _build_artifact_index(["reports/recommendations_preview.json"], deliverables)
             merged_index = _merge_artifact_index_entries(normalized_existing, additions)
-            with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
-                json.dump(merged_index, f_idx, indent=2)
+            dump_json("data/produced_artifact_index.json", merged_index)
             report_state["artifact_index"] = merged_index
             report_state["produced_artifact_index"] = merged_index
         except Exception as prev_err:
@@ -9202,8 +9412,7 @@ def run_translator(state: AgentState) -> AgentState:
         normalized_existing = existing_index if isinstance(existing_index, list) else []
         additions = _build_artifact_index(["data/executive_summary.md"], None)
         merged_index = _merge_artifact_index_entries(normalized_existing, additions)
-        with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
-            json.dump(merged_index, f_idx, indent=2)
+        dump_json("data/produced_artifact_index.json", merged_index)
         report_state["artifact_index"] = merged_index
         report_state["produced_artifact_index"] = merged_index
     except Exception as exec_err:
@@ -9223,8 +9432,7 @@ def run_translator(state: AgentState) -> AgentState:
         summary = summary or build_run_summary(state)
         try:
             os.makedirs("data", exist_ok=True)
-            with open("data/run_summary.json", "w", encoding="utf-8") as f:
-                json.dump(summary, f, indent=2)
+            dump_json("data/run_summary.json", summary)
         except Exception:
             pass
         fingerprint = state.get("dataset_fingerprint")

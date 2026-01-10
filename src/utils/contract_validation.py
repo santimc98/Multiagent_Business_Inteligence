@@ -94,6 +94,7 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "If contract includes missing_sentinels, treat sentinel values as missing during modeling and consider adding an observed-flag feature.",
         "If contract includes alignment_requirements, write data/alignment_check.json with PASS/WARN/FAIL and failure_mode.",
         "Include per-requirement evidence in alignment_check.json (metrics, artifacts, or log excerpts).",
+        "Include feature_usage in alignment_check.json (used_features, target_columns, excluded_features, reason_exclusions).",
     ],
     "must_not": [
         "Do not import sys.",
