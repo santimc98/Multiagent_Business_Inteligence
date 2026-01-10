@@ -6913,13 +6913,13 @@ def run_engineer(state: AgentState) -> AgentState:
     if isinstance(execution_contract, dict) and evaluation_spec and not execution_contract.get("evaluation_spec"):
         execution_contract["evaluation_spec"] = evaluation_spec
     contract_min = _load_json_safe("data/contract_min.json")
-        if not isinstance(contract_min, dict) or not contract_min:
-            contract_min = _build_contract_min(execution_contract, evaluation_spec)
-            try:
-                os.makedirs("data", exist_ok=True)
-                dump_json("data/contract_min.json", contract_min)
-            except Exception:
-                pass
+    if not isinstance(contract_min, dict) or not contract_min:
+        contract_min = _build_contract_min(execution_contract, evaluation_spec)
+        try:
+            os.makedirs("data", exist_ok=True)
+            dump_json("data/contract_min.json", contract_min)
+        except Exception:
+            pass
     if not execution_contract:
         data_audit_context = _merge_de_audit_override(
             data_audit_context,
@@ -8316,7 +8316,7 @@ def execute_code(state: AgentState) -> AgentState:
     artifact_index = _build_artifact_index(artifact_paths, deliverables if isinstance(deliverables, list) else None)
     try:
         os.makedirs("data", exist_ok=True)
-          dump_json("data/produced_artifact_index.json", artifact_index)
+        dump_json("data/produced_artifact_index.json", artifact_index)
     except Exception as idx_err:
         print(f"Warning: failed to persist produced_artifact_index.json: {idx_err}")
 
@@ -8487,11 +8487,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 case_history.append(float(violations))
         except Exception:
             pass
-      try:
-          os.makedirs("data", exist_ok=True)
-          dump_json("data/case_alignment_report.json", case_report)
-      except Exception as err:
-          print(f"Warning: failed to persist case_alignment_report.json: {err}")
+        try:
+            os.makedirs("data", exist_ok=True)
+            dump_json("data/case_alignment_report.json", case_report)
+        except Exception as err:
+            print(f"Warning: failed to persist case_alignment_report.json: {err}")
 
     # Detect stale metrics file across iterations (diagnostic for ML)
     metrics_report = _load_json_safe("data/metrics.json")
@@ -8530,11 +8530,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             new_history.append(
                 "METRICS_FALLBACK: metrics synthesized from weights/scored_rows due to missing or stale metrics.json."
             )
-              try:
-                  os.makedirs("data", exist_ok=True)
-                  dump_json("data/metrics.json", metrics_report)
-              except Exception as metrics_err:
-                  print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
+            try:
+                os.makedirs("data", exist_ok=True)
+                dump_json("data/metrics.json", metrics_report)
+            except Exception as metrics_err:
+                print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
 
     # 5.6) Model Metrics Consistency Validation (Informative helper)
     if metrics_report:
@@ -8594,43 +8594,43 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             normalized_alignment, alignment_issues = _normalize_alignment_check(
                 alignment_check, alignment_requirements
             )
-                if normalized_alignment != alignment_check:
-                    alignment_check = normalized_alignment
-                    try:
-                        dump_json("data/alignment_check.json", alignment_check)
-                    except Exception:
-                        pass
+            if normalized_alignment != alignment_check:
+                alignment_check = normalized_alignment
+                try:
+                    dump_json("data/alignment_check.json", alignment_check)
+                except Exception:
+                    pass
             raw_status = str(alignment_check.get("status", "")).upper()
             failure_mode = str(alignment_check.get("failure_mode", "")).lower()
             summary = alignment_check.get("summary") or alignment_check.get("notes") or ""
-              if alignment_issues and raw_status == "PASS":
-                  raw_status = "WARN"
-                  summary = f"{summary} Alignment evidence missing." if summary else "Alignment evidence missing."
-                  failure_mode = failure_mode or "format"
-                  alignment_check["status"] = raw_status
-                  alignment_check["summary"] = summary
-                  alignment_check["failure_mode"] = failure_mode
-              contract_min = _load_json_safe("data/contract_min.json")
-              alignment_check, forbidden_violations = _apply_forbidden_feature_gate(
-                  alignment_check,
-                  contract,
-                  contract_min,
-                  state.get("generated_code") or state.get("last_generated_code") or "",
-              )
-              if forbidden_violations:
-                  alignment_failed_gates.append("forbidden_features_used")
-                  msg = f"FORBIDDEN_FEATURES_USED: {forbidden_violations}"
-                  if status != "NEEDS_IMPROVEMENT":
-                      status = "NEEDS_IMPROVEMENT"
-                  new_history.append(msg)
-                  feedback = f"{feedback}\n{msg}" if feedback else msg
-                  try:
-                      dump_json("data/alignment_check.json", alignment_check)
-                  except Exception:
-                      pass
-              data_modes = {"data_limited", "data", "insufficient_data", "data_limitations"}
-              method_modes = {"method_choice", "method", "strategy", "approach"}
-              msg = f"ALIGNMENT_CHECK_{raw_status}: failure_mode={failure_mode}; summary={summary}"
+            if alignment_issues and raw_status == "PASS":
+                raw_status = "WARN"
+                summary = f"{summary} Alignment evidence missing." if summary else "Alignment evidence missing."
+                failure_mode = failure_mode or "format"
+                alignment_check["status"] = raw_status
+                alignment_check["summary"] = summary
+                alignment_check["failure_mode"] = failure_mode
+            contract_min = _load_json_safe("data/contract_min.json")
+            alignment_check, forbidden_violations = _apply_forbidden_feature_gate(
+                alignment_check,
+                contract,
+                contract_min,
+                state.get("generated_code") or state.get("last_generated_code") or "",
+            )
+            if forbidden_violations:
+                alignment_failed_gates.append("forbidden_features_used")
+                msg = f"FORBIDDEN_FEATURES_USED: {forbidden_violations}"
+                if status != "NEEDS_IMPROVEMENT":
+                    status = "NEEDS_IMPROVEMENT"
+                new_history.append(msg)
+                feedback = f"{feedback}\n{msg}" if feedback else msg
+                try:
+                    dump_json("data/alignment_check.json", alignment_check)
+                except Exception:
+                    pass
+            data_modes = {"data_limited", "data", "insufficient_data", "data_limitations"}
+            method_modes = {"method_choice", "method", "strategy", "approach"}
+            msg = f"ALIGNMENT_CHECK_{raw_status}: failure_mode={failure_mode}; summary={summary}"
             if raw_status in {"WARN", "FAIL"}:
                 if failure_mode in data_modes:
                     if status != "NEEDS_IMPROVEMENT":
@@ -8665,13 +8665,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         else:
             adequacy_consecutive = 0
         data_adequacy_report["consecutive_data_limited"] = adequacy_consecutive
-            data_adequacy_report["data_limited_threshold"] = adequacy_threshold
-            data_adequacy_report["threshold_reached"] = adequacy_consecutive >= adequacy_threshold
-            try:
-                os.makedirs("data", exist_ok=True)
-                dump_json("data/data_adequacy_report.json", data_adequacy_report)
-            except Exception as adequacy_err:
-                print(f"Warning: failed to persist data_adequacy_report.json: {adequacy_err}")
+        data_adequacy_report["data_limited_threshold"] = adequacy_threshold
+        data_adequacy_report["threshold_reached"] = adequacy_consecutive >= adequacy_threshold
+        try:
+            os.makedirs("data", exist_ok=True)
+            dump_json("data/data_adequacy_report.json", data_adequacy_report)
+        except Exception as adequacy_err:
+            print(f"Warning: failed to persist data_adequacy_report.json: {adequacy_err}")
     except Exception as adequacy_err:
         print(f"Warning: data adequacy evaluation failed: {adequacy_err}")
 
@@ -8907,18 +8907,18 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     response=getattr(results_advisor, "last_response", None) or insights,
                     context=insights_context,
                 )
-              try:
-                  os.makedirs("data", exist_ok=True)
-                  dump_json("data/insights.json", insights)
-                  existing_index = _load_json_any("data/produced_artifact_index.json")
-                  normalized_existing = existing_index if isinstance(existing_index, list) else []
-                  additions = _build_artifact_index(["data/insights.json"], None)
-                  merged_index = _merge_artifact_index_entries(normalized_existing, additions)
-                  dump_json("data/produced_artifact_index.json", merged_index)
-                  result_state["artifact_index"] = merged_index
-                  result_state["produced_artifact_index"] = merged_index
-              except Exception as ins_err:
-                  print(f"Warning: failed to persist insights.json: {ins_err}")
+            try:
+                os.makedirs("data", exist_ok=True)
+                dump_json("data/insights.json", insights)
+                existing_index = _load_json_any("data/produced_artifact_index.json")
+                normalized_existing = existing_index if isinstance(existing_index, list) else []
+                additions = _build_artifact_index(["data/insights.json"], None)
+                merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+                dump_json("data/produced_artifact_index.json", merged_index)
+                result_state["artifact_index"] = merged_index
+                result_state["produced_artifact_index"] = merged_index
+            except Exception as ins_err:
+                print(f"Warning: failed to persist insights.json: {ins_err}")
     except Exception as ins_err:
         print(f"Warning: results advisor insights failed: {ins_err}")
 
