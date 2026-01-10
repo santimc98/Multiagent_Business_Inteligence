@@ -697,6 +697,63 @@ def _build_required_sample_context(
     payload = {"sample_rows": int(len(sample_df)), "columns": samples}
     return "RAW_REQUIRED_COLUMN_SAMPLES:\n" + json.dumps(payload, ensure_ascii=True)
 
+
+def _infer_parsing_hints_from_sample_context(sample_context: str) -> str:
+    """
+    Builds compact, universal parsing guidance from RAW_REQUIRED_COLUMN_SAMPLES.
+    This is intentionally generic: it does not hardcode dataset-specific fixes, it derives hints from patterns.
+    """
+    if not sample_context:
+        return ""
+    if "RAW_REQUIRED_COLUMN_SAMPLES:" not in sample_context:
+        return ""
+    try:
+        _, raw_json = sample_context.split("\n", 1)
+    except ValueError:
+        return ""
+    try:
+        payload = json.loads(raw_json.strip())
+    except Exception:
+        return ""
+    columns = payload.get("columns") if isinstance(payload, dict) else None
+    if not isinstance(columns, dict) or not columns:
+        return ""
+
+    hints: List[str] = []
+    saw_symbols = False
+    saw_multi_dot = False
+    saw_multi_comma = False
+    saw_percent = False
+
+    for meta in columns.values():
+        if not isinstance(meta, dict):
+            continue
+        examples = meta.get("examples") or []
+        for ex in examples:
+            s = str(ex)
+            if "%" in s:
+                saw_percent = True
+            if s.count(".") >= 2:
+                saw_multi_dot = True
+            if s.count(",") >= 2:
+                saw_multi_comma = True
+            # Anything other than digits, whitespace, separators, sign, parentheses, and percent.
+            if re.search(r"[^\d\s,.\-+()%]", s):
+                saw_symbols = True
+
+    if saw_symbols:
+        hints.append("Strip currency symbols/letters before numeric conversion (keep digits, sign, separators, parentheses, and %).")
+    if saw_multi_dot:
+        hints.append("Values with multiple '.' are usually thousands separators; remove all '.' (unless you also detect a decimal separator elsewhere).")
+    if saw_multi_comma:
+        hints.append("Values with multiple ',' are usually thousands separators; remove all ',' and infer decimal by the last separator.")
+    if saw_percent:
+        hints.append("For percentages: strip '%' and normalize 1–100 to 0–1.")
+    hints.append("If raw values are mostly non-null but conversion yields mostly NaN, treat it as a parsing failure and switch to a more permissive sanitizer.")
+    hints.append("Add a small parser self-check: parse the provided examples and confirm you do not get all-NaN for required numeric columns.")
+
+    return "DE_PARSING_HINTS:\n- " + "\n- ".join(hints)
+
 def _extract_manifest_row_count(manifest: Dict[str, Any]) -> int | None:
     if not isinstance(manifest, dict):
         return None
@@ -5123,6 +5180,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
         sample_context = _build_required_sample_context(csv_path, input_dialect, required_cols, norm_map)
         if sample_context:
             data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, sample_context)
+            hints = _infer_parsing_hints_from_sample_context(sample_context)
+            if hints:
+                data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, hints)
     # Inject Raw Snippet for Dialect Grounding (DISABLED: Causing GLM-4.7 Empty Response / Safety Trigger)
     # try:
     #     raw_lines = []
@@ -6107,6 +6167,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         )
                         if sample_context:
                             payload = f"{payload}\n\n{sample_context}"
+                            hints = _infer_parsing_hints_from_sample_context(sample_context)
+                            if hints:
+                                payload = f"{payload}\n\n{hints}"
                     except Exception:
                         pass
                     if has_raw_values and not state.get("de_empty_required_retry_done"):

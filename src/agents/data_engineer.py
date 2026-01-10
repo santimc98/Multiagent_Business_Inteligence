@@ -123,6 +123,7 @@ class DataEngineerAgent:
         - NEVER use: df.assign(1stYearAmount=...) - This causes SyntaxError!
         - ALWAYS use: df.assign(**{'1stYearAmount': ...}) or df['1stYearAmount'] = ...
         - For Probability column: if max > 1 and max <= 100, divide by 100 to normalize to 0-1 range.
+        - For numeric parsing: ALWAYS sanitize symbols first (strip currency/letters; keep digits, sign, separators, parentheses, and %) and handle repeated thousands separators like '23.351.746'.
         
         *** INPUT PARAMETERS ***
         - Input: '$input_path'

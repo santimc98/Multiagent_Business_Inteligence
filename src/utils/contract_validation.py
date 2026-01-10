@@ -31,9 +31,12 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Only enforce existence for source='input' columns; source='derived' must be created after mapping.",
         "Ensure _json_default handles numpy scalar types (np.bool_, np.integer, np.floating) before json.dump.",
         "If a derived column has derived_owner='ml_engineer', do not create a placeholder; leave it absent for downstream derivation.",
+        "For numeric parsing, sanitize symbols first: strip currency/letters and keep only digits, sign, separators, parentheses, and % before conversion.",
+        "If a required numeric column becomes mostly NaN after conversion while raw_non_null_frac is high, treat it as a parsing failure and adjust parsing (do not silently proceed).",
     ],
     "must_not": [
         "Do not blindly strip '.'; infer thousands/decimal from patterns.",
+        "Do not assume 'parse_numeric' means 'no currency'—required numeric columns may include currency symbols or text prefixes; sanitize before conversion.",
         "Do not leave numeric columns as object when expected_kind is numeric; fix or abort with clear error.",
         "Do not create downstream ML artifacts (weights/metrics); only cleaned_data.csv + cleaning_manifest.json.",
         "Do not fabricate constant placeholders for derived grouping/segment columns without a formula or depends_on.",
@@ -41,6 +44,7 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
     "safe_idioms": [
         "For ratios of boolean patterns use mask.mean(); avoid sum(mask.sum()) or sum(<scalar>).",
         "Avoid double sum: never call sum(x.sum()) on a scalar; aggregate with .mean() or divide by len(mask).",
+        "Robust number parsing idiom: s=str(x); s=re.sub(r\"[^0-9,\\.\\-+()%\\s]\",\"\",s).strip(); handle parentheses negatives; infer decimal by last separator; remove thousands separators; then float(s).",
     ],
     "reasoning_checklist": [
         "Use canonical_name (if provided) for consistent references across mapping, validation, and derivations.",
@@ -48,6 +52,7 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Verify required columns after normalization/mapping; do not treat pre-mapped absence as missing.",
         "If a numeric-looking column is typed as object/string, treat conversion as a risk before comparisons/normalization.",
         "If the dialect indicates decimal=',' and raw samples show dots, treat dots as thousands unless evidence suggests decimals.",
+        "If raw samples contain currency symbols or prefixes, ensure numeric parsing removes them before float conversion.",
         "If data_risks mention canonicalization collisions, ensure column selection remains unambiguous.",
         "If normalization causes name collisions, choose deterministically and log a warning for traceability.",
         "If conversion yields too many NaN, revert and log instead of dropping required columns.",

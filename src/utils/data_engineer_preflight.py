@@ -64,4 +64,30 @@ def data_engineer_preflight(code: str) -> List[str]:
         issues.append(
             "Guard duplicate column labels: assign series = df[actual_col]; if isinstance(series, pd.DataFrame) use series = series.iloc[:, 0] before accessing dtype."
         )
+
+    # Guard against fragile numeric parsers that don't sanitize currency/letters before float conversion.
+    # This is a common cause of "all-NaN" required columns when raw values include symbols (€, $, %, etc).
+    try:
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name != "parse_numeric":
+                continue
+            segment = ast.get_source_segment(code, node) or ""
+            if not segment:
+                continue
+            uses_float = "float(" in segment or "pd.to_numeric" in segment
+            has_sanitizer = (
+                "re.sub" in segment
+                or ".translate(" in segment
+                or "isdigit" in segment
+                or "^[\\s\\-\\+]*[\\d,." in segment  # crude regex-like guard
+            )
+            if uses_float and not has_sanitizer:
+                issues.append(
+                    "parse_numeric should strip non-numeric symbols (currency/letters) before conversion (e.g., re.sub(r\"[^0-9,\\.\\-+()%\\s]\", \"\", s))."
+                )
+                break
+    except Exception:
+        pass
     return issues
