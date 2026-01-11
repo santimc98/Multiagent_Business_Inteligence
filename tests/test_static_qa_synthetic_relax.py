@@ -11,7 +11,10 @@ row = df.iloc[0].to_dict()
 single = pd.DataFrame([row])
 print("Mapping Summary:", {"target": "age", "features": ["age"]})
 """
-    evaluation_spec = {"qa_gates": ["target_variance_guard"], "canonical_columns": ["age"]}
+    evaluation_spec = {
+        "qa_gates": [{"name": "target_variance_guard", "severity": "HARD", "params": {}}],
+        "canonical_columns": ["age"],
+    }
     result = run_static_qa_checks(code, evaluation_spec)
     assert result is not None
     assert result.get("status") != "REJECTED"
@@ -26,7 +29,10 @@ if df["age"].nunique() <= 1:
 fake = pd.DataFrame({"a": [1, 2]})
 print("Mapping Summary:", {"target": "age", "features": ["age"]})
 """
-    evaluation_spec = {"qa_gates": ["target_variance_guard"], "canonical_columns": ["age"]}
+    evaluation_spec = {
+        "qa_gates": [{"name": "no_synthetic_data", "severity": "HARD", "params": {}}],
+        "canonical_columns": ["age"],
+    }
     result = run_static_qa_checks(code, evaluation_spec)
     assert result is not None
     assert result.get("status") == "REJECTED"
@@ -40,7 +46,7 @@ df = pd.read_csv("data/cleaned_data.csv")
 from sklearn.ensemble import RandomForestClassifier
 model = RandomForestClassifier(random_state=42)
 """
-    evaluation_spec = {"qa_gates": ["no_synthetic_data"]}
+    evaluation_spec = {"qa_gates": [{"name": "no_synthetic_data", "severity": "HARD", "params": {}}]}
     result = run_static_qa_checks(code, evaluation_spec)
     assert result is not None
     assert result.get("status") != "REJECTED"
@@ -53,8 +59,30 @@ import numpy as np
 pd.read_csv("data/cleaned_data.csv")
 fake = np.random.rand(10)
 """
-    evaluation_spec = {"qa_gates": ["no_synthetic_data"]}
+    evaluation_spec = {"qa_gates": [{"name": "no_synthetic_data", "severity": "HARD", "params": {}}]}
     result = run_static_qa_checks(code, evaluation_spec)
     assert result is not None
     assert result.get("status") == "REJECTED"
     assert "no_synthetic_data" in (result.get("failed_gates") or [])
+
+
+def test_static_qa_allows_resampling_choice_when_param_enabled():
+    code = """
+import pandas as pd
+import numpy as np
+df = pd.read_csv("data/cleaned_data.csv")
+idx = np.random.choice(len(df), size=len(df), replace=True)
+boot = df.iloc[idx]
+"""
+    evaluation_spec = {
+        "qa_gates": [
+            {
+                "name": "no_synthetic_data",
+                "severity": "HARD",
+                "params": {"allow_resampling_random": True},
+            }
+        ]
+    }
+    result = run_static_qa_checks(code, evaluation_spec)
+    assert result is not None
+    assert result.get("status") != "REJECTED"

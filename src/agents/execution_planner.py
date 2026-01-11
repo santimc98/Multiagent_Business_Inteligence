@@ -25,6 +25,150 @@ from src.utils.run_bundle import get_run_dir
 load_dotenv()
 
 
+_QA_SEVERITIES = {"HARD", "SOFT"}
+_RESAMPLING_TOKENS = {
+    "bootstrap",
+    "resample",
+    "resampling",
+    "cross validation",
+    "cross-validation",
+    "cv",
+    "kfold",
+    "k-fold",
+    "shuffle split",
+    "stratified",
+    "fold",
+}
+
+
+def _normalize_qa_gate_spec(item: Any) -> Dict[str, Any] | None:
+    if isinstance(item, dict):
+        name = item.get("name") or item.get("id") or item.get("gate")
+        if not name:
+            return None
+        severity = item.get("severity")
+        required = item.get("required")
+        if severity is None and required is not None:
+            severity = "HARD" if bool(required) else "SOFT"
+        severity = str(severity).upper() if severity else "HARD"
+        if severity not in _QA_SEVERITIES:
+            severity = "HARD"
+        params = item.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        return {"name": str(name), "severity": severity, "params": params}
+    if isinstance(item, str):
+        name = item.strip()
+        if not name:
+            return None
+        return {"name": name, "severity": "HARD", "params": {}}
+    return None
+
+
+def _normalize_qa_gates(raw_gates: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_gates, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_gates:
+        spec = _normalize_qa_gate_spec(item)
+        if not spec:
+            continue
+        key = spec["name"].strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(spec)
+    return normalized
+
+
+def _strategy_mentions_resampling(strategy: Dict[str, Any], business_objective: str) -> bool:
+    if not isinstance(strategy, dict):
+        strategy = {}
+    parts: List[str] = []
+    for key in ("title", "description", "approach", "plan", "notes", "analysis_type", "problem_type"):
+        value = strategy.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+        elif isinstance(value, list):
+            parts.extend([str(v) for v in value if isinstance(v, str)])
+    if isinstance(business_objective, str) and business_objective.strip():
+        parts.append(business_objective)
+    haystack = " ".join(parts).lower()
+    return any(token in haystack for token in _RESAMPLING_TOKENS)
+
+
+def _infer_requires_target(strategy: Dict[str, Any], contract: Dict[str, Any]) -> bool:
+    if not isinstance(strategy, dict):
+        strategy = {}
+    if not isinstance(contract, dict):
+        contract = {}
+    for source in (strategy, contract):
+        for key in ("target_column", "target_columns", "outcome_columns", "decision_variable", "decision_variables"):
+            val = source.get(key)
+            if isinstance(val, list) and val:
+                return True
+            if isinstance(val, str) and val.strip() and val.lower() != "unknown":
+                return True
+    obj_analysis = contract.get("objective_analysis")
+    if isinstance(obj_analysis, dict):
+        problem_type = str(obj_analysis.get("problem_type") or "").lower()
+        if problem_type:
+            if any(token in problem_type for token in ("predict", "prescript", "regress", "classif", "forecast", "rank")):
+                return True
+    analysis_type = str(strategy.get("analysis_type") or strategy.get("problem_type") or "").lower()
+    if analysis_type:
+        if any(token in analysis_type for token in ("predict", "prescript", "regress", "classif", "forecast", "rank")):
+            return True
+    return False
+
+
+def _build_default_qa_gates(
+    strategy: Dict[str, Any],
+    business_objective: str,
+    contract: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    requires_target = _infer_requires_target(strategy, contract)
+    allow_resampling = _strategy_mentions_resampling(strategy, business_objective)
+    gates: List[Dict[str, Any]] = [
+        {"name": "security_sandbox", "severity": "HARD", "params": {}},
+        {"name": "must_read_input_csv", "severity": "HARD", "params": {}},
+        {"name": "must_reference_contract_columns", "severity": "HARD", "params": {}},
+        {"name": "no_synthetic_data", "severity": "HARD", "params": {"allow_resampling_random": allow_resampling}},
+        {"name": "dialect_mismatch_handling", "severity": "SOFT", "params": {}},
+        {"name": "group_split_required", "severity": "SOFT", "params": {}},
+    ]
+    if requires_target:
+        gates.extend(
+            [
+                {"name": "target_variance_guard", "severity": "HARD", "params": {}},
+                {"name": "leakage_prevention", "severity": "HARD", "params": {}},
+                {"name": "train_eval_split", "severity": "SOFT", "params": {}},
+            ]
+        )
+    return gates
+
+
+def _apply_qa_gate_policy(
+    raw_gates: Any,
+    strategy: Dict[str, Any],
+    business_objective: str,
+    contract: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    gates = _normalize_qa_gates(raw_gates)
+    if not gates:
+        gates = _build_default_qa_gates(strategy, business_objective, contract)
+    allow_resampling = _strategy_mentions_resampling(strategy, business_objective)
+    for gate in gates:
+        if gate.get("name") == "no_synthetic_data":
+            params = gate.get("params")
+            if not isinstance(params, dict):
+                params = {}
+            params.setdefault("allow_resampling_random", allow_resampling)
+            gate["params"] = params
+    return gates
+
+
 def _create_v41_skeleton(
     strategy: Dict[str, Any],
     business_objective: str,
@@ -213,11 +357,7 @@ def _create_v41_skeleton(
             "file_schemas": {}
         },
         
-        "qa_gates": [
-            {"id": "mapping_summary", "required": True, "description": "Column mapping validated"},
-            {"id": "consistency_checks", "required": True, "description": "Basic consistency verified"},
-            {"id": "outputs_required", "required": True, "description": "Required outputs present"}
-        ],
+        "qa_gates": _apply_qa_gate_policy([], strategy, business_objective or "", {}),
         
         "reviewer_gates": [
             {"id": "methodology_alignment", "required": True, "description": "Methodology aligns with objective"},
@@ -627,6 +767,13 @@ def build_contract_min(
             "max_plots": int(plot_spec.get("max_plots", len(plot_spec.get("plots") or []))),
         }
 
+    qa_gates = _apply_qa_gate_policy(
+        contract.get("qa_gates"),
+        strategy_dict,
+        business_objective or "",
+        contract,
+    )
+
     return {
         "contract_version": contract.get("contract_version", 2),
         "strategy_title": contract.get("strategy_title") or strategy_dict.get("title", ""),
@@ -643,13 +790,7 @@ def build_contract_min(
         },
         "artifact_requirements": artifact_requirements,
         "required_outputs": required_outputs,
-        "qa_gates": [
-            "no_synthetic_data",
-            "no_column_invention",
-            "artifact_alignment",
-            "integrity_no_critical",
-            "no_leakage_features",
-        ],
+        "qa_gates": qa_gates,
         "reviewer_gates": [
             "strategy_followed",
             "metrics_present",
@@ -4053,6 +4194,12 @@ domain_expert_critique:
             contract = _fallback("JSON Parse Error after retries")
 
         contract = ensure_v41_schema(contract)
+        contract["qa_gates"] = _apply_qa_gate_policy(
+            contract.get("qa_gates"),
+            strategy,
+            business_objective or "",
+            contract,
+        )
 
         if column_inventory and not contract.get("available_columns"):
             contract["available_columns"] = column_inventory

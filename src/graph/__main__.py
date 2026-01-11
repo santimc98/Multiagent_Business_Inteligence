@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 from src.utils.contract_views import (
     build_de_view,
     build_ml_view,
+    build_qa_view,
     build_reviewer_view,
     build_translator_view,
     build_results_advisor_view,
@@ -62,12 +63,14 @@ def main() -> int:
 
     de_view = build_de_view(contract_full, contract_min, artifact_index)
     ml_view = build_ml_view(contract_full, contract_min, artifact_index)
+    qa_view = build_qa_view(contract_full, contract_min, artifact_index)
     reviewer_view = build_reviewer_view(contract_full, contract_min, artifact_index)
     translator_view = build_translator_view(contract_full, contract_min, artifact_index)
     results_advisor_view = build_results_advisor_view(contract_full, contract_min, artifact_index)
     views = {
         "de_view": de_view,
         "ml_view": ml_view,
+        "qa_view": qa_view,
         "reviewer_view": reviewer_view,
         "translator_view": translator_view,
         "results_advisor_view": results_advisor_view,

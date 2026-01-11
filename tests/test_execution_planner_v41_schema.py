@@ -145,7 +145,7 @@ def test_contract_driven_evaluation_spec():
     # Create a V4.1 contract
     contract = {
         "contract_version": 2,
-        "qa_gates": [{"id": "test_gate", "required": True}],
+        "qa_gates": [{"name": "test_gate", "severity": "HARD", "params": {}}],
         "reviewer_gates": [{"id": "review_gate", "required": True}],
         "artifact_requirements": {"required_files": ["data/test.csv"]},
         "validation_requirements": {"method": "cross_validation"},

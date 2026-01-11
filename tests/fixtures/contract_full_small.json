@@ -9,10 +9,23 @@
     "outcome": ["target"],
     "post_decision_audit_only": ["audit"]
   },
+  "qa_gates": [
+    {
+      "name": "no_synthetic_data",
+      "severity": "HARD",
+      "params": {}
+    }
+  ],
   "evaluation_spec": {
     "objective_type": "classification",
     "reviewer_gates": ["metrics_present"],
-    "qa_gates": ["no_synthetic_data"],
+    "qa_gates": [
+      {
+        "name": "no_synthetic_data",
+        "severity": "HARD",
+        "params": {}
+      }
+    ],
     "validation_requirements": {
       "method": "holdout",
       "test_size": 0.2

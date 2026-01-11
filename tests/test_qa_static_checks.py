@@ -11,7 +11,8 @@ df = pd.read_csv('data/cleaned_data.csv')
 y = df['Probability']
 y = y + np.random.normal(0, 1, len(y))
 """
-    result = run_static_qa_checks(code)
+    evaluation_spec = {"qa_gates": [{"name": "target_variance_guard", "severity": "HARD", "params": {}}]}
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
     assert result is not None
     assert result["status"] == "REJECTED"
     assert "target_variance_guard" in result.get("failed_gates", [])
@@ -24,7 +25,8 @@ df = pd.read_csv('data/cleaned_data.csv')
 _ = df['Size']
 print(df.shape)
 """
-    result = run_static_qa_checks(code)
+    evaluation_spec = {"qa_gates": [{"name": "target_variance_guard", "severity": "HARD", "params": {}}]}
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
     assert result is not None
     assert result["status"] == "REJECTED"
     assert "target_variance_guard" in result.get("failed_gates", [])
@@ -37,7 +39,8 @@ df = pd.read_csv('data/cleaned_data.csv')
 if df['Probability'].nunique() <= 1:
     raise ValueError("Target has no variance; cannot train meaningful model.")
 """
-    result = run_static_qa_checks(code)
+    evaluation_spec = {"qa_gates": [{"name": "target_variance_guard", "severity": "HARD", "params": {}}]}
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
     assert result is not None
     assert result["status"] in {"PASS", "WARN"}
 
@@ -49,7 +52,8 @@ df = pd.read_csv('data/cleaned_data.csv')
 _ = df['Size']
 df[['a','b']] = df['raw'].str.split(';', expand=True)
 """
-    result = run_static_qa_checks(code)
+    evaluation_spec = {"qa_gates": [{"name": "dialect_mismatch_handling", "severity": "HARD", "params": {}}]}
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
     assert result is not None
     assert "dialect_mismatch_handling" in result.get("failed_gates", [])
 
@@ -68,7 +72,8 @@ kf = KFold(n_splits=3)
 for tr, te in kf.split(df):
     pass
 """
-    result = run_static_qa_checks(code)
+    evaluation_spec = {"qa_gates": [{"name": "group_split_required", "severity": "HARD", "params": {}}]}
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
     assert result is not None
     assert "group_split_required" in result.get("failed_gates", [])
 
@@ -87,7 +92,8 @@ gkf = GroupKFold(n_splits=3)
 for tr, te in gkf.split(df, df['target'], groups):
     pass
 """
-    result = run_static_qa_checks(code)
+    evaluation_spec = {"qa_gates": [{"name": "group_split_required", "severity": "HARD", "params": {}}]}
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
     assert result is not None
     assert result["status"] in {"PASS", "WARN"}
 
@@ -105,6 +111,29 @@ X = df[['a', 'b']]
 y = df['target']
 model.fit(X, y)
 """
-    result = run_static_qa_checks(code, evaluation_spec={"qa_gates": ["target_variance_guard"]})
+    evaluation_spec = {"qa_gates": [{"name": "target_variance_guard", "severity": "HARD", "params": {}}]}
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
     assert result is not None
     assert result["status"] in {"PASS", "WARN"}
+
+
+def test_static_qa_soft_gate_warns_only():
+    code = """
+import numpy as np
+fake = np.random.rand(10)
+"""
+    evaluation_spec = {"qa_gates": [{"name": "no_synthetic_data", "severity": "SOFT", "params": {}}]}
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
+    assert result is not None
+    assert result["status"] == "WARN"
+    assert "no_synthetic_data" in (result.get("soft_failures") or [])
+    assert not (result.get("hard_failures") or [])
+
+
+def test_static_qa_missing_gates_triggers_fallback_warning():
+    code = "print('ok')"
+    result = run_static_qa_checks(code, evaluation_spec={})
+    assert result is not None
+    assert result.get("contract_source_used") == "fallback"
+    warnings = result.get("warnings") or []
+    assert any("CONTRACT_BROKEN_FALLBACK" in w for w in warnings)

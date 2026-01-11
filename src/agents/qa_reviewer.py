@@ -41,6 +41,81 @@ def _extract_json_object(text: str) -> Optional[str]:
                 return text[start:i + 1]
     return None
 
+
+_CONTRACT_FALLBACK_WARNING = "CONTRACT_BROKEN_FALLBACK: qa_gates missing; please fix contract generation"
+
+CONTRACT_BROKEN_FALLBACK_GATES = [
+    {"name": "security_sandbox", "severity": "HARD", "params": {}},
+    {"name": "must_read_input_csv", "severity": "SOFT", "params": {}},
+]
+
+
+def _normalize_qa_gate_spec(item: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(item, dict):
+        name = item.get("name") or item.get("id") or item.get("gate")
+        if not name:
+            return None
+        severity = item.get("severity")
+        required = item.get("required")
+        if severity is None and required is not None:
+            severity = "HARD" if bool(required) else "SOFT"
+        severity = str(severity).upper() if severity else "HARD"
+        if severity not in {"HARD", "SOFT"}:
+            severity = "HARD"
+        params = item.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        return {"name": str(name), "severity": severity, "params": params}
+    if isinstance(item, str):
+        name = item.strip()
+        if not name:
+            return None
+        return {"name": name, "severity": "HARD", "params": {}}
+    return None
+
+
+def _normalize_qa_gates(raw_gates: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_gates, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_gates:
+        spec = _normalize_qa_gate_spec(item)
+        if not spec:
+            continue
+        key = spec["name"].strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(spec)
+    return normalized
+
+
+def _gate_lookup(qa_gates: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {str(g.get("name")).lower(): g for g in qa_gates if isinstance(g, dict) and g.get("name")}
+
+
+def _gate_names(qa_gates: List[Dict[str, Any]]) -> List[str]:
+    return [str(g.get("name")) for g in qa_gates if isinstance(g, dict) and g.get("name")]
+
+
+def resolve_qa_gates(evaluation_spec: Dict[str, Any] | None) -> tuple[List[Dict[str, Any]], str, List[str]]:
+    warnings: List[str] = []
+    contract_source = "fallback"
+    raw_gates: Any = None
+    if isinstance(evaluation_spec, dict):
+        contract_source = str(evaluation_spec.get("_contract_source") or "qa_view")
+        raw_gates = (
+            evaluation_spec.get("qa_gates")
+            or evaluation_spec.get("gates")
+            or []
+        )
+    qa_gates = _normalize_qa_gates(raw_gates)
+    if qa_gates:
+        return qa_gates, contract_source, warnings
+    warnings.append(_CONTRACT_FALLBACK_WARNING)
+    return list(CONTRACT_BROKEN_FALLBACK_GATES), "fallback", warnings
+
 class QAReviewerAgent:
     def __init__(self, api_key: str = None):
         """
@@ -95,7 +170,9 @@ class QAReviewerAgent:
         from src.utils.prompting import render_prompt
 
         eval_spec_json = json.dumps(evaluation_spec or {}, indent=2)
-        qa_gates, default_gates = resolve_qa_gates(evaluation_spec)
+        qa_gate_specs, contract_source_used, gate_warnings = resolve_qa_gates(evaluation_spec)
+        qa_gate_names = _gate_names(qa_gate_specs)
+        qa_gates_json = json.dumps(qa_gate_specs, indent=2, ensure_ascii=True)
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are the Lead QA Engineer.
@@ -135,16 +212,17 @@ class QAReviewerAgent:
         - Strategy: $strategy_title
         - Evaluation Spec (JSON): $evaluation_spec_json
         - ML Dataset Path: $ml_data_path
-        - QA Gates (only these can fail): $qa_gates
-        - If QA Gates are empty, enforce minimal universal gates only (variance, train/eval separation, leakage basic, dialect mismatch handling, group split, security sandbox).
+        - QA Gates (contract-driven, with severity/params): $qa_gates
         
         INSTRUCTIONS:
         - Analyze the code line-by-line.
-        - If any CRITICAL Gate is violated, INVALIDATE with status "REJECTED".
+        - If any HARD gate is violated, INVALIDATE with status "REJECTED".
+        - If only SOFT gates are violated, return "APPROVE_WITH_WARNINGS".
         - If issues are minor (Style, Comments, non-critical Best Practices) but code is SAFE and CORRECT, return "APPROVE_WITH_WARNINGS".
         - Provide specific, actionable feedback on what is missing and how to fix it.
         - Do not request stylistic changes. Focus on correctness and safety.
         - Only fail gates listed in QA Gates; otherwise mention as warnings.
+        - When listing failed_gates, use the gate "name" values from QA Gates.
         
         OUTPUT FORMAT (JSON):
         $output_format_instructions
@@ -157,7 +235,7 @@ class QAReviewerAgent:
             strategy_title=strategy.get('title', 'Unknown'),
             evaluation_spec_json=eval_spec_json,
             ml_data_path=ml_data_path,
-            qa_gates=qa_gates,
+            qa_gates=qa_gates_json,
             output_format_instructions=output_format_instructions
         )
 
@@ -208,11 +286,21 @@ class QAReviewerAgent:
                     "failed_gates": [],
                     "required_fixes": [],
                 }
-                warnings = static_result.get("warnings", []) if static_result else []
+                warnings = []
+                if gate_warnings:
+                    warnings.extend(gate_warnings)
+                static_warnings = static_result.get("warnings", []) if static_result else []
+                if static_warnings:
+                    warnings.extend(static_warnings)
                 if warnings:
                     warning_text = "\n".join([f"- {w}" for w in warnings])
                     feedback = fallback.get("feedback") or "QA Passed with warnings."
-                    fallback["feedback"] = f"{feedback}\nStatic QA warnings:\n{warning_text}"
+                    fallback["feedback"] = f"{feedback}\nWarnings:\n{warning_text}"
+                fallback["qa_gates_evaluated"] = qa_gate_names
+                fallback["hard_failures"] = []
+                fallback["soft_failures"] = []
+                fallback["contract_source_used"] = contract_source_used
+                fallback["warnings"] = warnings
                 return fallback
 
             # Fallback normalization
@@ -230,24 +318,51 @@ class QAReviewerAgent:
                 else:
                      result[field] = val
 
-            allowed = {str(g).lower() for g in (qa_gates or [])}
-            if allowed:
-                filtered = []
-                for g in result.get("failed_gates", []):
-                    if str(g).lower() in allowed:
-                        filtered.append(g)
-                result["failed_gates"] = filtered
-                if result.get("status") == "REJECTED" and not result["failed_gates"]:
-                    result["status"] = "APPROVE_WITH_WARNINGS"
-                    result["feedback"] = "Spec-driven gating: no QA gates failed; downgraded to warnings."
+            gate_lookup = _gate_lookup(qa_gate_specs)
+            allowed = {name.lower() for name in qa_gate_names}
+            filtered: List[str] = []
+            for g in result.get("failed_gates", []):
+                if str(g).lower() in allowed:
+                    filtered.append(g)
+            result["failed_gates"] = filtered
 
-            warnings = static_result.get("warnings", []) if static_result else []
+            hard_failures: List[str] = []
+            soft_failures: List[str] = []
+            for g in filtered:
+                spec = gate_lookup.get(str(g).lower())
+                if spec and str(spec.get("severity")).upper() == "SOFT":
+                    soft_failures.append(g)
+                else:
+                    hard_failures.append(g)
+
+            if hard_failures:
+                result["status"] = "REJECTED"
+            elif soft_failures:
+                if result.get("status") != "APPROVE_WITH_WARNINGS":
+                    result["status"] = "APPROVE_WITH_WARNINGS"
+            else:
+                if result.get("status") == "REJECTED":
+                    result["status"] = "APPROVE_WITH_WARNINGS"
+                    result["feedback"] = "Spec-driven gating: no HARD QA gates failed; downgraded to warnings."
+
+            warnings = []
+            if gate_warnings:
+                warnings.extend(gate_warnings)
+            static_warnings = static_result.get("warnings", []) if static_result else []
+            if static_warnings:
+                warnings.extend(static_warnings)
             if warnings:
                 if result.get("status") == "APPROVED":
                     result["status"] = "APPROVE_WITH_WARNINGS"
                 feedback = result.get("feedback") or "QA Passed with warnings."
                 warning_text = "\n".join([f"- {w}" for w in warnings])
-                result["feedback"] = f"{feedback}\nStatic QA warnings:\n{warning_text}"
+                result["feedback"] = f"{feedback}\nWarnings:\n{warning_text}"
+
+            result["qa_gates_evaluated"] = qa_gate_names
+            result["hard_failures"] = hard_failures
+            result["soft_failures"] = soft_failures
+            result["contract_source_used"] = contract_source_used
+            result["warnings"] = warnings
             return result
                 
         except Exception as e:
@@ -257,10 +372,20 @@ class QAReviewerAgent:
                 "failed_gates": [],
                 "required_fixes": [],
             }
-            warnings = static_result.get("warnings", []) if static_result else []
+            warnings = []
+            if gate_warnings:
+                warnings.extend(gate_warnings)
+            static_warnings = static_result.get("warnings", []) if static_result else []
+            if static_warnings:
+                warnings.extend(static_warnings)
             if warnings:
                 warning_text = "\n".join([f"- {w}" for w in warnings])
-                fallback["feedback"] = f"{fallback.get('feedback')}\nStatic QA warnings:\n{warning_text}"
+                fallback["feedback"] = f"{fallback.get('feedback')}\nWarnings:\n{warning_text}"
+            fallback["qa_gates_evaluated"] = qa_gate_names
+            fallback["hard_failures"] = []
+            fallback["soft_failures"] = []
+            fallback["contract_source_used"] = contract_source_used
+            fallback["warnings"] = warnings
             return fallback
 
 
@@ -295,6 +420,45 @@ def _is_random_call(call_node: ast.Call) -> bool:
             return True
     if func_name == "default_rng":
         return True
+    return False
+
+
+def _node_is_index_like(node: ast.AST) -> bool:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return node.func.id in {"len", "range"}
+    if isinstance(node, ast.Attribute):
+        return node.attr in {"index", "indices", "shape"}
+    if isinstance(node, ast.Name):
+        return node.id.lower() in {"idx", "index", "indices", "rows", "row_idx", "row_indices"}
+    return False
+
+
+def _is_resampling_random_call(call_node: ast.Call) -> bool:
+    name = _call_name(call_node).lower()
+    if not any(token in name for token in ("choice", "permutation", "shuffle", "default_rng", "seed")):
+        return False
+    if name.endswith("seed") or "default_rng" in name:
+        return True
+    for arg in call_node.args:
+        if _node_is_index_like(arg):
+            return True
+        if isinstance(arg, ast.Attribute) and _node_is_index_like(arg):
+            return True
+    for kw in call_node.keywords:
+        if _node_is_index_like(kw.value):
+            return True
+    return False
+
+
+def _detect_synthetic_data_calls(tree: ast.AST, allow_resampling_random: bool) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if _is_sklearn_make_call(node) or _is_dataframe_literal_call(node):
+                return True
+            if _is_random_call(node):
+                if allow_resampling_random and _is_resampling_random_call(node):
+                    continue
+                return True
     return False
 
 
@@ -627,37 +791,6 @@ class _StaticQAScanner(ast.NodeVisitor):
             self.has_split_fabrication = True
 
 
-MANDATORY_QA_GATES = [
-    "must_read_input_csv",
-    "no_synthetic_data",
-    "must_reference_contract_columns",
-]
-
-DEFAULT_QA_GATES = [
-    "target_variance_guard",
-    "train_eval_split",
-    "leakage_prevention",
-    "dialect_mismatch_handling",
-    "group_split_required",
-    "security_sandbox",
-    *MANDATORY_QA_GATES,
-]
-
-
-def resolve_qa_gates(evaluation_spec: Dict[str, Any] | None) -> tuple[list[str], bool]:
-    qa_gates = []
-    if isinstance(evaluation_spec, dict):
-        qa_gates = (
-            evaluation_spec.get("qa_gates")
-            or evaluation_spec.get("gates")
-            or evaluation_spec.get("reviewer_gates")
-            or []
-        )
-    if isinstance(qa_gates, list) and qa_gates:
-        merged = list(dict.fromkeys([*qa_gates, *MANDATORY_QA_GATES]))
-        return merged, False
-    return list(DEFAULT_QA_GATES), True
-
 
 def _resolve_contract_columns_for_qa(evaluation_spec: Dict[str, Any] | None) -> List[str]:
     """V4.1: Extract columns from canonical_columns, column_roles, etc."""
@@ -668,6 +801,27 @@ def _resolve_contract_columns_for_qa(evaluation_spec: Dict[str, Any] | None) -> 
             vals = evaluation_spec.get(key)
             if isinstance(vals, list):
                 columns.extend([str(c) for c in vals if c])
+        # From allowed feature sets if present
+        allowed_sets = evaluation_spec.get("allowed_feature_sets")
+        if isinstance(allowed_sets, dict):
+            for key in (
+                "model_features",
+                "segmentation_features",
+                "audit_only_features",
+                "forbidden_features",
+                "forbidden_for_modeling",
+            ):
+                vals = allowed_sets.get(key)
+                if isinstance(vals, list):
+                    columns.extend([str(c) for c in vals if c])
+        # From artifact requirements clean_dataset bindings
+        artifact_reqs = evaluation_spec.get("artifact_requirements")
+        if isinstance(artifact_reqs, dict):
+            clean_cfg = artifact_reqs.get("clean_dataset")
+            if isinstance(clean_cfg, dict):
+                req_cols = clean_cfg.get("required_columns")
+                if isinstance(req_cols, list):
+                    columns.extend([str(c) for c in req_cols if c])
         
         # V4.1: Extract from column_roles (role -> list[str] mapping)
         column_roles = evaluation_spec.get("column_roles")
@@ -730,13 +884,17 @@ def run_static_qa_checks(
 
     scanner = _StaticQAScanner()
     scanner.visit(tree)
-    qa_gates, default_used = resolve_qa_gates(evaluation_spec)
-    qa_gate_set = set(qa_gates or [])
+    qa_gate_specs, contract_source_used, gate_warnings = resolve_qa_gates(evaluation_spec)
+    qa_gate_names = _gate_names(qa_gate_specs)
+    qa_gate_set = set(qa_gate_names)
+    gate_lookup = _gate_lookup(qa_gate_specs)
+    if gate_warnings:
+        for warning in gate_warnings:
+            print(warning)
     require_variance_guard = "target_variance_guard" in qa_gate_set
     require_leakage_guard = "leakage_prevention" in qa_gate_set
     require_dialect_guard = "dialect_mismatch_handling" in qa_gate_set
     require_group_split = "group_split_required" in qa_gate_set
-    require_security = "security_sandbox" in qa_gate_set
     require_read_csv = "must_read_input_csv" in qa_gate_set
     ml_data_path = (evaluation_spec or {}).get("ml_data_path") or "data/cleaned_data.csv"
     require_no_synth = "no_synthetic_data" in qa_gate_set
@@ -748,16 +906,32 @@ def run_static_qa_checks(
         train_eval_gate = "train_eval_separation"
     require_train_eval = train_eval_gate is not None
 
+    allow_resampling_random = False
+    no_synth_spec = gate_lookup.get("no_synthetic_data")
+    if isinstance(no_synth_spec, dict):
+        params = no_synth_spec.get("params")
+        if isinstance(params, dict):
+            allow_resampling_random = bool(params.get("allow_resampling_random"))
+    synthetic_detected = _detect_synthetic_data_calls(tree, allow_resampling_random)
+
     warnings: List[str] = []
     failed_gates: List[str] = []
     required_fixes: List[str] = []
+    hard_failures: List[str] = []
+    soft_failures: List[str] = []
 
     def _flag(gate: str, message: str, fix: str) -> None:
-        if gate in qa_gate_set:
-            failed_gates.append(gate)
-            required_fixes.append(fix)
-        else:
+        spec = gate_lookup.get(gate.lower())
+        if not spec:
             warnings.append(message)
+            return
+        if str(spec.get("severity")).upper() == "SOFT":
+            soft_failures.append(gate)
+            warnings.append(message)
+            return
+        failed_gates.append(gate)
+        hard_failures.append(gate)
+        required_fixes.append(fix)
 
     if scanner.has_security_violation:
         _flag(
@@ -787,7 +961,7 @@ def run_static_qa_checks(
             f"Read the ML dataset via pandas.read_csv('{ml_data_path}') and use it as the dataset source.",
         )
 
-    if require_no_synth and scanner.has_synthetic_data:
+    if require_no_synth and synthetic_detected:
         _flag(
             "no_synthetic_data",
             "Synthetic data construction detected (random generators, make_* datasets, or literal DataFrame).",
@@ -843,24 +1017,47 @@ def run_static_qa_checks(
 
     facts_payload = facts if isinstance(facts, dict) else collect_static_qa_facts(code)
     facts_payload["has_read_csv"] = scanner.has_read_csv
-    facts_payload["has_synthetic_data"] = scanner.has_synthetic_data
+    facts_payload["has_synthetic_data"] = synthetic_detected
     facts_payload["has_contract_column_reference"] = has_contract_column_reference
     facts_payload["contract_columns_checked"] = contract_columns
-    facts_payload["qa_gates"] = qa_gates
-    facts_payload["default_gates_used"] = default_used
+    facts_payload["qa_gates_evaluated"] = qa_gate_names
+    facts_payload["hard_failures"] = hard_failures
+    facts_payload["soft_failures"] = soft_failures
+    facts_payload["contract_source_used"] = contract_source_used
+    if gate_warnings:
+        facts_payload["warnings"] = list(gate_warnings)
 
-    if failed_gates:
+    if hard_failures:
         return {
             "status": "REJECTED",
             "feedback": "Static QA gate failures detected.",
             "failed_gates": failed_gates,
             "required_fixes": required_fixes,
             "facts": facts_payload,
-            "warnings": warnings,
+            "warnings": warnings + gate_warnings,
+            "qa_gates_evaluated": qa_gate_names,
+            "hard_failures": hard_failures,
+            "soft_failures": soft_failures,
+            "contract_source_used": contract_source_used,
         }
-    if warnings:
-        return {"status": "WARN", "warnings": warnings, "facts": facts_payload}
-    return {"status": "PASS", "facts": facts_payload}
+    if warnings or soft_failures or gate_warnings:
+        return {
+            "status": "WARN",
+            "warnings": warnings + gate_warnings,
+            "facts": facts_payload,
+            "qa_gates_evaluated": qa_gate_names,
+            "hard_failures": hard_failures,
+            "soft_failures": soft_failures,
+            "contract_source_used": contract_source_used,
+        }
+    return {
+        "status": "PASS",
+        "facts": facts_payload,
+        "qa_gates_evaluated": qa_gate_names,
+        "hard_failures": hard_failures,
+        "soft_failures": soft_failures,
+        "contract_source_used": contract_source_used,
+    }
 
 
 def collect_static_qa_facts(code: str) -> Dict[str, bool]:

@@ -35,7 +35,13 @@
     "objective_type": "classification"
   },
   "reviewer_gates": ["metrics_present"],
-  "qa_gates": ["no_synthetic_data"],
+  "qa_gates": [
+    {
+      "name": "no_synthetic_data",
+      "severity": "HARD",
+      "params": {}
+    }
+  ],
   "reporting_policy": {
     "sections": ["Executive Decision"],
     "slots": [

@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 from src.utils.contract_v41 import (
     get_canonical_columns,
     get_column_roles,
+    get_qa_gates,
     get_required_outputs,
     get_validation_requirements,
 )
@@ -66,6 +67,17 @@ class ResultsAdvisorView(TypedDict, total=False):
     objective_type: str
     reporting_policy: Dict[str, Any]
     evidence_inventory: List[Dict[str, Any]]
+
+
+class QAView(TypedDict, total=False):
+    role: str
+    qa_gates: List[Dict[str, Any]]
+    artifact_requirements: Dict[str, Any]
+    allowed_feature_sets: Dict[str, Any]
+    column_roles: Dict[str, List[str]]
+    canonical_columns: List[str]
+    objective_summary: Dict[str, str]
+    reporting_policy: Dict[str, Any]
 
 
 _PRESERVE_KEYS = {
@@ -311,6 +323,76 @@ def _resolve_validation_requirements(contract_min: Dict[str, Any], contract_full
         if isinstance(validation, dict) and validation:
             return validation
     return {}
+
+
+def _resolve_qa_gates(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[Dict[str, Any]]:
+    gates = get_qa_gates(contract_full)
+    if gates:
+        return gates
+    gates = get_qa_gates(contract_min)
+    if gates:
+        return gates
+    def _normalize(raw: Any) -> List[Dict[str, Any]]:
+        if not isinstance(raw, list):
+            return []
+        normalized: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for gate in raw:
+            if isinstance(gate, dict):
+                name = gate.get("name") or gate.get("id") or gate.get("gate")
+                if not name:
+                    continue
+                severity = str(gate.get("severity") or "HARD").upper()
+                if severity not in {"HARD", "SOFT"}:
+                    severity = "HARD"
+                params = gate.get("params")
+                if not isinstance(params, dict):
+                    params = {}
+                key = str(name).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                normalized.append({"name": str(name), "severity": severity, "params": params})
+            elif isinstance(gate, str) and gate.strip():
+                key = gate.strip().lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                normalized.append({"name": gate.strip(), "severity": "HARD", "params": {}})
+        return normalized
+    eval_spec = contract_full.get("evaluation_spec") if isinstance(contract_full, dict) else None
+    if isinstance(eval_spec, dict):
+        gates = _normalize(eval_spec.get("qa_gates"))
+        if gates:
+            return gates
+    eval_spec = contract_min.get("evaluation_spec") if isinstance(contract_min, dict) else None
+    if isinstance(eval_spec, dict):
+        gates = _normalize(eval_spec.get("qa_gates"))
+        if gates:
+            return gates
+    return []
+
+
+def _resolve_optional_outputs(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[str]:
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    optional_outputs: List[str] = []
+    for key in ("optional_files", "optional_outputs"):
+        values = artifact_reqs.get(key)
+        if isinstance(values, list):
+            optional_outputs.extend([str(v) for v in values if v])
+    for value in artifact_reqs.values():
+        if not isinstance(value, dict):
+            continue
+        if value.get("optional") is True:
+            path = _first_value(value.get("path"), value.get("output_path"), value.get("output"))
+            if path:
+                optional_outputs.append(str(path))
+            expected = value.get("expected")
+            if isinstance(expected, list):
+                optional_outputs.extend([str(v) for v in expected if v])
+    return list(dict.fromkeys([str(v) for v in optional_outputs if v]))
 
 
 def _resolve_case_rules(contract_full: Dict[str, Any]) -> Any:
@@ -650,6 +732,54 @@ def build_reviewer_view(
             "artifact_index_expected": bool(artifact_index),
         },
     }
+    return trim_to_budget(view, 12000)
+
+
+def build_qa_view(
+    contract_full: Dict[str, Any] | None,
+    contract_min: Dict[str, Any] | None,
+    artifact_index: Any,
+) -> Dict[str, Any]:
+    contract_full = contract_full if isinstance(contract_full, dict) else {}
+    contract_min = contract_min if isinstance(contract_min, dict) else {}
+    required_outputs = _resolve_required_outputs(contract_min, contract_full)
+    optional_outputs = _resolve_optional_outputs(contract_min, contract_full)
+    qa_gates = _resolve_qa_gates(contract_min, contract_full)
+    allowed_feature_sets = _resolve_allowed_feature_sets(contract_min, contract_full)
+    column_roles = _resolve_column_roles(contract_min, contract_full)
+    canonical_columns = contract_min.get("canonical_columns")
+    if not isinstance(canonical_columns, list):
+        canonical_columns = get_canonical_columns(contract_full)
+    canonical_columns = [str(c) for c in canonical_columns if c]
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    artifact_payload: Dict[str, Any] = {
+        "required_outputs": required_outputs,
+        "optional_outputs": optional_outputs,
+    }
+    file_schemas = artifact_reqs.get("file_schemas")
+    if isinstance(file_schemas, dict) and file_schemas:
+        artifact_payload["file_schemas"] = file_schemas
+    objective_summary = {
+        "strategy_title": _first_value(contract_full.get("strategy_title"), contract_min.get("strategy_title")) or "",
+        "business_objective": _first_value(contract_full.get("business_objective"), contract_min.get("business_objective"))
+        or "",
+    }
+    reporting_policy = contract_full.get("reporting_policy")
+    if not isinstance(reporting_policy, dict) or not reporting_policy:
+        reporting_policy = contract_min.get("reporting_policy")
+    view: QAView = {
+        "role": "qa_reviewer",
+        "qa_gates": qa_gates,
+        "artifact_requirements": artifact_payload,
+        "allowed_feature_sets": allowed_feature_sets,
+        "column_roles": column_roles,
+        "canonical_columns": canonical_columns,
+        "objective_summary": objective_summary,
+    }
+    if isinstance(reporting_policy, dict) and reporting_policy:
+        view["reporting_policy"] = reporting_policy
     return trim_to_budget(view, 12000)
 
 

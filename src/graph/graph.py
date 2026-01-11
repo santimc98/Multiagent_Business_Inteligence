@@ -74,6 +74,7 @@ from src.utils.contract_v41 import (
 from src.utils.contract_views import (
     build_de_view,
     build_ml_view,
+    build_qa_view,
     build_reviewer_view,
     build_translator_view,
     build_results_advisor_view,
@@ -118,6 +119,19 @@ from src.utils.json_sanitize import dump_json
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
+
+
+def _extract_qa_gate_names(raw_gates: Any) -> List[str]:
+    names: List[str] = []
+    if isinstance(raw_gates, list):
+        for gate in raw_gates:
+            if isinstance(gate, dict):
+                name = gate.get("name") or gate.get("id") or gate.get("gate")
+                if name:
+                    names.append(str(name))
+            elif isinstance(gate, str) and gate.strip():
+                names.append(gate)
+    return names
 
 
 def _is_percent_like(column_name: str, raw_values: List[str]) -> bool:
@@ -1598,12 +1612,14 @@ def _build_contract_views(
         artifact_index = _build_artifact_index(required_outputs, deliverables)
     de_view = build_de_view(contract, contract_min or {}, artifact_index)
     ml_view = build_ml_view(contract, contract_min or {}, artifact_index)
+    qa_view = build_qa_view(contract, contract_min or {}, artifact_index)
     reviewer_view = build_reviewer_view(contract, contract_min or {}, artifact_index)
     translator_view = build_translator_view(contract, contract_min or {}, artifact_index)
     results_advisor_view = build_results_advisor_view(contract, contract_min or {}, artifact_index)
     views = {
         "de_view": de_view,
         "ml_view": ml_view,
+        "qa_view": qa_view,
         "reviewer_view": reviewer_view,
         "translator_view": translator_view,
         "results_advisor_view": results_advisor_view,
@@ -1619,6 +1635,7 @@ def _build_contract_views(
         "artifact_index": artifact_index,
         "de_view": de_view,
         "ml_view": ml_view,
+        "qa_view": qa_view,
         "reviewer_view": reviewer_view,
         "translator_view": translator_view,
         "results_advisor_view": results_advisor_view,
@@ -5512,11 +5529,14 @@ def run_execution_planner(state: AgentState) -> AgentState:
         try:
             de_len = len(json.dumps(view_payload["contract_views"].get("de_view", {}), ensure_ascii=True))
             ml_len = len(json.dumps(view_payload["contract_views"].get("ml_view", {}), ensure_ascii=True))
+            qa_len = len(json.dumps(view_payload["contract_views"].get("qa_view", {}), ensure_ascii=True))
             print(f"Using DE_VIEW_CONTEXT length={de_len}")
             print(f"Using ML_VIEW_CONTEXT length={ml_len}")
+            print(f"Using QA_VIEW_CONTEXT length={qa_len}")
             if run_id:
                 log_run_event(run_id, "de_view_context", {"length": de_len})
                 log_run_event(run_id, "ml_view_context", {"length": ml_len})
+                log_run_event(run_id, "qa_view_context", {"length": qa_len})
         except Exception:
             pass
     if run_id:
@@ -7771,20 +7791,41 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     try:
         # Run QA Audit
         contract = state.get("execution_contract", {}) or {}
-        evaluation_spec = state.get("evaluation_spec") or contract.get("evaluation_spec")
-        if isinstance(evaluation_spec, dict):
-            evaluation_spec = dict(evaluation_spec)
+        qa_view = state.get("qa_view") or (state.get("contract_views") or {}).get("qa_view")
+        contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
+        if isinstance(qa_view, dict) and qa_view:
+            qa_context = dict(qa_view)
+            contract_source = "qa_view"
+        elif isinstance(contract_min, dict) and contract_min:
+            qa_context = dict(contract_min)
+            contract_source = "contract_min"
         else:
-            evaluation_spec = {}
-        evaluation_spec["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
-        if contract.get("canonical_columns") and not evaluation_spec.get("canonical_columns"):
-            evaluation_spec["canonical_columns"] = contract.get("canonical_columns")
-        if contract.get("data_requirements") and not evaluation_spec.get("data_requirements"):
-            evaluation_spec["data_requirements"] = contract.get("data_requirements")
-        allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
+            qa_context = {}
+            contract_source = "fallback"
+        qa_context["_contract_source"] = contract_source
+        ml_data_path = state.get("ml_data_path")
+        if not ml_data_path and isinstance(qa_context, dict):
+            artifact_reqs = qa_context.get("artifact_requirements")
+            if isinstance(artifact_reqs, dict):
+                outputs = artifact_reqs.get("required_outputs") or artifact_reqs.get("required_files") or []
+                if isinstance(outputs, list):
+                    for path in outputs:
+                        if isinstance(path, str) and path.endswith(".csv") and "clean" in path.lower():
+                            ml_data_path = path
+                            break
+        qa_context["ml_data_path"] = ml_data_path or "data/cleaned_data.csv"
+        if contract_source == "qa_view":
+            try:
+                qa_len = len(json.dumps(qa_context, ensure_ascii=True))
+                print(f"Using QA_VIEW_CONTEXT length={qa_len}")
+                if run_id:
+                    log_run_event(run_id, "qa_view_context", {"length": qa_len})
+            except Exception:
+                pass
+        allowed_columns = _resolve_allowed_columns_for_gate(state, contract, qa_context)
         allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
         static_facts = collect_static_qa_facts(code)
-        static_result = run_static_qa_checks(code, evaluation_spec, static_facts)
+        static_result = run_static_qa_checks(code, qa_context, static_facts)
         if static_result and static_result.get("status") == "REJECTED":
             status = "REJECTED"
             feedback = static_result.get("feedback") or "Static QA gate failures detected."
@@ -7824,7 +7865,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             }
 
         try:
-            qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
+            qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context)
         except TypeError:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective)
 
@@ -7833,7 +7874,8 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         failed_gates = qa_result.get('failed_gates', [])
         required_fixes = qa_result.get('required_fixes', [])
 
-        if status == "REJECTED":
+        hard_failures = qa_result.get("hard_failures") or []
+        if status == "REJECTED" and not hard_failures:
             feedback = f"QA_LLM_NONBLOCKING_WARNING: {feedback}"
             current_history.append(feedback)
             status = "APPROVE_WITH_WARNINGS"
@@ -7965,7 +8007,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             issues = [i for i in issues if i != "CROSS_VALIDATION_REQUIRED"]
         if flags["requires_time_series_split"] and "TIME_SERIES_SPLIT_REQUIRED" not in issues:
             pass
-        qa_gates = evaluation_spec.get("qa_gates") or evaluation_spec.get("gates") or []
+        qa_gates = _extract_qa_gate_names(evaluation_spec.get("qa_gates") or evaluation_spec.get("gates") or [])
         require_variance = "target_variance_guard" in qa_gates or obj_type in {"predictive", "prescriptive"}
         if not require_variance and "TARGET_VARIANCE_GUARD" in issues:
             issues = [i for i in issues if i != "TARGET_VARIANCE_GUARD"]
@@ -9106,7 +9148,26 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     review_counters = counters
     audit_rejected = False
     hard_qa_gate_reject = False
-    hard_qa_gates = {"no_synthetic_data", "must_reference_contract_columns", "must_read_input_csv"}
+    qa_view = state.get("qa_view") or (state.get("contract_views") or {}).get("qa_view")
+    contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
+    if isinstance(qa_view, dict) and qa_view:
+        qa_context = dict(qa_view)
+        qa_context["_contract_source"] = "qa_view"
+    elif isinstance(contract_min, dict) and contract_min:
+        qa_context = dict(contract_min)
+        qa_context["_contract_source"] = "contract_min"
+    else:
+        qa_context = {"_contract_source": "fallback"}
+    qa_context["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
+    hard_qa_gates: set[str] = set()
+    for gate in qa_context.get("qa_gates", []) if isinstance(qa_context, dict) else []:
+        if isinstance(gate, dict):
+            name = gate.get("name") or gate.get("id")
+            severity = str(gate.get("severity") or "").upper()
+            if name and severity == "HARD":
+                hard_qa_gates.add(str(name).lower())
+        elif isinstance(gate, str):
+            hard_qa_gates.add(gate.lower())
     if code:
         analysis_type = strategy.get("analysis_type", "predictive")
         review_warnings: List[str] = []
@@ -9142,7 +9203,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             review_counters = counters
             qa_result = None
             if ok:
-                qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
+                qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context)
                 if qa_result and qa_result.get("status") != "APPROVED":
                     review_warnings.append(
                         f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"

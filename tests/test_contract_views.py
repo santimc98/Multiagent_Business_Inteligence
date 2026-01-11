@@ -4,6 +4,7 @@ from pathlib import Path
 from src.utils.contract_views import (
     build_de_view,
     build_ml_view,
+    build_qa_view,
     build_reviewer_view,
     build_translator_view,
     persist_views,
@@ -141,6 +142,17 @@ def test_reviewer_view_contains_gates_and_outputs():
     assert reviewer_view.get("required_outputs")
 
 
+def test_qa_view_contains_gates_and_requirements():
+    contract_full = _load_fixture("contract_full_small.json")
+    contract_min = _load_fixture("contract_min_small.json")
+    artifact_index = _load_fixture("artifact_index_small.json")
+    qa_view = build_qa_view(contract_full, contract_min, artifact_index)
+    assert qa_view.get("qa_gates")
+    assert qa_view.get("artifact_requirements", {}).get("required_outputs")
+    assert qa_view.get("column_roles")
+    assert qa_view.get("allowed_feature_sets")
+
+
 def test_translator_view_contains_policy_and_inventory():
     contract_full = _load_fixture("contract_full_small.json")
     contract_min = _load_fixture("contract_min_small.json")
@@ -171,10 +183,12 @@ def test_persist_views_writes_files(tmp_path):
     views = {
         "de_view": {"role": "data_engineer"},
         "ml_view": {"role": "ml_engineer"},
+        "qa_view": {"role": "qa_reviewer"},
         "reviewer_view": {"role": "reviewer"},
         "translator_view": {"role": "translator"},
     }
     paths = persist_views(views, base_dir=str(tmp_path))
     assert (tmp_path / "contracts" / "views" / "de_view.json").exists()
     assert (tmp_path / "contracts" / "views" / "ml_view.json").exists()
+    assert (tmp_path / "contracts" / "views" / "qa_view.json").exists()
     assert paths.get("de_view")
