@@ -2158,6 +2158,7 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         ],
         "SYNTHETIC_DATA_DETECTED": [
             "CRITICAL: Remove ALL synthetic data generation logic. Common violations:",
+            "Remove any input existence checks and any fallback branches that generate data; the orchestrator guarantees the input exists.",
             "- Fallback patterns: 'if not os.path.exists(filepath): generate dummy data'",
             "- Random generation: np.random, random.randint, faker, pd.DataFrame with literals",
             "- Dummy datasets: pd.DataFrame({'col': [val1, val2, ...]}) when input is missing",

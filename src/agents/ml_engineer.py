@@ -380,6 +380,199 @@ class MLEngineerAgent:
 
         return code
 
+    def _call_name(self, call_node: ast.Call) -> str:
+        try:
+            return ast.unparse(call_node.func)
+        except Exception:
+            if isinstance(call_node.func, ast.Name):
+                return call_node.func.id
+            if isinstance(call_node.func, ast.Attribute):
+                return call_node.func.attr
+        return ""
+
+    def _get_call_parts(self, node: ast.AST) -> List[str]:
+        parts: List[str] = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return list(reversed(parts))
+
+    def _is_path_constructor(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id == "Path"
+        if isinstance(node, ast.Attribute):
+            return node.attr == "Path"
+        return False
+
+    def _node_is_input_reference(self, node: ast.AST, input_names: set, data_path: str) -> bool:
+        if isinstance(node, ast.Name) and node.id in input_names:
+            return True
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value == data_path:
+            return True
+        if isinstance(node, ast.Call) and self._is_path_constructor(node.func):
+            for arg in node.args:
+                if self._node_is_input_reference(arg, input_names, data_path):
+                    return True
+            for kw in node.keywords:
+                if self._node_is_input_reference(kw.value, input_names, data_path):
+                    return True
+        return False
+
+    def _extract_target_names(self, target: ast.AST) -> List[str]:
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names: List[str] = []
+            for elt in target.elts:
+                names.extend(self._extract_target_names(elt))
+            return names
+        return []
+
+    def _collect_input_path_names(self, tree: ast.AST, data_path: str) -> set:
+        names: set = set()
+
+        def value_is_data_path(value: ast.AST, known: set) -> bool:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str) and value.value == data_path:
+                return True
+            if isinstance(value, ast.Name) and value.id in known:
+                return True
+            if isinstance(value, ast.Call) and self._is_path_constructor(value.func):
+                for arg in value.args:
+                    if value_is_data_path(arg, known):
+                        return True
+                for kw in value.keywords:
+                    if value_is_data_path(kw.value, known):
+                        return True
+            return False
+
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    value = node.value
+                    if value is None or not value_is_data_path(value, names):
+                        continue
+                    for target in node.targets:
+                        for name in self._extract_target_names(target):
+                            if name not in names:
+                                names.add(name)
+                                changed = True
+                elif isinstance(node, ast.AnnAssign):
+                    value = node.value
+                    if value is None or not value_is_data_path(value, names):
+                        continue
+                    for name in self._extract_target_names(node.target):
+                        if name not in names:
+                            names.add(name)
+                            changed = True
+        return names
+
+    def _is_input_exists_call(self, call_node: ast.Call, input_names: set, data_path: str) -> bool:
+        if not isinstance(call_node.func, ast.Attribute) or call_node.func.attr != "exists":
+            return False
+        func_value = call_node.func.value
+        if isinstance(func_value, ast.Attribute):
+            if isinstance(func_value.value, ast.Name) and func_value.value.id == "os" and func_value.attr == "path":
+                return any(
+                    self._node_is_input_reference(arg, input_names, data_path)
+                    for arg in call_node.args
+                )
+        if isinstance(func_value, ast.Call) and self._is_path_constructor(func_value.func):
+            for arg in func_value.args:
+                if self._node_is_input_reference(arg, input_names, data_path):
+                    return True
+            for kw in func_value.keywords:
+                if self._node_is_input_reference(kw.value, input_names, data_path):
+                    return True
+        if self._node_is_input_reference(func_value, input_names, data_path):
+            return True
+        return False
+
+    def _try_handles_filenotfound(self, try_node: ast.Try) -> bool:
+        for handler in try_node.handlers:
+            exc_type = handler.type
+            if exc_type is None:
+                continue
+            if isinstance(exc_type, ast.Name) and exc_type.id == "FileNotFoundError":
+                return True
+            if isinstance(exc_type, ast.Attribute) and exc_type.attr == "FileNotFoundError":
+                return True
+            if isinstance(exc_type, ast.Tuple):
+                for elt in exc_type.elts:
+                    if isinstance(elt, ast.Name) and elt.id == "FileNotFoundError":
+                        return True
+                    if isinstance(elt, ast.Attribute) and elt.attr == "FileNotFoundError":
+                        return True
+        return False
+
+    def _call_is_read_csv(self, call_node: ast.Call) -> bool:
+        name = self._call_name(call_node).lower()
+        return name.endswith("read_csv")
+
+    def _call_uses_input(self, call_node: ast.Call, input_names: set, data_path: str) -> bool:
+        for arg in call_node.args:
+            if self._node_is_input_reference(arg, input_names, data_path):
+                return True
+        for kw in call_node.keywords:
+            if self._node_is_input_reference(kw.value, input_names, data_path):
+                return True
+        return False
+
+    def _synthetic_call_reason(self, call_node: ast.Call) -> str | None:
+        parts = self._get_call_parts(call_node.func)
+        if parts:
+            func_name = parts[-1].lower()
+            module_prefix = ".".join(part.lower() for part in parts[:-1])
+            if module_prefix in {"np.random", "numpy.random"}:
+                allowed = {"seed", "choice", "randint", "permutation", "shuffle", "default_rng"}
+                if func_name not in allowed:
+                    return f"forbidden_np_random_call:{module_prefix}.{func_name}"
+
+        call_name = self._call_name(call_node).lower()
+        if "sklearn.datasets.make_" in call_name or ".datasets.make_" in call_name or call_name.startswith("make_"):
+            return f"forbidden_sklearn_make_call:{call_name}"
+        if "faker" in call_name:
+            return f"forbidden_faker_call:{call_name}"
+        return None
+
+    def _detect_forbidden_input_fallback(self, code: str, data_path: str) -> List[str]:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as exc:
+            return [f"ast_parse_failed:{exc.msg}"]
+
+        input_names = self._collect_input_path_names(tree, data_path)
+        reasons: List[str] = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if self._is_input_exists_call(node, input_names, data_path):
+                    reasons.append("input_existence_check_on_input_file")
+                synthetic_reason = self._synthetic_call_reason(node)
+                if synthetic_reason:
+                    reasons.append(synthetic_reason)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try) and self._try_handles_filenotfound(node):
+                for stmt in node.body:
+                    for inner in ast.walk(stmt):
+                        if isinstance(inner, ast.Call) and self._call_is_read_csv(inner):
+                            if self._call_uses_input(inner, input_names, data_path):
+                                reasons.append("file_not_found_fallback_on_input_read")
+                                break
+
+        deduped: List[str] = []
+        seen = set()
+        for reason in reasons:
+            if reason in seen:
+                continue
+            seen.add(reason)
+            deduped.append(reason)
+        return deduped
+
     def generate_code(
         self,
         strategy: Dict[str, Any],
@@ -441,6 +634,16 @@ class MLEngineerAgent:
            - DO NOT hardcode sep=',', decimal='.', or any other dialect values. ALWAYS read from manifest first.
            - Fallback ONLY if manifest doesn't exist: use the defaults shown above.
         4) CRITICAL - INPUT PATH: You MUST read data from the EXACT path '$data_path' provided in the context.
+           INPUT GUARANTEE (NON-NEGOTIABLE):
+           - The orchestrator guarantees that the dataset at $data_path exists before your script runs.
+           PROHIBITED:
+           - Any input existence checks: os.path.exists(INPUT_FILE), Path(INPUT_FILE).exists(), or try/except FileNotFoundError around the input pd.read_csv.
+           - Any fallback branch that creates DataFrames/arrays when input is missing (dummy/demo/synthetic data).
+           - Any synthetic data generation with np.random (uniform/rand/randn/random_sample/normal/etc), sklearn.datasets.make_*, faker, etc.
+           CORRECT:
+           - Define INPUT_FILE = '$data_path' and call pd.read_csv with dialect.
+           - If read_csv fails, let the error bubble up; do not handle by creating data.
+           NOTE: os.path.exists is allowed only for reading data/cleaning_manifest.json and for creating output dirs; never for INPUT_FILE.
            - CORRECT: INPUT_FILE = '$data_path' then df = pd.read_csv(INPUT_FILE, sep=sep, decimal=decimal, encoding=encoding, ...)
            - WRONG: Using hardcoded paths like 'data.csv', 'input.csv', 'raw_data.csv', 'data/input_data.csv', etc.
            - WRONG: pd.read_csv(INPUT_FILE) without dialect parameters
@@ -1055,6 +1258,46 @@ class MLEngineerAgent:
 
             # Post-processing: Inject correct data_path if LLM used wrong path
             code = self._fix_data_path_in_code(code, data_path)
+            reasons = self._detect_forbidden_input_fallback(code, data_path)
+            if reasons:
+                guard_system = (
+                    "You are a senior ML engineer. Remove forbidden input-existence checks "
+                    "and synthetic fallbacks. Assume input exists at $data_path. "
+                    "Return full python script only."
+                )
+                guard_user = (
+                    "Remove any input existence checks and any fallback branches that generate data.\n"
+                    "Detected forbidden patterns:\n"
+                    + "\n".join([f"- {reason}" for reason in reasons])
+                    + "\n\nCODE:\n"
+                    + self._truncate_code_for_patch(code)
+                    + "\n\nReturn the FULL script only, without any input existence checks, "
+                    "FileNotFoundError fallbacks, or synthetic data generation (np.random, "
+                    "sklearn.datasets.make_*, faker)."
+                )
+                model_for_repairs = self.last_model_used or self.model_name
+                repaired = code
+                for _ in range(2):
+                    repaired = call_with_retries(
+                        lambda: _call_model_with_prompts(guard_system, guard_user, 0.0, model_for_repairs),
+                        max_retries=2,
+                        backoff_factor=2,
+                        initial_delay=1,
+                    )
+                    repaired = self._clean_code(repaired)
+                    if not is_syntax_valid(repaired):
+                        reasons = ["syntax_invalid_after_guardrail"]
+                        continue
+                    repaired = self._fix_data_path_in_code(repaired, data_path)
+                    reasons = self._detect_forbidden_input_fallback(repaired, data_path)
+                    if not reasons:
+                        code = repaired
+                        break
+                if reasons:
+                    raise RuntimeError(
+                        "ML guardrail failed: synthetic/fallback patterns still present: "
+                        + "; ".join(reasons)
+                    )
             return code
 
         except Exception as e:
