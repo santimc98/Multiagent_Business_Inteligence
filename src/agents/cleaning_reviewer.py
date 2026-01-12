@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import re
@@ -104,6 +105,16 @@ def _parse_review_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[
         return _parse_legacy_context(args[0])
 
     cleaning_view = args[0] if args else kwargs.get("cleaning_view") or {}
+    if not isinstance(cleaning_view, dict):
+        cleaning_view = {}
+    input_dialect = kwargs.get("input_dialect")
+    output_dialect = kwargs.get("output_dialect")
+    if isinstance(input_dialect, dict) and not cleaning_view.get("input_dialect"):
+        cleaning_view["input_dialect"] = input_dialect
+    if isinstance(output_dialect, dict) and not cleaning_view.get("output_dialect"):
+        cleaning_view["output_dialect"] = output_dialect
+    if isinstance(kwargs.get("dialect"), dict) and not cleaning_view.get("dialect"):
+        cleaning_view["dialect"] = kwargs.get("dialect")
     cleaned_csv_path = (
         (args[1] if len(args) > 1 else None)
         or kwargs.get("cleaned_csv_path")
@@ -122,7 +133,7 @@ def _parse_review_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[
         or kwargs.get("raw_path")
     )
     return {
-        "cleaning_view": cleaning_view if isinstance(cleaning_view, dict) else {},
+        "cleaning_view": cleaning_view,
         "cleaned_csv_path": str(cleaned_csv_path),
         "cleaning_manifest_path": str(cleaning_manifest_path),
         "raw_csv_path": str(raw_csv_path) if raw_csv_path else None,
@@ -137,10 +148,20 @@ def _parse_legacy_context(context: Dict[str, Any]) -> Dict[str, Any]:
         cleaning_view["cleaning_gates"] = context.get("cleaning_gates")
     if not cleaning_view.get("required_columns") and context.get("required_columns"):
         cleaning_view["required_columns"] = context.get("required_columns")
+    if not cleaning_view.get("input_dialect"):
+        input_dialect = context.get("input_dialect")
+        if isinstance(input_dialect, dict):
+            cleaning_view["input_dialect"] = input_dialect
+    if not cleaning_view.get("output_dialect"):
+        output_dialect = context.get("output_dialect")
+        if isinstance(output_dialect, dict):
+            cleaning_view["output_dialect"] = output_dialect
     if not cleaning_view.get("dialect"):
-        dialect = context.get("dialect") or context.get("input_dialect") or context.get("output_dialect")
-        if isinstance(dialect, dict):
-            cleaning_view["dialect"] = dialect
+        legacy_dialect = context.get("dialect")
+        if isinstance(legacy_dialect, dict):
+            cleaning_view["dialect"] = legacy_dialect
+            if not cleaning_view.get("input_dialect"):
+                cleaning_view["input_dialect"] = legacy_dialect
     if not cleaning_view.get("column_roles") and isinstance(context.get("column_roles"), dict):
         cleaning_view["column_roles"] = context.get("column_roles")
 
@@ -176,17 +197,42 @@ def _review_cleaning_impl(
     gates, contract_source_used, warnings = _merge_cleaning_gates(view)
     gate_names = [gate["name"] for gate in gates]
 
-    dialect = _resolve_dialect(view.get("dialect"))
     required_columns = _list_str(view.get("required_columns"))
     column_roles = _coerce_roles(view.get("column_roles"))
 
     manifest = _load_json(cleaning_manifest_path)
-    cleaned_header = _read_csv_header(cleaned_csv_path, dialect)
-    sample_str = _read_csv_sample(cleaned_csv_path, dialect, cleaned_header, dtype=str, nrows=400)
-    sample_infer = _read_csv_sample(cleaned_csv_path, dialect, cleaned_header, dtype=None, nrows=400)
+    dialect_in_context = _resolve_dialect(view.get("dialect"))
+    dialect_raw = _resolve_dialect(view.get("input_dialect") or view.get("dialect") or dialect_in_context)
+    dialect_cleaned = _resolve_dialect(
+        view.get("output_dialect")
+        or _extract_output_dialect_from_manifest(manifest)
+        or view.get("dialect")
+    )
+    dialect_warnings: List[str] = []
+
+    cleaned_header = _read_csv_header(cleaned_csv_path, dialect_cleaned)
+    if cleaned_header and len(cleaned_header) == 1:
+        header_text = str(cleaned_header[0])
+        if any(token in header_text for token in [",", ";", "\t", "|"]):
+            inferred_sep = _infer_delimiter_from_file(cleaned_csv_path)
+            if inferred_sep and inferred_sep != dialect_cleaned.get("sep"):
+                encoding = dialect_cleaned.get("encoding") or _infer_encoding(cleaned_csv_path)
+                sample_text = _read_text_sample(cleaned_csv_path, encoding, 50000)
+                inferred_decimal = _infer_decimal_from_sample(sample_text, inferred_sep)
+                dialect_cleaned = _resolve_dialect(
+                    {"sep": inferred_sep, "decimal": inferred_decimal, "encoding": encoding}
+                )
+                dialect_warnings.append(
+                    "DIALECT_AUTO_INFERRED_FOR_CLEANED: input dialect mismatched; "
+                    f"inferred sep={inferred_sep}, decimal={inferred_decimal}"
+                )
+                cleaned_header = _read_csv_header(cleaned_csv_path, dialect_cleaned)
+
+    sample_str = _read_csv_sample(cleaned_csv_path, dialect_cleaned, cleaned_header, dtype=str, nrows=400)
+    sample_infer = _read_csv_sample(cleaned_csv_path, dialect_cleaned, cleaned_header, dtype=None, nrows=400)
     raw_sample = None
     if raw_csv_path:
-        raw_sample = _read_csv_sample(raw_csv_path, dialect, None, dtype=str, nrows=200)
+        raw_sample = _read_csv_sample(raw_csv_path, dialect_raw, None, dtype=str, nrows=200)
 
     facts = _build_facts(
         cleaned_header=cleaned_header,
@@ -208,6 +254,7 @@ def _review_cleaning_impl(
         raw_sample=raw_sample,
         column_roles=column_roles,
     )
+    warnings.extend(dialect_warnings)
     deterministic_result = _assemble_result(
         deterministic,
         gate_names,
@@ -222,7 +269,7 @@ def _review_cleaning_impl(
     prompt, payload = _build_llm_prompt(
         gates=gates,
         required_columns=required_columns,
-        dialect=dialect,
+        dialect=dialect_cleaned,
         column_roles=column_roles,
         facts=facts,
         deterministic_gate_results=deterministic["gate_results"],
@@ -343,6 +390,66 @@ def _resolve_dialect(raw: Any) -> Dict[str, Any]:
         "decimal": raw.get("decimal", "."),
         "encoding": raw.get("encoding", "utf-8"),
     }
+
+
+def _extract_output_dialect_from_manifest(manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(manifest, dict):
+        return None
+    output = manifest.get("output_dialect")
+    return output if isinstance(output, dict) else None
+
+
+def _infer_encoding(path: str) -> str:
+    encodings = ("utf-8", "latin-1", "cp1252")
+    for enc in encodings:
+        try:
+            with open(path, "r", encoding=enc) as handle:
+                handle.read(2048)
+            return enc
+        except Exception:
+            continue
+    return "utf-8"
+
+
+def _read_text_sample(path: str, encoding: str, max_bytes: int) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding=encoding, errors="replace") as handle:
+            return handle.read(max_bytes)
+    except Exception:
+        return ""
+
+
+def _infer_delimiter_from_file(path: str) -> Optional[str]:
+    if not path or not os.path.exists(path):
+        return None
+    encoding = _infer_encoding(path)
+    sample = _read_text_sample(path, encoding, 50000)
+    if not sample:
+        return None
+    delimiters = [",", ";", "\t", "|"]
+    try:
+        sniffed = csv.Sniffer().sniff(sample, delimiters=delimiters)
+        if getattr(sniffed, "delimiter", None):
+            return sniffed.delimiter
+    except Exception:
+        pass
+    counts = {delim: sample.count(delim) for delim in delimiters}
+    best = max(counts, key=counts.get)
+    return best if counts.get(best, 0) > 0 else None
+
+
+def _infer_decimal_from_sample(sample: str, sep: str) -> str:
+    if not sample:
+        return "."
+    comma_hits = len(re.findall(r"\d+,\d+", sample))
+    dot_hits = len(re.findall(r"\d+\.\d+", sample))
+    if comma_hits > dot_hits:
+        return ","
+    if dot_hits > comma_hits:
+        return "."
+    return "."
 
 
 def _load_json(path: str) -> Dict[str, Any]:

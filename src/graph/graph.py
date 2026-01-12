@@ -6934,10 +6934,24 @@ def run_data_engineer(state: AgentState) -> AgentState:
             # --- CLEANING REVIEWER (contract-driven) ---
             if cleaning_reviewer:
                 try:
+                    manifest_for_review = _load_json_safe(local_manifest_path)
+                    output_dialect = None
+                    output_payload = manifest_for_review.get("output_dialect")
+                    if isinstance(output_payload, dict):
+                        output_dialect = {
+                            "sep": output_payload.get("sep") or csv_sep,
+                            "decimal": output_payload.get("decimal") or csv_decimal,
+                            "encoding": output_payload.get("encoding") or csv_encoding,
+                        }
                     cleaning_view = state.get("cleaning_view") or (state.get("contract_views") or {}).get("cleaning_view")
                     if cleaning_view:
+                        cleaning_view_copy = dict(cleaning_view)
+                        if output_dialect:
+                            cleaning_view_copy["output_dialect"] = output_dialect
+                        if isinstance(input_dialect, dict):
+                            cleaning_view_copy["input_dialect"] = input_dialect
                         review_result = cleaning_reviewer.review_cleaning(
-                            cleaning_view,
+                            cleaning_view_copy,
                             cleaned_csv_path=local_cleaned_path,
                             cleaning_manifest_path=local_manifest_path,
                             raw_csv_path=csv_path,
@@ -6957,6 +6971,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "cleaning_manifest_path": local_manifest_path,
                             "raw_csv_path": csv_path,
                         }
+                        if output_dialect:
+                            review_context["output_dialect"] = output_dialect
+                        if isinstance(input_dialect, dict):
+                            review_context["input_dialect"] = input_dialect
                         review_result = cleaning_reviewer.review_cleaning(review_context)
                     try:
                         os.makedirs("artifacts", exist_ok=True)
