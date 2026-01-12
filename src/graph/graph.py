@@ -6933,17 +6933,30 @@ def run_data_engineer(state: AgentState) -> AgentState:
             # --- CLEANING REVIEWER (contract-driven) ---
             if cleaning_reviewer:
                 try:
-                    cleaning_view = (
-                        state.get("cleaning_view")
-                        or (state.get("contract_views") or {}).get("cleaning_view")
-                        or {}
-                    )
-                    review_result = cleaning_reviewer.review_cleaning(
-                        cleaning_view,
-                        cleaned_csv_path=local_cleaned_path,
-                        cleaning_manifest_path=local_manifest_path,
-                        raw_csv_path=csv_path,
-                    )
+                    cleaning_view = state.get("cleaning_view") or (state.get("contract_views") or {}).get("cleaning_view")
+                    if cleaning_view:
+                        review_result = cleaning_reviewer.review_cleaning(
+                            cleaning_view,
+                            cleaned_csv_path=local_cleaned_path,
+                            cleaning_manifest_path=local_manifest_path,
+                            raw_csv_path=csv_path,
+                        )
+                    else:
+                        contract = state.get("execution_contract", {}) or {}
+                        contract_min = state.get("execution_contract_min", {}) or {}
+                        review_context = {
+                            "cleaning_view": {},
+                            "cleaning_gates": contract.get("cleaning_gates")
+                            or contract_min.get("cleaning_gates")
+                            or [],
+                            "required_columns": _resolve_required_input_columns(contract, selected),
+                            "dialect": input_dialect,
+                            "column_roles": contract.get("column_roles") if isinstance(contract, dict) else {},
+                            "cleaned_csv_path": local_cleaned_path,
+                            "cleaning_manifest_path": local_manifest_path,
+                            "raw_csv_path": csv_path,
+                        }
+                        review_result = cleaning_reviewer.review_cleaning(review_context)
                     try:
                         os.makedirs("artifacts", exist_ok=True)
                         with open(os.path.join("artifacts", "cleaning_reviewer_report.json"), "w", encoding="utf-8") as f_rep:

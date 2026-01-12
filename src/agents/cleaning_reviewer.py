@@ -4,12 +4,19 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from dotenv import load_dotenv
+from openai import OpenAI
 
 from src.utils.code_extract import extract_code_block
+
+load_dotenv()
 
 _CLEANING_FALLBACK_WARNING = (
     "CONTRACT_BROKEN_FALLBACK: cleaning_gates missing; please fix contract generation"
 )
+_LLM_DISABLED_WARNING = "LLM_DISABLED_NO_API_KEY"
+_LLM_PARSE_WARNING = "LLM_PARSE_FAILED"
+_LLM_CALL_WARNING = "LLM_CALL_FAILED"
 
 _DEFAULT_ID_REGEX = r"(?i)(^id$|id$|entity|cod|code|key|partida|invoice|account)"
 _DEFAULT_PERCENT_REGEX = r"(?i)%|pct|percent|plazo"
@@ -54,56 +61,120 @@ _FALLBACK_CLEANING_GATES = [
 
 class CleaningReviewerAgent:
     """
-    Contract-driven cleaning reviewer. Evaluates ONLY the cleaning_gates specified
-    by the Execution Planner (via CLEANING_VIEW_CONTEXT).
+    LLM-driven cleaning reviewer with deterministic evidence checks.
+    Falls back to deterministic mode if MIMO_API_KEY is unavailable.
     """
 
-    def __init__(self):
+    def __init__(self, api_key: Any = None):
+        self.api_key = api_key or os.getenv("MIMO_API_KEY")
+        if self.api_key:
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url="https://api.xiaomimimo.com/v1",
+            )
+        else:
+            self.client = None
+        self.model_name = "mimo-v2-flash"
         self.last_prompt = None
         self.last_response = None
-        self.model_name = "contract-driven"
 
-    def review_cleaning(
-        self,
-        cleaning_view: Dict[str, Any],
-        cleaned_csv_path: str,
-        cleaning_manifest_path: str,
-        raw_csv_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    def review_cleaning(self, *args, **kwargs) -> Dict[str, Any]:
         try:
-            result = _review_cleaning_impl(
-                cleaning_view=cleaning_view,
-                cleaned_csv_path=cleaned_csv_path,
-                cleaning_manifest_path=cleaning_manifest_path,
-                raw_csv_path=raw_csv_path,
+            request = _parse_review_inputs(args, kwargs)
+            result, prompt, response = _review_cleaning_impl(
+                cleaning_view=request["cleaning_view"],
+                cleaned_csv_path=request["cleaned_csv_path"],
+                cleaning_manifest_path=request["cleaning_manifest_path"],
+                raw_csv_path=request.get("raw_csv_path"),
+                client=self.client,
+                model_name=self.model_name,
             )
         except Exception as exc:
-            result = {
-                "status": "REJECTED",
-                "feedback": f"Cleaning reviewer exception: {exc}",
-                "failed_checks": ["CLEANING_REVIEWER_EXCEPTION"],
-                "required_fixes": ["Investigate cleaning reviewer failure."],
-                "warnings": [str(exc)],
-                "cleaning_gates_evaluated": [],
-                "hard_failures": ["CLEANING_REVIEWER_EXCEPTION"],
-                "soft_failures": [],
-                "contract_source_used": "error",
-            }
+            result = _exception_result(exc)
+            prompt = "cleaning_reviewer_exception"
+            response = str(exc)
 
-        self.last_prompt = "contract-driven-cleaning-review"
-        self.last_response = json.dumps(result, ensure_ascii=True)
+        self.last_prompt = prompt
+        self.last_response = response
         return result
+
+
+def _parse_review_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    if len(args) == 1 and isinstance(args[0], dict) and not kwargs.get("cleaned_csv_path"):
+        return _parse_legacy_context(args[0])
+
+    cleaning_view = args[0] if args else kwargs.get("cleaning_view") or {}
+    cleaned_csv_path = (
+        (args[1] if len(args) > 1 else None)
+        or kwargs.get("cleaned_csv_path")
+        or kwargs.get("cleaned_path")
+        or "data/cleaned_data.csv"
+    )
+    cleaning_manifest_path = (
+        (args[2] if len(args) > 2 else None)
+        or kwargs.get("cleaning_manifest_path")
+        or kwargs.get("manifest_path")
+        or "data/cleaning_manifest.json"
+    )
+    raw_csv_path = (
+        (args[3] if len(args) > 3 else None)
+        or kwargs.get("raw_csv_path")
+        or kwargs.get("raw_path")
+    )
+    return {
+        "cleaning_view": cleaning_view if isinstance(cleaning_view, dict) else {},
+        "cleaned_csv_path": str(cleaned_csv_path),
+        "cleaning_manifest_path": str(cleaning_manifest_path),
+        "raw_csv_path": str(raw_csv_path) if raw_csv_path else None,
+    }
+
+
+def _parse_legacy_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    context = context if isinstance(context, dict) else {}
+    cleaning_view = context.get("cleaning_view") if isinstance(context.get("cleaning_view"), dict) else {}
+
+    if not cleaning_view.get("cleaning_gates") and isinstance(context.get("cleaning_gates"), list):
+        cleaning_view["cleaning_gates"] = context.get("cleaning_gates")
+    if not cleaning_view.get("required_columns") and context.get("required_columns"):
+        cleaning_view["required_columns"] = context.get("required_columns")
+    if not cleaning_view.get("dialect"):
+        dialect = context.get("dialect") or context.get("input_dialect") or context.get("output_dialect")
+        if isinstance(dialect, dict):
+            cleaning_view["dialect"] = dialect
+    if not cleaning_view.get("column_roles") and isinstance(context.get("column_roles"), dict):
+        cleaning_view["column_roles"] = context.get("column_roles")
+
+    cleaned_csv_path = (
+        context.get("cleaned_csv_path")
+        or context.get("cleaned_path")
+        or context.get("cleaned_csv")
+        or "data/cleaned_data.csv"
+    )
+    cleaning_manifest_path = (
+        context.get("cleaning_manifest_path")
+        or context.get("manifest_path")
+        or "data/cleaning_manifest.json"
+    )
+    raw_csv_path = context.get("raw_csv_path") or context.get("raw_path")
+    return {
+        "cleaning_view": cleaning_view,
+        "cleaned_csv_path": str(cleaned_csv_path),
+        "cleaning_manifest_path": str(cleaning_manifest_path),
+        "raw_csv_path": str(raw_csv_path) if raw_csv_path else None,
+    }
 
 
 def _review_cleaning_impl(
     cleaning_view: Dict[str, Any],
     cleaned_csv_path: str,
     cleaning_manifest_path: str,
-    raw_csv_path: Optional[str] = None,
-) -> Dict[str, Any]:
+    raw_csv_path: Optional[str],
+    client: Optional[OpenAI],
+    model_name: str,
+) -> Tuple[Dict[str, Any], str, str]:
     view = cleaning_view if isinstance(cleaning_view, dict) else {}
-    gates, contract_source_used, warnings = _resolve_cleaning_gates(view)
-    gates_evaluated = [gate["name"] for gate in gates]
+    gates, contract_source_used, warnings = _merge_cleaning_gates(view)
+    gate_names = [gate["name"] for gate in gates]
 
     dialect = _resolve_dialect(view.get("dialect"))
     required_columns = _list_str(view.get("required_columns"))
@@ -111,100 +182,110 @@ def _review_cleaning_impl(
 
     manifest = _load_json(cleaning_manifest_path)
     cleaned_header = _read_csv_header(cleaned_csv_path, dialect)
-    sample_str = _read_csv_sample(cleaned_csv_path, dialect, cleaned_header, dtype=str)
-    sample_infer = _read_csv_sample(cleaned_csv_path, dialect, cleaned_header, dtype=None)
+    sample_str = _read_csv_sample(cleaned_csv_path, dialect, cleaned_header, dtype=str, nrows=400)
+    sample_infer = _read_csv_sample(cleaned_csv_path, dialect, cleaned_header, dtype=None, nrows=400)
     raw_sample = None
     if raw_csv_path:
-        raw_sample = _read_csv_sample(raw_csv_path, dialect, None, dtype=str)
+        raw_sample = _read_csv_sample(raw_csv_path, dialect, None, dtype=str, nrows=200)
 
-    hard_failures: List[str] = []
-    soft_failures: List[str] = []
-    failed_checks: List[str] = []
-    required_fixes: List[str] = []
-    soft_warnings: List[str] = list(warnings)
-    failure_summaries: List[str] = []
-    warning_summaries: List[str] = []
+    facts = _build_facts(
+        cleaned_header=cleaned_header,
+        required_columns=required_columns,
+        manifest=manifest,
+        sample_str=sample_str,
+        sample_infer=sample_infer,
+        raw_sample=raw_sample,
+    )
 
-    for gate in gates:
-        name = gate["name"]
-        severity = gate["severity"]
-        params = gate["params"]
-        issues: List[str] = []
+    deterministic = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=required_columns,
+        cleaned_header=cleaned_header,
+        cleaned_csv_path=cleaned_csv_path,
+        sample_str=sample_str,
+        sample_infer=sample_infer,
+        manifest=manifest,
+        raw_sample=raw_sample,
+        column_roles=column_roles,
+    )
+    deterministic_result = _assemble_result(
+        deterministic,
+        gate_names,
+        warnings,
+        contract_source_used,
+    )
 
-        if name == "required_columns_present":
-            issues = _check_required_columns(required_columns, cleaned_header, cleaned_csv_path)
-        elif name == "id_integrity":
-            issues = _check_id_integrity(
-                cleaned_header,
-                sample_str,
-                sample_infer,
-                params,
-                column_roles,
-            )
-        elif name == "no_semantic_rescale":
-            issues = _check_no_semantic_rescale(
-                manifest,
-                params,
-                cleaned_header,
-                column_roles,
-                raw_sample,
-                sample_infer if sample_infer is not None else sample_str,
-            )
-        elif name == "no_synthetic_data":
-            issues = _check_no_synthetic_data(manifest)
-        elif name == "row_count_sanity":
-            issues = _check_row_count_sanity(manifest, params)
-        else:
-            soft_warnings.append(f"UNKNOWN_GATE_SKIPPED: {name}")
+    if not client:
+        deterministic_result["warnings"].append(_LLM_DISABLED_WARNING)
+        return normalize_cleaning_reviewer_result(deterministic_result), "LLM_DISABLED", "deterministic"
 
-        if issues:
-            _record_gate_failure(
-                name,
-                severity,
-                issues,
-                hard_failures,
-                soft_failures,
-                failed_checks,
-                required_fixes,
-                failure_summaries,
-                warning_summaries,
-            )
+    prompt, payload = _build_llm_prompt(
+        gates=gates,
+        required_columns=required_columns,
+        dialect=dialect,
+        column_roles=column_roles,
+        facts=facts,
+        deterministic_gate_results=deterministic["gate_results"],
+        contract_source_used=contract_source_used,
+    )
+    print(f"DEBUG: Cleaning Reviewer calling MIMO ({model_name})...")
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+        )
+        content = response.choices[0].message.content
+    except Exception as exc:
+        deterministic_result["warnings"].append(f"{_LLM_CALL_WARNING}: {exc}")
+        return normalize_cleaning_reviewer_result(deterministic_result), prompt, str(exc)
 
-    status = "APPROVED"
-    if hard_failures:
-        status = "REJECTED"
-    elif soft_failures:
-        status = "APPROVE_WITH_WARNINGS"
+    parsed = _parse_llm_json(content)
+    if not parsed:
+        deterministic_result["warnings"].append(_LLM_PARSE_WARNING)
+        return normalize_cleaning_reviewer_result(deterministic_result), prompt, content
 
-    if hard_failures:
-        feedback = "Cleaning reviewer rejected: " + " | ".join(failure_summaries)
-    elif soft_failures:
-        feedback = "Cleaning reviewer approved with warnings: " + " | ".join(warning_summaries)
-    else:
-        feedback = "Cleaning reviewer approved: all gates passed."
+    merged = _merge_llm_with_deterministic(
+        llm_result=parsed,
+        deterministic=deterministic,
+        gate_names=gate_names,
+        contract_source_used=contract_source_used,
+        warnings=warnings,
+    )
+    return normalize_cleaning_reviewer_result(merged), prompt, content
 
-    if warning_summaries:
-        soft_warnings.extend(warning_summaries)
 
-    result = {
-        "status": status,
-        "feedback": feedback,
-        "failed_checks": failed_checks,
-        "required_fixes": required_fixes,
-        "warnings": soft_warnings,
-        "cleaning_gates_evaluated": gates_evaluated,
-        "hard_failures": hard_failures,
-        "soft_failures": soft_failures,
-        "contract_source_used": contract_source_used,
+def _exception_result(exc: Exception) -> Dict[str, Any]:
+    return {
+        "status": "REJECTED",
+        "feedback": f"Cleaning reviewer exception: {exc}",
+        "failed_checks": ["CLEANING_REVIEWER_EXCEPTION"],
+        "required_fixes": ["Investigate cleaning reviewer failure."],
+        "warnings": [str(exc)],
+        "cleaning_gates_evaluated": [],
+        "hard_failures": ["CLEANING_REVIEWER_EXCEPTION"],
+        "soft_failures": [],
+        "gate_results": [],
+        "contract_source_used": "error",
     }
-    return normalize_cleaning_reviewer_result(result)
 
 
-def _resolve_cleaning_gates(view: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str, List[str]]:
-    raw = view.get("cleaning_gates") if isinstance(view, dict) else None
-    if isinstance(raw, list) and raw:
-        return _normalize_cleaning_gates(raw), "cleaning_view", []
-    return _normalize_cleaning_gates(_FALLBACK_CLEANING_GATES), "fallback", [_CLEANING_FALLBACK_WARNING]
+def _merge_cleaning_gates(view: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str, List[str]]:
+    contract_gates = _normalize_cleaning_gates(view.get("cleaning_gates"))
+    universal_gates = _normalize_cleaning_gates(_FALLBACK_CLEANING_GATES)
+    warnings: List[str] = []
+    if contract_gates:
+        merged = _dedupe_gates(contract_gates + universal_gates)
+        source = "merged" if universal_gates else "cleaning_view"
+    else:
+        merged = universal_gates
+        source = "fallback"
+        warnings.append(_CLEANING_FALLBACK_WARNING)
+    return merged, source, warnings
 
 
 def _normalize_cleaning_gates(raw: Any) -> List[Dict[str, Any]]:
@@ -233,6 +314,18 @@ def _normalize_cleaning_gates(raw: Any) -> List[Dict[str, Any]]:
             seen.add(key)
             normalized.append({"name": gate.strip(), "severity": "HARD", "params": {}})
     return normalized
+
+
+def _dedupe_gates(gates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for gate in gates:
+        key = str(gate.get("name", "")).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(gate)
+    return deduped
 
 
 def _normalize_severity(severity: Any, required: Any = None) -> str:
@@ -284,7 +377,7 @@ def _read_csv_sample(
     dialect: Dict[str, Any],
     columns: Optional[List[str]],
     dtype: Optional[Any],
-    nrows: int = 1000,
+    nrows: int,
 ) -> Optional[pd.DataFrame]:
     if not path or not os.path.exists(path):
         return None
@@ -321,6 +414,393 @@ def _coerce_roles(raw: Any) -> Dict[str, List[str]]:
         if isinstance(val, list):
             out[str(key)] = [str(item) for item in val if item]
     return out
+
+
+def _build_facts(
+    cleaned_header: List[str],
+    required_columns: List[str],
+    manifest: Dict[str, Any],
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    raw_sample: Optional[pd.DataFrame],
+) -> Dict[str, Any]:
+    facts: Dict[str, Any] = {}
+    facts["cleaned_header"] = cleaned_header[:200]
+    facts["required_columns"] = required_columns
+    facts["missing_required_columns"] = [c for c in required_columns if c not in cleaned_header]
+
+    row_counts = manifest.get("row_counts") or {}
+    facts["row_counts"] = {
+        "rows_before": manifest.get("rows_before") or row_counts.get("initial"),
+        "rows_after": manifest.get("rows_after") or row_counts.get("final"),
+    }
+    conversions = manifest.get("conversions") if isinstance(manifest, dict) else {}
+    dropped = manifest.get("dropped_columns") if isinstance(manifest, dict) else {}
+    warnings = manifest.get("warnings") if isinstance(manifest, dict) else []
+    facts["manifest_summary"] = {
+        "conversions_count": len(conversions) if isinstance(conversions, dict) else 0,
+        "dropped_columns_count": len(dropped) if isinstance(dropped, (list, dict)) else 0,
+        "warnings": [str(w) for w in warnings[:5]] if isinstance(warnings, list) else [],
+    }
+    facts["column_stats_sample"] = _build_column_stats(sample_str, sample_infer, max_cols=40)
+    facts["cleaned_sample_rows"] = _sample_rows(sample_str, max_rows=5)
+    facts["raw_sample_rows"] = _sample_rows(raw_sample, max_rows=5)
+    return facts
+
+
+def _build_column_stats(
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    max_cols: int,
+) -> List[Dict[str, Any]]:
+    if sample_str is None or sample_str.empty:
+        return []
+    columns = list(sample_str.columns)[:max_cols]
+    stats: List[Dict[str, Any]] = []
+    for col in columns:
+        series = sample_str[col]
+        total = len(series)
+        null_frac = float(series.isna().sum() / total) if total else 0.0
+        unique_count = int(series.nunique(dropna=True)) if total else 0
+        examples = [str(v) for v in series.dropna().head(3).tolist()]
+        dtype = "unknown"
+        if sample_infer is not None and col in sample_infer.columns:
+            dtype = str(sample_infer[col].dtype)
+        stats.append(
+            {
+                "column": col,
+                "dtype": dtype,
+                "null_frac": round(null_frac, 4),
+                "unique_count": unique_count,
+                "examples": examples,
+            }
+        )
+    return stats
+
+
+def _sample_rows(sample_df: Optional[pd.DataFrame], max_rows: int) -> List[Dict[str, Any]]:
+    if sample_df is None or sample_df.empty:
+        return []
+    rows = sample_df.head(max_rows).to_dict(orient="records")
+    return rows if isinstance(rows, list) else []
+
+
+def _evaluate_gates_deterministic(
+    gates: List[Dict[str, Any]],
+    required_columns: List[str],
+    cleaned_header: List[str],
+    cleaned_csv_path: str,
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    manifest: Dict[str, Any],
+    raw_sample: Optional[pd.DataFrame],
+    column_roles: Dict[str, List[str]],
+) -> Dict[str, Any]:
+    hard_failures: List[str] = []
+    soft_failures: List[str] = []
+    failed_checks: List[str] = []
+    required_fixes: List[str] = []
+    warnings: List[str] = []
+    failure_summaries: List[str] = []
+    warning_summaries: List[str] = []
+    gate_results: List[Dict[str, Any]] = []
+
+    for gate in gates:
+        name = gate["name"]
+        severity = gate["severity"]
+        params = gate["params"]
+        issues: List[str] = []
+        evidence: Dict[str, Any] = {}
+        evaluated = True
+
+        if name == "required_columns_present":
+            issues = _check_required_columns(required_columns, cleaned_header, cleaned_csv_path)
+            evidence["missing"] = [c for c in required_columns if c not in cleaned_header]
+        elif name == "id_integrity":
+            issues = _check_id_integrity(
+                cleaned_header,
+                sample_str,
+                sample_infer,
+                params,
+                column_roles,
+            )
+        elif name == "no_semantic_rescale":
+            issues = _check_no_semantic_rescale(
+                manifest,
+                params,
+                cleaned_header,
+                column_roles,
+                raw_sample,
+                sample_infer if sample_infer is not None else sample_str,
+            )
+        elif name == "no_synthetic_data":
+            issues = _check_no_synthetic_data(manifest)
+        elif name == "row_count_sanity":
+            issues = _check_row_count_sanity(manifest, params)
+            evidence["row_counts"] = (manifest.get("row_counts") or {})
+        else:
+            evaluated = False
+            warnings.append(f"UNKNOWN_GATE_SKIPPED: {name}")
+
+        passed = None
+        if evaluated:
+            passed = not issues
+        gate_results.append(
+            {
+                "name": name,
+                "severity": severity,
+                "passed": passed,
+                "issues": issues,
+                "evidence": evidence or {"source": "deterministic"},
+            }
+        )
+
+        if issues:
+            _record_gate_failure(
+                name,
+                severity,
+                issues,
+                hard_failures,
+                soft_failures,
+                failed_checks,
+                required_fixes,
+                failure_summaries,
+                warning_summaries,
+            )
+
+    status = "APPROVED"
+    if hard_failures:
+        status = "REJECTED"
+    elif soft_failures:
+        status = "APPROVE_WITH_WARNINGS"
+
+    if hard_failures:
+        feedback = "Cleaning reviewer rejected: " + " | ".join(failure_summaries)
+    elif soft_failures:
+        feedback = "Cleaning reviewer approved with warnings: " + " | ".join(warning_summaries)
+    else:
+        feedback = "Cleaning reviewer approved: all gates passed."
+
+    if warning_summaries:
+        warnings.extend(warning_summaries)
+
+    return {
+        "status": status,
+        "feedback": feedback,
+        "failed_checks": failed_checks,
+        "required_fixes": required_fixes,
+        "warnings": warnings,
+        "hard_failures": hard_failures,
+        "soft_failures": soft_failures,
+        "gate_results": gate_results,
+    }
+
+
+def _assemble_result(
+    deterministic: Dict[str, Any],
+    gate_names: List[str],
+    warnings: List[str],
+    contract_source_used: str,
+) -> Dict[str, Any]:
+    result = dict(deterministic)
+    result["warnings"] = _dedupe_list(list(warnings) + result.get("warnings", []))
+    result["cleaning_gates_evaluated"] = gate_names
+    result["contract_source_used"] = contract_source_used
+    result.setdefault("gate_results", [])
+    result.setdefault("hard_failures", [])
+    result.setdefault("soft_failures", [])
+    return result
+
+
+def _build_llm_prompt(
+    gates: List[Dict[str, Any]],
+    required_columns: List[str],
+    dialect: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+    facts: Dict[str, Any],
+    deterministic_gate_results: List[Dict[str, Any]],
+    contract_source_used: str,
+) -> Tuple[str, Dict[str, Any]]:
+    system_prompt = (
+        "You are a Senior Data Cleaning Reviewer.\n"
+        "Evaluate ONLY the gates listed in cleaning_gates.\n"
+        "Use the provided evidence and samples; do not invent data.\n"
+        "If a HARD gate fails, status must be REJECTED.\n"
+        "If only SOFT gates fail, status must be APPROVE_WITH_WARNINGS.\n"
+        "If no gates fail, status must be APPROVED.\n"
+        "When evidence is insufficient, mark the gate as not failed and add a warning.\n"
+        "Return JSON only with the specified schema.\n"
+        "\n"
+        "Required JSON schema:\n"
+        "{\n"
+        '  "status": "APPROVED" | "APPROVE_WITH_WARNINGS" | "REJECTED",\n'
+        '  "feedback": "string",\n'
+        '  "failed_checks": ["gate_name", ...],\n'
+        '  "required_fixes": ["actionable fix", ...],\n'
+        '  "warnings": ["warning", ...],\n'
+        '  "hard_failures": ["gate_name", ...],\n'
+        '  "soft_failures": ["gate_name", ...],\n'
+        '  "gate_results": [\n'
+        "     {\n"
+        '       "name": "gate_name",\n'
+        '       "severity": "HARD|SOFT",\n'
+        '       "passed": true|false,\n'
+        '       "issues": ["issue", ...],\n'
+        '       "evidence": "short evidence string"\n'
+        "     }\n"
+        "  ],\n"
+        '  "contract_source_used": "cleaning_view|fallback|merged"\n'
+        "}\n"
+    )
+
+    payload = {
+        "cleaning_gates": gates,
+        "required_columns": required_columns,
+        "dialect": dialect,
+        "column_roles": column_roles,
+        "facts": facts,
+        "deterministic_gate_results": deterministic_gate_results,
+        "contract_source_used": contract_source_used,
+    }
+    return system_prompt, payload
+
+
+def _parse_llm_json(content: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(content, str):
+        return None
+    cleaned = extract_code_block(content)
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _merge_llm_with_deterministic(
+    llm_result: Dict[str, Any],
+    deterministic: Dict[str, Any],
+    gate_names: List[str],
+    contract_source_used: str,
+    warnings: List[str],
+) -> Dict[str, Any]:
+    llm = _normalize_llm_result(llm_result)
+    det = deterministic
+
+    hard_failures = _merge_gate_lists(
+        llm.get("hard_failures", []), det.get("hard_failures", []), gate_names
+    )
+    soft_failures = _merge_gate_lists(
+        llm.get("soft_failures", []), det.get("soft_failures", []), gate_names
+    )
+    failed_checks = _merge_gate_lists(
+        llm.get("failed_checks", []), det.get("failed_checks", []), gate_names
+    )
+    required_fixes = _dedupe_list(det.get("required_fixes", []) + llm.get("required_fixes", []))
+    merged_warnings = _dedupe_list(warnings + det.get("warnings", []) + llm.get("warnings", []))
+
+    status = "APPROVED"
+    if hard_failures:
+        status = "REJECTED"
+    elif soft_failures:
+        status = "APPROVE_WITH_WARNINGS"
+
+    feedback = llm.get("feedback") or det.get("feedback") or ""
+    if hard_failures and feedback:
+        feedback = feedback + " Deterministic evidence confirms HARD failures."
+
+    gate_results = _merge_gate_results(
+        llm.get("gate_results", []),
+        det.get("gate_results", []),
+        gate_names,
+    )
+
+    return {
+        "status": status,
+        "feedback": feedback,
+        "failed_checks": failed_checks,
+        "required_fixes": required_fixes,
+        "warnings": merged_warnings,
+        "hard_failures": hard_failures,
+        "soft_failures": soft_failures,
+        "gate_results": gate_results,
+        "cleaning_gates_evaluated": gate_names,
+        "contract_source_used": contract_source_used,
+    }
+
+
+def _normalize_llm_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    out = result if isinstance(result, dict) else {}
+    out.setdefault("failed_checks", [])
+    out.setdefault("required_fixes", [])
+    out.setdefault("warnings", [])
+    out.setdefault("hard_failures", [])
+    out.setdefault("soft_failures", [])
+    out.setdefault("gate_results", [])
+    return out
+
+
+def _merge_gate_lists(primary: List[Any], secondary: List[Any], allowed: List[str]) -> List[str]:
+    allowed_norm = {str(name).lower() for name in allowed}
+    merged = _dedupe_list([str(item) for item in primary + secondary if item])
+    filtered = [item for item in merged if item.lower() in allowed_norm]
+    return filtered
+
+
+def _merge_gate_results(
+    llm_results: List[Any],
+    det_results: List[Any],
+    gate_names: List[str],
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for entry in det_results:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            continue
+        merged[name.lower()] = dict(entry)
+    for entry in llm_results:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            continue
+        key = name.lower()
+        existing = merged.get(key, {})
+        updated = dict(existing)
+        updated.update(entry)
+        merged[key] = updated
+    ordered = []
+    for gate in gate_names:
+        key = gate.lower()
+        if key in merged:
+            ordered.append(merged[key])
+        else:
+            ordered.append(
+                {
+                    "name": gate,
+                    "severity": "HARD",
+                    "passed": None,
+                    "issues": [],
+                    "evidence": "no_result",
+                }
+            )
+    return ordered
+
+
+def _dedupe_list(items: List[Any]) -> List[str]:
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(text)
+    return deduped
 
 
 def _record_gate_failure(
