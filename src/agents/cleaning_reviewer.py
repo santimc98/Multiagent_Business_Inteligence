@@ -148,7 +148,7 @@ def _review_cleaning_impl(
                 cleaned_header,
                 column_roles,
                 raw_sample,
-                sample_infer or sample_str,
+                sample_infer if sample_infer is not None else sample_str,
             )
         elif name == "no_synthetic_data":
             issues = _check_no_synthetic_data(manifest)
