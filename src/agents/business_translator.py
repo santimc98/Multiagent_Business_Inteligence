@@ -108,6 +108,183 @@ def _summarize_numeric_columns(rows: List[Dict[str, Any]], columns: List[str], d
             break
     return numeric_summary
 
+def _truncate_cell(text: str, max_len: int) -> str:
+    cleaned = str(text).replace("\n", " ").replace("\r", " ").strip()
+    cleaned = cleaned.replace("|", "/")
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max(0, max_len - 3)] + "..."
+
+def render_table_text(headers: List[str], rows: List[List[str]], max_rows: int = 8, max_cell_len: int = 28) -> str:
+    if not headers or not rows:
+        return "No data available."
+    safe_rows = []
+    for row in rows[:max_rows]:
+        if not isinstance(row, list):
+            continue
+        safe_rows.append([_truncate_cell(cell, max_cell_len) for cell in row])
+    if not safe_rows:
+        return "No data available."
+    widths = []
+    for idx, header in enumerate(headers):
+        header_text = _truncate_cell(header, max_cell_len)
+        col_width = len(header_text)
+        for row in safe_rows:
+            if idx < len(row):
+                col_width = max(col_width, len(row[idx]))
+        widths.append(min(col_width, max_cell_len))
+    header_line = "  ".join(
+        _truncate_cell(header, max_cell_len).ljust(widths[idx]) for idx, header in enumerate(headers)
+    )
+    sep_line = "  ".join("-" * widths[idx] for idx in range(len(widths)))
+    data_lines = []
+    for row in safe_rows:
+        padded = []
+        for idx, width in enumerate(widths):
+            cell = row[idx] if idx < len(row) else ""
+            padded.append(_truncate_cell(cell, max_cell_len).ljust(width))
+        data_lines.append("  ".join(padded))
+    return "\n".join([header_line, sep_line] + data_lines)
+
+def _flatten_metrics(metrics: Dict[str, Any], prefix: str = "") -> List[tuple[str, Any]]:
+    items: List[tuple[str, Any]] = []
+    if not isinstance(metrics, dict):
+        return items
+    for key, value in metrics.items():
+        metric_key = f"{prefix}{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            items.extend(_flatten_metrics(value, f"{metric_key}."))
+        else:
+            items.append((metric_key, value))
+    return items
+
+def _select_informative_columns(sample: Dict[str, Any], max_cols: int = 8, min_cols: int = 5) -> List[str]:
+    if not isinstance(sample, dict):
+        return []
+    columns = sample.get("columns", []) or []
+    rows = sample.get("rows", []) or []
+    decimal = (sample.get("dialect_used") or {}).get("decimal") or "."
+    if not columns:
+        return []
+    if not rows:
+        return columns[:max_cols]
+    stats = []
+    for col in columns:
+        values = []
+        for row in rows[:50]:
+            raw = row.get(col)
+            if raw not in (None, ""):
+                values.append(raw)
+        if not values:
+            continue
+        numeric_hits = sum(1 for val in values if coerce_number(val, decimal) is not None)
+        unique_count = len({str(val) for val in values})
+        ratio = numeric_hits / max(len(values), 1)
+        stats.append(
+            {
+                "col": col,
+                "numeric_ratio": ratio,
+                "unique_count": unique_count,
+                "non_null": len(values),
+            }
+        )
+    numeric_cols = [item for item in stats if item["numeric_ratio"] >= 0.6]
+    cat_cols = [item for item in stats if item["numeric_ratio"] < 0.6]
+    numeric_cols.sort(key=lambda item: item["non_null"], reverse=True)
+    cat_cols.sort(key=lambda item: item["unique_count"])
+    selected = [item["col"] for item in numeric_cols[:4]]
+    selected.extend([item["col"] for item in cat_cols[:4] if item["col"] not in selected])
+    if len(selected) < min_cols:
+        for col in columns:
+            if col not in selected:
+                selected.append(col)
+            if len(selected) >= min_cols:
+                break
+    return selected[:max_cols]
+
+def _select_scored_columns(sample: Dict[str, Any], max_cols: int = 6) -> List[str]:
+    if not isinstance(sample, dict):
+        return []
+    columns = sample.get("columns", []) or []
+    if not columns:
+        return []
+    tokens = ["pred", "prob", "score", "segment", "cluster", "group", "rank", "risk", "expected", "optimal", "recommend"]
+    preferred = []
+    for col in columns:
+        norm = col.lower()
+        if any(tok in norm for tok in tokens):
+            preferred.append(col)
+    for col in columns:
+        if col.lower() in {"row_id", "case_id", "caseid", "id"} and col not in preferred:
+            preferred.insert(0, col)
+    if not preferred:
+        return _select_informative_columns(sample, max_cols=max_cols, min_cols=min(5, max_cols))
+    deduped = []
+    for col in preferred:
+        if col not in deduped:
+            deduped.append(col)
+    return deduped[:max_cols]
+
+def _rows_from_sample(sample: Dict[str, Any], columns: List[str], max_rows: int = 5) -> List[List[str]]:
+    rows = sample.get("rows", []) if isinstance(sample, dict) else []
+    out = []
+    for row in rows[:max_rows]:
+        out.append([str(row.get(col, "")) for col in columns])
+    return out
+
+def _metrics_table(metrics_payload: Dict[str, Any], max_items: int = 10) -> str:
+    if not isinstance(metrics_payload, dict):
+        return "No data available."
+    model_perf = metrics_payload.get("model_performance") if isinstance(metrics_payload.get("model_performance"), dict) else {}
+    items: List[tuple[str, str]] = []
+    if isinstance(model_perf, dict):
+        for key, value in model_perf.items():
+            if isinstance(value, dict) and {"mean", "ci_lower", "ci_upper"}.issubset(value.keys()):
+                mean = value.get("mean")
+                lower = value.get("ci_lower")
+                upper = value.get("ci_upper")
+                items.append((f"model_performance.{key}", f"mean={mean} ci=[{lower}, {upper}]"))
+            elif _is_number(value):
+                items.append((f"model_performance.{key}", str(value)))
+            if len(items) >= max_items:
+                break
+    if len(items) < max_items:
+        flat = _flatten_metrics(metrics_payload)
+        for key, value in flat:
+            if len(items) >= max_items:
+                break
+            if key.startswith("model_performance."):
+                continue
+            if _is_number(value):
+                items.append((key, str(value)))
+    if not items:
+        return "No data available."
+    rows = [[metric, val] for metric, val in items[:max_items]]
+    return render_table_text(["metric", "value"], rows, max_rows=max_items)
+
+def _recommendations_table(preview: Dict[str, Any], max_rows: int = 3) -> str:
+    if not isinstance(preview, dict):
+        return "No data available."
+    items = preview.get("items")
+    if not isinstance(items, list) or not items:
+        return "No data available."
+    keys = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in item.keys():
+            keys[key] = keys.get(key, 0) + 1
+    sorted_keys = [k for k, _ in sorted(keys.items(), key=lambda kv: kv[1], reverse=True)]
+    headers = sorted_keys[:4]
+    if not headers:
+        return "No data available."
+    rows = []
+    for item in items[:max_rows]:
+        if not isinstance(item, dict):
+            continue
+        rows.append([str(item.get(key, "")) for key in headers])
+    return render_table_text(headers, rows, max_rows=max_rows)
+
 def _pick_top_examples(rows: List[Dict[str, Any]], columns: List[str], value_keys: List[str], label_keys: List[str], decimal: str, max_rows: int = 3):
     if not rows or not columns:
         return None
@@ -294,6 +471,7 @@ class BusinessTranslatorAgent:
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
         run_summary = _safe_load_json("data/run_summary.json") or {}
         recommendations_preview = _safe_load_json("reports/recommendations_preview.json") or {}
+        metrics_payload = _safe_load_json("data/metrics.json") or {}
         weights_path = _first_artifact_path(artifact_index, "weights")
         predictions_path = _first_artifact_path(artifact_index, "predictions")
         weights_payload = _safe_load_json(weights_path) if weights_path else None
@@ -556,6 +734,14 @@ class BusinessTranslatorAgent:
         model_metrics_context = _summarize_model_metrics()
         facts_context = _facts_from_insights(insights) or _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
         artifacts_context = view_inventory if view_inventory else []
+        evidence_paths = []
+        for item in artifacts_context or []:
+            if isinstance(item, dict) and item.get("path"):
+                evidence_paths.append(str(item.get("path")))
+            elif isinstance(item, str):
+                evidence_paths.append(str(item))
+        evidence_paths = [p for idx, p in enumerate(evidence_paths) if p and p not in evidence_paths[:idx]]
+        evidence_paths = evidence_paths[:8]
         reporting_policy_context = view_policy if isinstance(view_policy, dict) else {}
         if not reporting_policy_context:
             reporting_policy_context = contract.get("reporting_policy", {}) if isinstance(contract, dict) else {}
@@ -596,6 +782,22 @@ class BusinessTranslatorAgent:
             "missing_required_slots": missing_required_slots,
         }
 
+        cleaned_sample_table_text = "No data available."
+        if isinstance(cleaned_rows, dict) and cleaned_rows.get("rows"):
+            cleaned_cols = _select_informative_columns(cleaned_rows, max_cols=8, min_cols=5)
+            cleaned_rows_list = _rows_from_sample(cleaned_rows, cleaned_cols, max_rows=5)
+            cleaned_sample_table_text = render_table_text(cleaned_cols, cleaned_rows_list, max_rows=5)
+
+        scored_sample_table_text = "No data available."
+        if isinstance(scored_rows, dict) and scored_rows.get("rows"):
+            scored_cols = _select_scored_columns(scored_rows, max_cols=6)
+            scored_rows_list = _rows_from_sample(scored_rows, scored_cols, max_rows=5)
+            scored_sample_table_text = render_table_text(scored_cols, scored_rows_list, max_rows=5)
+
+        metrics_table_text = _metrics_table(metrics_payload, max_items=10)
+        recommendations_table_text = _recommendations_table(recommendations_preview, max_rows=3)
+        evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths) if evidence_paths else "No data available."
+
         # Define Template
         SYSTEM_PROMPT_TEMPLATE = Template("""
         You are a Senior Executive Translator and Data Storyteller.
@@ -606,7 +808,7 @@ class BusinessTranslatorAgent:
         
         *** FORMATTING CONSTRAINTS (CRITICAL) ***
         1. **LANGUAGE:** DETECT the language of the 'Business Objective' in the state. GENERATE THE REPORT IN THAT SAME LANGUAGE. (If objective is Spanish, output Spanish).
-        2. **NO MARKDOWN TABLES:** The PDF generator breaks on tables. DO NOT use table syntax. Use bulleted lists or key-value pairs instead.
+        2. **NO MARKDOWN TABLES:** The PDF generator breaks on tables. DO NOT use table syntax. Use bulleted lists, key-value pairs, or the provided fixed-width text tables (no pipes).
            - Bad: | Metric | Value |
            - Good: 
              * Metric: Value
@@ -637,6 +839,11 @@ class BusinessTranslatorAgent:
         - Plot Insights (data-driven): $plot_insights_json
         - Artifacts Available: $artifacts_context
         - Recommendations Preview: $recommendations_preview_context
+        - Cleaned Data Sample Table (text): $cleaned_sample_table_text
+        - Scored Rows Sample Table (text): $scored_sample_table_text
+        - Metrics Table (text): $metrics_table_text
+        - Recommendations Table (text): $recommendations_table_text
+        - Evidence Paths (max 8): $evidence_paths_text
         - Reporting Policy: $reporting_policy_context
         - Translator View: $translator_view_context
         - Slot Payloads: $slot_payloads_context
@@ -644,12 +851,15 @@ class BusinessTranslatorAgent:
 
         GUIDANCE:
         - Use Insights as the primary evidence source; only reference other artifacts if they add clear value.
+        - Include 2-4 short "tablas de muestra" using the provided text tables. Do NOT use markdown tables or pipes; use the text tables as-is.
         - If reporting_policy.demonstrative_examples_enabled is true AND run_outcome is in reporting_policy.demonstrative_examples_when_outcome_in,
           you MUST include a section titled "Ejemplos ilustrativos (no aptos para producción)".
           Use recommendations_preview.items (max 3-5) and include strong disclaimers plus support (n, observed_support if available).
           If items are empty, explain why using recommendations_preview.reason and mention which artifact was missing.
         - If run_outcome is GO, you may include a short "Recommendations Snapshot" section if recommendations_preview.items exists,
           without the "illustrative" labeling.
+        - For every plot you mention, include 1-3 concrete findings (n/%/top categories) drawn from plot_insights_json. If no quantitative insights are available for a plot, explicitly say "No se dispone de insights cuantitativos para este gráfico" (or equivalent in the target language).
+        - Do NOT invent segment/category names; only mention names that appear in facts, insights, or plot_insights_json.
         - Slot-driven reporting:
           For each slot in reporting_policy.slots:
             * if mode == "required": include it using evidence (payload or artifact); if missing => write "No disponible" and cite missing sources.
@@ -712,6 +922,7 @@ class BusinessTranslatorAgent:
         If Alignment Check is WARN or FAIL, explicitly state the limitation and whether it is data-limited
         or method-choice, and reflect it in Risks & Limitations.
 
+        End the report with a final section titled "Evidencia usada" listing up to 8 artifact paths from Evidence Paths.
                 OUTPUT: Markdown format (NO TABLES).
         """)
         
@@ -746,6 +957,11 @@ class BusinessTranslatorAgent:
             plot_insights_json=json.dumps(plot_insights, ensure_ascii=False),
             artifacts_context=json.dumps(artifacts_context, ensure_ascii=False),
             recommendations_preview_context=json.dumps(recommendations_preview, ensure_ascii=False),
+            cleaned_sample_table_text=cleaned_sample_table_text,
+            scored_sample_table_text=scored_sample_table_text,
+            metrics_table_text=metrics_table_text,
+            recommendations_table_text=recommendations_table_text,
+            evidence_paths_text=evidence_paths_text,
             reporting_policy_context=json.dumps(reporting_policy_context, ensure_ascii=False),
             translator_view_context=json.dumps(translator_view_context, ensure_ascii=False),
             slot_payloads_context=json.dumps(slot_payloads, ensure_ascii=False),
