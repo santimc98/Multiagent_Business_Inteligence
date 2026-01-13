@@ -3493,6 +3493,32 @@ def _read_csv_header(csv_path: str, encoding: str, sep: str) -> List[str]:
     except Exception:
         return []
 
+def _detect_alternate_csv_sep(csv_path: str, encoding: str, current_sep: str) -> str | None:
+    try:
+        import csv
+        with open(csv_path, "r", encoding=encoding, errors="replace") as f:
+            header_line = f.readline()
+        if not header_line:
+            return None
+        candidates = [",", ";", "\t", "|"]
+        best_sep = None
+        best_cols = 1
+        for sep in candidates:
+            if sep == current_sep:
+                continue
+            try:
+                row = next(csv.reader([header_line], delimiter=sep), [])
+            except Exception:
+                continue
+            if len(row) > best_cols:
+                best_cols = len(row)
+                best_sep = sep
+        if best_cols >= 2:
+            return best_sep
+    except Exception:
+        return None
+    return None
+
 def _cleanup_run_artifacts() -> None:
     paths_to_remove = [
         os.path.join("artifacts", "ml_engineer_last.py"),
@@ -3609,11 +3635,18 @@ def _summarize_segmentation_stats(
     }
     if not scored_path or not os.path.exists(scored_path):
         return stats
-    columns = _read_csv_header(scored_path, csv_encoding, csv_sep)
+    detected_sep = csv_sep
+    columns = _read_csv_header(scored_path, csv_encoding, detected_sep)
+    if len(columns) <= 1:
+        alt_sep = _detect_alternate_csv_sep(scored_path, csv_encoding, detected_sep)
+        if alt_sep:
+            detected_sep = alt_sep
+            columns = _read_csv_header(scored_path, csv_encoding, detected_sep)
+            stats["scored_rows_sep_used"] = detected_sep
     segment_col = _select_segment_column(columns, contract)
     stats["segment_column"] = segment_col
     try:
-        stats["n_rows"] = _count_raw_rows(scored_path, csv_encoding, csv_sep, csv_decimal)
+        stats["n_rows"] = _count_raw_rows(scored_path, csv_encoding, detected_sep, csv_decimal)
     except Exception:
         stats["n_rows"] = None
     if not segment_col:
@@ -3622,7 +3655,7 @@ def _summarize_segmentation_stats(
         import pandas as pd
         df = pd.read_csv(
             scored_path,
-            sep=csv_sep,
+            sep=detected_sep,
             decimal=csv_decimal,
             encoding=csv_encoding,
             usecols=[segment_col],
@@ -4231,9 +4264,19 @@ def _artifact_alignment_gate(
 
     try:
         import pandas as pd
-        scored_df = pd.read_csv(scored_path, sep=csv_sep, decimal=csv_decimal, encoding=csv_encoding)
+        scored_sep = csv_sep
+        scored_df = pd.read_csv(scored_path, sep=scored_sep, decimal=csv_decimal, encoding=csv_encoding)
+        if scored_df.shape[1] == 1:
+            alt_sep = _detect_alternate_csv_sep(scored_path, csv_encoding, scored_sep)
+            if alt_sep:
+                scored_sep = alt_sep
+                scored_df = pd.read_csv(scored_path, sep=scored_sep, decimal=csv_decimal, encoding=csv_encoding)
     except Exception as err:
         issues.append(f"scored_rows_read_failed:{err}")
+        return issues
+
+    if scored_df.shape[1] == 1:
+        issues.append("scored_rows_dialect_mismatch")
         return issues
 
     if len(scored_df) != len(cleaned_df):

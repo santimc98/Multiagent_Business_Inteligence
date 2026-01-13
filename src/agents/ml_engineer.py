@@ -380,6 +380,54 @@ class MLEngineerAgent:
 
         return code
 
+    def _fix_to_csv_dialect_in_code(self, code: str) -> str:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return code
+
+        has_sep = False
+        has_decimal = False
+        has_encoding = False
+        has_load_dialect = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                if node.id == "sep":
+                    has_sep = True
+                elif node.id == "decimal":
+                    has_decimal = True
+                elif node.id == "encoding":
+                    has_encoding = True
+            if isinstance(node, ast.Call):
+                name = self._call_name(node)
+                if name.endswith("load_dialect"):
+                    has_load_dialect = True
+        if not has_load_dialect and not (has_sep and has_decimal and has_encoding):
+            return code
+
+        class _ToCsvDialectFixer(ast.NodeTransformer):
+            def visit_Call(self, node: ast.Call) -> ast.AST:
+                self.generic_visit(node)
+                if not isinstance(node.func, ast.Attribute) or node.func.attr != "to_csv":
+                    return node
+                if any(kw.arg is None for kw in node.keywords):
+                    return node
+                existing = {kw.arg for kw in node.keywords if kw.arg}
+                if "sep" not in existing:
+                    node.keywords.append(ast.keyword(arg="sep", value=ast.Name(id="sep", ctx=ast.Load())))
+                if "decimal" not in existing:
+                    node.keywords.append(ast.keyword(arg="decimal", value=ast.Name(id="decimal", ctx=ast.Load())))
+                if "encoding" not in existing:
+                    node.keywords.append(ast.keyword(arg="encoding", value=ast.Name(id="encoding", ctx=ast.Load())))
+                return node
+
+        try:
+            fixed_tree = _ToCsvDialectFixer().visit(tree)
+            ast.fix_missing_locations(fixed_tree)
+            return ast.unparse(fixed_tree)
+        except Exception:
+            return code
+
     def _call_name(self, call_node: ast.Call) -> str:
         try:
             return ast.unparse(call_node.func)
@@ -633,6 +681,7 @@ class MLEngineerAgent:
            - Then use these values in ALL pd.read_csv() and .to_csv() calls.
            - DO NOT hardcode sep=',', decimal='.', or any other dialect values. ALWAYS read from manifest first.
            - Fallback ONLY if manifest doesn't exist: use the defaults shown above.
+           - When writing any CSV artifacts (scored_rows.csv, optimal_pricing_guide.csv, etc.), ALWAYS pass sep, decimal, encoding from load_dialect().
         4) CRITICAL - INPUT PATH: You MUST read data from the EXACT path '$data_path' provided in the context.
            INPUT GUARANTEE (NON-NEGOTIABLE):
            - The orchestrator guarantees that the dataset at $data_path exists before your script runs.
@@ -1258,6 +1307,7 @@ class MLEngineerAgent:
 
             # Post-processing: Inject correct data_path if LLM used wrong path
             code = self._fix_data_path_in_code(code, data_path)
+            code = self._fix_to_csv_dialect_in_code(code)
             reasons = self._detect_forbidden_input_fallback(code, data_path)
             if reasons:
                 guard_system = (
@@ -1289,6 +1339,7 @@ class MLEngineerAgent:
                         reasons = ["syntax_invalid_after_guardrail"]
                         continue
                     repaired = self._fix_data_path_in_code(repaired, data_path)
+                    repaired = self._fix_to_csv_dialect_in_code(repaired)
                     reasons = self._detect_forbidden_input_fallback(repaired, data_path)
                     if not reasons:
                         code = repaired
