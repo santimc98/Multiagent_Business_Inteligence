@@ -1195,11 +1195,16 @@ def _resolve_allowed_patterns_for_gate(contract: Any) -> List[str]:
     patterns: List[str] = []
     if not isinstance(contract, dict):
         return patterns
-    schema = contract.get("artifact_requirements", {}).get("file_schemas")
+    artifact_requirements = contract.get("artifact_requirements", {})
+    if not isinstance(artifact_requirements, dict):
+        artifact_requirements = {}
+    schema = artifact_requirements.get("file_schemas")
     if not isinstance(schema, dict):
         # Legacy Fallback
-        spec = contract.get("spec_extraction") or {}
-        schema = spec.get("artifact_schemas") or contract.get("artifact_schemas")
+        spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+        schema = spec.get("artifact_schemas") if isinstance(spec, dict) else None
+        if not isinstance(schema, dict):
+            schema = contract.get("artifact_schemas") if isinstance(contract.get("artifact_schemas"), dict) else None
     if isinstance(schema, dict):
         scored_schema = schema.get("data/scored_rows.csv")
         if isinstance(scored_schema, dict):
