@@ -90,3 +90,5 @@ data/produced_artifact_index.json
 # Run bundles
 run_*.zip
 runs/archive/run_*.zip
+
+claude_plans/

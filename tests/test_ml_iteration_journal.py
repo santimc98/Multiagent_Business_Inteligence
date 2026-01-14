@@ -6,6 +6,7 @@ from src.graph.graph import _load_ml_iteration_journal
 def test_ml_iteration_journal_append_and_load(tmp_path):
     entry = {
         "iteration_id": 1,
+        "stage": "review_complete",  # Stage field for deduplication key
         "code_hash": "abc123",
         "preflight_issues": ["UNKNOWN_COLUMNS_REFERENCED"],
         "runtime_error": None,
@@ -22,7 +23,8 @@ def test_ml_iteration_journal_append_and_load(tmp_path):
     assert path.exists()
     entries = _load_ml_iteration_journal("run1", base_dir=str(tmp_path))
     assert entries and entries[0]["iteration_id"] == 1
-    assert written == [1]
+    # Deduplication key is now "iteration_id:stage"
+    assert written == ["1:review_complete"]
 
 
 def test_ml_iteration_memory_block_compact():

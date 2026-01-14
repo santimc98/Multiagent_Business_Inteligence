@@ -2318,6 +2318,8 @@ def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
                 out[key] = max(1, int(val))
         except Exception:
             continue
+    if out:
+        print(f"ITER_POLICY metric_improvement_max={out.get('metric_improvement_max')} runtime_fix_max={out.get('runtime_fix_max')} plateau_window={out.get('plateau_window')} epsilon={out.get('plateau_epsilon')}")
     return out or None
 
 def _classify_iteration_type(
@@ -2335,6 +2337,123 @@ def _classify_iteration_type(
     if feedback and any(token in feedback for token in ["CODE_AUDIT_REJECTED", "OUTPUT_CONTRACT_MISSING"]):
         return "compliance"
     return "metric"
+
+def _normalize_allowed_feature_sets(feature_sets: Any) -> Any:
+    """Normalize allowed_feature_sets for consistent comparison.
+
+    If dict: sort each list value and return normalized dict.
+    If list: sort and return.
+    Otherwise: return as-is.
+    """
+    if isinstance(feature_sets, dict):
+        normalized = {}
+        for key, val in feature_sets.items():
+            if isinstance(val, list):
+                normalized[key] = sorted(val)
+            else:
+                normalized[key] = val
+        return normalized
+    elif isinstance(feature_sets, list):
+        return sorted(feature_sets)
+    return feature_sets
+
+def _derive_forbidden_from_allowed(allowed_feature_sets: Any, explicit_forbidden: List[str]) -> List[str]:
+    """Derive forbidden features from allowed_feature_sets if explicit list is empty.
+
+    If allowed_feature_sets is a dict with 'forbidden' key, use that.
+    Otherwise return explicit_forbidden.
+    """
+    if explicit_forbidden:
+        return sorted(explicit_forbidden)
+    if isinstance(allowed_feature_sets, dict):
+        forbidden = allowed_feature_sets.get("forbidden", [])
+        if isinstance(forbidden, list):
+            return sorted(forbidden)
+    return []
+
+def _capture_strategy_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Capture snapshot of strategy and contract for drift detection."""
+    strategy = state.get("selected_strategy") or {}
+    contract = state.get("execution_contract") or {}
+
+    # Use contract_version with fallback to version
+    contract_version = contract.get("contract_version") or contract.get("version")
+
+    # Normalize allowed_feature_sets (handles both dict and list formats)
+    raw_allowed = contract.get("allowed_feature_sets", []) or []
+    allowed_normalized = _normalize_allowed_feature_sets(raw_allowed)
+
+    # Derive forbidden_features from allowed_feature_sets if not explicitly set
+    raw_forbidden = contract.get("forbidden_features", []) or []
+    forbidden_normalized = _derive_forbidden_from_allowed(raw_allowed, raw_forbidden)
+
+    return {
+        "strategy_title": strategy.get("title"),
+        "strategy_id": strategy.get("id") or strategy.get("strategy_id"),
+        "contract_version": contract_version,
+        "canonical_columns": sorted(contract.get("canonical_columns", []) or []),
+        "decision_columns": sorted(contract.get("decision_columns", []) or []),
+        "outcome_columns": sorted(contract.get("outcome_columns", []) or []),
+        "allowed_feature_sets": allowed_normalized,
+        "forbidden_features": forbidden_normalized,
+    }
+
+def _validate_strategy_lock(state: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+    """
+    Validate that strategy/contract has not drifted from initial snapshot.
+    Returns (ok, details) where ok=True means no drift detected.
+    """
+    snapshot = state.get("strategy_lock_snapshot")
+    if not snapshot:
+        # No snapshot to compare - first iteration, capture it
+        return True, {"reason": "no_snapshot_yet"}
+
+    current = _capture_strategy_snapshot(state)
+    drifts: List[str] = []
+
+    # Compare key fields
+    if snapshot.get("strategy_title") and current.get("strategy_title"):
+        if snapshot["strategy_title"] != current["strategy_title"]:
+            drifts.append(f"strategy_title: {snapshot['strategy_title']} -> {current['strategy_title']}")
+
+    if snapshot.get("strategy_id") and current.get("strategy_id"):
+        if snapshot["strategy_id"] != current["strategy_id"]:
+            drifts.append(f"strategy_id: {snapshot['strategy_id']} -> {current['strategy_id']}")
+
+    if snapshot.get("contract_version") and current.get("contract_version"):
+        if snapshot["contract_version"] != current["contract_version"]:
+            drifts.append(f"contract_version: {snapshot['contract_version']} -> {current['contract_version']}")
+
+    if snapshot.get("canonical_columns") and current.get("canonical_columns"):
+        if snapshot["canonical_columns"] != current["canonical_columns"]:
+            added = set(current["canonical_columns"]) - set(snapshot["canonical_columns"])
+            removed = set(snapshot["canonical_columns"]) - set(current["canonical_columns"])
+            if added or removed:
+                drifts.append(f"canonical_columns changed: +{list(added)}, -{list(removed)}")
+
+    if snapshot.get("decision_columns") and current.get("decision_columns"):
+        if snapshot["decision_columns"] != current["decision_columns"]:
+            drifts.append(f"decision_columns changed")
+
+    if snapshot.get("outcome_columns") and current.get("outcome_columns"):
+        if snapshot["outcome_columns"] != current["outcome_columns"]:
+            drifts.append(f"outcome_columns changed")
+
+    # Compare allowed_feature_sets (normalized - can be dict or list)
+    snap_allowed = snapshot.get("allowed_feature_sets")
+    curr_allowed = current.get("allowed_feature_sets")
+    if snap_allowed and curr_allowed:
+        if snap_allowed != curr_allowed:
+            drifts.append(f"allowed_feature_sets changed")
+
+    if snapshot.get("forbidden_features") and current.get("forbidden_features"):
+        if snapshot["forbidden_features"] != current["forbidden_features"]:
+            drifts.append(f"forbidden_features changed")
+
+    if drifts:
+        return False, {"drifts": drifts, "snapshot": snapshot, "current": current}
+
+    return True, {"reason": "no_drift"}
 
 def _detect_refscore_alias(execution_output: str, contract: Dict[str, Any]) -> bool:
     if not execution_output or not isinstance(contract, dict):
@@ -7609,9 +7728,41 @@ def run_engineer(state: AgentState) -> AgentState:
             "execution_output_stale": bool(last_success_output),
             "budget_counters": counters,
         }
+
+    # Strategy Lock: Capture snapshot on first iteration, validate on subsequent iterations
+    strategy_lock_snapshot = state.get("strategy_lock_snapshot")
+    if not strategy_lock_snapshot:
+        strategy_lock_snapshot = _capture_strategy_snapshot(state)
+        state["strategy_lock_snapshot"] = strategy_lock_snapshot
+        print(f"STRATEGY_LOCK: Captured initial snapshot: {strategy_lock_snapshot.get('strategy_title')}")
+    else:
+        lock_ok, lock_details = _validate_strategy_lock(state)
+        if not lock_ok:
+            drifts = lock_details.get("drifts", [])
+            print(f"STRATEGY_LOCK_FAILED: Drift detected: {drifts}")
+            if run_id:
+                log_run_event(run_id, "strategy_lock_failed", {"drifts": drifts})
+            error_msg = f"STRATEGY_LOCK_FAILED: Strategy drift detected: {drifts}"
+            placeholder_code = f"# {error_msg}\n# Pipeline halted due to strategy/contract drift."
+            return {
+                "hard_fail_reason": "STRATEGY_LOCK_FAILED",
+                "review_verdict": "NEEDS_IMPROVEMENT",
+                "review_retry_worth_it": False,
+                "stop_reason": "STRATEGY_LOCK",
+                "error_message": error_msg,
+                "strategy_lock_failed": True,
+                "strategy_lock_details": lock_details,
+                "budget_counters": counters,
+                # Terminal flags to halt pipeline before execution
+                "ml_preflight_failed": True,
+                "generated_code": placeholder_code,
+                "last_generated_code": placeholder_code,
+                "review_abort_reason": "strategy_lock_failed",
+            }
+
     if run_id:
         log_run_event(run_id, "ml_engineer_start", {"iteration": state.get("iteration_count", 0) + 1})
-    
+
     strategy = state.get('selected_strategy')
     
     # Pass input context
@@ -7973,6 +8124,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "execution_contract_min": contract_min,
             },
             "budget_counters": counters,
+            "strategy_lock_snapshot": strategy_lock_snapshot,
         }
     except Exception as e:
         msg = f"CRITICAL: ML Engineer crashed in host: {str(e)}"
@@ -9258,14 +9410,21 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     
     new_history = list(state.get('feedback_history', []))
     has_deterministic_error = "Traceback" in execution_output or "EXECUTION ERROR" in execution_output
+    downgraded = False
     if status == "NEEDS_IMPROVEMENT":
         if has_deterministic_error:
             new_history.append(f"RESULT EVALUATION FEEDBACK: {feedback}")
         else:
+            # Only downgrade to APPROVE_WITH_WARNINGS if retry is explicitly NOT worth it.
+            # If retry_worth_it is True or None (unknown), keep NEEDS_IMPROVEMENT to allow metric iteration.
             warning = f"REVIEWER_LLM_NONBLOCKING_WARNING: {feedback}"
             new_history.append(warning)
             feedback = warning
-            status = "APPROVE_WITH_WARNINGS"
+            if retry_worth_it is False:
+                status = "APPROVE_WITH_WARNINGS"
+                downgraded = True
+            # else: keep status as NEEDS_IMPROVEMENT for metric iteration
+    print(f"ITER_EVAL status={status} retry_worth_it={retry_worth_it} downgraded={downgraded} reason={'no_traceback_retry_not_worth' if downgraded else 'none'}")
 
     # Case alignment QA gate (optional if required by contract/spec)
     contract = state.get("execution_contract", {}) or {}
@@ -10025,33 +10184,58 @@ def finalize_runtime_failure(state: AgentState) -> AgentState:
     return result
 
 def check_evaluation(state: AgentState):
+    # Helper to get metric info for logging
+    def _get_metric_info():
+        snapshot = state.get("primary_metric_snapshot") or {}
+        metric_name = snapshot.get("primary_metric_name", "unknown")
+        metric_value = snapshot.get("primary_metric_value", "N/A")
+        best_value = snapshot.get("baseline_value", "N/A")
+        return metric_name, metric_value, best_value
+
+    policy = _get_iteration_policy(state)
+    last_iter_type = state.get("last_iteration_type")
+    metric_iters = state.get("metric_iterations", 0)
+    metric_max = policy.get("metric_improvement_max") if policy else None
+    budget_left = (metric_max - metric_iters) if metric_max else "unlimited"
+    metric_name, metric_value, best_value = _get_metric_info()
+
     if state.get("hard_qa_gate_reject"):
         hard_count = int(state.get("hard_qa_retry_count", 0))
         if hard_count > 1:
-            print("WARNING: Hard QA gate retry limit reached (max 1). Proceeding with current results.")
+            # Hard QA gate failed and retry limit reached - NEVER approve, just stop iterating
+            print("WARNING: Hard QA gate retry limit reached (max 1). Stopping iterations - NOT approving.")
+            print(f"ITER_DECISION type=hard_qa action=stop reason=HARD_GATE_FAIL metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+            # Ensure the state reflects the hard gate failure for final reporting
+            state["stop_reason"] = "HARD_GATE_FAIL"
+            state["hard_gate_terminal"] = True
+            # NOTE: Returning "approved" here means "stop iterating", NOT "final approval"
+            # The review_verdict in state should still be NEEDS_IMPROVEMENT
             return "approved"
-    policy = _get_iteration_policy(state)
-    last_iter_type = state.get("last_iteration_type")
+
     if policy:
         compliance_max = policy.get("compliance_bootstrap_max")
-        metric_max = policy.get("metric_improvement_max")
         if last_iter_type == "compliance" and compliance_max:
             if state.get("compliance_iterations", 0) >= compliance_max:
                 print("WARNING: Compliance bootstrap limit reached. Proceeding with current results.")
+                print(f"ITER_DECISION type=compliance action=stop reason=BUDGET metric={metric_name}:{metric_value} best={best_value} budget_left=0")
                 return "approved"
         if last_iter_type != "compliance" and metric_max:
-            if state.get("metric_iterations", 0) >= metric_max:
+            if metric_iters >= metric_max:
                 print("WARNING: Metric-iteration limit reached. Proceeding with current results.")
+                print(f"ITER_DECISION type=metric action=stop reason=BUDGET metric={metric_name}:{metric_value} best={best_value} budget_left=0")
                 return "approved"
     else:
         if state.get('iteration_count', 0) >= 6:
             print("WARNING: Max iterations reached. Proceeding with current results.")
+            print(f"ITER_DECISION type=metric action=stop reason=BUDGET metric={metric_name}:{metric_value} best={best_value} budget_left=0")
             return "approved"
 
     # Adaptive stop: if case alignment degrades or stagnates, stop early.
     if last_iter_type == "compliance":
         if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
+            print(f"ITER_DECISION type=compliance action=retry reason=COMPLIANCE_FIX metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
             return "retry"
+        print(f"ITER_DECISION type=compliance action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         return "approved"
 
     if last_iter_type == "metric":
@@ -10062,6 +10246,8 @@ def check_evaluation(state: AgentState):
             msg = "DATA_LIMITED_STOP: data adequacy indicates signal ceiling reached; stopping metric iterations."
             print(f"WARNING: {msg}")
             _append_feedback_history(state, msg)
+            state["stop_reason"] = "CEILING"
+            print(f"ITER_DECISION type=metric action=stop reason=CEILING metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
             return "approved"
         plateau_window = 2
         plateau_epsilon = 0.01
@@ -10073,6 +10259,8 @@ def check_evaluation(state: AgentState):
             msg = f"PLATEAU_STOP: {reason or 'metric plateau detected'}"
             print(f"WARNING: {msg}")
             _append_feedback_history(state, msg)
+            state["stop_reason"] = "PLATEAU"
+            print(f"ITER_DECISION type=metric action=stop reason=PLATEAU metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
             return "approved"
 
     case_report = state.get("case_alignment_report", {}) or {}
@@ -10091,16 +10279,22 @@ def check_evaluation(state: AgentState):
             prev2 = new_history[-3]
             if last >= prev * 0.95 and prev >= prev2 * 0.95:
                 print("WARNING: Case alignment not improving across iterations. Stopping early.")
+                state["stop_reason"] = "CASE_ALIGNMENT_STAGNANT"
+                print(f"ITER_DECISION type=metric action=stop reason=CASE_ALIGNMENT_STAGNANT metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
                 return "approved"
         # stop if regression >10% vs best so far
         best = min(new_history) if new_history else curr_violation_rate
         if curr_violation_rate > best * 1.10:
             print("WARNING: Case alignment regressed vs best. Stopping early.")
+            state["stop_reason"] = "CASE_ALIGNMENT_REGRESSED"
+            print(f"ITER_DECISION type=metric action=stop reason=CASE_ALIGNMENT_REGRESSED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
             return "approved"
 
     if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
+        print(f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         return "retry"
     else:
+        print(f"ITER_DECISION type=metric action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         return "approved"
 
 def run_translator(state: AgentState) -> AgentState:
