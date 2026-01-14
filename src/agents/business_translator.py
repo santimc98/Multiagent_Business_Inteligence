@@ -864,7 +864,7 @@ class BusinessTranslatorAgent:
           For each slot in reporting_policy.slots:
             * if mode == "required": include it using evidence (payload or artifact); if missing => write "No disponible" and cite missing sources.
             * if mode == "conditional" or "optional": include only if payload exists; otherwise omit without inventing.
-          Structure the report using reporting_policy.sections order; do not add sections outside that list.
+          Structure the report using reporting_policy.sections order; do not add top-level sections outside that list, EXCEPT the final mandatory section titled "Evidencia usada".
 
         ERROR CONDITION:
         $error_condition
@@ -873,39 +873,76 @@ class BusinessTranslatorAgent:
         $visuals_context_json
 
         ERROR LOGIC (HIGHEST PRIORITY):
-        check: Is "$error_condition" != "No critical errors." OR does Run Summary say "FAIL"?
-        
-        IF ERROR DETECTED: 
+        Determine execution status:
+        - ERROR if "$error_condition" != "No critical errors." OR Run Summary indicates FAIL.
+        - SUCCESS otherwise.
+
+        IF ERROR DETECTED:
         1. Title: "EXECUTION FAILURE REPORT" (in the target language).
         2. Status Line: START with "⛔ BLOCKED / FALLO CRÍTICO".
-        3. Explain the failure based on error_condition and run_summary.
-        4. PROHIBITION: DO NOT generate "Evidence & Metrics", "Business Impact", or "Visual Insights" if the run failed. Do NOT hallucinate success.
-        
+        3. Explain the failure based on error_condition and run_summary (non-technical, executive tone).
+        4. State which critical artifacts are missing and why that blocks a decision (use Evidence Paths + artifact_index).
+        5. If VISUALS CONTEXT indicates plots_list is non-empty:
+           - Include a short subsection "Visual evidence available" and EMBED each plot:
+             ![<filename>](<exact_path_from_plots_list>)
+           - Under each plot add 1 bullet: what it suggests (or "No disponible" if unknown).
+           - Do NOT claim "no visualizations" when plots_list is non-empty.
+        6. Close with 2-4 "Next actions" that would unblock the pipeline (data / pipeline / validation).
+
         IF SUCCESS (Only if NO Error):
-        Produce a senior-level executive report with these required sections:
-        1) Executive Decision: ONE line with readiness (GO / GO_WITH_LIMITATIONS / NO_GO) and why.
-        2) Objective & Approach: What we set out to do and the approach used.
-        3) Evidence & Metrics: Cite 3+ concrete numbers from Fact Cards or snapshots, with source file names.
-           If a number is unavailable, write "No disponible" and state which artifact is missing.
-        4) Business Impact: Translate metrics into business implications and expected value.
-        5) Risks & Limitations: Call out data risks, gate failures, or misalignment with the objective.
-        6) Metric Ceiling (if applicable): State whether a ceiling was detected and why.
-        7) Recommended Next Actions: 2-5 specific actions (short-term + data improvements).
-        8) Visual Insights: Explain what each plot shows using Plot Insights; do not describe only the chart type.
-        Explain clearly what went wrong in non-technical terms and suggest next steps.
-        CRITICAL: If "has_partial_visuals" is true, you MUST state: "Despite individual errors, partial visualizations were generated." and refer to the plots listed in "plots_list". Do NOT say "No visualizations created" if they exist.
-        
-        IF SUCCESS:
-        Produce a senior-level executive report with these required sections:
-        1) Executive Decision: ONE line with readiness (GO / GO_WITH_LIMITATIONS / NO_GO) and why.
-        2) Objective & Approach: What we set out to do and the approach used.
-        3) Evidence & Metrics: Cite 3+ concrete numbers from Fact Cards or snapshots, with source file names.
-           If a number is unavailable, write "No disponible" and state which artifact is missing.
-        4) Business Impact: Translate metrics into business implications and expected value.
-        5) Risks & Limitations: Call out data risks, gate failures, or misalignment with the objective.
-        6) Metric Ceiling (if applicable): State whether a ceiling was detected and why.
-        7) Recommended Next Actions: 2-5 specific actions (short-term + data improvements).
-        8) Visual Insights: Explain what each plot shows using Plot Insights; do not describe only the chart type.
+        OUTPUT FORMAT (MANDATORY):
+        - You MUST generate ONLY the top-level sections listed in reporting_policy.sections, in that exact order.
+        - Each section MUST be a level-2 heading: "## <Section Title>".
+        - You MAY use short subheadings or bullet lists inside a section, but do NOT add new top-level sections.
+        - Exception: you WILL add the final mandatory top-level section "## Evidencia usada" at the end (see later instruction).
+
+        SECTION TITLE GUIDELINES:
+        - decision -> Executive Decision
+        - objective_approach -> Objective & Approach
+        - evidence_metrics -> Evidence & Metrics
+        - business_impact -> Business Impact
+        - risks_limitations -> Risks & Limitations
+        - next_actions -> Recommended Next Actions
+        - visual_insights -> Visual Insights
+        - If a section key is not listed above: convert it to Title Case (replace "_" with " ").
+
+        SLOT-TO-SECTION GUIDELINES (use best judgment; do NOT invent):
+        - model_metrics, predictions_overview, forecast_summary, ranking_top -> Evidence & Metrics
+        - explainability, error_analysis -> Evidence & Metrics (or Risks & Limitations if negative)
+        - alignment_risks -> Risks & Limitations
+        - segment_pricing -> Business Impact (and/or Recommended Next Actions if it contains recommendations)
+
+        REQUIRED CONTENT BY SECTION (adapt to the objective and available evidence):
+        - Executive Decision:
+          * First line: readiness (GO / GO_WITH_LIMITATIONS / NO_GO) + 1-sentence reason.
+          * Ground the reason in gates/reviewer verdict/alignment check; if a required artifact is missing, downgrade readiness.
+        - Objective & Approach:
+          * Restate the business objective in plain language.
+          * Summarize the chosen strategy and the minimum viable method used (segmentation + model + optimization).
+          * Briefly describe the data preparation at a high level (no code, no hallucinations).
+        - Evidence & Metrics:
+          * Cite at least 3 concrete numbers (metrics, counts, segment sizes, ranges) from facts_context, metrics.json summary, scored_rows snapshot, or alignment_check.
+          * For each number: include the source artifact name/path.
+          * If a required number is unavailable: write "No disponible" + which artifact is missing.
+          * Include required/available slots from reporting_policy.slots (respect mode).
+        - Business Impact:
+          * Translate the evidence into business implications (pricing decision logic, expected value, risk/return).
+          * If there is a segment-based recommendation, explain how segments differ WITHOUT inventing segment names.
+        - Risks & Limitations:
+          * List the top 3-6 risks/limitations (data quality, leakage risk, small sample size, misalignment warnings).
+          * Include an "Execution Trace" bullet list: summarize iterations, warnings, and reviewer verdict using run_summary + review_feedback + gate_context (no speculation).
+          * If Data Adequacy indicates data_limited/insufficient_signal, state it clearly and tie it to confidence.
+          * If Alignment Check is WARN/FAIL, state it explicitly and the practical implication.
+        - Recommended Next Actions:
+          * 2-5 specific, actionable steps (quick wins + structural data improvements) aligned to the objective.
+          * If Data Adequacy provides recommendations, reuse them (do NOT invent).
+        - Visual Insights (ONLY if this section exists in reporting_policy.sections):
+          * For EACH plot in VISUALS CONTEXT plots_list:
+            - Embed the plot using the exact path string:
+              ![<filename>](<exact_path_from_plots_list>)
+            - Add 1-3 bullets with concrete takeaways, grounded in plot_insights_json/facts/metrics. If not available, write "No disponible".
+          * Do NOT describe only the chart type; state what it implies for the business decision.
+          * Do NOT claim "no visualizations" when plots_list is non-empty.
 
         Ensure logical consistency: do not claim elasticity, uplift, or improvements unless supported by metrics or plots.
         If quality gates are missing or misaligned, explicitly state that evaluation confidence is reduced.
