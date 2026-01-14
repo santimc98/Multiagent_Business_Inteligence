@@ -2295,6 +2295,10 @@ def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
     compliance_max = policy.get("compliance_bootstrap_max")
     metric_max = policy.get("metric_improvement_max")
     runtime_max = policy.get("runtime_fix_max")
+    if metric_max is None:
+        legacy_max = policy.get("max_iterations")
+        if legacy_max is not None:
+            metric_max = legacy_max
     plateau_window = policy.get("plateau_window")
     plateau_epsilon = policy.get("plateau_epsilon")
     out: Dict[str, Any] = {}
@@ -5104,16 +5108,23 @@ def _ml_iteration_journal_path(run_id: str, base_dir: str = "runs") -> str:
 def _append_ml_iteration_journal(
     run_id: str,
     entry: Dict[str, Any],
-    written_ids: List[int] | None = None,
+    written_ids: List[str] | None = None,
     base_dir: str = "runs",
-) -> List[int]:
+) -> List[str]:
     if not run_id or not isinstance(entry, dict):
         return written_ids or []
     iter_id = entry.get("iteration_id")
+    stage = entry.get("stage") or "unknown"
     if iter_id is None:
         return written_ids or []
-    known = set(int(i) for i in (written_ids or []) if isinstance(i, int) or str(i).isdigit())
-    if int(iter_id) in known:
+    known: set[str] = set()
+    for item in written_ids or []:
+        if isinstance(item, str):
+            known.add(item)
+        elif isinstance(item, int) or str(item).isdigit():
+            known.add(f"{int(item)}:unknown")
+    entry_key = f"{int(iter_id)}:{stage}"
+    if entry_key in known:
         return sorted(known)
     path = _ml_iteration_journal_path(run_id, base_dir=base_dir)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -5122,7 +5133,7 @@ def _append_ml_iteration_journal(
             f.write(json.dumps(entry, ensure_ascii=True) + "\n")
     except Exception:
         return sorted(known)
-    known.add(int(iter_id))
+    known.add(entry_key)
     return sorted(known)
 
 def _load_ml_iteration_journal(run_id: str, base_dir: str = "runs") -> List[Dict[str, Any]]:
@@ -5233,6 +5244,7 @@ def _build_ml_iteration_journal_entry(
     qa_verdict: str | None,
     qa_reasons: List[str],
     next_actions: List[str],
+    stage: str,
 ) -> Dict[str, Any]:
     code = state.get("generated_code") or ""
     code_hash = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:12] if code else ""
@@ -5240,8 +5252,10 @@ def _build_ml_iteration_journal_entry(
     diagnostics = _collect_iteration_diagnostics(state)
     if runtime_error and isinstance(runtime_error, dict) and runtime_error.get("message"):
         diagnostics.setdefault("root_cause", runtime_error.get("message"))
+    stage_value = stage if stage in {"preflight", "runtime_fix", "review_complete"} else "unknown"
     return {
         "iteration_id": iter_id,
+        "stage": stage_value,
         "code_hash": code_hash,
         "preflight_issues": preflight_issues or [],
         "runtime_error": runtime_error,
@@ -5435,7 +5449,7 @@ class AgentState(TypedDict):
     iteration_count: int
     ml_iteration_memory: List[Dict[str, Any]]
     ml_iteration_memory_block: str
-    ml_journal_written_ids: List[int]
+    ml_journal_written_ids: List[str]
     metrics_signature: str
     weights_signature: str
     execution_output_stale: bool
@@ -8499,6 +8513,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
                 qa_verdict=None,
                 qa_reasons=[],
                 next_actions=next_actions,
+                stage="preflight",
             )
             written_ids = _append_ml_iteration_journal(
                 run_id,
@@ -8541,6 +8556,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
                 qa_verdict=None,
                 qa_reasons=[],
                 next_actions=next_actions,
+                stage="preflight",
             )
             written_ids = _append_ml_iteration_journal(
                 run_id,
@@ -9851,6 +9867,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             qa_verdict=None,
             qa_reasons=[],
             next_actions=next_actions,
+            stage="review_complete",
         )
         written_ids = _append_ml_iteration_journal(
             run_id,
@@ -9980,6 +9997,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
             qa_verdict=None,
             qa_reasons=[],
             next_actions=next_actions,
+            stage="runtime_fix",
         )
         written_ids = _append_ml_iteration_journal(
             run_id,

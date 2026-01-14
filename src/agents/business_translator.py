@@ -113,7 +113,10 @@ def _truncate_cell(text: str, max_len: int) -> str:
     cleaned = cleaned.replace("|", "/")
     if len(cleaned) <= max_len:
         return cleaned
-    return cleaned[: max(0, max_len - 3)] + "..."
+    suffix = " [cut]"
+    if max_len <= len(suffix):
+        return cleaned[:max_len]
+    return cleaned[: max(0, max_len - len(suffix))] + suffix
 
 def render_table_text(headers: List[str], rows: List[List[str]], max_rows: int = 8, max_cell_len: int = 28) -> str:
     if not headers or not rows:
@@ -325,6 +328,62 @@ def _is_number(value: Any) -> bool:
     except Exception:
         return False
 
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _extract_lift_value(data_adequacy_report: Dict[str, Any], metrics_payload: Dict[str, Any]) -> Optional[float]:
+    if isinstance(data_adequacy_report, dict):
+        signals = data_adequacy_report.get("signals", {})
+        for key in ("classification_lift", "regression_lift", "f1_lift", "mae_lift"):
+            lift = _coerce_float(signals.get(key)) if isinstance(signals, dict) else None
+            if lift is not None:
+                return lift
+    if isinstance(metrics_payload, dict):
+        model_perf = metrics_payload.get("model_performance") if isinstance(metrics_payload.get("model_performance"), dict) else {}
+        for key, value in model_perf.items():
+            if "lift" in str(key).lower():
+                lift = _coerce_float(value if not isinstance(value, dict) else value.get("mean"))
+                if lift is not None:
+                    return lift
+    return None
+
+
+def _derive_exec_decision(
+    review_verdict: Optional[str],
+    data_adequacy_report: Dict[str, Any],
+    metrics_payload: Dict[str, Any],
+) -> str:
+    verdict = str(review_verdict or "").upper()
+    status = str(data_adequacy_report.get("status") if isinstance(data_adequacy_report, dict) else "").lower()
+    lift = _extract_lift_value(data_adequacy_report, metrics_payload)
+
+    if verdict in {"NEEDS_IMPROVEMENT", "REJECTED"}:
+        return "NO_GO"
+    if status in {"unknown", "insufficient_signal"}:
+        return "GO_WITH_LIMITATIONS"
+    if status == "data_limited":
+        if lift is not None and lift <= 0:
+            return "NO_GO"
+        return "GO_WITH_LIMITATIONS"
+    if status == "sufficient_signal":
+        if lift is None:
+            return "GO_WITH_LIMITATIONS"
+        return "GO" if lift > 0 else "NO_GO"
+    return "GO_WITH_LIMITATIONS"
+
+
+def _sanitize_report_text(text: str) -> str:
+    if not text:
+        return text
+    while "..." in text:
+        text = text.replace("...", ".")
+    return text
+
 def _extract_numeric_metrics(metrics: Dict[str, Any], max_items: int = 8):
     if not isinstance(metrics, dict):
         return []
@@ -416,7 +475,10 @@ class BusinessTranslatorAgent:
 
         # Sanitize Visuals Context
         has_partial_visuals = bool(has_partial_visuals)
-        plots = plots or []
+        plots = [str(p).replace("\\", "/") for p in (plots or []) if p]
+        plot_reference_mode = "inline"
+        if any(not p.startswith("static/plots/") for p in plots):
+            plot_reference_mode = "figure_only"
         artifact_index = _normalize_artifact_index(
             state.get("artifact_index") or _safe_load_json("data/produced_artifact_index.json") or []
         )
@@ -454,7 +516,8 @@ class BusinessTranslatorAgent:
         visuals_context_data = {
             "has_partial_visuals": has_partial_visuals,
             "plots_count": len(plots),
-            "plots_list": plots
+            "plots_list": plots,
+            "plot_reference_mode": plot_reference_mode,
         }
         visuals_context_json = json.dumps(visuals_context_data, ensure_ascii=False)
         
@@ -481,6 +544,11 @@ class BusinessTranslatorAgent:
         cleaned_path = _first_artifact_path(artifact_index, "dataset") or "data/cleaned_data.csv"
         cleaned_rows = _safe_load_csv(cleaned_path, max_rows=100) if _artifact_available(cleaned_path) else None
         business_objective = state.get("business_objective") or contract.get("business_objective") or ""
+        executive_decision_label = _derive_exec_decision(
+            review_verdict or compliance,
+            data_adequacy_report,
+            metrics_payload,
+        )
 
         def _summarize_integrity():
             issues = integrity_audit.get("issues", []) if isinstance(integrity_audit, dict) else []
@@ -812,12 +880,15 @@ class BusinessTranslatorAgent:
            - Bad: | Metric | Value |
            - Good: 
              * Metric: Value
+        3. **NO ELLIPSIS:** Never output the literal sequence "..." anywhere in the report.
+        4. **NO TRUNCATED SENTENCES:** Do not leave sentences hanging; rewrite as complete, concise sentences.
         
         CONTEXT:
         - Business Objective: $business_objective
         - Strategy: $strategy_title
         - Hypothesis: $hypothesis
         - Compliance Check: $compliance
+        - Executive Decision Label (deterministic): $executive_decision_label
         - Contract: $contract_context
         - Integrity Audit: $integrity_context
         - Output Contract: $output_contract_context
@@ -830,6 +901,7 @@ class BusinessTranslatorAgent:
         - Cleaning Summary: $cleaning_context
         - Run Summary: $run_summary_context
         - Data Adequacy: $data_adequacy_context
+        - Data Adequacy Report (verbatim): $data_adequacy_report_json
         - Insights (primary): $insights_context
         - Fact Cards (use as evidence): $facts_context
         - Model Metrics & Weights: $weights_context
@@ -851,7 +923,7 @@ class BusinessTranslatorAgent:
 
         GUIDANCE:
         - Use Insights as the primary evidence source; only reference other artifacts if they add clear value.
-        - Include 2-4 short "tablas de muestra" using the provided text tables. Do NOT use markdown tables or pipes; use the text tables as-is.
+        - Include 2-4 short "tablas de muestra" using the provided text tables. Label them explicitly as samples and keep 3-5 rows maximum. Do NOT use markdown tables or pipes; use the text tables as-is.
         - If reporting_policy.demonstrative_examples_enabled is true AND run_outcome is in reporting_policy.demonstrative_examples_when_outcome_in,
           you MUST include a section titled "Ejemplos ilustrativos (no aptos para producción)".
           Use recommendations_preview.items (max 3-5) and include strong disclaimers plus support (n, observed_support if available).
@@ -860,6 +932,9 @@ class BusinessTranslatorAgent:
           without the "illustrative" labeling.
         - For every plot you mention, include 1-3 concrete findings (n/%/top categories) drawn from plot_insights_json. If no quantitative insights are available for a plot, explicitly say "No se dispone de insights cuantitativos para este gráfico" (or equivalent in the target language).
         - Do NOT invent segment/category names; only mention names that appear in facts, insights, or plot_insights_json.
+        - Data Adequacy must be reported verbatim: status, up to 3 reason tags, and up to 3 recommendations from data_adequacy_report_json. Do not rephrase status (e.g., keep "sufficient_signal" as-is).
+        - If data_adequacy_report_json reasons include classification_baseline_missing or regression_baseline_missing, call it out as a limitation and advise adding Dummy baselines.
+        - Plot paths must use forward slashes. If VISUALS CONTEXT plot_reference_mode is "figure_only", reference plots as "Figure: <filename>" instead of inline markdown images.
         - Slot-driven reporting:
           For each slot in reporting_policy.slots:
             * if mode == "required": include it using evidence (payload or artifact); if missing => write "No disponible" and cite missing sources.
@@ -883,7 +958,9 @@ class BusinessTranslatorAgent:
         3. Explain the failure based on error_condition and run_summary (non-technical, executive tone).
         4. State which critical artifacts are missing and why that blocks a decision (use Evidence Paths + artifact_index).
         5. If VISUALS CONTEXT indicates plots_list is non-empty:
-           - Include a short subsection "Visual evidence available" and EMBED each plot:
+           - Include a short subsection "Visual evidence available" and list each plot.
+           - If plot_reference_mode is "figure_only", reference as "Figure: <filename>" instead of inline images.
+           - Otherwise embed each plot using forward slashes:
              ![<filename>](<exact_path_from_plots_list>)
            - Under each plot add 1 bullet: what it suggests (or "No disponible" if unknown).
            - Do NOT claim "no visualizations" when plots_list is non-empty.
@@ -915,6 +992,7 @@ class BusinessTranslatorAgent:
         REQUIRED CONTENT BY SECTION (adapt to the objective and available evidence):
         - Executive Decision:
           * First line: readiness (GO / GO_WITH_LIMITATIONS / NO_GO) + 1-sentence reason.
+          * Use the Executive Decision Label (deterministic) as the readiness label.
           * Ground the reason in gates/reviewer verdict/alignment check; if a required artifact is missing, downgrade readiness.
         - Objective & Approach:
           * Restate the business objective in plain language.
@@ -931,14 +1009,17 @@ class BusinessTranslatorAgent:
         - Risks & Limitations:
           * List the top 3-6 risks/limitations (data quality, leakage risk, small sample size, misalignment warnings).
           * Include an "Execution Trace" bullet list: summarize iterations, warnings, and reviewer verdict using run_summary + review_feedback + gate_context (no speculation).
+          * Report Data Adequacy verbatim: status, up to 3 reason tags, and up to 3 recommendations from data_adequacy_report_json.
           * If Data Adequacy indicates data_limited/insufficient_signal, state it clearly and tie it to confidence.
+          * If Data Adequacy reports missing baseline metrics, call it out and advise adding Dummy baselines.
           * If Alignment Check is WARN/FAIL, state it explicitly and the practical implication.
         - Recommended Next Actions:
           * 2-5 specific, actionable steps (quick wins + structural data improvements) aligned to the objective.
           * If Data Adequacy provides recommendations, reuse them (do NOT invent).
         - Visual Insights (ONLY if this section exists in reporting_policy.sections):
           * For EACH plot in VISUALS CONTEXT plots_list:
-            - Embed the plot using the exact path string:
+            - Use forward slashes in paths. If plot_reference_mode is "figure_only", reference as "Figure: <filename>" instead of inline images.
+            - Otherwise embed the plot using the exact path string:
               ![<filename>](<exact_path_from_plots_list>)
             - Add 1-3 bullets with concrete takeaways, grounded in plot_insights_json/facts/metrics. If not available, write "No disponible".
           * Do NOT describe only the chart type; state what it implies for the business decision.
@@ -970,6 +1051,7 @@ class BusinessTranslatorAgent:
             strategy_title=strategy_title,
             hypothesis=hypothesis,
             compliance=compliance,
+            executive_decision_label=executive_decision_label,
             error_condition=error_condition_str,
             visuals_context_json=visuals_context_json,
             analysis_type=analysis_type,
@@ -984,6 +1066,7 @@ class BusinessTranslatorAgent:
             cleaning_context=json.dumps(cleaning_context, ensure_ascii=False),
             run_summary_context=json.dumps(run_summary_context, ensure_ascii=False),
             data_adequacy_context=json.dumps(data_adequacy_context, ensure_ascii=False),
+            data_adequacy_report_json=json.dumps(data_adequacy_report, ensure_ascii=False),
             insights_context=json.dumps(insights, ensure_ascii=False),
             alignment_check_context=json.dumps(alignment_check_context, ensure_ascii=False),
             facts_context=json.dumps(facts_context, ensure_ascii=False),
@@ -1032,6 +1115,7 @@ class BusinessTranslatorAgent:
         try:
             response = self.model.generate_content(full_prompt)
             content = (getattr(response, "text", "") or "").strip()
+            content = _sanitize_report_text(content)
             self.last_response = content
             return content
         except Exception as e:
