@@ -92,3 +92,7 @@ run_*.zip
 runs/archive/run_*.zip
 
 claude_plans/
+
+# Large Kaggle datasets (>100MB)
+data/combined_porto_seguros.csv
+data/combined_digit_recognizer.csv
