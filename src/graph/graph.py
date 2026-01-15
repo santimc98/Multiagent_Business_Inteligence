@@ -2334,7 +2334,11 @@ def _classify_iteration_type(
         return "compliance"
     if oc_report and oc_report.get("missing"):
         return "compliance"
-    if feedback and any(token in feedback for token in ["CODE_AUDIT_REJECTED", "OUTPUT_CONTRACT_MISSING"]):
+    if feedback and any(token in feedback for token in [
+        "CODE_AUDIT_REJECTED",
+        "OUTPUT_CONTRACT_MISSING",
+        "METRICS_SCHEMA_INCONSISTENT",  # Malformed metrics data = code error, not low metrics
+    ]):
         return "compliance"
     return "metric"
 
@@ -9416,14 +9420,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             new_history.append(f"RESULT EVALUATION FEEDBACK: {feedback}")
         else:
             # Only downgrade to APPROVE_WITH_WARNINGS if retry is explicitly NOT worth it.
-            # If retry_worth_it is True or None (unknown), keep NEEDS_IMPROVEMENT to allow metric iteration.
+            # Note: Metric iteration is DISABLED. Metric-only issues are downgraded later via _classify_iteration_type.
             warning = f"REVIEWER_LLM_NONBLOCKING_WARNING: {feedback}"
             new_history.append(warning)
             feedback = warning
             if retry_worth_it is False:
                 status = "APPROVE_WITH_WARNINGS"
                 downgraded = True
-            # else: keep status as NEEDS_IMPROVEMENT for metric iteration
+            # else: keep NEEDS_IMPROVEMENT - will be classified as compliance or downgraded if metric-only
     print(f"ITER_EVAL status={status} retry_worth_it={retry_worth_it} downgraded={downgraded} reason={'no_traceback_retry_not_worth' if downgraded else 'none'}")
 
     # Case alignment QA gate (optional if required by contract/spec)
@@ -9839,6 +9843,19 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         print(f"Advice: {feedback}")
 
     iteration_type = _classify_iteration_type(status, audit_rejected, oc_report, feedback)
+
+    # METRIC ITERATION DISABLED: Force downgrade to APPROVE_WITH_WARNINGS for metric-only issues.
+    # This stops the metric retry loop while preserving compliance/runtime retries.
+    metric_iteration_disabled = False
+    if status == "NEEDS_IMPROVEMENT" and iteration_type == "metric":
+        status = "APPROVE_WITH_WARNINGS"
+        metric_disable_msg = "(Metric iteration disabled: reporting limitations & next steps only.)"
+        feedback = f"{feedback}\n{metric_disable_msg}" if feedback else metric_disable_msg
+        new_history.append(metric_disable_msg)
+        iteration_type = None  # Clear iteration_type to prevent any metric loop logic
+        metric_iteration_disabled = True
+        print(f"METRIC_ITERATION_DISABLED: Downgraded to APPROVE_WITH_WARNINGS for metric-only issue.")
+
     if iteration_type:
         gate_context["iteration_type"] = iteration_type
     compliance_iterations = int(state.get("compliance_iterations", 0))
@@ -9848,9 +9865,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         if iteration_type == "compliance":
             compliance_iterations += 1
             compliance_passed = False
-        elif iteration_type == "metric":
-            metric_iterations += 1
-            compliance_passed = True
+        # Note: metric branch removed since iteration_type="metric" is now downgraded above
 
     review_feedback = feedback or state.get("review_feedback", "")
     result_state = {
@@ -9886,50 +9901,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         result_state["last_successful_gate_context"] = gate_context
     if review_counters:
         result_state["budget_counters"] = review_counters
-    if status == "NEEDS_IMPROVEMENT" and iteration_type == "metric":
-        try:
-            prev_case_report = _load_json_safe(
-                os.path.join("artifacts", "iterations", f"case_alignment_report_iter_{iter_id - 1}.json")
-            ) if iter_id > 1 else {}
-            advisor_ctx = {
-                "iteration_id": iter_id,
-                "previous_case_alignment_report": prev_case_report,
-                "case_alignment_report": case_report,
-                "output_contract_report": oc_report,
-                "case_summary_stats": _summarize_case_summary("data/case_summary.csv"),
-                "weights": _load_json_safe("data/weights.json"),
-                "weights_uniformity": _summarize_weight_uniformity(_load_json_safe("data/weights.json")),
-                "metrics": _load_json_safe("data/metrics.json"),
-                "review_feedback": feedback,
-                "business_alignment": contract.get("business_alignment", {}),
-                "spec_extraction": contract.get("spec_extraction", {}),
-                "saved_iteration_artifacts": saved_iter_artifacts,
-            }
-            advice = results_advisor.generate_ml_advice(advisor_ctx)
-            if advice:
-                base_override = state.get("ml_engineer_audit_override") or state.get("data_summary", "")
-                result_state["ml_engineer_audit_override"] = _merge_de_audit_override(
-                    base_override,
-                    "RESULTS_ADVISOR:\n" + advice.strip(),
-                )
-                result_state["ml_results_advice"] = advice.strip()
-                run_id = state.get("run_id")
-                if run_id:
-                    log_agent_snapshot(
-                        run_id,
-                        "results_advisor",
-                        prompt=getattr(results_advisor, "last_prompt", None),
-                        response=getattr(results_advisor, "last_response", None) or advice,
-                        context=advisor_ctx,
-                    )
-                try:
-                    os.makedirs("artifacts", exist_ok=True)
-                    with open(os.path.join("artifacts", "ml_results_advisor.txt"), "w", encoding="utf-8") as f_adv:
-                        f_adv.write(advice.strip())
-                except Exception as adv_err:
-                    print(f"Warning: failed to persist ml_results_advisor.txt: {adv_err}")
-        except Exception as adv_err:
-            print(f"Warning: results advisor failed: {adv_err}")
+    if metric_iteration_disabled:
+        result_state["stop_reason"] = "METRIC_ITERATION_DISABLED"
+
+    # NOTE: results_advisor.generate_ml_advice block REMOVED.
+    # Metric iteration is disabled, so this block was dead code.
+    # The condition (status=="NEEDS_IMPROVEMENT" and iteration_type=="metric") can never
+    # be true because we force downgrade to APPROVE_WITH_WARNINGS above.
 
     try:
         strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
@@ -10290,11 +10268,21 @@ def check_evaluation(state: AgentState):
             print(f"ITER_DECISION type=metric action=stop reason=CASE_ALIGNMENT_REGRESSED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
             return "approved"
 
+    # AIRBAG: Metric iteration is DISABLED. Never retry for metric-only issues.
+    # Even if somehow NEEDS_IMPROVEMENT with last_iteration_type="metric" reaches here,
+    # we force stop and proceed to translator.
+    if last_iter_type == "metric":
+        print(f"AIRBAG_METRIC_STOP: Metric iteration disabled. Proceeding to report generation.")
+        print(f"ITER_DECISION type=metric action=stop reason=METRIC_ITERATION_DISABLED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+        state["stop_reason"] = "METRIC_ITERATION_DISABLED"
+        return "approved"
+
     if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
-        print(f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+        # This branch should only be reached for compliance/runtime retries now
+        print(f"ITER_DECISION type=other action=retry reason=COMPLIANCE_OR_RUNTIME metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         return "retry"
     else:
-        print(f"ITER_DECISION type=metric action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+        print(f"ITER_DECISION type=other action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         return "approved"
 
 def run_translator(state: AgentState) -> AgentState:
