@@ -95,7 +95,9 @@ if uploaded_file is not None:
     os.makedirs("data", exist_ok=True)
     data_path = os.path.join("data", uploaded_file.name)
     with open(data_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+        uploaded_file.seek(0)
+        while chunk := uploaded_file.read(8 * 1024 * 1024):  # 8MB chunks
+            f.write(chunk)
     
     # Preview logic (only if not analyzing)
     if not st.session_state["analysis_complete"] and not start_btn:
