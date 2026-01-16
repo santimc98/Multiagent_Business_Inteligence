@@ -134,6 +134,27 @@ from src.utils.recommendations_preview import build_recommendations_preview
 from src.utils.label_enrichment import enrich_outputs
 from src.utils.ml_validation import validate_model_metrics_consistency, validate_metrics_ci_consistency
 from src.utils.json_sanitize import dump_json
+from src.utils.sandbox_paths import (
+    CANONICAL_RAW_REL,
+    CANONICAL_CLEANED_REL,
+    CANONICAL_MANIFEST_REL,
+    COMMON_RAW_ALIASES,
+    COMMON_CLEANED_ALIASES,
+    patch_placeholders,
+    build_symlink_or_copy_commands,
+    canonical_abs,
+)
+from src.utils.sandbox_resilience import (
+    run_code_with_optional_timeout,
+    run_cmd_with_retry,
+    safe_download_file,
+)
+from src.utils.dataset_size import (
+    file_size_mb,
+    estimate_rows_fast,
+    classify_dataset_scale,
+    get_dataset_scale_hints,
+)
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
