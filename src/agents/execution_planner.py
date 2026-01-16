@@ -21,6 +21,8 @@ from src.utils.contract_v41 import (
     get_required_outputs,
 )
 from src.utils.run_bundle import get_run_dir
+from src.utils.feature_selectors import infer_feature_selectors, compact_column_representation
+from src.utils.contract_validator import validate_contract, normalize_artifact_requirements
 
 load_dotenv()
 
@@ -821,6 +823,30 @@ def build_contract_min(
         "data/alignment_check.json",
     ]
 
+    # P1.5: Infer feature selectors for wide datasets
+    feature_selectors = []
+    if len(canonical_columns) > 200:
+        feature_selectors, remaining_cols = infer_feature_selectors(
+            canonical_columns, max_list_size=200, min_group_size=50
+        )
+        if feature_selectors:
+            print(f"FEATURE_SELECTORS: Inferred {len(feature_selectors)} selectors for {len(canonical_columns)} columns")
+
+    # P1.1: Determine scored_rows required columns based on objective type
+    objective_type = contract.get("objective_type") or strategy_dict.get("objective_type") or ""
+    scored_rows_required_columns = ["id"]  # Always need ID
+
+    # Universal heuristics for required columns (no dataset hardcode)
+    obj_lower = str(objective_type).lower()
+    if any(kw in obj_lower for kw in ["ranking", "triage", "targeting", "priorit", "segment"]):
+        scored_rows_required_columns.extend(["score", "priority"])
+    elif any(kw in obj_lower for kw in ["classification", "binary", "churn", "fraud", "claim"]):
+        scored_rows_required_columns.extend(["probability", "prediction"])
+    elif any(kw in obj_lower for kw in ["regression", "forecast", "predict"]):
+        scored_rows_required_columns.extend(["prediction"])
+    elif any(kw in obj_lower for kw in ["multi", "label"]):
+        scored_rows_required_columns.extend(["prediction", "probabilities"])
+
     artifact_requirements = {
         "clean_dataset": {
             "required_columns": canonical_columns,
@@ -829,7 +855,14 @@ def build_contract_min(
         "metrics": {"required": True, "path": "data/metrics.json"},
         "alignment_check": {"required": True, "path": "data/alignment_check.json"},
         "plots": {"optional": True, "expected": ["*.png"]},
-        "required_files": list(required_outputs),
+        # P1.1: Formal file vs column separation
+        "required_files": [
+            {"path": p, "description": ""} for p in required_outputs
+        ],
+        "scored_rows_schema": {
+            "required_columns": scored_rows_required_columns,
+            "recommended_columns": [],
+        },
         "file_schemas": {},
         "schema_binding": {
             "required_columns": canonical_columns,
@@ -913,6 +946,7 @@ def build_contract_min(
         },
         "artifact_requirements": artifact_requirements,
         "required_outputs": required_outputs,
+        "feature_selectors": feature_selectors,  # P1.5: For wide datasets
         "qa_gates": qa_gates,
         "cleaning_gates": cleaning_gates,
         "reviewer_gates": [
@@ -4348,6 +4382,22 @@ domain_expert_critique:
             contract["omitted_columns_policy"] = omitted_columns_policy
 
         contract = validate_artifact_requirements(contract)
+
+        # P1.2: Contract Self-Consistency Gate
+        validation_result = validate_contract(contract)
+        contract["_contract_validation"] = validation_result
+        if validation_result["status"] == "error":
+            print(f"CONTRACT_VALIDATION_ERROR: {len(validation_result['issues'])} issues found")
+            for issue in validation_result["issues"]:
+                print(f"  - [{issue['severity']}] {issue['rule']}: {issue['message']}")
+        elif validation_result["status"] == "warning":
+            print(f"CONTRACT_VALIDATION_WARNING: {len(validation_result['issues'])} issues found")
+            for issue in validation_result["issues"]:
+                print(f"  - [{issue['severity']}] {issue['rule']}: {issue['message']}")
+        # Store normalized artifact_requirements
+        if validation_result.get("normalized_artifact_requirements"):
+            contract["artifact_requirements"] = validation_result["normalized_artifact_requirements"]
+
         contract = _attach_reporting_policy(contract)
 
         def _sanitize_runbook_text(text: str) -> str:
