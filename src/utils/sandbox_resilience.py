@@ -10,6 +10,13 @@ import inspect
 from typing import Optional, Any, Callable
 
 
+# Sandbox timeout constants (P2.2)
+DE_TIMEOUT_S = 600  # 10 minutes for Data Engineer
+ML_TIMEOUT_SMALL_S = 600  # 10 minutes
+ML_TIMEOUT_MEDIUM_S = 900  # 15 minutes
+ML_TIMEOUT_LARGE_S = 1200  # 20 minutes
+
+
 # Patterns that suggest transient/temporary errors
 TRANSIENT_ERROR_PATTERNS = [
     "timeout", "timed out", "temporarily unavailable",
@@ -19,18 +26,80 @@ TRANSIENT_ERROR_PATTERNS = [
 ]
 
 
-def _is_transient_error(error_message: str) -> bool:
+def is_transient_error_like(msg: str) -> bool:
     """
     Check if an error message suggests a transient/temporary failure.
 
     Args:
-        error_message: The error message to check
+        msg: The error message to check
 
     Returns:
-        True if the error appears transient
+        True if error appears transient
     """
-    error_lower = error_message.lower()
+    error_lower = msg.lower()
     return any(pattern in error_lower for pattern in TRANSIENT_ERROR_PATTERNS)
+
+
+def _is_transient_error(msg: str) -> bool:
+    """
+    Check if an error message suggests a transient/temporary failure.
+
+    Args:
+        msg: The error message to check
+
+    Returns:
+        True if error appears transient
+    """
+    error_lower = msg.lower()
+    return any(pattern in error_lower for pattern in TRANSIENT_ERROR_PATTERNS)
+
+
+def _is_transient_sandbox_error(err: Exception) -> bool:
+    """
+    Check if an exception is a transient sandbox error.
+
+    Args:
+        err: The exception to check
+
+    Returns:
+        True if exception appears to be a transient sandbox issue
+    """
+    err_msg = str(err).lower()
+
+    # Timeout patterns
+    if any(p in err_msg for p in ["timeout", "timed out", "deadline", "expired"]):
+        return True
+
+    # Network/transport patterns
+    if any(p in err_msg for p in ["connection", "transport", "unavailable", "refused", "reset", "broken pipe", "socket", "network"]):
+        return True
+
+    # 50x HTTP errors
+    if any(p in err_msg for p in ["502", "503", "504", "502 bad gateway", "503 service unavailable", "504 gateway timeout"]):
+        return True
+
+    # Sandbox-specific patterns (expired, gone, terminated)
+    if any(p in err_msg for p in ["sandbox expired", "sandbox terminated", "sandbox gone", "container", "pod"]):
+        return True
+
+    # Rate limits / temporarily unavailable
+    if any(p in err_msg for p in ["rate limit", "temporarily unavailable", "too many requests", "quota exceeded"]):
+        return True
+
+    return False
+
+
+def is_transient_sandbox_error(err: Exception) -> bool:
+    """
+    Public wrapper for checking if an exception is a transient sandbox error.
+
+    Args:
+        err: The exception to check
+
+    Returns:
+        True if exception appears to be a transient sandbox issue
+    """
+    return _is_transient_sandbox_error(err)
 
 
 def run_code_with_optional_timeout(sandbox: Any, code: str, timeout_s: Optional[int] = None) -> Any:
@@ -55,16 +124,17 @@ def run_code_with_optional_timeout(sandbox: Any, code: str, timeout_s: Optional[
         return sandbox.run_code(code)
 
 
-def run_cmd_with_retry(sandbox: Any, cmd: str, retries: int = 2) -> Any:
+def run_cmd_with_retry(sandbox: Any, cmd: str, retries: int = 2, timeout_s: Optional[int] = None) -> Any:
     """
     Run a sandbox command with retry logic for transient errors.
 
-    Retries if the error appears to be transient.
+    Retries if error appears to be transient.
 
     Args:
         sandbox: The sandbox instance
         cmd: The command to run
         retries: Number of retries (default: 2)
+        timeout_s: Optional timeout in seconds
 
     Returns:
         Result from sandbox.commands.run
@@ -79,49 +149,106 @@ def run_cmd_with_retry(sandbox: Any, cmd: str, retries: int = 2) -> Any:
             return sandbox.commands.run(cmd)
         except Exception as e:
             last_error = e
-            error_msg = str(e)
+            error_msg = str(e).lower()
 
-            if attempt < retries and _is_transient_error(error_msg):
+            # Check if error appears transient
+            if attempt < retries and is_transient_sandbox_error(e):
                 # Exponential backoff
                 backoff = 2 ** attempt
                 print(f"RETRYING_SANDBOX_CMD (attempt {attempt + 1}/{retries}): {error_msg}")
                 time.sleep(backoff)
             else:
-                # Not transient or out of retries
+                # Last attempt or non-transient error
                 raise
 
-    # All retries exhausted
-    if last_error is not None:
-        raise last_error
-    raise Exception("All retries exhausted without specific error")
+    raise last_error
 
 
-def safe_download_file(sandbox: Any, remote_path: str, local_path: str) -> Optional[str]:
+def safe_download_bytes(sandbox: Any, remote_path: str, max_attempts: int = 2) -> Optional[bytes]:
     """
     Download a file from sandbox with base64 fallback.
 
     Args:
         sandbox: The sandbox instance
         remote_path: Path in sandbox to download
-        local_path: Local path to save to
+        max_attempts: Maximum number of retry attempts
 
     Returns:
-        Content as string, or None if download fails
+        Content as bytes, or None if download fails
     """
-    try:
-        return sandbox.files.read(remote_path)
-    except Exception as e:
-        print(f"SANDBOX_DOWNLOAD_FAILED: {e}")
-
-        # Try base64 fallback
+    for attempt in range(max_attempts):
         try:
-            cmd = f"base64 -w 0 {remote_path}"
-            result = sandbox.commands.run(cmd)
-            if result and result.strip():
-                import base64
-                decoded = base64.b64decode(result.strip())
-                return decoded.decode("utf-8", errors="ignore")
-        except Exception as e2:
-            print(f"SANDBOX_BASE64_FALLBACK_FAILED: {e2}")
+            content = sandbox.files.read(remote_path)
+            # Normalize to bytes if needed
+            if isinstance(content, (bytes, bytearray)):
+                return content
+            elif hasattr(content, "tobytes"):
+                return content.tobytes()
+            else:
+                # Try to decode to bytes
+                if isinstance(content, str):
+                    return content.encode("utf-8", errors="ignore")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"DOWNLOAD_ATTEMPT_{attempt + 1}/{max_attempts} FAILED: {error_msg}")
 
-        return None
+            # Try base64 fallback
+            if attempt < max_attempts - 1:
+                try:
+                    cmd = f"base64 -w 0 {remote_path}"
+                    proc = sandbox.commands.run(cmd)
+                    if proc.exit_code == 0:
+                        import base64
+                        decoded = base64.b64decode(proc.stdout.strip())
+                        return decoded.encode("utf-8", errors="ignore")
+                except Exception as e2:
+                    print(f"BASE64_FALLBACK_ATTEMPT_{attempt + 2}/{max_attempts} FAILED: {e2}")
+
+    return None
+
+
+def create_sandbox_with_retry(SandboxCls, *, max_attempts: int = 2, run_id: Optional[str] = None, step: Optional[str] = None):
+    """
+    Wrapper for creating sandbox with retry logic.
+
+    Args:
+        SandboxCls: The Sandbox class (e.g., Sandbox from e2b)
+        max_attempts: Maximum number of attempts (default: 2)
+        run_id: Optional run ID for logging
+        step: Optional step name for logging
+
+    Returns:
+        Context manager for sandbox that retries on transient errors
+
+    Example:
+        with create_sandbox_with_retry(Sandbox, max_attempts=2) as sandbox:
+            # Use sandbox normally
+            sandbox.files.write(path, content)
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _sandbox_context():
+        attempt = 0
+        sandbox = None
+
+        try:
+            while attempt < max_attempts:
+                attempt += 1
+                try:
+                    sandbox = SandboxCls()
+                    if run_id is not None and hasattr(sandbox, "client"):
+                        # Some sandboxes support setting client ID
+                        pass
+                    if step is not None:
+                        print(f"SANDBOX_ATTEMPT step={step} attempt={attempt}/{max_attempts}")
+                    yield sandbox
+                    return
+                except Exception as e:
+                    if not is_transient_sandbox_error(e):
+                        raise
+                    print(f"SANDBOX_TRANSIENT_FAILURE_RETRY step={step} attempt={attempt}/{max_attempts}: {e}")
+            # All attempts failed
+            raise Exception(f"All {max_attempts} sandbox creation attempts failed. Last error: {last_error}")
+
+    return _sandbox_context()
