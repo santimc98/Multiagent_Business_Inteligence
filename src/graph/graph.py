@@ -6728,11 +6728,24 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 sandbox.commands.run(f"rm -rf {run_root}")
                 sandbox.commands.run(f"mkdir -p {run_root}/data")
                 
-                # 2. Upload Raw Data
-                remote_raw_path = f"{run_root}/data/raw.csv"
-                print(f"Uploading {csv_path} to sandbox...")
+                # 2. Upload Raw Data (P2.1: Use canonical path + aliases)
+                remote_raw_abs = canonical_abs(run_root, CANONICAL_RAW_REL)
+                print(f"Uploading {csv_path} to sandbox at {CANONICAL_RAW_REL}...")
                 with open(csv_path, "rb") as f:
-                    sandbox.files.write(remote_raw_path, f)
+                    sandbox.files.write(remote_raw_abs, f)
+
+                # 2.5 Create aliases for raw data (P2.1)
+                alias_commands = build_symlink_or_copy_commands(
+                    run_root,
+                    canonical_rel=CANONICAL_RAW_REL,
+                    aliases=COMMON_RAW_ALIASES
+                )
+                if alias_commands:
+                    print(f"Creating {len(alias_commands)} raw data aliases...")
+                    full_cmd = " && ".join(alias_commands)
+                    run_cmd_with_retry(sandbox, f"sh -lc 'cd {run_root} && {full_cmd}'")
+                    print(f"SANDBOX_INPUT_CANONICAL: {CANONICAL_RAW_REL}")
+                    print(f"SANDBOX_INPUT_ALIASES: {COMMON_RAW_ALIASES}")
     
                 # 2.5 Upload Execution Contract (best-effort)
                 local_contract_path = "data/execution_contract.json"
@@ -6743,9 +6756,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     except Exception as contract_err:
                         print(f"Warning: failed to upload execution_contract.json: {contract_err}")
     
-                # 3. Execute Cleaning
-                code = code.replace("data/raw.csv", remote_raw_path)
-                code = code.replace("./data/raw.csv", remote_raw_path)
+                # 3. Execute Cleaning (P2.1: Patch placeholders + minimal backward compat)
+                code = patch_placeholders(code, data_rel=CANONICAL_RAW_REL)
                 working_dir_injection = (
                     "import os\n"
                     f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
@@ -7700,21 +7712,32 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "budget_counters": counters,
             }
 
-        if run_id:
-            log_run_event(
-                run_id,
-                "data_engineer_complete",
-                {"rows": len(df_final), "columns": len(df_final.columns)},
-            )
-        return {
-            "cleaning_code": code,
-            "cleaned_data_preview": preview,
-            "csv_sep": csv_sep,
-            "csv_decimal": csv_decimal,
-            "csv_encoding": csv_encoding,
-            "leakage_audit_summary": leakage_audit_summary,
-            "budget_counters": counters,
-        }
+         # P2.3: Calculate dataset scale hints after Data Engineer
+         work_dir = state.get("work_dir", ".")
+         dataset_scale_hints = get_dataset_scale_hints(work_dir, "data/cleaned_data.csv")
+
+         if run_id:
+             log_run_event(
+                 run_id,
+                 "data_engineer_complete",
+                 {
+                     "rows": len(df_final),
+                     "columns": len(df_final.columns),
+                     "dataset_scale": dataset_scale_hints.get("scale"),
+                     "dataset_file_mb": dataset_scale_hints.get("file_mb"),
+                 },
+             )
+
+         return {
+             "cleaning_code": code,
+             "cleaned_data_preview": preview,
+             "csv_sep": csv_sep,
+             "csv_decimal": csv_decimal,
+             "csv_encoding": csv_encoding,
+             "leakage_audit_summary": leakage_audit_summary,
+             "budget_counters": counters,
+             "dataset_scale_hints": dataset_scale_hints,
+         }
 
     except Exception as e:
         print(f"Cleaning Execution Error (System): {e}")
@@ -8929,51 +8952,51 @@ def execute_code(state: AgentState) -> AgentState:
             sandbox.commands.run(f"mkdir -p {run_root}/static/plots")
             sandbox.commands.run(f"mkdir -p {run_root}/data")
             
+            # P2.1: Use canonical cleaned path + aliases (P2.2: run_cmd_with_retry)
             local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
             if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
                 local_csv = "data/cleaned_data.csv"
-            remote_csv = f"{run_root}/data.csv"
-            
+
+            # Upload cleaned data (P2.1: Canonical path)
+            remote_clean_abs = canonical_abs(run_root, CANONICAL_CLEANED_REL)
+
             if os.path.exists(local_csv):
                 with open(local_csv, "rb") as f:
-                    sandbox.files.write(remote_csv, f)
-                print(f"Data uploaded to {remote_csv}")
-                
-                # Robust path patching
-                if local_csv:
-                    code = code.replace(local_csv, remote_csv)
-                    if not local_csv.startswith("./"):
-                        code = code.replace(f"./{local_csv}", remote_csv)
-                code = code.replace("data/cleaned_data.csv", remote_csv)
-                code = code.replace("./data/cleaned_data.csv", remote_csv)
-                code = code.replace("data/cleaned_full.csv", remote_csv)
-                code = code.replace("./data/cleaned_full.csv", remote_csv)
-                
-                # Manifest Round-trip (Upload & Patch)
-                local_manifest = "data/cleaning_manifest.json"
-                remote_manifest = f"{run_root}/cleaning_manifest.json"
-                
-                if os.path.exists(local_manifest):
-                    with open(local_manifest, "rb") as f:
-                        sandbox.files.write(remote_manifest, f)
-                    print(f"Manifest uploaded to {remote_manifest}")
-                    
-                    # Patch Manifest Path
-                    code = code.replace("data/cleaning_manifest.json", remote_manifest)
-                    code = code.replace("./data/cleaning_manifest.json", remote_manifest)
-                    
-                    # Idempotent Injection of Manifest Path (Contract)
-                    # Ensures the remote path is available even if not explicitly used in original script
-                    if remote_manifest not in code:
-                        injection = f'\n# Cleaning manifest available at {remote_manifest}\nCLEANING_MANIFEST_PATH = "{remote_manifest}"\n'
-                        # Import injection if needed? No, just variable definition at top
-                        # We append it to import section or top of file. 
-                        # Simplest: Prepend to code
-                        code = injection + code
-                else:
-                    print("Warning: Manifest not found locally. Code patching skipped.")
-            else:
-                print("Warning: Local cleaned data not found. Upload skipped.")
+                    sandbox.files.write(remote_clean_abs, f)
+                print(f"Data uploaded to {CANONICAL_CLEANED_REL}")
+
+            # P2.1: Create aliases for cleaned data (run_cmd_with_retry for resilience)
+            cleaned_alias_commands = build_symlink_or_copy_commands(
+                run_root,
+                canonical_rel=CANONICAL_CLEANED_REL,
+                aliases=COMMON_CLEANED_ALIASES
+            )
+            if cleaned_alias_commands:
+                print(f"Creating {len(cleaned_alias_commands)} cleaned data aliases...")
+                full_cmd = " && ".join(cleaned_alias_commands)
+                run_cmd_with_retry(sandbox, f"sh -lc 'cd {run_root} && {full_cmd}'")
+                print(f"SANDBOX_INPUT_CANONICAL: {CANONICAL_CLEANED_REL}")
+                print(f"SANDBOX_INPUT_ALIASES: {COMMON_CLEANED_ALIASES}")
+
+            # P2.1: Upload manifest to canonical path
+            local_manifest = "data/cleaning_manifest.json"
+            remote_manifest_abs = canonical_abs(run_root, CANONICAL_MANIFEST_REL)
+
+            if os.path.exists(local_manifest):
+                with open(local_manifest, "rb") as f:
+                    sandbox.files.write(remote_manifest_abs, f)
+                print(f"Manifest uploaded to {CANONICAL_MANIFEST_REL}")
+
+                # P2.1: Create alias for manifest in root
+                sandbox.commands.run(f"cd {run_root} && ln -sf {CANONICAL_MANIFEST_REL} cleaning_manifest.json || cp -f {CANONICAL_MANIFEST_REL} cleaning_manifest.json")
+
+            # P2.1: Patch code with placeholders (minimal backward compat)
+            code = patch_placeholders(code, data_rel=CANONICAL_CLEANED_REL, manifest_rel=CANONICAL_MANIFEST_REL)
+            if local_csv:
+                # Keep minimal backward compat: only replace exact local_csv paths
+                code = code.replace(local_csv, remote_clean_abs)
+                if not local_csv.startswith("./"):
+                    code = code.replace(f"./{local_csv}", remote_clean_abs)
 
             working_dir_injection = (
                 "import os\n"
