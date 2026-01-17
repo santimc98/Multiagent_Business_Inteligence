@@ -5662,6 +5662,7 @@ class AgentState(TypedDict):
     max_sandbox_retries: int
     ml_call_refund_pending: bool
     execution_call_refund_pending: bool
+    ml_preflight_failed: bool
     artifact_content_issues: List[str]
     artifact_content_diagnostics: Dict[str, Any]
     last_successful_execution_output: str
@@ -5684,10 +5685,13 @@ class AgentState(TypedDict):
     csv_encoding: str
     csv_sep: str
     csv_decimal: str
+    dataset_scale_hints: Dict[str, Any]
+    dataset_scale: str
     # Reviewer State
     review_verdict: str
     review_feedback: str
     reviewer_iteration: int
+    review_abort_reason: str
     # Failure State
     error_message: str
     # Domain Expert
@@ -5703,6 +5707,8 @@ class AgentState(TypedDict):
     data_engineer_attempt: int
     execution_attempt: int # Track runtime retries
     runtime_fix_count: int
+    max_runtime_fix_attempts: int
+    runtime_fix_terminal: bool
     last_runtime_error_tail: str # Added for Runtime Error Visibility
     data_engineer_audit_override: str
     ml_engineer_audit_override: str
@@ -7843,6 +7849,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
              "leakage_audit_summary": leakage_audit_summary,
              "budget_counters": counters,
              "dataset_scale_hints": dataset_scale_hints,
+             "dataset_scale": dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None,
          }
 
     except Exception as e:
@@ -8045,6 +8052,12 @@ def run_engineer(state: AgentState) -> AgentState:
         sig = inspect.signature(ml_engineer.generate_code)
         if "execution_contract" in sig.parameters:
             kwargs["execution_contract"] = contract_min or execution_contract
+        if "dataset_scale" in sig.parameters:
+            dataset_scale_hints = state.get("dataset_scale_hints") or {}
+            kwargs["dataset_scale"] = dataset_scale_hints
+        if "dataset_scale_str" in sig.parameters:
+            dataset_scale_hints = state.get("dataset_scale_hints") or {}
+            kwargs["dataset_scale_str"] = dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None
         if "ml_view" in sig.parameters:
             ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
             if not isinstance(ml_view, dict) or not ml_view:
@@ -8061,6 +8074,16 @@ def run_engineer(state: AgentState) -> AgentState:
         derived_present = []
         sample_context = ""
         context_ops_blocks = []
+        dataset_scale_hints = state.get("dataset_scale_hints") or {}
+        scale_line = (
+            "POST-CLEAN DATASET SCALE: "
+            f"scale={dataset_scale_hints.get('scale') or 'unknown'} "
+            f"file_mb={dataset_scale_hints.get('file_mb') or 'unknown'} "
+            f"est_rows={dataset_scale_hints.get('est_rows') or 'unknown'} "
+            f"max_train_rows={dataset_scale_hints.get('max_train_rows') or 'unknown'} "
+            f"chunk_size={dataset_scale_hints.get('chunk_size') or 'unknown'}"
+        )
+        context_ops_blocks.append(scale_line)
         if feature_availability or availability_summary:
             availability_payload = {
                 "availability_summary": availability_summary,
@@ -8198,6 +8221,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "ml_engineer_audit_override": ml_audit_override,
                 "feature_availability": feature_availability,
                 "availability_summary": availability_summary,
+                "dataset_scale_hints": dataset_scale_hints,
                 "signal_summary": kwargs.get("signal_summary", {}),
                 "iteration_memory": iteration_memory,
                 "iteration_memory_block": iteration_memory_block,
@@ -8911,6 +8935,11 @@ def check_qa_review(state: AgentState):
 
 def check_ml_preflight(state: AgentState):
     if state.get("ml_preflight_failed"):
+        return "failed"
+    if (
+        state.get("review_verdict") == "REJECTED"
+        and (state.get("last_gate_context") or {}).get("source") == "ml_preflight"
+    ):
         return "failed"
     return "passed"
 

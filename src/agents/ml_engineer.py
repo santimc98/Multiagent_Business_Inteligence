@@ -640,6 +640,8 @@ class MLEngineerAgent:
         signal_summary: Dict[str, Any] | None = None,
         iteration_memory: List[Dict[str, Any]] | None = None,
         iteration_memory_block: str = "",
+        dataset_scale: Dict[str, Any] | None = None,
+        dataset_scale_str: str | None = None,
     ) -> str:
 
         SYSTEM_PROMPT_TEMPLATE = """
@@ -684,7 +686,7 @@ class MLEngineerAgent:
            - CORRECT pattern:
              ```python
              def load_dialect():
-                 manifest_path = 'data/cleaning_manifest.json'
+                 manifest_path = MANIFEST_PATH
                  if os.path.exists(manifest_path):
                      with open(manifest_path, 'r') as f:
                          manifest = json.load(f)
@@ -702,6 +704,9 @@ class MLEngineerAgent:
            - DO NOT hardcode sep=',', decimal='.', or any other dialect values. ALWAYS read from manifest first.
            - Fallback ONLY if manifest doesn't exist: use the defaults shown above.
            - When writing any CSV artifacts (scored_rows.csv, optimal_pricing_guide.csv, etc.), ALWAYS pass sep, decimal, encoding from load_dialect().
+        3b) USE ORCHESTRATOR PATH VARIABLES: Always use MANIFEST_PATH for dialect loading and CLEANED_CSV_PATH for input data.
+           - Do NOT hardcode file paths. Do NOT use alternate path variables.
+           - If you define INPUT_FILE, set INPUT_FILE = CLEANED_CSV_PATH (this is equivalent to $data_path).
         4) CRITICAL - INPUT PATH: You MUST read data from the EXACT path '$data_path' provided in the context.
            INPUT GUARANTEE (NON-NEGOTIABLE):
            - The orchestrator guarantees that the dataset at $data_path exists before your script runs.
@@ -728,6 +733,12 @@ class MLEngineerAgent:
         9) Start the script with a short comment block labeled PLAN describing: (1) dialect loading from cleaning_manifest.json, (2) detected columns, (3) row_id construction, (4) scored_rows columns, and (5) where extra derived artifacts go.
         10) Define CONTRACT_COLUMNS from the Execution Contract (prefer data_requirements source=input; else canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
         11) LEAKAGE ZERO-TOLERANCE: Check 'allowed_feature_sets' in the contract. Any column listed as 'audit_only_features' or 'forbidden_for_modeling' MUST be excluded from X (features). Use them ONLY for audit/metrics calculation. Violation = REJECTION.
+        12) PIPELINE ISOLATION: If you define multiple models/pipelines, do NOT reuse the same preprocessor/transformer across pipelines.
+            - Create separate preprocessors or clone them.
+            - Example:
+              preprocessor1 = ColumnTransformer(...)
+              preprocessor2 = ColumnTransformer(...)
+              # or: preprocessor2 = sklearn.base.clone(preprocessor1)
         
         UNIVERSAL FEATURE USAGE RULE (CONTRACT-DRIVEN):
         - Each phase (segmentation/modeling/optimization) MUST use ONLY features allowed by the contract.
@@ -1045,6 +1056,7 @@ class MLEngineerAgent:
             signal_summary_json=json.dumps(signal_summary or {}, indent=2),
             iteration_memory_json=json.dumps(iteration_memory or [], indent=2),
             iteration_memory_block=iteration_memory_block or "",
+            dataset_scale=dataset_scale,
         )
         
         # USER TEMPLATES (Static)
