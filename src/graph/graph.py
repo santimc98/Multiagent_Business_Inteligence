@@ -17,6 +17,7 @@ try:
     from e2b import Sandbox as BaseSandbox
 except Exception:
     BaseSandbox = None
+Sandbox = CodeSandbox
 from dotenv import load_dotenv
 import base64
 
@@ -773,16 +774,16 @@ def _resolve_requirement_meta(contract: Dict[str, Any], col: str) -> Dict[str, A
     """
     if not isinstance(contract, dict):
         return {}
-        
+
     norm_col = _norm_name(col)
-    
+
     # Check V4.1 canonical columns (Strictly required usually)
     from src.utils.contract_v41 import get_canonical_columns, get_artifact_requirements
     canonical = get_canonical_columns(contract)
     for c in canonical:
         if _norm_name(c) == norm_col:
             return {"name": c, "required": True, "nullable": False}
-            
+
     # Check optional passthrough
     artifact_reqs = get_artifact_requirements(contract)
     schema = artifact_reqs.get("schema_binding", {})
@@ -800,7 +801,7 @@ def _resolve_requirement_meta(contract: Dict[str, Any], col: str) -> Dict[str, A
             name = req.get("canonical_name") or req.get("name") or req.get("column")
             if name and _norm_name(name) == norm_col:
                 return req
-                
+
     # Default: if not found in canonical, assume it might be optional or extra
     return {}
 
@@ -1111,13 +1112,13 @@ def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return {}
     new_contract = dict(contract)
-    
+
     # Legacy cleanup
     reqs = contract.get("data_requirements", []) or []
     if reqs:
         filtered = [r for r in reqs if isinstance(r, dict) and r.get("source", "input") == "input"]
         new_contract["data_requirements"] = filtered
-        
+
     return new_contract
 
 def _filter_contract_for_data_engineer(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -1126,17 +1127,17 @@ def _filter_contract_for_data_engineer(contract: Dict[str, Any]) -> Dict[str, An
     """
     if not isinstance(contract, dict):
         return {}
-        
+
     # In V4.1, contract is already structured by role ownership (DataEng owns loading/cleaning)
     # We just return the contract; the agent runbook handles the rest.
     new_contract = dict(contract)
-    
+
     # Legacy legacy cleanup
     reqs = contract.get("data_requirements", []) or []
     if reqs:
         filtered = [r for r in reqs if isinstance(r, dict) and r.get("source", "input") == "input"]
         new_contract["data_requirements"] = filtered
-        
+
     return new_contract
 
 
@@ -1161,7 +1162,7 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
         canonical = get_canonical_columns(contract)
         if canonical:
             return canonical
-        
+
         # Legacy fallback: data_requirements with source='input'
         contract_reqs = contract.get("data_requirements", []) or []
         if contract_reqs:
@@ -1184,13 +1185,13 @@ def _resolve_contract_deliverables(contract: Dict[str, Any]) -> List[Dict[str, A
     Returns a list of dicts [{'path': str, 'required': bool, ...}]
     """
     from src.utils.contract_v41 import get_required_outputs
-    
+
     # V4.1: get_required_outputs returns List[str]
     outputs = get_required_outputs(contract)
     if outputs:
         # Convert to list of dicts for compatibility with existing graph logic
         return [{"path": p, "required": True} for p in outputs]
-        
+
     # Legacy Fallback
     spec = contract.get("spec_extraction") or {}
     deliverables = spec.get("deliverables")
@@ -1212,7 +1213,7 @@ def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None
     if sources and 'derived' in sources:
         from src.utils.contract_v41 import get_derived_column_names
         return get_derived_column_names(contract)
-        
+
     # Legacy Fallback
     reqs = contract.get("data_requirements", []) or []
     out: List[str] = []
@@ -1253,7 +1254,7 @@ def _resolve_allowed_columns_for_gate(
         from src.utils.contract_v41 import get_derived_column_names
         derived_cols = get_derived_column_names(contract)
         allowed.extend([str(c) for c in derived_cols if c])
-        
+
         # Minimal legacy fallback for data_requirements
         data_reqs = contract.get("data_requirements", []) or []
         if isinstance(data_reqs, list):
@@ -1349,19 +1350,19 @@ def _resolve_required_outputs(contract: Dict[str, Any]) -> List[str]:
     """
     if not isinstance(contract, dict):
         return []
-    
+
     # Priority 1: evaluation_spec.required_outputs
     eval_spec = contract.get("evaluation_spec")
     if isinstance(eval_spec, dict):
         eval_outputs = eval_spec.get("required_outputs")
         if isinstance(eval_outputs, list) and eval_outputs:
             return [_normalize_output_path(str(p)) for p in eval_outputs if p]
-    
+
     # Priority 2: contract.required_outputs
     req_outputs = contract.get("required_outputs")
     if isinstance(req_outputs, list) and req_outputs:
         return [_normalize_output_path(str(p)) for p in req_outputs if p]
-    
+
     # Priority 3: artifact_requirements.required_files
     artifact_reqs = contract.get("artifact_requirements")
     if isinstance(artifact_reqs, dict):
@@ -1380,7 +1381,7 @@ def _resolve_required_outputs(contract: Dict[str, Any]) -> List[str]:
                     resolved.append(_normalize_output_path(path))
             if resolved:
                 return resolved
-    
+
     # Fallback: minimal required outputs for a valid ML run
     return ["data/scored_rows.csv", "data/metrics.json", "data/alignment_check.json"]
 
@@ -1505,10 +1506,10 @@ def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any
     """
     if not isinstance(contract, dict):
         contract = {}
-    
+
     eval_spec = evaluation_spec if isinstance(evaluation_spec, dict) else contract.get("evaluation_spec") or {}
     alignment = contract.get("alignment_requirements") or (eval_spec.get("alignment_requirements") if isinstance(eval_spec, dict) else []) or []
-    
+
     # Get derived_columns from V4.1 location (feature_engineering_plan or direct)
     fep = contract.get("feature_engineering_plan")
     derived_cols = []
@@ -1842,10 +1843,10 @@ def _infer_scored_rows_schema(
 ) -> Dict[str, Any] | None:
     """
     UNIVERSAL: Infer schema for scored_rows.csv based on strategy type and contract.
-    
+
     Works for ANY objective type (prediction, optimization, clustering, descriptive)
     with NO hardcoded column names or business logic.
-    
+
     Returns dict with:
       - required_columns: list of canonical input columns (always included)
       - derived_columns: list of derived output columns (based on strategy type)
@@ -1853,73 +1854,73 @@ def _infer_scored_rows_schema(
     """
     if not isinstance(contract, dict):
         return None
-    
+
     # Base schema: always include input columns
     canonical_columns = contract.get("canonical_columns") or []
     if not isinstance(canonical_columns, list):
         canonical_columns = []
-    
+
     schema = {
         "required_columns": canonical_columns.copy(),
         "derived_columns": [],
         "row_count": "must_match_input",
         "description": "One row per input record with canonical columns plus derived outputs (predictions, scores, segments, optimal values as applicable)"
     }
-    
+
     # Infer strategy type from contract
     strategy_context = contract.get("strategy_context") or {}
     analysis_type = str(strategy_context.get("analysis_type", "")).lower()
-    
+
     # Check if evaluation spec requires specific outputs
     eval_spec = evaluation_spec or contract.get("evaluation_spec") or {}
     objective_type = str(eval_spec.get("objective_type", "")).lower()
     requires_target = bool(eval_spec.get("requires_target"))
-    
+
     # Derive output columns based on objective type (UNIVERSAL)
     derived_cols = schema["derived_columns"]
-    
+
     # 1. Segmentation/Clustering outputs
     segmentation = eval_spec.get("segmentation") or {}
     if segmentation.get("required") or "segment" in analysis_type or "cluster" in analysis_type:
         # Generic segment identifier (not hardcoded to specific name)
         derived_cols.append("segment_id")  # or cluster_id
-    
+
     # 2. Predictive modeling outputs  
     if "predict" in analysis_type or "predict" in objective_type or requires_target:
         # Generic prediction columns (adapt to target type)
         target_info = eval_spec.get("target") or {}
         target_name = target_info.get("name", "target")
-        
+
         # Add prediction column (name based on target if available)
         if target_name and target_name != "target":
             derived_cols.append(f"predicted_{target_name}")
         else:
             derived_cols.append("predicted_value")  # generic
-        
+
         # Add probability for classification tasks
         if requires_target:  # Likely binary/multi-class
             derived_cols.append("predicted_probability")
-    
+
     # 3. Optimization/Prescriptive outputs
     decision_var = eval_spec.get("decision_variable") or {}
     decision_var_name = decision_var.get("name")
-    
+
     if decision_var_name or "optim" in analysis_type or "prescript" in objective_type:
         # Add optimal value for decision variable (generic name)
         if decision_var_name:
             derived_cols.append(f"optimal_{decision_var_name}")
         else:
             derived_cols.append("optimal_value")  # fallback generic
-        
+
         # Optionally add expected outcome at optimal
         if requires_target:
             derived_cols.append("expected_outcome_at_optimal")
-    
+
     # 4. Ranking/Scoring outputs
     if "rank" in analysis_type or "scor" in analysis_type:
         derived_cols.append("score")
         derived_cols.append("rank")
-    
+
     # Remove duplicates while preserving order
     seen = set()
     unique_derived = []
@@ -1928,7 +1929,7 @@ def _infer_scored_rows_schema(
             seen.add(col)
             unique_derived.append(col)
     schema["derived_columns"] = unique_derived
-    
+
     return schema
 
 
@@ -2004,16 +2005,16 @@ def _ensure_contract_deliverable(
     existing_outputs = contract.get("required_outputs")
     if not isinstance(existing_outputs, list):
         existing_outputs = []
-    
+
     seen: set[str] = set(_normalize_output_path(p) for p in existing_outputs if p)
     merged_outputs = [_normalize_output_path(p) for p in existing_outputs if p]
-    
+
     # Add new required deliverables not already in required_outputs
     if required:
         norm_path = _normalize_output_path(path)
         if norm_path not in seen:
             merged_outputs.append(norm_path)
-    
+
     contract["required_outputs"] = merged_outputs
     return contract
 
@@ -2044,7 +2045,7 @@ def _ensure_scored_rows_output(
     if explicit_required or requires_row_scoring:
         # ← NEW: Generate universal schema for scored_rows.csv
         scored_rows_schema = _infer_scored_rows_schema(contract, evaluation_spec)
-        
+
         contract = _ensure_contract_deliverable(
             contract,
             "data/scored_rows.csv",
@@ -2162,7 +2163,7 @@ def _ensure_alignment_check_output(contract: Dict[str, Any]) -> Dict[str, Any]:
 def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     V4.1 CUTOVER: Minimal normalization only.
-    
+
     Contract is now IMMUTABLE after Execution Planner generates it.
     We only normalize quality_gates structure for backward compatibility.
     All other fields are preserved as-is from V4.1 schema.
@@ -2193,7 +2194,7 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
 
     # V4.1: DO NOT touch spec_extraction, data_requirements, or role_runbooks
     # The contract comes from Execution Planner with V4.1 schema already populated
-    
+
     return normalized
 
 def _normalize_required_fixes(items: List[Any] | None) -> List[str]:
@@ -3506,11 +3507,11 @@ def _collect_derived_targets(contract: Dict[str, Any]) -> List[str]:
     if not isinstance(fep, dict):
         fep = {}
     derived_cols = fep.get("derived_columns") or []
-    
+
     spec = contract.get("spec_extraction")
     if not isinstance(spec, dict):
         spec = {}
-    
+
     if not derived_cols:
         derived_cols = spec.get("derived_columns") or []
     derived_names: List[str] = []
@@ -5818,7 +5819,7 @@ def run_steward(state: AgentState) -> AgentState:
         },
     )
     log_run_event(run_id, "steward_start", {"csv_path": csv_path})
-    
+
     # Pre-emptive cleanup
     import glob
     # Delete all potential report files including unique ones to avoid clutter
@@ -5832,7 +5833,7 @@ def run_steward(state: AgentState) -> AgentState:
             print(f"Debug: Cleanup failed for {pdf_file}: {e}")
 
     result = steward.analyze_data(state['csv_path'], state['business_objective'])
-    
+
     summary = result.get('summary', 'Error')
     encoding = result.get('encoding', 'utf-8')
     sep = result.get('sep', ',')
@@ -5868,9 +5869,9 @@ def run_steward(state: AgentState) -> AgentState:
             )
     except Exception as summary_err:
         print(f"Warning: failed to persist steward summary: {summary_err}")
-    
+
     print(f"Steward Detected: Encoding={encoding}, Sep='{sep}', Decimal='{decimal}'")
-    
+
     log_run_event(
         run_id,
         "steward_complete",
@@ -5930,7 +5931,7 @@ def run_strategist(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "strategist")
     if abort_state:
         return abort_state
-    
+
     # Strategist now returns a dict with "strategies": [list of 3]
     user_context = state.get("strategist_context_override") or state.get("business_objective", "")
     result = strategist.generate_strategies(state['data_summary'], user_context)
@@ -5945,7 +5946,7 @@ def run_strategist(state: AgentState) -> AgentState:
         )
     strategies_list = result.get('strategies', [])
     strategy_spec = result.get("strategy_spec", {})
-    
+
     # Fallback if list is empty or malformed
     if not strategies_list:
         print("Warning: Strategist returned no strategies. Using fallback.")
@@ -5976,12 +5977,12 @@ def run_domain_expert(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "domain_expert")
     if abort_state:
         return abort_state
-    
+
     strategies_wrapper = state.get('strategies', {})
     strategies_list = strategies_wrapper.get('strategies', [])
     business_objective = state.get("business_objective", "")
     data_summary = state.get('data_summary', '')
-    
+
     # Deliberation Step
     evaluation = domain_expert.evaluate_strategies(data_summary, business_objective, strategies_list)
     reviews = evaluation.get('reviews', [])
@@ -5998,35 +5999,35 @@ def run_domain_expert(state: AgentState) -> AgentState:
                 "strategy_count": len(strategies_list) if isinstance(strategies_list, list) else 0,
             },
         )
-    
+
     # Selection Logic
     best_strategy = None
     best_score = -1.0
     selection_reason = "Default Selection"
-    
+
     # Map reviews to strategies (assuming order consistency or title matching)
     # We use Title matching for robustness
-    
+
     print("\n🧐 EXPERT DELIBERATION:")
     for strat in strategies_list:
         # Find matching review
         match = next((r for r in reviews if r.get('title') == strat.get('title')), None)
         score = match.get('score', 0) if match else 0
-        
+
         print(f"  • Strategy: {strat.get('title')} | Score: {score}/10")
         if match:
              print(f"    - Critique: {match.get('reasoning')[:100]}...")
-        
+
         if score > best_score:
             best_score = score
             best_strategy = strat
             selection_reason = match.get('reasoning') if match else "Highest Score"
-            
+
     # Fallback to first if no valid scores
     if not best_strategy and strategies_list:
         best_strategy = strategies_list[0]
         selection_reason = "Fallback: First strategy selected (No scores available)."
-        
+
     print(f"\n🏆 WINNER: {best_strategy.get('title')} (Score: {best_score})")
     print(f"   Reason: {selection_reason}\n")
 
@@ -6091,10 +6092,10 @@ def run_execution_planner(state: AgentState) -> AgentState:
             "decimal": csv_decimal,
             "encoding": csv_encoding
         }
-        
+
         # Prepare env_constraints (conservative default)
         env_constraints = {"forbid_inplace_column_creation": True}
-        
+
         domain_expert_critique = state.get("selection_reason", "")
 
         contract = execution_planner.generate_contract(
@@ -6283,11 +6284,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
     state["data_engineer_attempt"] = attempt_id
     if run_id:
         log_run_event(run_id, "data_engineer_start", {})
-    
+
     selected = state.get('selected_strategy')
     if not selected:
         raise ValueError("No strategy selected for data cleaning.")
-        
+
     business_objective = state.get('business_objective', '')
     csv_path = state['csv_path']
     print(f"DE_INPUT_CSV: {csv_path}")
@@ -6376,7 +6377,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
     #     data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, raw_context)
     # except Exception as e:
     #     print(f"Warning: could not read raw snippet for DE: {e}")
-        
+
     state["data_engineer_audit_override"] = data_engineer_audit_override
     contract_min = state.get("execution_contract_min") or _load_json_safe("data/contract_min.json") or {}
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
@@ -6515,7 +6516,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "data_engineer_failed": True,
                 "budget_counters": counters,
             }
-    
+
     # Check if generation failed
     if code.strip().startswith("# Error"):
         print(f"Correction: Data Engineer failed to generate code. Error: {code}")
@@ -6846,15 +6847,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
             if not api_key:
                 msg = "CRITICAL: E2B_API_KEY missing in .env file."
                 return {"error_message": msg, "cleaned_data_preview": "Error: Missing E2B Key", "budget_counters": counters}
-            
+
             os.environ["E2B_API_KEY"] = api_key
 
             for sb_attempt in range(2):
               try:
-                with create_sandbox_with_retry(CodeSandbox, max_attempts=2, run_id=run_id, step="data_engineer") as sandbox:
+                with create_sandbox_with_retry(Sandbox, max_attempts=2, run_id=run_id, step="data_engineer") as sandbox:
                     if not hasattr(sandbox, "run_code"):
                         raise RuntimeError(
-                            "E2B Sandbox missing run_code. Ensure we are using e2b_code_interpreter.Sandbox (CodeSandbox)."
+                            "E2B Sandbox missing run_code. Ensure we are using e2b_code_interpreter.Sandbox (Sandbox)."
                         )
                     step_name = "data_engineer"
                     run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
@@ -7238,6 +7239,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     continue
                 raise
 
+
         if not os.path.exists(local_cleaned_path):
             return {
                 "cleaning_code": code,
@@ -7271,7 +7273,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             format_patch_instructions,
             sample_raw_columns,
         )
-        
+
         try:
             df = pd.read_csv(
                 local_cleaned_path,
@@ -7289,12 +7291,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
             contract_all_cols = _resolve_contract_columns(contract)
             contract_derived_cols = _resolve_contract_columns_for_cleaning(contract, sources={"derived", "output"})
             cleaned_columns_set = set(df.columns.str.lower())
-            
+
             print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")
             print(f"Required: {required_cols}")
-            
+
             mapping_result = build_mapping(required_cols, df.columns.tolist())
-            
+
             # Check for Missing Critical Columns (input only)
             if mapping_result['missing']:
                 missing_cols = mapping_result['missing']
@@ -7328,7 +7330,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         "leakage_audit_summary": leakage_audit_summary,
                         "budget_counters": counters,
                     }
-            
+
             # Apply Renaming to Canonical Names
             df_mapped = df.rename(columns=mapping_result['rename_mapping'])
 
@@ -7714,7 +7716,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         "cleaned_data_preview": "Error: Derived Columns Constant",
                         "error_message": "CRITICAL: Derived columns present but constant; verify mapping and derivation.",
                     }
-            
+
             # Create Synthetic Columns if needed
             for synth in mapping_result['synthetic']:
                 print(f"Creating Synthetic Column: {synth} (0.0)")
@@ -7752,7 +7754,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         json.dump({"error": str(audit_err)}, f, indent=2)
                 except Exception:
                     pass
-        
+
             try:
                 os.makedirs("data", exist_ok=True)
                 df_mapped.to_csv(
@@ -7794,7 +7796,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             if not final_cols:
                 final_cols = df_mapped.columns.tolist()
             df_final = df_mapped[final_cols]
-            
+
             # Save Mapped Data back to disk
             df_final.to_csv(
                 local_cleaned_path,
@@ -7804,13 +7806,13 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 encoding=csv_encoding
             )
             print("Mapped data saved to 'data/cleaned_data.csv'")
-            
+
             # Save Summary
             with open("data/column_mapping_summary.json", "w") as f:
                 json.dump(mapping_result, f, indent=2)
-                
+
             preview = df_final.head(5).to_json(orient='split')
-            
+
         except Exception as e:
             print(f"Column Mapping Failed: {e}")
             return {
@@ -7866,7 +7868,7 @@ def check_data_success(state: AgentState):
     if err:
         print(f"❌ Data Engineer Failed: {err}")
         return "failed"
-    
+
     if not os.path.exists("data/cleaned_data.csv"):
         print("❌ Critical: cleaned_data.csv missing locally.")
         return "failed"
@@ -7945,7 +7947,7 @@ def run_engineer(state: AgentState) -> AgentState:
         log_run_event(run_id, "ml_engineer_start", {"iteration": state.get("iteration_count", 0) + 1})
 
     strategy = state.get('selected_strategy')
-    
+
     # Pass input context
     data_path = "data/cleaned_data.csv"
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
@@ -8029,7 +8031,7 @@ def run_engineer(state: AgentState) -> AgentState:
         gate_context = None
 
     print(f"DEBUG: Generating code for strategy: {strategy['title']}")
-    
+
     try:
         import inspect
         kwargs = dict(
@@ -8359,7 +8361,7 @@ def run_reviewer(state: AgentState) -> AgentState:
         }
     if run_id:
         log_run_event(run_id, "reviewer_start", {})
-    
+
     code = state['generated_code']
     current_iter = state.get('reviewer_iteration', 0)
     new_history = list(state.get('feedback_history', []))
@@ -8383,7 +8385,7 @@ def run_reviewer(state: AgentState) -> AgentState:
             log_run_event(run_id, "reviewer_view_context", {"length": reviewer_view_len})
     except Exception:
         pass
-    
+
     try:
         review = reviewer.review_code(
             code,
@@ -8394,7 +8396,7 @@ def run_reviewer(state: AgentState) -> AgentState:
             reviewer_view=reviewer_view,
         )
         print(f"Verdict: {review['status']}")
-        
+
         # Update Streak
         streak = state.get('review_reject_streak', 0)
         if review['status'] == "REJECTED":
@@ -8402,7 +8404,7 @@ def run_reviewer(state: AgentState) -> AgentState:
             print(f"Feedback: {review['feedback']}")
         else:
             streak = 0
-            
+
         # Pass Structured Context for Patching
         gate_context = {
             "source": "reviewer",
@@ -8417,7 +8419,7 @@ def run_reviewer(state: AgentState) -> AgentState:
 
         if review['status'] == "REJECTED":
             new_history.append(f"REVIEWER FEEDBACK (Attempt {current_iter+1}): {review['feedback']}")
-            
+
             # Check Fail-Safe Condition (Streak Based)
             # 1. Critical API Error
             if "Reviewer unavailable" in review['feedback']:
@@ -8500,7 +8502,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     code = state['generated_code']
     strategy = state.get('selected_strategy', {})
     business_objective = state.get('business_objective', '')
-    
+
     current_history = list(state.get('feedback_history', []))
     try:
         # Run QA Audit
@@ -8595,14 +8597,14 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             status = "APPROVE_WITH_WARNINGS"
             failed_gates = []
             required_fixes = []
-        
+
         print(f"QA Verdict: {status}")
-        
+
         # Update QA Streak (only deterministic rejects)
         streak = state.get('qa_reject_streak', 0)
         if status in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
             streak = 0
-        
+
         # Structured context for Patching
         gate_context = {
             "source": "qa_reviewer",
@@ -8614,7 +8616,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         fix_block = _build_fix_instructions(gate_context["required_fixes"])
         if fix_block:
             gate_context["edit_instructions"] = fix_block
-        
+
         review_verdict = status if status in {"APPROVED", "APPROVE_WITH_WARNINGS"} else "APPROVED"
         if run_id:
             log_run_event(run_id, "qa_reviewer_complete", {"status": status})
@@ -8975,7 +8977,7 @@ def execute_code(state: AgentState) -> AgentState:
             os.remove("data/metrics.json")
     except Exception:
         pass
-    
+
     # 0. Static Safety Scan
     is_safe, violations = scan_code_safety(code)
     if not is_safe:
@@ -9084,7 +9086,7 @@ def execute_code(state: AgentState) -> AgentState:
 
         for sb_attempt in range(2):
           try:
-            with create_sandbox_with_retry(CodeSandbox, max_attempts=2, run_id=run_id, step="ml_engineer") as sandbox:
+            with create_sandbox_with_retry(Sandbox, max_attempts=2, run_id=run_id, step="ml_engineer") as sandbox:
                 if not hasattr(sandbox, "run_code"):
                     raise RuntimeError(
                         "E2B Sandbox missing run_code. Ensure we are using e2b_code_interpreter.Sandbox (CodeSandbox)."
@@ -9139,10 +9141,10 @@ def execute_code(state: AgentState) -> AgentState:
                         sandbox.files.write(remote_manifest_abs, manifest_content)
                         sandbox.files.write(remote_manifest_root_abs, manifest_content)
                     print(f"Manifest uploaded to {CANONICAL_MANIFEST_REL} and root")
-                
+
                 # P2.1: Patch code with placeholders and explicit absolute entries
                 code = patch_placeholders(code, data_rel=CANONICAL_CLEANED_REL, manifest_rel=CANONICAL_MANIFEST_REL)
-                
+
                 # Explicit substitutions to ensure absolute paths and avoid .//
                 if local_csv:
                      # Replace generic data paths with remote_clean_abs
@@ -9150,7 +9152,7 @@ def execute_code(state: AgentState) -> AgentState:
                      code = code.replace("./data/cleaned_data.csv", remote_clean_abs)
                      code = code.replace("'data/cleaned_data.csv'", f"'{remote_clean_abs}'")
                      code = code.replace('"data/cleaned_data.csv"', f'"{remote_clean_abs}"')
-                     
+
                      # Only if local_csv is something else like 'data/input.csv'
                      if local_csv not in ["data/cleaned_data.csv", "./data/cleaned_data.csv"]:
                          code = code.replace(local_csv, remote_clean_abs)
@@ -9328,16 +9330,16 @@ def execute_code(state: AgentState) -> AgentState:
     except Exception as e:
         output = f"Sandbox Execution Failed: {e}"
         print(output)
-        
+
     # Calculate Visuals State locally
     import glob
     plots_local = glob.glob("static/plots/*.png")
-    
+
     fallback_plots_local = []
     # Fallback plots removed per user request (User prefers no plots over generic ones)
-             
+
     has_partial_visuals = len(plots_local) > 0
-    
+
     print(f"Execution finished. Plots generated: {len(plots_local)}")
 
     eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
@@ -9357,31 +9359,31 @@ def execute_code(state: AgentState) -> AgentState:
         csv_decimal=csv_decimal,
         csv_encoding=csv_encoding,
     )
-    
+
     # ← NEW: UNIVERSAL soft-warn logic for artifact alignment issues
     # Works for ANY artifact type (scored_rows, metrics, alignment_check, etc.)
     # No hardcoding of specific issues or objectives
     if artifact_issues:
         # Track issue history across iterations to enable learning
         issue_history = state.get("artifact_alignment_issue_history", [])
-        
+
         # Count occurrences of each specific issue across all previous iterations
         issue_occurrence_counts = {}
         for past_issues in issue_history:
             for issue in past_issues:
                 issue_occurrence_counts[issue] = issue_occurrence_counts.get(issue, 0) + 1
-        
+
         # Determine max occurrence count for current issues (to decide soft vs hard block)
         max_occurrence = 0
         for issue in artifact_issues:
             count = issue_occurrence_counts.get(issue, 0)
             if count > max_occurrence:
                 max_occurrence = count
-        
+
         # UNIVERSAL POLICY: Soft warn for first 2 occurrences, hard block on 3rd+
         # This gives ML Engineer 2 chances to learn and fix before failing
         SOFT_WARN_THRESHOLD = 2  # Can be made configurable per strategy if needed
-        
+
         if max_occurrence < SOFT_WARN_THRESHOLD:
             # Soft warning: Add to feedback but DON'T block execution
             issue_text = "; ".join(artifact_issues)
@@ -9391,25 +9393,25 @@ def execute_code(state: AgentState) -> AgentState:
                 f"   Note: These artifacts will be required for final validation. "
                 f"Please generate them in the next iteration."
             )
-            
+
             # Add to feedback history so ML Engineer receives this in next prompt
             if "feedback_history" not in state:
                 state["feedback_history"] = []
             state["feedback_history"].append(warning_msg)
-            
+
             # Print to logs for visibility
             print(warning_msg)
-            
+
         else:
             # Hard block: This is the 3rd+ occurrence, fail the execution
             issue_text = "; ".join(artifact_issues)
             output = f"{output}\nEXECUTION ERROR: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
-        
+
         # Track current issues for next iteration (universal tracking)
         if "artifact_alignment_issue_history" not in state:
             state["artifact_alignment_issue_history"] = []
         state["artifact_alignment_issue_history"].append(artifact_issues)
-    
+
     stale_outputs = _find_stale_outputs(required_outputs, exec_start_ts)
     if stale_outputs:
         output = f"{output}\nEXECUTION ERROR: STALE_OUTPUTS: {stale_outputs}"
@@ -9418,7 +9420,7 @@ def execute_code(state: AgentState) -> AgentState:
     if content_issues:
         issue_text = ", ".join(content_issues)
         output = f"{output}\nEXECUTION ERROR: ARTIFACT_CONTENT_INVALID: {issue_text}"
-    
+
     # Check for Runtime Errors in Output (Traceback)
     sandbox_failed = (
         "Sandbox Execution Failed" in output
@@ -9447,7 +9449,7 @@ def execute_code(state: AgentState) -> AgentState:
             stale_outputs=stale_outputs,
             content_issues=content_issues,
         )
-    
+
     runtime_tail = None
     ml_skipped_reason = state.get("ml_skipped_reason", None)
     if error_in_output:
@@ -9459,7 +9461,7 @@ def execute_code(state: AgentState) -> AgentState:
         runtime_tail = tail
         if "DETERMINISTIC_TARGET_RELATION" in tail:
             ml_skipped_reason = "DETERMINISTIC_TARGET_RELATION"
-        
+
     # Suppress fallback plots in successful executions (avoid reporting placeholders)
     if not error_in_output and not sandbox_failed and plots_local:
         plots_local = [
@@ -9579,16 +9581,16 @@ def execute_code(state: AgentState) -> AgentState:
 
 def retry_handler(state: AgentState) -> AgentState:
     print("--- [!] Performance Low. Retrying... ---")
-    
+
     # Fix: Ensure feedback_history is a list
     current_history = list(state.get('feedback_history', []))
-    
+
     # Append execution summary
     last_output = state.get('execution_output', '')
     if last_output and ("Traceback" in last_output or "EXECUTION ERROR" in last_output):
         summary = f"EXECUTION OUTPUT (last run): {last_output[-3000:]}" # Truncate to save context
         current_history.append(summary)
-    
+
     # Cap history size
     if len(current_history) > 20:
         current_history = current_history[-20:]
@@ -9609,7 +9611,7 @@ def retry_sandbox_execution(state: AgentState) -> AgentState:
         "sandbox_retry_count": retry_count,
         "feedback_history": history,
     }
-    
+
 def run_result_evaluator(state: AgentState) -> AgentState:
     print("--- [5.5] Reviewer: Evaluating Results ---")
     abort_state = _abort_if_requested(state, "result_evaluator")
@@ -9618,7 +9620,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "result_evaluator_start", {})
-    
+
     execution_output = state.get('execution_output', '')
     if "Traceback" in execution_output or "EXECUTION ERROR" in execution_output:
          print("Reviewer: Critical Execution Error detected. Requesting fix.")
@@ -9632,13 +9634,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     strategy_context = f"Strategy: {strategy.get('title')}\nType: {strategy.get('analysis_type')}\nRules: {strategy.get('reasoning')}"
     business_objective = state.get('business_objective', '')
     evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
-    
+
     eval_result = reviewer.evaluate_results(execution_output, business_objective, strategy_context, evaluation_spec)
-    
+
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
     retry_worth_it = eval_result.get("retry_worth_it") if isinstance(eval_result, dict) else None
-    
+
     new_history = list(state.get('feedback_history', []))
     has_deterministic_error = "Traceback" in execution_output or "EXECUTION ERROR" in execution_output
     downgraded = False
@@ -10255,7 +10257,7 @@ def check_execution_status(state: AgentState):
     attempt = state.get("execution_attempt", 1)
     runtime_fix_count = int(state.get("runtime_fix_count", 0))
     skipped_reason = state.get("ml_skipped_reason")
-    
+
     # Traceback check (Runtime Error)
     has_error = (
         "Traceback (most recent call last)" in output
@@ -10278,7 +10280,7 @@ def check_execution_status(state: AgentState):
 
     if determinism_error or skipped_reason == "DETERMINISTIC_TARGET_RELATION":
         return "evaluate"
-    
+
     if undefined_precheck:
         return "retry_fix"
 
@@ -10298,7 +10300,7 @@ def check_execution_status(state: AgentState):
             return "retry_fix"
         print(f"Runtime Error detected (Attempt {runtime_fix_count}/{max_runtime_fixes}). Max runtime fixes reached.")
         return "failed_runtime"
-             
+
     return "evaluate"
 
 def prepare_runtime_fix(state: AgentState) -> AgentState:
@@ -10308,7 +10310,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     terminal_fix = bool(state.get("runtime_fix_terminal"))
     fix_attempt = base_fix_count if terminal_fix else base_fix_count + 1
     max_runtime_fixes = int(state.get("max_runtime_fix_attempts", 3))
-    
+
     error_context = {
         "source": "Execution Runtime",
         "status": "REJECTED",
@@ -10543,12 +10545,12 @@ def run_translator(state: AgentState) -> AgentState:
             state = {**state, **updates}
 
     error_msg = state.get("error_message")
-    
+
     # Extract visuals context
     has_partial_visuals = state.get("has_partial_visuals", False)
     plots_local = state.get("plots_local", [])
     fallback_plots = state.get("fallback_plots", [])
-    
+
     report_state = dict(state)
     summary = None
     try:
@@ -10723,21 +10725,21 @@ def run_translator(state: AgentState) -> AgentState:
         # Fallback Report
         report = f"""
         # System Recovery Report
-        
+
         **CRITICAL FAILURE IN REPORT GENERATION**
-        
+
         The system encountered an internal error while synthesizing the final report.
-        
+
         ### Error Details:
         {str(e)}
-        
+
         ### Original Error (if any):
         {error_msg if error_msg else "None"}
-        
+
         ### Partial Results:
         - Visuals Generated: {has_partial_visuals}
         - Plots Available: {len(plots_local)}
-        
+
         Please check the logs for more details.
         """
     if run_id:
@@ -10752,7 +10754,7 @@ def run_translator(state: AgentState) -> AgentState:
                 "plot_count": len(report_plots) if isinstance(report_plots, list) else 0,
             },
         )
-        
+
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/executive_summary.md", "w", encoding="utf-8") as f_exec:

@@ -120,6 +120,21 @@ _IDENTIFIER_TOKENS = {
 }
 _SHORT_IDENTIFIER_TOKENS = {"id", "cod", "ref", "key"}
 _LONG_IDENTIFIER_TOKENS = sorted(_IDENTIFIER_TOKENS - _SHORT_IDENTIFIER_TOKENS)
+_STRICT_IDENTIFIER_EXACT = {
+    "id",
+    "uuid",
+    "guid",
+    "rowid",
+    "recordid",
+    "row_id",
+    "record_id",
+    "index",
+    "idx",
+    "record",
+}
+_STRICT_IDENTIFIER_PATTERN = re.compile(r"^(row|record)[ _\-]?id$", re.IGNORECASE)
+_CANDIDATE_IDENTIFIER_TOKENS = {"key", "ref", "code", "cod"}
+_CANDIDATE_SUFFIXES = ("_id", "-id", " id")
 
 
 def _coerce_list(value: Any) -> List[Any]:
@@ -149,20 +164,45 @@ def _first_value(*values: Any) -> Any:
 def is_identifier_column(col_name: str) -> bool:
     if not col_name:
         return False
+    if is_strict_identifier_column(col_name):
+        return True
+    if is_candidate_identifier_column(col_name):
+        return True
+    return False
+
+
+def is_strict_identifier_column(col_name: str) -> bool:
+    if not col_name:
+        return False
+    raw = str(col_name)
+    lowered = raw.lower().replace("-", "_")
+    normalized = re.sub(r"[^0-9a-zA-Z_]+", "", lowered)
+    if normalized in _STRICT_IDENTIFIER_EXACT:
+        return True
+    if _STRICT_IDENTIFIER_PATTERN.match(raw):
+        return True
+    tokens = [t for t in re.split(r"[^0-9a-zA-Z]+", lowered) if t]
+    camel_tokens = [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\\d+", col_name) if t]
+    if any(token in {"uuid", "guid"} for token in (tokens + camel_tokens)):
+        return True
+    return False
+
+
+def is_candidate_identifier_column(col_name: str) -> bool:
+    if not col_name:
+        return False
+    if is_strict_identifier_column(col_name):
+        return False
     raw = str(col_name)
     lowered = raw.lower()
+    normalized = re.sub(r"[^0-9a-zA-Z_]+", "", lowered)
+    if normalized.endswith("_id") or normalized.endswith("-id") or normalized.endswith(" id"):
+        return True
     tokens = [t for t in re.split(r"[^0-9a-zA-Z]+", lowered) if t]
-    camel_tokens = [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\\d+", raw) if t]
-    if any(token in _IDENTIFIER_TOKENS for token in (tokens + camel_tokens)):
+    camel_tokens = [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\\d+", col_name) if t]
+    if any(token in _CANDIDATE_IDENTIFIER_TOKENS for token in (tokens + camel_tokens)):
         return True
-    normalized = re.sub(r"[ _]+", "", lowered)
-    for token in _LONG_IDENTIFIER_TOKENS:
-        if normalized.endswith(token):
-            return True
-    short_pattern = r"(?:^|[ _\\-])(" + "|".join(sorted(_SHORT_IDENTIFIER_TOKENS)) + r")$"
-    if re.search(short_pattern, lowered):
-        return True
-    if re.search(r"[A-Za-z0-9]+(?:Id|ID)$", raw):
+    if re.search(r"[A-Za-z]+Id$", raw):
         return True
     return False
 
@@ -704,16 +744,67 @@ def build_ml_view(
     if audit_only_features is not None:
         audit_only_cols = list(dict.fromkeys([str(c) for c in audit_only_features if c]))
 
-    forbidden = list(dict.fromkeys([str(c) for c in forbidden if c] + outcome_cols + audit_only_cols))
-    identifier_cols = [c for c in canonical_columns if is_identifier_column(c)]
-    forbidden = sorted(dict.fromkeys(forbidden + [str(c) for c in identifier_cols if c]))
-    forbidden_set = set(forbidden)
-    model_features = [str(c) for c in model_features if c and c not in forbidden_set]
-    segmentation_features = [str(c) for c in segmentation_features if c and c not in forbidden_set]
+    explicit_allowed = set()
+    for candidate_list in (full_model, min_model, full_seg, min_seg):
+        if isinstance(candidate_list, list):
+            explicit_allowed.update(str(c) for c in candidate_list if c)
+
+    strict_ids = []
+    candidate_ids = []
+    seen = set()
+    for col in canonical_columns:
+        if not col:
+            continue
+        if col in seen:
+            continue
+        seen.add(col)
+        if is_strict_identifier_column(col):
+            strict_ids.append(col)
+        elif is_candidate_identifier_column(col):
+            candidate_ids.append(col)
+
+    strict_allowed_by_contract = [c for c in strict_ids if c in explicit_allowed]
+    candidate_allowed_by_contract = [c for c in candidate_ids if c in explicit_allowed]
+    strict_forbidden = [c for c in strict_ids if c not in explicit_allowed]
+
+    forbidden = list(dict.fromkeys([str(c) for c in forbidden if c]))
+    forbidden = sorted(dict.fromkeys(forbidden + strict_forbidden + outcome_cols + audit_only_cols))
+
+    def _filter_noncanonical(items: List[str]) -> tuple[List[str], List[str]]:
+        filtered = []
+        dropped = []
+        for val in items:
+            if not val:
+                continue
+            if val in canonical_set:
+                filtered.append(str(val))
+            else:
+                dropped.append(str(val))
+        return filtered, dropped
+
+    forbidden_filtered, dropped_forbidden = _filter_noncanonical(forbidden)
+    forbidden_set = set(forbidden_filtered)
+    model_features_filtered, dropped_model = _filter_noncanonical(model_features)
+    segmentation_features_filtered, dropped_segmentation = _filter_noncanonical(segmentation_features)
+
+    view_warnings: Dict[str, Any] = {}
+    dropped_noncanonical = {}
+    if dropped_model:
+        dropped_noncanonical["model_features"] = dropped_model
+    if dropped_segmentation:
+        dropped_noncanonical["segmentation_features"] = dropped_segmentation
+    if dropped_forbidden:
+        dropped_noncanonical["forbidden_features"] = dropped_forbidden
+    if dropped_noncanonical:
+        view_warnings["dropped_noncanonical"] = dropped_noncanonical
+
+    model_features = [c for c in model_features_filtered if c not in forbidden_set]
+    segmentation_features = [c for c in segmentation_features_filtered if c not in forbidden_set]
+    final_forbidden = forbidden_filtered
     allowed_sets = {
         "segmentation_features": segmentation_features,
         "model_features": model_features,
-        "forbidden_features": forbidden,
+        "forbidden_features": final_forbidden,
     }
     if audit_only_features is not None:
         allowed_sets["audit_only_features"] = [str(c) for c in audit_only_features if c]
@@ -728,12 +819,28 @@ def build_ml_view(
         "decision_columns": decision_cols,
         "outcome_columns": outcome_cols,
         "audit_only_columns": audit_only_cols,
-        "identifier_columns": identifier_cols,
+        "identifier_columns": strict_ids + candidate_ids,
         "allowed_feature_sets": allowed_sets,
-        "forbidden_features": forbidden,
+        "forbidden_features": final_forbidden,
         "required_outputs": required_outputs,
         "validation_requirements": validation,
     }
+    identifier_policy = {
+        "strict_forbidden": strict_forbidden,
+        "candidates": candidate_ids,
+        "guidance": [
+            "Candidate identifiers may be useful categorical features if low-cardinality.",
+            "If a candidate identifier is high-cardinality or near-unique, drop it.",
+            "Perform a quick uniqueness/cardinality check on a sample before using.",
+        ],
+    }
+    view["identifier_policy"] = identifier_policy
+    view["identifier_overrides"] = {
+        "strict_allowed_by_contract": strict_allowed_by_contract,
+        "candidate_allowed_by_contract": candidate_allowed_by_contract,
+    }
+    if view_warnings:
+        view["view_warnings"] = view_warnings
     if case_rules is not None:
         view["case_rules"] = case_rules
     policy = contract_full.get("reporting_policy")

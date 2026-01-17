@@ -116,7 +116,9 @@ def test_ml_view_excludes_identifier_columns():
     }
     ml_view = build_ml_view({}, contract_min, [])
     assert "EntityId" in (ml_view.get("identifier_columns") or [])
-    assert "EntityId" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
+    identifier_overrides = ml_view.get("identifier_overrides", {})
+    assert "EntityId" in (identifier_overrides.get("candidate_allowed_by_contract") or [])
+    assert "EntityId" in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
 
 
 def test_ml_view_preserves_forbidden_features_from_min():
@@ -134,9 +136,11 @@ def test_ml_view_preserves_forbidden_features_from_min():
     }
     ml_view = build_ml_view({}, contract_min, [])
     forbidden = set(ml_view.get("forbidden_features") or [])
-    assert forbidden == {"audit_col", "EntityId"}
+    assert forbidden == {"audit_col"}
     assert "feature_a" in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
     assert "audit_col" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
+    identifier_overrides = ml_view.get("identifier_overrides", {})
+    assert "EntityId" in (identifier_overrides.get("candidate_allowed_by_contract") or [])
 
 
 def test_ml_view_prefers_full_allowed_feature_sets():
@@ -159,10 +163,12 @@ def test_ml_view_prefers_full_allowed_feature_sets():
     }
     ml_view = build_ml_view(contract_full, contract_min, [])
     allowed = ml_view.get("allowed_feature_sets") or {}
-    assert allowed.get("model_features") == ["feature_a"]
-    assert allowed.get("segmentation_features") == ["feature_b"]
+    assert allowed.get("model_features") == ["feature_a", "EntityId"]
+    assert allowed.get("segmentation_features") == ["feature_b", "EntityId"]
     assert ml_view.get("audit_only_columns") == ["audit_col"]
     assert "EntityId" in (ml_view.get("identifier_columns") or [])
+    identifier_overrides = ml_view.get("identifier_overrides", {})
+    assert "EntityId" in (identifier_overrides.get("candidate_allowed_by_contract") or [])
 
 
 def test_reviewer_view_contains_gates_and_outputs():

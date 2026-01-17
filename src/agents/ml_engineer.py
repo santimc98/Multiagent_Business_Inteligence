@@ -658,6 +658,12 @@ class MLEngineerAgent:
          [ ] VARIABLE DEFINITION: Define all metric variables (e.g., auc, f1, precision) locally before trying to save them to metrics.json.
          [ ] CASTING SAFEGUARDS: When converting columns, handle non-numeric values gracefully (coerce).
 
+         IDENTIFIER USAGE WARNING:
+         - Do NOT automatically drop columns just because the name contains 'id'.
+         - Refer to ML_VIEW.identifier_policy: strict identifiers are forbidden unless explicitly allowed by the contract.
+         - Candidate identifiers may be useful categorical features; run a fast cardinality/uniqueness check and keep only low-cardinality ones.
+         - High-cardinality candidate identifiers should be dropped or neutralized; mention the check in comments.
+
          {% if dataset_scale and dataset_scale.scale in ['medium', 'large'] %}
          LARGE DATASET PROTOCOL:
          {% if dataset_scale.scale == 'medium' %}
