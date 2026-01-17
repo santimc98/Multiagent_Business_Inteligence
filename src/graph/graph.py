@@ -110,6 +110,7 @@ from src.utils.run_storage import (
     normalize_status,
 )
 from src.utils.run_workspace import enter_run_workspace, exit_run_workspace
+from src.utils.path_resolution import _resolve_csv_path_with_base, _add_workspace_metadata
 from src.utils.artifact_resolver import (
     load_json_scoped,
     exists_scoped,
@@ -5758,11 +5759,13 @@ def run_steward(state: AgentState) -> AgentState:
     run_start_epoch = state.get("run_start_epoch") if state else None
     if run_start_epoch is None:
         run_start_epoch = time.time()
+    orig_cwd_pre = os.getcwd()
     csv_path = state.get("csv_path") if state else ""
-    if csv_path and not os.path.isabs(csv_path):
-        resolved_csv_path = os.path.normpath(os.path.abspath(csv_path))
-        state["csv_path"] = resolved_csv_path
-        csv_path = resolved_csv_path
+    if csv_path:
+        resolved_csv_path = _resolve_csv_path_with_base(orig_cwd_pre, csv_path)
+        if resolved_csv_path != csv_path:
+            state["csv_path"] = resolved_csv_path
+            csv_path = resolved_csv_path
     dataset_fingerprint = fingerprint_dataset(csv_path)
     memory_entries = load_dataset_memory()
     memory_context = summarize_memory(memory_entries, dataset_fingerprint)
@@ -5909,6 +5912,7 @@ def run_steward(state: AgentState) -> AgentState:
             steward_payload["profile"] = result.get("profile")
         if "dataset_profile" in result:
             steward_payload["dataset_profile"] = result.get("dataset_profile")
+    steward_payload = _add_workspace_metadata(steward_payload, state, orig_cwd_pre, run_dir)
     return steward_payload
 
 def run_strategist(state: AgentState) -> AgentState:
@@ -6038,6 +6042,28 @@ def run_execution_planner(state: AgentState) -> AgentState:
     if run_id:
         log_run_event(run_id, "execution_planner_start", {"strategy": strategy.get("title", "")})
     csv_path = state.get("csv_path", "")
+    orig_cwd = state.get("_orig_cwd")
+    if csv_path and not os.path.isabs(csv_path) and orig_cwd:
+        resolved_csv_path = _resolve_csv_path_with_base(orig_cwd, csv_path)
+        if resolved_csv_path != csv_path:
+            state["csv_path"] = resolved_csv_path
+            csv_path = resolved_csv_path
+    if not csv_path or not os.path.exists(csv_path):
+        error_message = f"Warning: input CSV not found: {csv_path}"
+        print(error_message)
+        if run_id:
+            log_run_event(
+                run_id,
+                "pipeline_aborted_reason",
+                {"reason": "input_csv_missing", "csv_path": csv_path},
+            )
+        oc_report = _persist_output_contract_report(state, reason="input_csv_missing")
+        return {
+            "error_message": error_message,
+            "pipeline_aborted_reason": "input_csv_missing",
+            "execution_planner_failed": True,
+            "output_contract_report": oc_report,
+        }
     csv_sep = state.get("csv_sep", ",")
     csv_decimal = state.get("csv_decimal", ".")
     csv_encoding = state.get("csv_encoding", "utf-8")
@@ -6254,6 +6280,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
         
     business_objective = state.get('business_objective', '')
     csv_path = state['csv_path']
+    print(f"DE_INPUT_CSV: {csv_path}")
+    if csv_path and not os.path.isabs(csv_path):
+        print(f"DE_INPUT_RELATIVE_WARNING: {csv_path}")
     csv_encoding = state.get('csv_encoding', 'utf-8')
     csv_decimal = state.get('csv_decimal', '.')
     csv_sep = state.get('csv_sep', ',')
