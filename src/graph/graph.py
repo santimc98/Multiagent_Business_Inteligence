@@ -12,7 +12,11 @@ from pathlib import Path
 from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal, Optional
 from langgraph.graph import StateGraph, END
-from e2b_code_interpreter import Sandbox
+from e2b_code_interpreter import Sandbox as CodeSandbox
+try:
+    from e2b import Sandbox as BaseSandbox
+except Exception:
+    BaseSandbox = None
 from dotenv import load_dotenv
 import base64
 
@@ -151,6 +155,7 @@ from src.utils.sandbox_resilience import (
     safe_download_file,
     safe_download_bytes,
     is_transient_sandbox_error,
+    create_sandbox_with_retry,
     DE_TIMEOUT_S,
     ML_TIMEOUT_SMALL_S,
     ML_TIMEOUT_MEDIUM_S,
@@ -162,7 +167,6 @@ from src.utils.dataset_size import (
     classify_dataset_scale,
     get_dataset_scale_hints,
 )
-from e2b import Sandbox
 
 
 def _retry_sandbox_operations(sandbox_func, max_attempts: int = 2, run_id: Optional[str] = None, step: Optional[str] = None) -> Any:
@@ -6841,7 +6845,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
             for sb_attempt in range(2):
               try:
-                with Sandbox.create() as sandbox:
+                with create_sandbox_with_retry(CodeSandbox, max_attempts=2, run_id=run_id, step="data_engineer") as sandbox:
+                    if not hasattr(sandbox, "run_code"):
+                        raise RuntimeError(
+                            "E2B Sandbox missing run_code. Ensure we are using e2b_code_interpreter.Sandbox (CodeSandbox)."
+                        )
                     step_name = "data_engineer"
                     run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
                     # 1. Setup Environment
@@ -9047,7 +9055,11 @@ def execute_code(state: AgentState) -> AgentState:
 
         for sb_attempt in range(2):
           try:
-            with Sandbox.create() as sandbox:
+            with create_sandbox_with_retry(CodeSandbox, max_attempts=2, run_id=run_id, step="ml_engineer") as sandbox:
+                if not hasattr(sandbox, "run_code"):
+                    raise RuntimeError(
+                        "E2B Sandbox missing run_code. Ensure we are using e2b_code_interpreter.Sandbox (CodeSandbox)."
+                    )
                 step_name = "ml_engineer"
                 run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
                 print("Installing dependencies in Sandbox...")

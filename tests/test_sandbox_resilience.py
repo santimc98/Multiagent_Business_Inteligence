@@ -92,6 +92,42 @@ def test_run_code_with_optional_timeout_no_timeout_param():
     # Should NOT have timeout key since function doesn't support it
 
 
+def test_run_code_with_optional_timeout_fallback_commands_run():
+    """Test run_code fallback via commands.run when run_code is missing."""
+    class DummyCommands:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd):
+            self.calls.append(cmd)
+            result = Mock()
+            result.stdout = "ok\n"
+            result.stderr = ""
+            result.exit_code = 0
+            return result
+
+    class DummyFiles:
+        def __init__(self):
+            self.writes = []
+
+        def write(self, path, content):
+            self.writes.append((path, content))
+
+    class DummySandbox:
+        def __init__(self):
+            self.commands = DummyCommands()
+            self.files = DummyFiles()
+
+    dummy = DummySandbox()
+    execution = run_code_with_optional_timeout(dummy, "print('ok')", timeout_s=1)
+
+    assert dummy.files.writes
+    assert dummy.commands.calls
+    assert execution.logs.stdout == ["ok"]
+    assert execution.logs.stderr == []
+    assert execution.error is None
+
+
 @patch('src.utils.sandbox_resilience.time.sleep', return_value=None)
 def test_run_cmd_with_retry_transient_success(mock_sleep):
     """Test that run_cmd_with_retry succeeds on second attempt after transient error."""

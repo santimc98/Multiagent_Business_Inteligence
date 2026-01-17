@@ -103,6 +103,80 @@ def is_transient_sandbox_error(err: Exception) -> bool:
     return _is_transient_sandbox_error(err)
 
 
+class _ExecutionLogs:
+    def __init__(self, stdout: Optional[str], stderr: Optional[str]) -> None:
+        self.stdout = stdout.splitlines() if stdout else []
+        self.stderr = stderr.splitlines() if stderr else []
+
+
+class _ExecutionError:
+    def __init__(self, name: str, value: str, traceback: str) -> None:
+        self.name = name
+        self.value = value
+        self.traceback = traceback
+
+
+class _ExecutionResult:
+    def __init__(self, stdout: Optional[str], stderr: Optional[str], exit_code: Optional[int]) -> None:
+        self.logs = _ExecutionLogs(stdout, stderr)
+        self.exit_code = exit_code
+        if exit_code is not None and exit_code != 0:
+            error_text = stderr or stdout or f"Process exited with code {exit_code}"
+            self.error = _ExecutionError("RuntimeError", error_text, error_text)
+        else:
+            self.error = None
+
+
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _run_code_via_commands_run(
+    sandbox: Any,
+    code: str,
+    timeout_s: Optional[int] = None,
+    workdir: Optional[str] = None,
+) -> Any:
+    import posixpath
+
+    run_dir = workdir or "/tmp"
+    run_dir = run_dir.rstrip("/") or "/tmp"
+    script_path = posixpath.join(run_dir, "run_code.py")
+
+    try:
+        sandbox.commands.run(f"mkdir -p {shlex.quote(run_dir)}")
+    except Exception:
+        pass
+
+    sandbox.files.write(script_path, code)
+
+    if workdir:
+        cmd = f"sh -lc 'cd {shlex.quote(run_dir)} && python {shlex.quote(script_path)}'"
+    else:
+        cmd = f"python {shlex.quote(script_path)}"
+
+    supports_timeout = False
+    try:
+        sig = inspect.signature(sandbox.commands.run)
+        supports_timeout = "timeout" in sig.parameters
+    except (ValueError, TypeError):
+        supports_timeout = False
+
+    if supports_timeout and timeout_s is not None:
+        proc = sandbox.commands.run(cmd, timeout=timeout_s)
+    else:
+        proc = sandbox.commands.run(cmd)
+
+    stdout = _normalize_text(getattr(proc, "stdout", ""))
+    stderr = _normalize_text(getattr(proc, "stderr", ""))
+    exit_code = getattr(proc, "exit_code", None)
+    return _ExecutionResult(stdout, stderr, exit_code)
+
+
 def run_code_with_optional_timeout(sandbox: Any, code: str, timeout_s: Optional[int] = None) -> Any:
     """
     Run code in sandbox with optional timeout.
@@ -117,12 +191,14 @@ def run_code_with_optional_timeout(sandbox: Any, code: str, timeout_s: Optional[
     Returns:
         Result from sandbox.run_code
     """
-    sig = inspect.signature(sandbox.run_code)
+    run_code = getattr(sandbox, "run_code", None)
+    if callable(run_code):
+        sig = inspect.signature(run_code)
+        if "timeout" in sig.parameters and timeout_s is not None:
+            return run_code(code, timeout=timeout_s)
+        return run_code(code)
 
-    if "timeout" in sig.parameters and timeout_s is not None:
-        return sandbox.run_code(code, timeout=timeout_s)
-    else:
-        return sandbox.run_code(code)
+    return _run_code_via_commands_run(sandbox, code, timeout_s=timeout_s)
 
 
 def run_cmd_with_retry(sandbox: Any, cmd: str, retries: int = 2, timeout_s: Optional[int] = None) -> Any:
