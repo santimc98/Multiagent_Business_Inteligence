@@ -5681,6 +5681,9 @@ class AgentState(TypedDict):
     feedback_history: List[str]
     # PDF
     pdf_path: str
+    orig_cwd: str
+    work_dir: str
+    workspace_active: bool
     # Encoding & CSV Format
     csv_encoding: str
     csv_sep: str
@@ -6052,7 +6055,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
     if run_id:
         log_run_event(run_id, "execution_planner_start", {"strategy": strategy.get("title", "")})
     csv_path = state.get("csv_path", "")
-    orig_cwd = state.get("_orig_cwd")
+    orig_cwd = state.get("orig_cwd")
     if csv_path and not os.path.isabs(csv_path) and orig_cwd:
         resolved_csv_path = _resolve_csv_path_with_base(orig_cwd, csv_path)
         if resolved_csv_path != csv_path:
@@ -6308,7 +6311,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
     if csv_path and not os.path.exists(csv_path):
         candidate = None
         if not os.path.isabs(csv_path):
-            orig_cwd = state.get("_orig_cwd") or ""
+            orig_cwd = state.get("orig_cwd") or ""
             if orig_cwd:
                 candidate = os.path.normpath(os.path.abspath(os.path.join(orig_cwd, csv_path)))
         if candidate and os.path.exists(candidate):
@@ -10842,119 +10845,116 @@ def run_translator(state: AgentState) -> AgentState:
 import uuid
 
 def generate_pdf_artifact(state: AgentState) -> AgentState:
-    print("--- [7] System: Generating PDF Report ---")
-    import glob
-
-    work_dir = state.get("work_dir") if isinstance(state, dict) else None
-    if not work_dir:
-        work_dir = "."
-    work_dir = os.path.abspath(work_dir)
-
-    def _copy_pdf_artifact(pdf_path: str) -> None:
-        run_id = state.get("run_id")
-        if run_id:
-            copy_run_reports(run_id, [pdf_path], since_epoch=None)
-            try:
-                dest_root = os.path.join("runs", run_id, "report")
-                os.makedirs(dest_root, exist_ok=True)
-                shutil.copy2(pdf_path, os.path.join(dest_root, "final_report.pdf"))
-            except Exception:
-                pass
-        run_bundle_dir = state.get("run_bundle_dir")
-        if run_bundle_dir:
-            try:
-                dest_path = os.path.join(run_bundle_dir, "report", "final_report.pdf")
-                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                shutil.copy2(pdf_path, dest_path)
-            except Exception:
-                pass
-
-    report = state.get("final_report")
-    existing_pdf = state.get("pdf_path")
-    if existing_pdf:
-        candidate = existing_pdf
-        if not os.path.isabs(candidate):
-            candidate = os.path.join(work_dir, candidate)
-        if os.path.exists(candidate):
-            _copy_pdf_artifact(candidate)
-            return {"final_report": report, "pdf_path": os.path.abspath(candidate)}
-    if not report:
-        try:
-            summary_path = os.path.join(work_dir, "data", "executive_summary.md")
-            with open(summary_path, "r", encoding="utf-8") as f_exec:
-                report = f_exec.read()
-        except Exception:
-            report = ""
-    report = str(report or "")
-    if not report.strip():
-        print("PDF Generation Skipped: no report content available.")
-        return {"final_report": state.get("final_report"), "pdf_path": None}
-
-    # Check for visualizations
-    if "static/plots" not in report:
-        plots = state.get("plots_local", []) or []
-        fallback_plots = state.get("fallback_plots", []) or []
-        has_exec_error = bool(state.get("execution_error") or state.get("sandbox_failed"))
-        if not has_exec_error and fallback_plots:
-            plots = [plot for plot in plots if plot not in fallback_plots]
-        if not plots:
-            report_plots_dir = os.path.join(work_dir, "report", "static", "plots")
-            if os.path.isdir(report_plots_dir):
-                plots = glob.glob(os.path.join(report_plots_dir, "*.png"))
-        if plots:
-            report += "\n\n## Visualizations\n"
-            for plot in plots:
-                if os.path.isabs(plot) and plot.startswith(work_dir):
-                    rel_plot = os.path.relpath(plot, work_dir)
-                else:
-                    rel_plot = plot
-                plot_ref = _normalize_path_posix(rel_plot)
-                report += f"![{os.path.basename(plot)}]({plot_ref})\n"
-
-    # Generate unique filename
-    unique_id = uuid.uuid4().hex[:8]
-    pdf_filename = os.path.join(work_dir, f"final_report_{unique_id}.pdf")
-
-    # Absolute path for clarity
-    abs_pdf_path = os.path.abspath(pdf_filename)
-
-    # Convert - ensure CWD is work_dir for relative asset resolution
-    cwd0 = os.getcwd()
-    success = False
     try:
-        os.chdir(work_dir)
-        success = convert_report_to_pdf(report, abs_pdf_path)
-    finally:
-        os.chdir(cwd0)
+        print("--- [7] System: Generating PDF Report ---")
+        import glob
 
-    if success:
-        print(f"PDF generated at: {abs_pdf_path}")
-        run_id = state.get("run_id")
-        since_epoch = state.get("run_start_epoch")
+        work_dir = state.get("work_dir") if isinstance(state, dict) else None
+        if not work_dir:
+            work_dir = "."
+        work_dir = os.path.abspath(work_dir)
 
-        latest_pdf = pdf_filename
-        try:
-            candidates = []
-            for path in glob.glob(os.path.join(work_dir, "final_report*.pdf")):
+        def _copy_pdf_artifact(pdf_path: str) -> None:
+            run_id = state.get("run_id")
+            if run_id:
+                copy_run_reports(run_id, [pdf_path], since_epoch=None)
                 try:
-                    mtime = os.path.getmtime(path)
+                    dest_root = os.path.join("runs", run_id, "report")
+                    os.makedirs(dest_root, exist_ok=True)
+                    shutil.copy2(pdf_path, os.path.join(dest_root, "final_report.pdf"))
                 except Exception:
-                    continue
-                if since_epoch is None or mtime >= float(since_epoch) - 1.0:
-                    candidates.append((mtime, path))
-            if candidates:
-                candidates.sort(reverse=True)
-                latest_pdf = candidates[0][1]
-        except Exception:
+                    pass
+            run_bundle_dir = state.get("run_bundle_dir")
+            if run_bundle_dir:
+                try:
+                    dest_path = os.path.join(run_bundle_dir, "report", "final_report.pdf")
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    shutil.copy2(pdf_path, dest_path)
+                except Exception:
+                    pass
+
+        report = state.get("final_report")
+        existing_pdf = state.get("pdf_path")
+        if existing_pdf:
+            candidate = existing_pdf
+            if not os.path.isabs(candidate):
+                candidate = os.path.join(work_dir, candidate)
+            if os.path.exists(candidate):
+                _copy_pdf_artifact(candidate)
+                return {"final_report": report, "pdf_path": os.path.abspath(candidate)}
+        if not report:
+            try:
+                summary_path = os.path.join(work_dir, "data", "executive_summary.md")
+                with open(summary_path, "r", encoding="utf-8") as f_exec:
+                    report = f_exec.read()
+            except Exception:
+                report = ""
+        report = str(report or "")
+        if not report.strip():
+            print("PDF Generation Skipped: no report content available.")
+            return {"final_report": state.get("final_report"), "pdf_path": None}
+
+        # Check for visualizations
+        if "static/plots" not in report:
+            plots = state.get("plots_local", []) or []
+            fallback_plots = state.get("fallback_plots", []) or []
+            has_exec_error = bool(state.get("execution_error") or state.get("sandbox_failed"))
+            if not has_exec_error and fallback_plots:
+                plots = [plot for plot in plots if plot not in fallback_plots]
+            if not plots:
+                report_plots_dir = os.path.join(work_dir, "report", "static", "plots")
+                if os.path.isdir(report_plots_dir):
+                    plots = glob.glob(os.path.join(report_plots_dir, "*.png"))
+            if plots:
+                report += "\n\n## Visualizations\n"
+                for plot in plots:
+                    if os.path.isabs(plot) and plot.startswith(work_dir):
+                        rel_plot = os.path.relpath(plot, work_dir)
+                    else:
+                        rel_plot = plot
+                    plot_ref = _normalize_path_posix(rel_plot)
+                    report += f"![{os.path.basename(plot)}]({plot_ref})\n"
+
+        # Generate unique filename
+        unique_id = uuid.uuid4().hex[:8]
+        pdf_filename = os.path.join(work_dir, f"final_report_{unique_id}.pdf")
+
+        # Absolute path for clarity
+        abs_pdf_path = os.path.abspath(pdf_filename)
+
+        # Convert without relying on cwd
+        success = convert_report_to_pdf(report, abs_pdf_path, base_dir=work_dir)
+
+        if success:
+            print(f"PDF generated at: {abs_pdf_path}")
+            run_id = state.get("run_id")
+            since_epoch = state.get("run_start_epoch")
+
             latest_pdf = pdf_filename
+            try:
+                candidates = []
+                for path in glob.glob(os.path.join(work_dir, "final_report*.pdf")):
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except Exception:
+                        continue
+                    if since_epoch is None or mtime >= float(since_epoch) - 1.0:
+                        candidates.append((mtime, path))
+                if candidates:
+                    candidates.sort(reverse=True)
+                    latest_pdf = candidates[0][1]
+            except Exception:
+                latest_pdf = pdf_filename
 
-        latest_abs = os.path.abspath(latest_pdf)
-        _copy_pdf_artifact(latest_abs)
-        return {"final_report": report, "pdf_path": latest_abs}
-    else:
-        print("PDF Generation Failed")
-        return {"final_report": report, "pdf_path": None}
+            latest_abs = os.path.abspath(latest_pdf)
+            _copy_pdf_artifact(latest_abs)
+            return {"final_report": report, "pdf_path": latest_abs}
+        else:
+            print("PDF Generation Failed")
+            return {"final_report": report, "pdf_path": None}
 
+    finally:
+        exit_run_workspace(state)
 # 3. Build Graph
 workflow = StateGraph(AgentState)
 

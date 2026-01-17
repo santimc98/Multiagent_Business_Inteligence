@@ -23,7 +23,7 @@ def _add_workspace_metadata(
     payload.update(
         {
             "csv_path": state.get("csv_path"),
-            "_orig_cwd": state.get("_orig_cwd") or orig_cwd_pre,
+            "orig_cwd": state.get("orig_cwd") or orig_cwd_pre,
             "work_dir": state.get("work_dir"),
             "workspace_active": state.get("workspace_active", True),
         }

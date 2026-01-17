@@ -14,7 +14,7 @@ def test_state_path_propagation_helpers(tmp_path):
     payload = {"data_summary": "ok"}
     state = {
         "csv_path": resolved,
-        "_orig_cwd": base_cwd,
+        "orig_cwd": base_cwd,
         "work_dir": os.path.join(base_cwd, "runs", "abc", "work"),
         "workspace_active": True,
     }
@@ -22,7 +22,7 @@ def test_state_path_propagation_helpers(tmp_path):
     updated = _add_workspace_metadata(payload, state, base_cwd, run_dir)
 
     assert updated["csv_path"] == resolved
-    assert updated["_orig_cwd"] == base_cwd
+    assert updated["orig_cwd"] == base_cwd
     assert updated["work_dir"] == state["work_dir"]
     assert updated["workspace_active"] is True
     assert updated["run_dir"] == run_dir

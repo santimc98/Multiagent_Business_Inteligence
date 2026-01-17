@@ -55,7 +55,7 @@ def enter_run_workspace(state: Dict[str, Any], run_dir: str) -> Dict[str, Any]:
     """
     # Save original cwd for restoration
     orig_cwd = os.getcwd()
-    state["_orig_cwd"] = orig_cwd
+    state["orig_cwd"] = orig_cwd
 
     for key in ("csv_path", "raw_csv_path", "input_csv_path"):
         value = state.get(key)
@@ -92,9 +92,9 @@ def exit_run_workspace(state: Dict[str, Any]) -> None:
     Exit the run workspace - restores original cwd.
 
     Args:
-        state: Agent state dict with _orig_cwd
+        state: Agent state dict with orig_cwd
     """
-    orig_cwd = state.get("_orig_cwd")
+    orig_cwd = state.get("orig_cwd")
     if orig_cwd and os.path.isdir(orig_cwd):
         os.chdir(orig_cwd)
         print(f"WORKSPACE_EXIT: Restored cwd to {orig_cwd}")

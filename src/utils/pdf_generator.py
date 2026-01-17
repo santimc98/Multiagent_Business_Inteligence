@@ -3,13 +3,19 @@ from xhtml2pdf import pisa
 import os
 import re
 from pathlib import Path
+from typing import Optional
 
-def convert_report_to_pdf(markdown_content: str, output_filename: str = "final_report.pdf") -> bool:
+def convert_report_to_pdf(
+    markdown_content: str,
+    output_filename: str = "final_report.pdf",
+    base_dir: Optional[str] = None,
+) -> bool:
     """
     Converts markdown content to a PDF file using xhtml2pdf.
     Resolves image paths and adds basic styling.
     """
     try:
+        base_dir_abs = os.path.abspath(base_dir) if base_dir else None
         # 1. Extract and Remove Images from Markdown
         # Find all images: ![Alt](path)
         images = re.findall(r'!\[(.*?)\]\((.*?)\)', markdown_content)
@@ -19,7 +25,10 @@ def convert_report_to_pdf(markdown_content: str, output_filename: str = "final_r
         
         # FALLBACK: If no images in markdown, scan static/plots
         if not images:
-            plots_dir = os.path.abspath("static/plots")
+            if base_dir_abs:
+                plots_dir = os.path.join(base_dir_abs, "static", "plots")
+            else:
+                plots_dir = os.path.abspath("static/plots")
             if os.path.exists(plots_dir):
                 supported_ext = ('.png', '.jpg', '.jpeg')
                 # Sort for consistency
@@ -47,7 +56,10 @@ def convert_report_to_pdf(markdown_content: str, output_filename: str = "final_r
                 
                 # Resolve absolute path and URI
                 if not os.path.isabs(img_path):
-                    abs_path = os.path.abspath(img_path)
+                    if base_dir_abs:
+                        abs_path = os.path.abspath(os.path.join(base_dir_abs, img_path))
+                    else:
+                        abs_path = os.path.abspath(img_path)
                 else:
                     abs_path = img_path
                 
@@ -122,8 +134,11 @@ def convert_report_to_pdf(markdown_content: str, output_filename: str = "final_r
         </html>
         """
         
+        output_path = output_filename
+        if base_dir_abs and not os.path.isabs(output_filename):
+            output_path = os.path.join(base_dir_abs, output_filename)
         # 4. Write to PDF
-        with open(output_filename, "wb") as pdf_file:
+        with open(output_path, "wb") as pdf_file:
             pisa_status = pisa.CreatePDF(
                 styled_html, dest=pdf_file
             )
@@ -132,7 +147,7 @@ def convert_report_to_pdf(markdown_content: str, output_filename: str = "final_r
             print(f"PDF generation error: {pisa_status.err}")
             return False
             
-        print(f"PDF generated successfully: {output_filename}")
+        print(f"PDF generated successfully: {output_path}")
         return True
 
     except Exception as e:

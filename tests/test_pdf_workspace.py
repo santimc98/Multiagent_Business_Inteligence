@@ -33,8 +33,11 @@ def test_pdf_generated_in_workdir_not_cwd(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(cwd_root)
 
     # Monkeypatch convert_report_to_pdf to avoid pandoc/latex
-    def fake_convert(md: str, pdf_path: str) -> bool:
+    captured_base_dir = []
+
+    def fake_convert(md: str, pdf_path: str, base_dir=None) -> bool:
         os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+        captured_base_dir.append(base_dir)
         with open(pdf_path, "wb") as f:
             f.write(b"%PDF-1.4\n%%EOF")
         return True
@@ -62,6 +65,8 @@ def test_pdf_generated_in_workdir_not_cwd(tmp_path: Path, monkeypatch):
         pdf_posix = Path(pdf_path).as_posix()
         work_dir_posix = work_dir.as_posix()
         assert pdf_posix.startswith(work_dir_posix), f"PDF {pdf_path} should be in work_dir {work_dir}"
+        assert len(captured_base_dir) == 1
+        assert os.path.abspath(captured_base_dir[0]) == os.path.abspath(str(work_dir))
 
         # NO PDF should exist in cwd_root
         cwd_pdfs = list(cwd_root.glob("final_report*.pdf"))
@@ -107,7 +112,7 @@ def test_pdf_includes_plots_from_workdir(tmp_path: Path, monkeypatch):
     # Monkeypatch convert_report_to_pdf to capture the markdown
     captured_md = []
 
-    def fake_convert(md: str, pdf_path: str) -> bool:
+    def fake_convert(md: str, pdf_path: str, base_dir=None) -> bool:
         os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
         captured_md.append(md)
         with open(pdf_path, "wb") as f:
@@ -140,10 +145,10 @@ def test_pdf_includes_plots_from_workdir(tmp_path: Path, monkeypatch):
         os.chdir(original_cwd)
 
 
-def test_pdf_generation_uses_workdir_as_cwd(tmp_path: Path, monkeypatch):
+def test_pdf_generation_uses_base_dir_not_cwd(tmp_path: Path, monkeypatch):
     """
-    P1.6.1: PDF generation should temporarily change CWD to work_dir.
-    Verify that os.getcwd() during convert_report_to_pdf is work_dir.
+    P1.6.1: PDF generation should not rely on CWD.
+    Verify that base_dir is work_dir and CWD stays unchanged.
     """
     from src.graph.graph import generate_pdf_artifact
 
@@ -167,11 +172,13 @@ def test_pdf_generation_uses_workdir_as_cwd(tmp_path: Path, monkeypatch):
     original_cwd = os.getcwd()
     monkeypatch.chdir(cwd_root)
 
-    # Capture CWD during convert_report_to_pdf
+    # Capture CWD and base_dir during convert_report_to_pdf
     captured_cwd = []
+    captured_base_dir = []
 
-    def fake_convert(md: str, pdf_path: str) -> bool:
+    def fake_convert(md: str, pdf_path: str, base_dir=None) -> bool:
         captured_cwd.append(os.getcwd())
+        captured_base_dir.append(base_dir)
         os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
         with open(pdf_path, "wb") as f:
             f.write(b"%PDF-1.4\n%%EOF")
@@ -191,11 +198,13 @@ def test_pdf_generation_uses_workdir_as_cwd(tmp_path: Path, monkeypatch):
 
         result = generate_pdf_artifact(state)
 
-        # Verify CWD during convert was work_dir
+        # Verify CWD during convert was unchanged and base_dir was work_dir
         assert len(captured_cwd) == 1, "convert_report_to_pdf should be called once"
         convert_cwd = Path(captured_cwd[0]).as_posix()
-        work_dir_posix = work_dir.as_posix()
-        assert convert_cwd == work_dir_posix, f"CWD should be work_dir: {convert_cwd} vs {work_dir_posix}"
+        cwd_root_posix = cwd_root.as_posix()
+        assert convert_cwd == cwd_root_posix, f"CWD should remain cwd_root: {convert_cwd} vs {cwd_root_posix}"
+        assert len(captured_base_dir) == 1
+        assert os.path.abspath(captured_base_dir[0]) == os.path.abspath(str(work_dir))
 
         # Verify PDF was created
         assert result["pdf_path"] is not None

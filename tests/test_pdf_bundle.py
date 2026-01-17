@@ -10,7 +10,7 @@ def test_generate_pdf_copies_to_run_bundle(tmp_path, monkeypatch):
     run_id = "runpdf"
     run_dir = init_run_bundle(run_id, {}, base_dir=str(tmp_path / "runs"), enable_tee=False)
 
-    def _fake_convert(_content: str, output_filename: str) -> bool:
+    def _fake_convert(_content: str, output_filename: str, base_dir=None) -> bool:
         Path(output_filename).write_text("pdf", encoding="utf-8")
         return True
 
