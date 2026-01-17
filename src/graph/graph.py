@@ -9017,55 +9017,51 @@ def execute_code(state: AgentState) -> AgentState:
     forbidden_assignments: List[str] = []
     if "DF_COLUMN_ASSIGNMENT_FORBIDDEN" in preflight_issues and allowed_columns:
         forbidden_assignments = _detect_forbidden_df_assignments(code, allowed_columns, allowed_patterns)
-    fatal_preflight = {
-        "SYNTHETIC_DATA_DETECTED",
-        "DATAFRAME_LITERAL_OVERWRITE",
-        "UNKNOWN_COLUMNS_REFERENCED",
-        "DF_COLUMN_ASSIGNMENT_FORBIDDEN",
-    }
-    fatal_hits = [issue for issue in preflight_issues if issue in fatal_preflight]
-    if fatal_hits:
-        msg = f"ML_PREFLIGHT_BLOCK: {', '.join(fatal_hits)}"
+    preexec_warnings: List[str] = []
+    preexec_payload: Dict[str, Any] = {}
+    if preflight_issues:
+        msg = f"ML_PREEXEC_WARNINGS: {', '.join(preflight_issues)}"
         if unknown_cols:
             preview = unknown_cols[:10]
             msg += f" | Unknown columns ({len(unknown_cols)}): {preview}"
         if forbidden_assignments:
             preview = forbidden_assignments[:10]
-            msg += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}. SOLUTION: Use df.assign() instead of df['col']=value. Pattern: df = df.assign(new_col=expression). Example: df = df.assign(derived_target=(df['source_col']==condition).astype(int))"
+            msg += (
+                f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}. "
+                "SOLUTION: Use df.assign() instead of df['col']=value. Pattern: df = df.assign(new_col=expression). "
+                "Example: df = df.assign(derived_target=(df['source_col']==condition).astype(int))"
+            )
         snippet_tokens = [f"'{col}'" for col in (unknown_cols + forbidden_assignments)[:10]]
-        snippets = _collect_violation_snippets(code, snippet_tokens)
+        snippets: List[str] = _collect_violation_snippets(code, snippet_tokens) if snippet_tokens else []
         if snippets:
             msg += f" | Code refs: {snippets[:5]}"
-        fh = list(state.get("feedback_history", []))
-        fh.append(msg)
-        if run_id:
-            payload = {"issues": fatal_hits}
-            if unknown_cols:
-                payload["unknown_columns"] = unknown_cols
-            if forbidden_assignments:
-                payload["forbidden_df_assignments"] = forbidden_assignments
-            if snippets:
-                payload["snippets"] = snippets
-            log_run_event(run_id, "ml_preflight_blocked", payload)
-        return {
-            "error_message": msg,
-            "execution_output": msg,
-            "feedback_history": fh,
-            "ml_skipped_reason": "ML_PREFLIGHT_BLOCKED",
-            "budget_counters": counters,
-        }
+        preexec_warnings.append(msg)
+        preexec_payload["issues"] = preflight_issues
+        if unknown_cols:
+            preexec_payload["unknown_columns"] = unknown_cols
+        if forbidden_assignments:
+            preexec_payload["forbidden_df_assignments"] = forbidden_assignments
+        if snippets:
+            preexec_payload["snippets"] = snippets
 
-    # 0b. Undefined name preflight (avoid sandbox NameError)
+    # 0b. Undefined name preflight (warn only; allow sandbox execution)
     undefined = detect_undefined_names(code)
     if undefined:
-        msg = f"STATIC_PRECHECK_UNDEFINED: Undefined names detected preflight: {', '.join(undefined)}"
+        msg = f"ML_PREEXEC_WARNINGS: Undefined names detected preflight: {', '.join(undefined)}"
+        preexec_warnings.append(msg)
+        preexec_payload["undefined_names"] = undefined
+
+    if preexec_warnings:
         fh = list(state.get("feedback_history", []))
-        fh.append(f"STATIC_PRECHECK_UNDEFINED: {msg}")
-        try:
-            print(msg)
-        except Exception:
-            pass
-        return {"error_message": msg, "execution_output": msg, "feedback_history": fh}
+        fh.extend(preexec_warnings)
+        state["feedback_history"] = fh
+        for msg in preexec_warnings:
+            try:
+                print(msg)
+            except Exception:
+                pass
+        if run_id:
+            log_run_event(run_id, "ml_preexec_warnings", preexec_payload)
 
     # Secure execution using E2B
     try:
