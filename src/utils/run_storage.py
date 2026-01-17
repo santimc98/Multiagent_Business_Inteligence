@@ -24,24 +24,21 @@ def _safe_load_json(path: str) -> Dict[str, Any]:
         return {}
 
 
-def init_run_dir(run_id: str, started_at: Optional[str] = None, runs_dir: str = RUNS_DIR) -> str:
-    latest_dir = os.path.join(runs_dir, "latest")
-    if os.path.exists(latest_dir):
-        shutil.rmtree(latest_dir, ignore_errors=True)
-    _ensure_dir(latest_dir)
-    try:
-        with open(os.path.join(latest_dir, "run_id.txt"), "w", encoding="utf-8") as f:
-            f.write(run_id)
-    except Exception:
-        pass
-    run_dir = os.path.join(runs_dir, run_id)
-    for sub in ["contracts", "agents", "sandbox", "artifacts", "report"]:
-        _ensure_dir(os.path.join(run_dir, sub))
-    write_manifest_partial(
-        run_id=run_id,
-        manifest_path=os.path.join(run_dir, "run_manifest.json"),
-        started_at=started_at,
-    )
+def init_run_dir(run_id: str, base_dir: str = "runs", started_at: Optional[str] = None) -> str:
+    run_dir = os.path.abspath(os.path.join(base_dir, run_id))  # CLAVE
+    os.makedirs(run_dir, exist_ok=True)
+
+    if started_at is None:
+        started_at = datetime.utcnow().isoformat()
+
+    run_manifest_path = os.path.join(run_dir, "run_manifest.json")
+    if not os.path.exists(run_manifest_path):
+        with open(run_manifest_path, "w", encoding="utf-8") as f:
+            f.write("{\n")
+            f.write(f'  "run_id": "{run_id}",\n')
+            f.write(f'  "started_at": "{started_at}"\n')
+            f.write("}\n")
+
     return run_dir
 
 
