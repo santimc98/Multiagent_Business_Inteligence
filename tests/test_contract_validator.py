@@ -43,11 +43,12 @@ class TestAmbiguityDetection:
             "priority_score",  # Column
         ]
 
-        files, columns, warnings = detect_output_ambiguity(required_outputs)
+        files, columns, warnings, conceptual_outputs = detect_output_ambiguity(required_outputs)
 
         assert len(files) == 2
         assert len(columns) == 2
         assert len(warnings) == 2
+        assert len(conceptual_outputs) == 0
 
         file_paths = [f["path"] for f in files]
         assert "data/metrics.json" in file_paths

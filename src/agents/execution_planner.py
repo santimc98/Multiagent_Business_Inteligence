@@ -139,6 +139,27 @@ def _normalize_text(*values: Any) -> str:
     return " ".join(token for token in tokens if token)
 
 
+def _compress_text_preserve_ends(
+    text: str,
+    max_chars: int = 1800,
+    head: int = 900,
+    tail: int = 900,
+) -> str:
+    if not isinstance(text, str):
+        return ""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    head_len = max(0, min(head, max_chars))
+    tail_len = max(0, min(tail, max_chars - head_len))
+    if head_len + tail_len == 0:
+        return text[:max_chars]
+    if head_len + tail_len < max_chars:
+        head_len = max_chars - tail_len
+    return text[:head_len] + "\n...\n" + text[-tail_len:]
+
+
 def _matches_any_phrase(text: str, phrases: set[str]) -> bool:
     normalized = text.lower()
     return any(phrase in normalized for phrase in phrases)
@@ -393,6 +414,131 @@ def _apply_qa_gate_policy(
             params.setdefault("allow_resampling_random", allow_resampling)
             gate["params"] = params
     return gates
+
+
+_KPI_ALIASES = {
+    "accuracy": ["accuracy", "acc", "balanced accuracy", "balanced_accuracy"],
+    "auc": ["auc", "auroc", "roc auc", "roc_auc"],
+    "f1": ["f1", "f1-score", "f1_score"],
+    "precision": ["precision", "prec"],
+    "recall": ["recall", "sensitivity", "tpr"],
+    "rmse": ["rmse", "root mean squared error"],
+    "mae": ["mae", "mean absolute error"],
+    "mse": ["mse", "mean squared error"],
+    "r2": ["r2", "r^2", "r-squared", "rsquared", "r_squared"],
+    "logloss": ["logloss", "log loss", "log_loss", "cross entropy", "cross_entropy"],
+    "mape": ["mape", "mean absolute percentage error"],
+    "pr_auc": ["pr_auc", "pr auc", "average precision", "average_precision"],
+}
+
+
+def _normalize_kpi_metric(value: Any) -> str:
+    if value is None:
+        return ""
+    raw = str(value).strip().lower()
+    if not raw:
+        return ""
+    raw = re.sub(r"[^a-z0-9]+", " ", raw).strip()
+    for canonical, aliases in _KPI_ALIASES.items():
+        for alias in aliases:
+            alias_norm = re.sub(r"[^a-z0-9]+", " ", alias).strip()
+            if raw == alias_norm:
+                return canonical
+    return ""
+
+
+def _extract_kpi_from_list(values: Any) -> str:
+    if not isinstance(values, list):
+        return ""
+    for item in values:
+        if isinstance(item, dict):
+            metric = item.get("metric") or item.get("name") or item.get("id")
+            normalized = _normalize_kpi_metric(metric)
+        else:
+            normalized = _normalize_kpi_metric(item)
+        if normalized:
+            return normalized
+    return ""
+
+
+def _extract_kpi_from_text(text: str) -> str:
+    if not text:
+        return ""
+    lower = text.lower()
+    for canonical, aliases in _KPI_ALIASES.items():
+        for alias in aliases:
+            pattern = r"\b" + re.escape(alias.lower()) + r"\b"
+            if re.search(pattern, lower):
+                return canonical
+    return ""
+
+
+def _ensure_benchmark_kpi_gate(
+    contract: Dict[str, Any],
+    strategy: Dict[str, Any],
+    business_objective: str,
+) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+    strategy = strategy if isinstance(strategy, dict) else {}
+
+    kpi = _normalize_kpi_metric(strategy.get("success_metric"))
+    if not kpi:
+        kpi = _extract_kpi_from_list(strategy.get("recommended_evaluation_metrics"))
+    if not kpi:
+        kpi = _extract_kpi_from_text(business_objective or "")
+    if not kpi:
+        return contract
+
+    qa_gates = contract.get("qa_gates")
+    if not isinstance(qa_gates, list):
+        qa_gates = []
+
+    gate_exists = False
+    for gate in qa_gates:
+        if not isinstance(gate, dict):
+            continue
+        if gate.get("name") == "benchmark_kpi_report":
+            params = gate.get("params")
+            if not isinstance(params, dict):
+                params = {}
+            params.setdefault("metric", kpi)
+            params.setdefault("validation", "cross_validation_or_holdout")
+            gate["type"] = gate.get("type") or "metric_report"
+            gate["params"] = params
+            gate.setdefault("severity", "warning")
+            gate_exists = True
+            break
+        if gate.get("type") == "metric_report":
+            params = gate.get("params")
+            if isinstance(params, dict) and params.get("metric") == kpi:
+                gate_exists = True
+                break
+
+    if not gate_exists:
+        qa_gates.append(
+            {
+                "name": "benchmark_kpi_report",
+                "type": "metric_report",
+                "params": {"metric": kpi, "validation": "cross_validation_or_holdout"},
+                "severity": "warning",
+            }
+        )
+
+    contract["qa_gates"] = qa_gates
+
+    validation = contract.get("validation_requirements")
+    if not isinstance(validation, dict):
+        validation = {}
+    validation.setdefault("primary_metric", kpi)
+    metrics_list = validation.get("metrics_to_report")
+    if not isinstance(metrics_list, list):
+        metrics_list = []
+    if kpi not in metrics_list:
+        metrics_list.append(kpi)
+    validation["metrics_to_report"] = metrics_list
+    contract["validation_requirements"] = validation
+    return contract
 
 
 def _create_v41_skeleton(
@@ -964,6 +1110,16 @@ def build_contract_min(
     if missing_sets:
         print(f"FALLBACK_FEATURE_SETS: {', '.join(sorted(set(missing_sets)))}")
 
+    identifier_candidates = _resolve_identifier_candidates(contract, canonical_columns)
+    if identifier_candidates:
+        filtered_model = [col for col in model_features if col not in identifier_candidates]
+        removed_ids = [col for col in model_features if col not in filtered_model]
+        if removed_ids:
+            model_features = filtered_model
+            for col in removed_ids:
+                if col not in audit_only_features:
+                    audit_only_features.append(col)
+
     required_outputs = [
         "data/cleaned_data.csv",
         "data/scored_rows.csv",
@@ -1348,6 +1504,106 @@ def _normalize_column_identifier(value: Any) -> str:
         return ""
     cleaned = re.sub(r"[^0-9a-zA-Z]+", "", str(value).lower())
     return cleaned
+
+
+def _is_identifier_like_name(name: str) -> bool:
+    if not name:
+        return False
+    normalized = _tokenize_name(name)
+    if not normalized:
+        return False
+    tokens = normalized.split()
+    joined = normalized.replace(" ", "")
+    strict = {"id", "uuid", "guid", "rowid", "recordid", "index", "idx"}
+    if joined in strict:
+        return True
+    if any(tok in {"uuid", "guid"} for tok in tokens):
+        return True
+    if "id" in tokens or "key" in tokens:
+        return True
+    for tok in tokens:
+        if len(tok) > 3 and tok.endswith("id"):
+            return True
+    return False
+
+
+def _load_profile_identifier_candidates() -> set[str]:
+    profile_path = os.path.join("data", "dataset_profile.json")
+    if not os.path.exists(profile_path):
+        return set()
+    try:
+        with open(profile_path, "r", encoding="utf-8") as f_profile:
+            profile = json.load(f_profile)
+    except Exception:
+        return set()
+    if not isinstance(profile, dict):
+        return set()
+    candidates = set()
+    suspected = profile.get("suspected_ids")
+    if isinstance(suspected, list):
+        candidates.update([str(col) for col in suspected if col])
+    rows = profile.get("rows") or profile.get("row_count") or profile.get("n_rows")
+    cardinality = profile.get("cardinality")
+    if isinstance(rows, int) and rows > 0 and isinstance(cardinality, dict):
+        for col, stats in cardinality.items():
+            if not isinstance(stats, dict):
+                continue
+            unique = stats.get("unique")
+            try:
+                unique_count = int(unique)
+            except Exception:
+                continue
+            if unique_count / max(rows, 1) > 0.98:
+                candidates.add(str(col))
+    return candidates
+
+
+def _resolve_identifier_candidates(
+    contract: Dict[str, Any],
+    canonical_columns: List[str] | None,
+) -> set[str]:
+    candidates: set[str] = set()
+    roles = contract.get("column_roles") if isinstance(contract, dict) else None
+    if isinstance(roles, dict):
+        role_ids = roles.get("identifiers")
+        if isinstance(role_ids, list):
+            candidates.update([str(col) for col in role_ids if col])
+    candidates.update(_load_profile_identifier_candidates())
+    for col in canonical_columns or []:
+        if _is_identifier_like_name(str(col)):
+            candidates.add(str(col))
+    return candidates
+
+
+def _prune_identifier_model_features(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+    allowed_sets = contract.get("allowed_feature_sets")
+    if not isinstance(allowed_sets, dict):
+        return contract
+    model_features = allowed_sets.get("model_features")
+    if not isinstance(model_features, list) or not model_features:
+        return contract
+    canonical_columns = contract.get("canonical_columns")
+    if not isinstance(canonical_columns, list):
+        canonical_columns = []
+    identifier_candidates = _resolve_identifier_candidates(contract, canonical_columns)
+    if not identifier_candidates:
+        return contract
+    filtered = [col for col in model_features if col not in identifier_candidates]
+    removed = [col for col in model_features if col not in filtered]
+    if not removed:
+        return contract
+    allowed_sets["model_features"] = filtered
+    audit_only = allowed_sets.get("audit_only_features")
+    if not isinstance(audit_only, list):
+        audit_only = []
+    for col in removed:
+        if col not in audit_only:
+            audit_only.append(col)
+    allowed_sets["audit_only_features"] = audit_only
+    contract["allowed_feature_sets"] = allowed_sets
+    return contract
 
 
 def _build_allowed_column_norms(column_sets: List[str] | None, *more_sets: List[str] | None) -> set[str]:
@@ -4748,6 +5004,12 @@ domain_expert_critique:
             "ml_engineer_runbook",
             "omitted_columns_policy",
         ]
+        compressed_objective = _compress_text_preserve_ends(business_objective or "")
+        success_metric = strategy.get("success_metric") if isinstance(strategy, dict) else None
+        recommended_metrics = (
+            strategy.get("recommended_evaluation_metrics") if isinstance(strategy, dict) else None
+        )
+        validation_strategy = strategy.get("validation_strategy") if isinstance(strategy, dict) else None
         repair_prompt = (
             "Return ONLY valid JSON with EXACT keys: "
             + json.dumps(repair_keys)
@@ -4760,7 +5022,16 @@ domain_expert_critique:
             + json.dumps(strategy.get("title", "") if isinstance(strategy, dict) else "")
             + "\n"
             + "BUSINESS_OBJECTIVE: "
-            + json.dumps(business_objective[:500] if business_objective else "")
+            + json.dumps(compressed_objective)
+            + "\n"
+            + "SUCCESS_METRIC: "
+            + json.dumps(success_metric or "")
+            + "\n"
+            + "RECOMMENDED_EVALUATION_METRICS: "
+            + json.dumps(recommended_metrics or [])
+            + "\n"
+            + "VALIDATION_STRATEGY: "
+            + json.dumps(validation_strategy or "")
         )
 
         attempt_prompts = [
@@ -4837,6 +5108,7 @@ domain_expert_critique:
             business_objective or "",
             contract,
         )
+        contract = _ensure_benchmark_kpi_gate(contract, strategy, business_objective or "")
         contract["cleaning_gates"] = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
 
         if column_inventory and not contract.get("available_columns"):
@@ -4859,6 +5131,8 @@ domain_expert_critique:
                         filtered_roles[role] = cols
                 contract["column_roles"] = filtered_roles
             contract["omitted_columns_policy"] = omitted_columns_policy
+
+        contract = _prune_identifier_model_features(contract)
 
         contract = validate_artifact_requirements(contract)
 

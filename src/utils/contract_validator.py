@@ -29,13 +29,17 @@ def is_file_path(value: str) -> bool:
 
     value = value.strip()
 
-    # Contains path separator
-    if "/" in value or "\\" in value:
-        return True
-
     # Has a recognized file extension
     _, ext = os.path.splitext(value.lower())
     if ext in FILE_EXTENSIONS:
+        return True
+
+    # Contains path separator but looks like a conceptual phrase
+    if ("/" in value or "\\" in value) and re.search(r"[\s\(\)\[\]\{\}<>]", value):
+        return False
+
+    # Contains path separator
+    if "/" in value or "\\" in value:
         return True
 
     return False
@@ -64,24 +68,34 @@ def is_column_name(value: str) -> bool:
     if ext in FILE_EXTENSIONS:
         return False
 
+    # Disallow spaces or bracketed annotations in column names for this heuristic
+    if re.search(r"[\s\(\)\[\]\{\}<>]", value):
+        return False
+
+    # Basic identifier-like check (letters, numbers, underscore, dash, dot)
+    if not re.match(r"^[A-Za-z0-9_.-]+$", value):
+        return False
+
     return True
 
 
 def detect_output_ambiguity(
     required_outputs: List[Any]
-) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
     """
     Detect and separate ambiguous entries in required_outputs.
 
     Returns:
-        (files, columns, warnings)
+        (files, columns, warnings, conceptual_outputs)
         - files: entries that are clearly file paths
         - columns: entries that are clearly column names
         - warnings: list of {"item": ..., "message": ...} for ambiguous cases
+        - conceptual_outputs: entries that are non-file, non-column output requests
     """
     files = []
     columns = []
     warnings = []
+    conceptual_outputs = []
 
     for item in required_outputs:
         # Handle both string and dict formats
@@ -108,15 +122,14 @@ def detect_output_ambiguity(
                 "action": "moved_to_columns"
             })
         else:
-            # Unknown - treat as file with warning
-            files.append({"path": path_clean, "description": desc})
+            conceptual_outputs.append({"name": path_clean, "description": desc})
             warnings.append({
                 "item": path_clean,
-                "message": f"'{path_clean}' format is ambiguous. Treating as file path.",
-                "action": "kept_as_file"
+                "message": f"'{path_clean}' looks like a conceptual output. Moved to reporting_requirements.",
+                "action": "moved_to_conceptual_outputs"
             })
 
-    return files, columns, warnings
+    return files, columns, warnings, conceptual_outputs
 
 
 def normalize_artifact_requirements(
@@ -171,7 +184,7 @@ def normalize_artifact_requirements(
     # Process legacy required_outputs
     legacy_outputs = contract.get("required_outputs", [])
     if isinstance(legacy_outputs, list) and legacy_outputs:
-        files, columns, ambig_warnings = detect_output_ambiguity(legacy_outputs)
+        files, columns, ambig_warnings, conceptual_outputs = detect_output_ambiguity(legacy_outputs)
         warnings.extend(ambig_warnings)
 
         # Merge with existing
@@ -187,6 +200,32 @@ def normalize_artifact_requirements(
             if col_name.lower() not in existing_cols:
                 required_columns.append(col_name)
                 existing_cols.add(col_name.lower())
+
+        if conceptual_outputs:
+            reporting_requirements = contract.get("reporting_requirements")
+            if not isinstance(reporting_requirements, dict):
+                reporting_requirements = {}
+            existing_conceptual = reporting_requirements.get("conceptual_outputs")
+            if not isinstance(existing_conceptual, list):
+                existing_conceptual = []
+            existing_lower = {str(item).lower() for item in existing_conceptual}
+            for item in conceptual_outputs:
+                name = item.get("name") if isinstance(item, dict) else str(item)
+                if not name:
+                    continue
+                if name.lower() in existing_lower:
+                    continue
+                existing_conceptual.append(name)
+                existing_lower.add(name.lower())
+            reporting_requirements["conceptual_outputs"] = existing_conceptual
+            contract["reporting_requirements"] = reporting_requirements
+            notes = contract.get("notes_for_engineers")
+            if not isinstance(notes, list):
+                notes = []
+            note = "Conceptual outputs requested (non-file): " + ", ".join(existing_conceptual)
+            if note not in notes:
+                notes.append(note)
+            contract["notes_for_engineers"] = notes
 
     # Ensure minimum required files exist
     default_files = [
