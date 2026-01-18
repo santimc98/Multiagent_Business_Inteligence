@@ -14,6 +14,21 @@ from src.utils.contract_v41 import (
     get_validation_requirements,
 )
 
+# Shared helper for decisioning requirements extraction
+def _get_decisioning_requirements(contract_full: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any]:
+    for source in (contract_min, contract_full):
+        if not isinstance(source, dict):
+            continue
+        decisioning = source.get("decisioning_requirements")
+        if isinstance(decisioning, dict) and decisioning:
+            return {
+                "enabled": bool(decisioning.get("enabled")),
+                "required": bool(decisioning.get("required")),
+                "output": decisioning.get("output", {}),
+                "policy_notes": decisioning.get("policy_notes", ""),
+            }
+    return {"enabled": False, "required": False, "output": {}, "policy_notes": ""}
+
 # contract_full: traceability/strategy; contract_min: binding; views: prompt context.
 
 
@@ -850,6 +865,7 @@ def build_ml_view(
         "items": visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else [],
         "notes": visual_reqs.get("notes") or "",
     }
+    view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
     if view_warnings:
         view["view_warnings"] = view_warnings
     if case_rules is not None:
@@ -860,6 +876,7 @@ def build_ml_view(
     plot_spec = _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
     if plot_spec is not None:
         view["plot_spec"] = plot_spec
+    view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
     return trim_to_budget(view, 16000)
 
 
@@ -887,6 +904,7 @@ def build_reviewer_view(
             "artifact_index_expected": bool(artifact_index),
         },
     }
+    view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
     return trim_to_budget(view, 12000)
 
 
@@ -935,6 +953,7 @@ def build_qa_view(
     }
     if isinstance(reporting_policy, dict) and reporting_policy:
         view["reporting_policy"] = reporting_policy
+    view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
     return trim_to_budget(view, 12000)
 
 
@@ -985,6 +1004,7 @@ def build_translator_view(
         "items": visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else [],
         "notes": visual_reqs.get("notes") or "",
     }
+    view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
     return trim_to_budget(view, 16000)
 
 

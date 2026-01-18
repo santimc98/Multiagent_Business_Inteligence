@@ -43,6 +43,43 @@ _RESAMPLING_TOKENS = {
     "fold",
 }
 
+_DECISIONING_ENABLED_TOKENS = {
+    "ranking",
+    "priority",
+    "prioritization",
+    "top",
+    "decision",
+    "action",
+    "triage",
+    "moderation",
+    "scorecard",
+    "targeting",
+    "outlier",
+    "review",
+    "segmentation",
+    "operational",
+    "rule",
+    "uncertainty",
+    "policy",
+}
+
+_DECISIONING_REQUIRED_PHRASES = {
+    "ranking",
+    "prioridad",
+    "ranking prioritario",
+    "decision policy",
+    "política de decisión",
+    "segmentación",
+    "acción recomendada",
+    "marcar casos",
+    "baja confianza",
+    "decision rule",
+    "flag de revisión",
+    "moderación humana",
+    "prioritize",
+    "review flag",
+}
+
 _VISUAL_ENABLED_TOKENS = {
     "segment",
     "segmentation",
@@ -105,6 +142,40 @@ def _normalize_text(*values: Any) -> str:
 def _matches_any_phrase(text: str, phrases: set[str]) -> bool:
     normalized = text.lower()
     return any(phrase in normalized for phrase in phrases)
+
+
+def _contains_decisioning_token(text: str, tokens: set[str]) -> bool:
+    if not text:
+        return False
+    words = set(text.split())
+    return any(tok in words for tok in tokens)
+
+
+def _build_decision_column_entry(
+    name: str,
+    role: str,
+    type_name: str,
+    inputs: List[str],
+    logic_hint: str,
+    allowed_values: List[str] | None = None,
+    constraints: Dict[str, Any] | None = None,
+    derivation_source: str = "postprocess",
+) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "name": name,
+        "role": role,
+        "type": type_name,
+        "derivation": {
+            "source": derivation_source,
+            "inputs": inputs[:],
+            "logic_hint": logic_hint,
+        },
+    }
+    if allowed_values:
+        entry["allowed_values"] = allowed_values
+    if constraints:
+        entry["constraints"] = constraints
+    return entry
 
 
 def _normalize_qa_gate_spec(item: Any) -> Dict[str, Any] | None:
@@ -1061,6 +1132,7 @@ def build_contract_min(
         "ml_engineer_runbook": ml_engineer_runbook,
         "omitted_columns_policy": omitted_columns_policy,
         "reporting_policy": reporting_policy or {},
+        "decisioning_requirements": contract.get("decisioning_requirements", {}),
     }
 
 
@@ -1921,6 +1993,181 @@ def _build_visual_requirements(
         "items": items,
         "notes": notes,
         "plot_spec": plot_spec,
+    }
+
+
+def _build_decisioning_requirements(
+    contract: Dict[str, Any],
+    strategy: Dict[str, Any],
+    business_objective: str,
+) -> Dict[str, Any]:
+    strategy_text = _normalize_text(
+        strategy.get("analysis_type"),
+        strategy.get("techniques"),
+        strategy.get("notes"),
+        strategy.get("description"),
+        contract.get("strategy_title"),
+        contract.get("business_objective"),
+        business_objective,
+    )
+    objective_type = str(
+        contract.get("objective_type")
+        or strategy.get("analysis_type")
+        or ""
+    ).lower()
+    enabled = _contains_decisioning_token(strategy_text, _DECISIONING_ENABLED_TOKENS) or any(
+        kw in objective_type for kw in ["rank", "priority", "decision", "segment", "triage", "outlier", "action"]
+    )
+    required = _matches_any_phrase(strategy_text, _DECISIONING_REQUIRED_PHRASES)
+
+    canonical_columns = contract.get("canonical_columns") if isinstance(contract.get("canonical_columns"), list) else []
+    canonical_columns = [str(col) for col in canonical_columns if col]
+    id_column = next((col for col in canonical_columns if re.search(r"^id$|_id$|row_id", col, flags=re.IGNORECASE)), None)
+    key_columns = [id_column] if id_column else canonical_columns[:1]
+
+    def _has_objective(tok_list: List[str]) -> bool:
+        return any(tok in objective_type for tok in tok_list) or _contains_decisioning_token(strategy_text, set(tok_list))
+
+    is_classification = _has_objective(["class", "classification", "binary", "propensity", "moderation"])
+    is_regression = _has_objective(["regress", "price", "eta", "forecast", "numeric", "value"])
+    is_ranking = _has_objective(["rank", "priority", "top", "targeting", "triage"])
+    is_segmentation = _has_objective(["segment", "cohort", "cluster"])
+    is_outlier = _has_objective(["outlier", "anomaly"])
+    needs_action = _has_objective(["action", "decision", "policy", "review", "moderation"])
+
+    columns: List[Dict[str, Any]] = []
+    inputs_base = ["prediction"]
+    if is_classification:
+        inputs_base.append("probability")
+    if is_regression:
+        inputs_base.append("prediction")
+
+    if is_ranking or is_classification:
+        columns.append(
+            _build_decision_column_entry(
+                name="priority_score",
+                role="score",
+                type_name="numeric",
+                inputs=["prediction", "probability"],
+                logic_hint="Use normalized model score/probability to represent priority from 0 to 1.",
+                constraints={"non_null_rate_min": 0.98, "range": {"min": 0.0, "max": 1.0}},
+            )
+        )
+        columns.append(
+            _build_decision_column_entry(
+                name="priority_rank",
+                role="priority",
+                type_name="integer",
+                inputs=["priority_score"],
+                logic_hint="Rank records by priority_score into integer ranks (1=head, higher=lower priority).",
+                constraints={"non_null_rate_min": 0.95, "range": {"min": 1, "max": 100}},
+            )
+        )
+    if is_regression:
+        columns.append(
+            _build_decision_column_entry(
+                name="prediction_value",
+                role="prediction",
+                type_name="numeric",
+                inputs=["prediction"],
+                logic_hint="Use the regression model output as the primary prediction value.",
+                constraints={"non_null_rate_min": 0.98},
+            )
+        )
+        columns.append(
+            _build_decision_column_entry(
+                name="uncertainty_flag",
+                role="flag",
+                type_name="bool",
+                inputs=["prediction", "residual"],
+                logic_hint="Flag high uncertainty when residuals exceed thresholds or standard deviation is high.",
+                allowed_values=["True", "False"],
+                constraints={"non_null_rate_min": 0.95},
+            )
+        )
+    if is_outlier:
+        columns.append(
+            _build_decision_column_entry(
+                name="outlier_flag",
+                role="flag",
+                type_name="bool",
+                inputs=["residual", "prediction"],
+                logic_hint="Mark rows as outliers when residuals or scoring errors exceed predefined thresholds.",
+                allowed_values=["True", "False"],
+                constraints={"non_null_rate_min": 0.95},
+            )
+        )
+        columns.append(
+            _build_decision_column_entry(
+                name="outlier_severity",
+                role="score",
+                type_name="numeric",
+                inputs=["residual"],
+                logic_hint="Use absolute residual magnitude to quantify severity.",
+                constraints={"non_null_rate_min": 0.9, "range": {"min": 0.0}},
+            )
+        )
+    if is_segmentation:
+        columns.append(
+            _build_decision_column_entry(
+                name="segment_assignment",
+                role="segment",
+                type_name="category",
+                inputs=["segment_id", "cluster_label"],
+                logic_hint="Assign rows to the declared segment identifiers detected in the contract or derived clusters.",
+                constraints={"non_null_rate_min": 0.9},
+            )
+        )
+    if needs_action:
+        columns.append(
+            _build_decision_column_entry(
+                name="action_recommendation",
+                role="action",
+                type_name="category",
+                inputs=["priority_score", "uncertainty_flag"],
+                logic_hint="Map scores and flags to actions (review/contact/escalate) using simple thresholds.",
+                allowed_values=["review", "contact", "escalate", "ignore"],
+                constraints={"non_null_rate_min": 0.9},
+            )
+        )
+
+    if not columns and enabled:
+        # Provide a default minimal decision pipeline
+        columns.append(
+            _build_decision_column_entry(
+                name="decision_flag",
+                role="flag",
+                type_name="bool",
+                inputs=["priority_score"],
+                logic_hint="Flag rows for follow-up when priority_score exceeds a business threshold.",
+                allowed_values=["True", "False"],
+                constraints={"non_null_rate_min": 0.9},
+            )
+        )
+
+    unique = []
+    seen_names = set()
+    for col in columns:
+        if col["name"] in seen_names:
+            continue
+        seen_names.add(col["name"])
+        unique.append(col)
+
+    policy_notes = (
+        "These decision columns capture business priority, action recommendations, and uncertainty flags requested by the strategy."
+        if unique
+        else "Decision policy is disabled for this strategy."
+    )
+
+    return {
+        "enabled": bool(enabled and unique),
+        "required": required and bool(unique),
+        "output": {
+            "file": "data/scored_rows.csv",
+            "key_columns": [col for col in key_columns if col],
+            "required_columns": unique,
+        },
+        "policy_notes": policy_notes,
     }
 
 
@@ -4639,6 +4886,11 @@ domain_expert_critique:
             business_objective or "",
         )
         contract["artifact_requirements"] = artifact_reqs
+        contract["decisioning_requirements"] = _build_decisioning_requirements(
+            contract,
+            strategy,
+            business_objective or "",
+        )
 
         contract = _attach_reporting_policy(contract)
 

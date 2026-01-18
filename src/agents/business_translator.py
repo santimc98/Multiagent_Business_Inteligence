@@ -520,6 +520,16 @@ class BusinessTranslatorAgent:
             "plot_reference_mode": plot_reference_mode,
         }
         visuals_context_json = json.dumps(visuals_context_data, ensure_ascii=False)
+        decisioning_context = translator_view.get("decisioning_requirements") or contract.get("decisioning_requirements") or {}
+        if not isinstance(decisioning_context, dict):
+            decisioning_context = {}
+        decisioning_context_json = json.dumps(decisioning_context, ensure_ascii=False)
+        decisioning_columns = [
+            str(col.get("name"))
+            for col in (decisioning_context.get("output", {}).get("required_columns") or [])
+            if isinstance(col, dict) and col.get("name")
+        ]
+        decisioning_columns_text = ", ".join(decisioning_columns) if decisioning_columns else "None requested."
         
         # Load optional artifacts for context
         contract = _safe_load_json("data/execution_contract.json") or {}
@@ -920,6 +930,8 @@ class BusinessTranslatorAgent:
         - Translator View: $translator_view_context
         - Slot Payloads: $slot_payloads_context
         - Slot Coverage: $slot_coverage_context
+        - Decisioning Requirements (json): $decisioning_context_json
+        - Decisioning Columns (text): $decisioning_columns_text
 
         GUIDANCE:
         - Use Insights as the primary evidence source; only reference other artifacts if they add clear value.
@@ -940,6 +952,10 @@ class BusinessTranslatorAgent:
             * if mode == "required": include it using evidence (payload or artifact); if missing => write "No disponible" and cite missing sources.
             * if mode == "conditional" or "optional": include only if payload exists; otherwise omit without inventing.
           Structure the report using reporting_policy.sections order; do not add top-level sections outside that list, EXCEPT the final mandatory section titled "Evidencia usada".
+        - Decision Policy / Actions:
+          If DECISIONING REQUIREMENTS (json) indicates enabled=true, add a dedicated section titled "Decision Policy / Actions" after "Evidence & Metrics".
+          Describe each required decision column (name, type, role, derivation logic) using the JSON context and mention how the column supports prioritized actions or flags.
+          Reference the Scored Rows Sample Table to show concrete values for those columns. Do not invent values nor attributes beyond what the sample shows.
 
         ERROR CONDITION:
         $error_condition
@@ -1086,6 +1102,8 @@ class BusinessTranslatorAgent:
             translator_view_context=json.dumps(translator_view_context, ensure_ascii=False),
             slot_payloads_context=json.dumps(slot_payloads, ensure_ascii=False),
             slot_coverage_context=json.dumps(slot_coverage_context, ensure_ascii=False),
+            decisioning_context_json=decisioning_context_json,
+            decisioning_columns_text=decisioning_columns_text,
         )
         
         # Execution Results

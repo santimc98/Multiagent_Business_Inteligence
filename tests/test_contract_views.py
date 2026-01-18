@@ -41,6 +41,9 @@ def test_ml_view_includes_required_fields():
     assert "forbidden_features" in ml_view
     assert isinstance(ml_view.get("forbidden_features"), list)
     assert ml_view.get("objective_type")
+    decisioning = ml_view.get("decisioning_requirements", {})
+    assert isinstance(decisioning, dict)
+    assert decisioning.get("enabled") is False
 
 
 def test_ml_view_includes_plot_spec_from_policy():
@@ -72,6 +75,34 @@ def test_ml_view_includes_plot_spec_from_policy():
     ml_view = build_ml_view(contract_full, contract_min, [])
     plot_spec = ml_view.get("plot_spec") or {}
     assert plot_spec.get("plots")
+
+
+def test_translator_view_includes_decisioning_requirements():
+    contract_full = {
+        "strategy_title": "Decision Strategy",
+        "business_objective": "Prioritize top cases",
+        "canonical_columns": ["id", "feature_a"],
+        "decisioning_requirements": {
+            "enabled": True,
+            "required": True,
+            "output": {
+                "file": "data/scored_rows.csv",
+                "required_columns": [
+                    {"name": "priority_score", "role": "score", "type": "numeric"},
+                ],
+            },
+            "policy_notes": "Rank cases by priority_score.",
+        },
+    }
+    contract_min = {
+        "strategy_title": "Decision Strategy",
+        "business_objective": "Prioritize top cases",
+        "canonical_columns": ["id", "feature_a"],
+    }
+    translator_view = build_translator_view(contract_full, contract_min, [])
+    decisioning = translator_view.get("decisioning_requirements", {})
+    assert decisioning.get("enabled") is True
+    assert decisioning.get("required") is True
 
 
 def test_ml_view_inherits_roles_when_min_lax():

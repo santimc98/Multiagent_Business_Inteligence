@@ -5,6 +5,7 @@ import subprocess
 import re
 import json
 import hashlib
+import csv
 import threading
 import time
 import fnmatch
@@ -9663,6 +9664,92 @@ def retry_sandbox_execution(state: AgentState) -> AgentState:
         "feedback_history": history,
     }
 
+# Decisioning output validator
+def _check_decisioning_columns(decisioning: Dict[str, Any], max_rows: int = 500) -> Dict[str, Any]:
+    result = {"missing_columns": [], "constraint_violations": []}
+    if not isinstance(decisioning, dict):
+        return result
+    output = decisioning.get("output") if isinstance(decisioning.get("output"), dict) else {}
+    required_columns = output.get("required_columns") or []
+    file_path = output.get("file") or "data/scored_rows.csv"
+    if not required_columns:
+        return result
+    if not os.path.exists(file_path):
+        result["missing_file"] = file_path
+        return result
+    with open(file_path, newline="", encoding="utf-8") as csvfile:
+        reader = csv.DictReader(csvfile)
+        fieldnames = reader.fieldnames or []
+        missing_cols = [col for col in required_columns if isinstance(col, dict) and col.get("name") not in fieldnames]
+        if missing_cols:
+            result["missing_columns"] = [col.get("name") for col in missing_cols if isinstance(col, dict)]
+            return result
+        counters: Dict[str, int] = {}
+        non_null: Dict[str, int] = {}
+        numeric_ranges: Dict[str, Dict[str, float]] = {}
+        allowed_values: Dict[str, set] = {}
+        for entry in required_columns:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not name:
+                continue
+            constraints = entry.get("constraints") or {}
+            if isinstance(constraints.get("range"), dict):
+                numeric_ranges[name] = {
+                    "min": float(constraints["range"].get("min", float("-inf"))),
+                    "max": float(constraints["range"].get("max", float("inf"))),
+                }
+            if entry.get("allowed_values"):
+                allowed_values[name] = set(str(val) for val in entry["allowed_values"])
+            counters[name] = 0
+            non_null[name] = 0
+        rows = 0
+        for row in reader:
+            rows += 1
+            for name in counters:
+                counters[name] += 1
+                val = row.get(name)
+                if val not in (None, "", "null"):
+                    non_null[name] += 1
+                    if name in allowed_values and val not in allowed_values[name]:
+                        result["constraint_violations"].append(
+                            {"column": name, "issue": f"value '{val}' not in allowed values"}
+                        )
+                    if name in numeric_ranges:
+                        try:
+                            num = float(val)
+                            rng = numeric_ranges[name]
+                            if num < rng["min"] or num > rng["max"]:
+                                result["constraint_violations"].append(
+                                    {"column": name, "issue": f"value {num} outside range {rng}"}
+                                )
+                        except Exception:
+                            result["constraint_violations"].append(
+                                {"column": name, "issue": f"cannot convert '{val}' to float for range check"}
+                            )
+            if rows >= max_rows:
+                break
+        for name, total in counters.items():
+            if total:
+                rate = non_null.get(name, 0) / total
+                constraint = next(
+                    (
+                        entry.get("constraints", {}).get("non_null_rate_min")
+                        for entry in required_columns
+                        if isinstance(entry, dict) and entry.get("name") == name
+                    ),
+                    None,
+                )
+                if constraint and rate < float(constraint):
+                    result["constraint_violations"].append(
+                        {
+                            "column": name,
+                            "issue": f"non-null rate {rate:.2f} below {constraint}",
+                        }
+                    )
+    return result
+
 def run_result_evaluator(state: AgentState) -> AgentState:
     print("--- [5.5] Reviewer: Evaluating Results ---")
     abort_state = _abort_if_requested(state, "result_evaluator")
@@ -9689,6 +9776,43 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "failed_gates": ["visual_requirements_missing"],
             "feedback_history": feedback_history,
         }
+
+    decisioning_reqs = (
+        contract.get("decisioning_requirements") if isinstance(contract.get("decisioning_requirements"), dict) else {}
+    )
+    decisioning_enabled = bool(decisioning_reqs.get("enabled"))
+    decisioning_required = bool(decisioning_reqs.get("required")) and decisioning_enabled
+    if decisioning_enabled:
+        decisioning_result = _check_decisioning_columns(decisioning_reqs)
+        missing_file = decisioning_result.get("missing_file")
+        missing_columns = decisioning_result.get("missing_columns") or []
+        constraint_violations = decisioning_result.get("constraint_violations") or []
+        if decisioning_required and (missing_file or missing_columns or constraint_violations):
+            message = (
+                "Decisioning requirements missing: "
+                f"file={missing_file if missing_file else 'data/scored_rows.csv'}, "
+                f"columns={missing_columns}, constraints={constraint_violations}"
+            )
+            history = list(state.get("feedback_history", []))
+            history.append(message)
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "decisioning_requirements_review",
+                    {"missing_columns": missing_columns, "violations": constraint_violations, "file": missing_file},
+                )
+            return {
+                "review_verdict": "NEEDS_IMPROVEMENT",
+                "review_feedback": message,
+                "failed_gates": ["decisioning_requirements_missing"],
+                "feedback_history": history,
+            }
+        if not decisioning_required and (missing_columns or constraint_violations):
+            history = list(state.get("feedback_history", []))
+            history.append(
+                f"Decisioning warning: columns={missing_columns} violations={constraint_violations}"
+            )
+            state["feedback_history"] = history
 
     execution_output = state.get('execution_output', '')
     if "Traceback" in execution_output or "EXECUTION ERROR" in execution_output:

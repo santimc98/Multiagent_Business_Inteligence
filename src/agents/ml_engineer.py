@@ -224,6 +224,17 @@ class MLEngineerAgent:
         ml_view = ml_view or {}
         ml_view_json = json.dumps(ml_view, indent=2)
         plot_spec_json = json.dumps(ml_view.get("plot_spec", {}), indent=2)
+        decisioning_requirements = ml_view.get("decisioning_requirements") or (execution_contract or {}).get(
+            "decisioning_requirements", {}
+        ) or {}
+        decisioning_requirements_context = json.dumps(decisioning_requirements, indent=2)
+        decisioning_columns = [
+            str(col.get("name"))
+            for col in (decisioning_requirements.get("output", {}).get("required_columns") or [])
+            if isinstance(col, dict) and col.get("name")
+        ]
+        decisioning_columns_text = ", ".join(decisioning_columns) if decisioning_columns else "None requested."
+        decisioning_policy_notes = decisioning_requirements.get("policy_notes", "")
         visual_requirements_json = json.dumps(ml_view.get("visual_requirements", {}), indent=2)
         
         # STRUCTURED CRITICAL ERRORS SECTION
@@ -836,6 +847,9 @@ class MLEngineerAgent:
         - Strategy: $strategy_title ($analysis_type)
         - ML_VIEW_CONTEXT (json): $ml_view_context
         - PLOT_SPEC_CONTEXT (json): $plot_spec_context
+        - DECISIONING REQUIREMENTS CONTEXT (json): $decisioning_requirements_context
+        - DECISIONING POLICY NOTES: $decisioning_policy_notes
+        - DECISIONING COLUMNS: $decisioning_columns_text
         - VISUAL_REQUIREMENTS_CONTEXT (json): $visual_requirements_context
         - CONTRACT_MIN_CONTEXT (json): $contract_min_context
         - Execution Contract (json): $execution_contract_json
@@ -978,6 +992,11 @@ class MLEngineerAgent:
             * Descriptive/Rule-based: Coverage %, Rule Hit Rate.
           - Never leave "model_performance" empty for a modeling task.
         - Plotting: matplotlib.use('Agg') BEFORE pyplot; if PLOT_SPEC_CONTEXT.enabled true, generate plots per plot_spec; otherwise save a plot only when required deliverables include plots.
+        DECISION POLICY (CONTRACT-DRIVEN)
+        - If DECISIONING_REQUIREMENTS_CONTEXT.enabled == true, you MUST generate each required column listed in the context and save them to $data_path/decisioning output (scored_rows.csv) with types/ranges as described.
+        - Use decision columns to summarize priority, actions, segments, or flags as requested. Prefer threshold-based logic (top-k, quantiles) to complex heuristics, and document thresholds in comments or metrics.json.
+        - If DECISIONING_REQUIREMENTS_CONTEXT.enabled == false, do NOT invent new action/flag/segment columns or write additional decision artifacts.
+        - If a decision column cannot be produced (missing inputs, no predictions), log the issue in alignment_check.json/feedback_history so the reviewers can request a fix.
         - If computing optimal prices or using minimize_scalar, ensure the objective returns float and coerce optimal_price = float(optimal_price) before assignment.
         - scored_rows.csv must include canonical columns plus derived outputs required by the contract
           (e.g., is_success, cluster_id, pred_prob_success, recommended_* and expected_value_at_recommendation).
@@ -1057,6 +1076,9 @@ class MLEngineerAgent:
             contract_min_context=json.dumps(execution_contract_compact, indent=2),
             ml_view_context=ml_view_json,
             plot_spec_context=plot_spec_json,
+            decisioning_requirements_context=decisioning_requirements_context,
+            decisioning_policy_notes=decisioning_policy_notes,
+            decisioning_columns_text=decisioning_columns_text,
             visual_requirements_context=visual_requirements_json,
             evaluation_spec_json=evaluation_spec_json,
             spec_extraction_json=spec_extraction_json,
