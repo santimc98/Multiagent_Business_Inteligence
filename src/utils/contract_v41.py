@@ -12,6 +12,7 @@ All accessors:
 """
 
 from typing import Dict, Any, List
+from src.utils.contract_validator import is_probably_path
 
 
 def get_available_columns(contract: Dict[str, Any]) -> List[str]:
@@ -557,13 +558,13 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     if isinstance(required_files, list):
         for entry in required_files:
             path = _extract_path(entry)
-            if path:
+            if path and is_probably_path(path):
                 outputs.append(path)
     required_plots = artifacts.get("required_plots")
     if isinstance(required_plots, list):
         for entry in required_plots:
             path = _extract_path(entry)
-            if path:
+            if path and is_probably_path(path):
                 outputs.append(path)
     
     # From top-level required_outputs
@@ -571,7 +572,7 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     if isinstance(top_level, list):
         for entry in top_level:
             path = _extract_path(entry)
-            if path:
+            if path and is_probably_path(path):
                 outputs.append(path)
     
     # Normalize and deduplicate

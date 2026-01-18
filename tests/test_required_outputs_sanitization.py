@@ -1,0 +1,35 @@
+from src.utils.contract_validator import normalize_artifact_requirements
+from src.utils.contract_v41 import get_required_outputs
+from src.utils.output_contract import check_required_outputs
+
+
+def test_normalize_artifact_requirements_filters_conceptual_outputs() -> None:
+    contract = {"required_outputs": ["data/metrics.json", "Priority ranking"]}
+
+    normalize_artifact_requirements(contract)
+
+    required_outputs = contract.get("required_outputs", [])
+    assert "Priority ranking" not in required_outputs
+    assert "data/metrics.json" in required_outputs
+    reporting = contract.get("reporting_requirements", {})
+    narrative = reporting.get("narrative_outputs", [])
+    assert "Priority ranking" in narrative
+
+
+def test_get_required_outputs_ignores_concepts() -> None:
+    contract = {"required_outputs": ["Priority ranking", "data/metrics.json"]}
+
+    outputs = get_required_outputs(contract)
+
+    assert "data/metrics.json" in outputs
+    assert "Priority ranking" not in outputs
+
+
+def test_output_contract_ignores_concepts(tmp_path) -> None:
+    metrics_path = tmp_path / "data" / "metrics.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text("{}", encoding="utf-8")
+
+    report = check_required_outputs([str(metrics_path), "Priority ranking"])
+
+    assert "Priority ranking" not in report.get("missing", [])

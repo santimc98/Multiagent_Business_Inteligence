@@ -16,6 +16,33 @@ FILE_EXTENSIONS = {
 }
 
 
+def is_probably_path(value: str) -> bool:
+    """
+    Determine if a string looks like a filesystem path.
+
+    Heuristics:
+    - Contains "/" or "\\" or glob "*"
+    - Starts with data/, static/, or reports/
+    - Ends with a known file extension
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+
+    value = value.strip()
+    lower = value.lower()
+
+    if "*" in value:
+        return True
+    if lower.startswith(("data/", "static/", "reports/")):
+        return True
+    if "/" in value or "\\" in value:
+        return True
+    _, ext = os.path.splitext(lower)
+    if ext in FILE_EXTENSIONS:
+        return True
+    return False
+
+
 def is_file_path(value: str) -> bool:
     """
     Determine if a string looks like a file path.
@@ -218,6 +245,16 @@ def normalize_artifact_requirements(
                 existing_conceptual.append(name)
                 existing_lower.add(name.lower())
             reporting_requirements["conceptual_outputs"] = existing_conceptual
+            existing_narrative = reporting_requirements.get("narrative_outputs")
+            if not isinstance(existing_narrative, list):
+                existing_narrative = []
+            existing_narrative_lower = {str(item).lower() for item in existing_narrative}
+            for item in existing_conceptual:
+                if str(item).lower() in existing_narrative_lower:
+                    continue
+                existing_narrative.append(item)
+                existing_narrative_lower.add(str(item).lower())
+            reporting_requirements["narrative_outputs"] = existing_narrative
             contract["reporting_requirements"] = reporting_requirements
             notes = contract.get("notes_for_engineers")
             if not isinstance(notes, list):
@@ -246,6 +283,25 @@ def normalize_artifact_requirements(
         },
         "file_schemas": file_schemas
     }
+
+    def _extract_path(item: Any) -> str:
+        if not item:
+            return ""
+        if isinstance(item, dict):
+            path = item.get("path") or item.get("output") or item.get("artifact")
+            return str(path) if path else ""
+        return str(item)
+
+    required_plots = artifact_req.get("required_plots", [])
+    if not isinstance(required_plots, list):
+        required_plots = []
+    combined_outputs: List[str] = []
+    for source in (required_files, required_plots):
+        for entry in source:
+            path = _extract_path(entry)
+            if path and is_probably_path(path):
+                combined_outputs.append(path)
+    contract["required_outputs"] = list(dict.fromkeys(combined_outputs))
 
     return artifact_requirements, warnings
 

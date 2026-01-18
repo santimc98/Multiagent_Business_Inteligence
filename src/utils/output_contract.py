@@ -37,12 +37,30 @@ def get_csv_dialect(work_dir: str = ".") -> Dict[str, Any]:
 
 
 def _split_deliverables(deliverables: List[Any]) -> Tuple[List[str], List[str]]:
+    def _is_probably_path(value: str) -> bool:
+        if not isinstance(value, str) or not value.strip():
+            return False
+        value = value.strip()
+        lower = value.lower()
+        if "*" in value:
+            return True
+        if lower.startswith(("data/", "static/", "reports/")):
+            return True
+        if "/" in value or "\\" in value:
+            return True
+        _, ext = os.path.splitext(lower)
+        if ext in {".csv", ".json", ".md", ".png", ".jpg", ".jpeg", ".pdf", ".txt", ".html", ".xlsx", ".xls", ".parquet", ".pkl", ".pickle"}:
+            return True
+        return False
+
     required: List[str] = []
     optional: List[str] = []
     for item in deliverables or []:
         if isinstance(item, dict):
             path = item.get("path") or item.get("output") or item.get("artifact")
             if not path:
+                continue
+            if not _is_probably_path(str(path)):
                 continue
             is_required = item.get("required")
             if is_required is None:
@@ -70,7 +88,7 @@ def _split_deliverables(deliverables: List[Any]) -> Tuple[List[str], List[str]]:
                     # If parsing fails, skip this entry (it's malformed)
                     continue
 
-            if path:
+            if path and _is_probably_path(path):
                 required.append(path)
     return required, optional
 

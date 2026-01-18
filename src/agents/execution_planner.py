@@ -22,7 +22,7 @@ from src.utils.contract_v41 import (
 )
 from src.utils.run_bundle import get_run_dir
 from src.utils.feature_selectors import infer_feature_selectors, compact_column_representation
-from src.utils.contract_validator import validate_contract, normalize_artifact_requirements
+from src.utils.contract_validator import validate_contract, normalize_artifact_requirements, is_probably_path
 
 load_dotenv()
 
@@ -137,6 +137,87 @@ def _normalize_text(*values: Any) -> str:
         cleaned = re.sub(r"[^0-9a-zA-ZÁÉÍÓÚáéíóúüÜñÑ]+", " ", text.lower())
         tokens.extend(cleaned.split())
     return " ".join(token for token in tokens if token)
+
+
+def _extract_required_paths(artifact_requirements: Dict[str, Any]) -> List[str]:
+    if not isinstance(artifact_requirements, dict):
+        return []
+    required_files = artifact_requirements.get("required_files")
+    if not isinstance(required_files, list):
+        return []
+    paths: List[str] = []
+    for entry in required_files:
+        if not entry:
+            continue
+        if isinstance(entry, dict):
+            path = entry.get("path") or entry.get("output") or entry.get("artifact")
+        else:
+            path = entry
+        if path and is_probably_path(str(path)):
+            paths.append(str(path))
+    return paths
+
+
+def _sync_execution_contract_outputs(contract: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict) or not isinstance(contract_min, dict):
+        return contract
+
+    required_outputs = contract.get("required_outputs")
+    required_outputs_list = [str(item) for item in required_outputs if item] if isinstance(required_outputs, list) else []
+    has_conceptual = any(item and not is_probably_path(item) for item in required_outputs_list)
+
+    min_required_outputs = contract_min.get("required_outputs")
+    min_required_outputs_list = (
+        [str(item) for item in min_required_outputs if item and is_probably_path(str(item))]
+        if isinstance(min_required_outputs, list)
+        else []
+    )
+
+    if has_conceptual and min_required_outputs_list:
+        contract["required_outputs"] = min_required_outputs_list
+    elif not required_outputs_list and min_required_outputs_list:
+        contract["required_outputs"] = min_required_outputs_list
+
+    contract_artifacts = contract.get("artifact_requirements")
+    if not isinstance(contract_artifacts, dict):
+        contract_artifacts = {}
+    min_artifacts = contract_min.get("artifact_requirements")
+    if not isinstance(min_artifacts, dict):
+        min_artifacts = {}
+
+    min_required_files = _extract_required_paths(min_artifacts)
+    contract_required_files = _extract_required_paths(contract_artifacts)
+    if min_required_files:
+        merged_files: List[Dict[str, Any]] = []
+        seen = {path.lower() for path in contract_required_files if path}
+        for path in contract_required_files:
+            merged_files.append({"path": path, "description": ""})
+        for path in min_required_files:
+            key = path.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_files.append({"path": path, "description": ""})
+        if merged_files:
+            contract_artifacts["required_files"] = merged_files
+            contract["artifact_requirements"] = contract_artifacts
+
+    merged_outputs: List[str] = []
+    seen_outputs: set[str] = set()
+    for path in (contract.get("required_outputs") or []) + min_required_files:
+        if not path:
+            continue
+        if not is_probably_path(str(path)):
+            continue
+        normalized = str(path)
+        if normalized in seen_outputs:
+            continue
+        seen_outputs.add(normalized)
+        merged_outputs.append(normalized)
+    if merged_outputs:
+        contract["required_outputs"] = merged_outputs
+
+    return contract
 
 
 def _compress_text_preserve_ends(
@@ -4939,6 +5020,7 @@ class ExecutionPlannerAgent:
             contract = _fallback()
             contract = _attach_reporting_policy(contract)
             contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns)
+            contract = _sync_execution_contract_outputs(contract, contract_min)
             self.last_contract_min = contract_min
             _persist_contracts(contract, contract_min)
             return contract
@@ -5208,6 +5290,7 @@ domain_expert_critique:
             contract["role_runbooks"]["ml_engineer"] = contract["ml_engineer_runbook"]
 
         contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns)
+        contract = _sync_execution_contract_outputs(contract, contract_min)
         self.last_contract_min = contract_min
         _persist_contracts(contract, contract_min)
 

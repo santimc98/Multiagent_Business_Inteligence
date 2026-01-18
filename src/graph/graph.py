@@ -9524,6 +9524,35 @@ def execute_code(state: AgentState) -> AgentState:
                             print(f"Downloaded optional output: {local_path}")
                         else:
                             print(f"Warning: failed to download optional output {remote_opt}")
+
+                # Defense-in-depth: download canonical outputs if they exist in sandbox
+                for rel_path in ["data/scored_rows.csv", "data/alignment_check.json"]:
+                    if os.path.exists(rel_path):
+                        continue
+                    remote_path = f"{run_root}/{rel_path}"
+                    list_cmd = f"sh -c 'ls -1 {remote_path} 2>/dev/null || true'"
+                    lst = sandbox.commands.run(list_cmd)
+                    if lst.exit_code != 0:
+                        continue
+                    files = [p for p in lst.stdout.strip().split("\n") if p]
+                    for remote_extra in files:
+                        if not remote_extra:
+                            continue
+                        content = safe_download_bytes(sandbox, remote_extra)
+                        if content is None:
+                            print(f"Warning: failed to download optional canonical output {remote_extra}")
+                            continue
+                        if remote_extra.startswith(run_root):
+                            local_path = remote_extra[len(run_root):].lstrip("/")
+                        elif remote_extra.startswith("/home/user/"):
+                            local_path = remote_extra[len("/home/user/"):].lstrip("/")
+                        else:
+                            local_path = remote_extra.lstrip("/")
+                        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+                        with open(local_path, "wb") as f_local:
+                            f_local.write(content)
+                        downloaded_paths.append(local_path)
+                        print(f"Downloaded canonical output: {local_path}")
                 list_cmd = f"sh -c 'cd {run_root} && find . -maxdepth 5 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
                 outputs_listing = []
                 try:
