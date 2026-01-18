@@ -367,8 +367,14 @@ def write_run_manifest(
     run_dir = get_run_dir(run_id) or os.path.join(RUNS_DIR, run_id)
     csv_path = state.get("csv_path") or ""
     contracts_dir = os.path.join(run_dir, "contracts")
-    contract = _safe_load_json(os.path.join(contracts_dir, "execution_contract.json")) or state.get("execution_contract") or {}
-    evaluation_spec = _safe_load_json(os.path.join(contracts_dir, "evaluation_spec.json")) or state.get("evaluation_spec") or {}
+    work_dir = state.get("work_dir_abs") or state.get("work_dir") or ""
+    work_dir_abs = os.path.abspath(work_dir) if work_dir else ""
+    work_contract_path = os.path.join(work_dir_abs, "data", "execution_contract.json") if work_dir_abs else ""
+    work_eval_path = os.path.join(work_dir_abs, "data", "evaluation_spec.json") if work_dir_abs else ""
+    work_contract = _safe_load_json(work_contract_path) if work_contract_path else None
+    work_eval = _safe_load_json(work_eval_path) if work_eval_path else None
+    contract = work_contract or _safe_load_json(os.path.join(contracts_dir, "execution_contract.json")) or state.get("execution_contract") or {}
+    evaluation_spec = work_eval or _safe_load_json(os.path.join(contracts_dir, "evaluation_spec.json")) or state.get("evaluation_spec") or {}
     artifact_index = (
         _safe_load_json(os.path.join(run_dir, "artifacts", "data", "produced_artifact_index.json"))
         or state.get("produced_artifact_index")
@@ -421,10 +427,11 @@ def write_run_manifest(
             "status_final": status_final or existing_dict.get("status_final") or gates_summary.get("status"),
             "gates_summary": gates_summary,
             "contracts": {
-                "execution_contract": os.path.exists(os.path.join(contracts_dir, "execution_contract.json")),
-                "evaluation_spec": os.path.exists(os.path.join(contracts_dir, "evaluation_spec.json")),
+                "execution_contract": bool(work_contract) or os.path.exists(os.path.join(contracts_dir, "execution_contract.json")),
+                "evaluation_spec": bool(work_eval) or os.path.exists(os.path.join(contracts_dir, "evaluation_spec.json")),
                 "artifact_index": os.path.exists(os.path.join(contracts_dir, "artifact_index.json")),
-                "contract_min": os.path.exists(os.path.join(contracts_dir, "contract_min.json")),
+                "contract_min": os.path.exists(os.path.join(contracts_dir, "contract_min.json"))
+                or (bool(work_dir_abs) and os.path.exists(os.path.join(work_dir_abs, "data", "contract_min.json"))),
             },
         }
     )

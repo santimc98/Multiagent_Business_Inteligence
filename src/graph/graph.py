@@ -3832,6 +3832,59 @@ def _load_json_any(path: str) -> Any:
     except Exception:
         return None
 
+
+def _abs_in_work(work_dir: str, rel: str) -> str:
+    return os.path.normpath(os.path.join(work_dir, rel))
+
+
+def _resolve_work_dir_abs(state: Dict[str, Any] | None) -> str:
+    work_dir = ""
+    if isinstance(state, dict):
+        work_dir = state.get("work_dir_abs") or state.get("work_dir") or ""
+    if not work_dir:
+        work_dir = "."
+    work_dir_abs = os.path.abspath(work_dir)
+    if isinstance(state, dict):
+        state["work_dir_abs"] = work_dir_abs
+    return work_dir_abs
+
+
+def _verify_run_bundle_contracts(
+    run_id: str,
+    expected_contract: Dict[str, Any] | None,
+    work_dir_abs: str,
+) -> None:
+    if not run_id or not work_dir_abs:
+        return
+    run_dir = get_run_dir(run_id) or os.path.join("runs", run_id)
+    contracts_dir = os.path.join(run_dir, "contracts")
+    contract_path = os.path.join(contracts_dir, "execution_contract.json")
+    loaded = _load_json_safe(contract_path)
+    expected_title = ""
+    if isinstance(expected_contract, dict):
+        expected_title = str(expected_contract.get("strategy_title") or "")
+    observed_title = str(loaded.get("strategy_title") or "")
+    if not expected_title or expected_title == observed_title:
+        return
+    log_run_event(
+        run_id,
+        "run_bundle_contract_mismatch",
+        {
+            "expected_strategy_title": expected_title,
+            "observed_strategy_title": observed_title,
+            "contracts_path": contract_path,
+        },
+    )
+    copy_run_contracts(
+        run_id,
+        [
+            _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+            _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
+            _abs_in_work(work_dir_abs, "data/plan.json"),
+            _abs_in_work(work_dir_abs, "data/contract_min.json"),
+        ],
+    )
+
 def _resolve_artifact_gate_dialect(state: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str, str]:
     csv_sep = state.get("csv_sep") or None
     csv_decimal = state.get("csv_decimal") or None
@@ -5700,6 +5753,7 @@ class AgentState(TypedDict):
     pdf_path: str
     orig_cwd: str
     work_dir: str
+    work_dir_abs: str
     workspace_active: bool
     # Encoding & CSV Format
     csv_encoding: str
@@ -5804,6 +5858,7 @@ def run_steward(state: AgentState) -> AgentState:
 
     # P0 FIX: Enter isolated run workspace to prevent cross-run contamination
     state = enter_run_workspace(state, run_dir)
+    state["work_dir_abs"] = os.path.abspath(state.get("work_dir") or ".")
 
     # P0 FIX: Clean workspace AFTER entering (cleans work_dir, not repo root)
     clean_workspace_outputs()
@@ -6197,26 +6252,29 @@ def run_execution_planner(state: AgentState) -> AgentState:
         except Exception:
             contract_min = None
     _maybe_set_contract_min_policy(contract_min, merged_policy if isinstance(merged_policy, dict) else {})
+    work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
     try:
-        os.makedirs("data", exist_ok=True)
-        dump_json("data/execution_contract.json", contract)
-        dump_json("data/plan.json", execution_plan)
+        data_dir = _abs_in_work(work_dir_abs, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        dump_json(_abs_in_work(work_dir_abs, "data/execution_contract.json"), contract)
+        dump_json(_abs_in_work(work_dir_abs, "data/plan.json"), execution_plan)
         if evaluation_spec:
-            dump_json("data/evaluation_spec.json", evaluation_spec)
+            dump_json(_abs_in_work(work_dir_abs, "data/evaluation_spec.json"), evaluation_spec)
         if contract_min:
-            dump_json("data/contract_min.json", contract_min)
+            dump_json(_abs_in_work(work_dir_abs, "data/contract_min.json"), contract_min)
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
     if run_id:
         copy_run_contracts(
             run_id,
             [
-                "data/execution_contract.json",
-                "data/evaluation_spec.json",
-                "data/plan.json",
-                "data/contract_min.json",
+                _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+                _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
+                _abs_in_work(work_dir_abs, "data/plan.json"),
+                _abs_in_work(work_dir_abs, "data/contract_min.json"),
             ],
         )
+        _verify_run_bundle_contracts(run_id, contract, work_dir_abs)
     view_payload = _build_contract_views(state if isinstance(state, dict) else {}, contract, contract_min)
     if view_payload.get("contract_views"):
         try:
@@ -10833,9 +10891,14 @@ def run_translator(state: AgentState) -> AgentState:
         if run_dir:
             preview_root = os.path.join(run_dir, "artifacts")
             try:
+                work_dir_abs = _resolve_work_dir_abs(report_state if isinstance(report_state, dict) else None)
                 copy_run_artifacts(
                     run_id,
-                    ["data", "reports", "static"],
+                    [
+                        _abs_in_work(work_dir_abs, "data"),
+                        _abs_in_work(work_dir_abs, "reports"),
+                        _abs_in_work(work_dir_abs, "static"),
+                    ],
                     since_epoch=state.get("run_start_epoch"),
                 )
             except Exception:
@@ -11013,31 +11076,38 @@ def run_translator(state: AgentState) -> AgentState:
         if run_id:
             finalize_run_log(run_id, summary)
             log_run_event(run_id, "translator_complete", {"report_len": len(report or "")})
+            work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
             copy_run_contracts(
                 run_id,
                 [
-                    "data/execution_contract.json",
-                    "data/evaluation_spec.json",
-                    "data/produced_artifact_index.json",
-                    "data/contract_min.json",
+                    _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+                    _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
+                    _abs_in_work(work_dir_abs, "data/produced_artifact_index.json"),
+                    _abs_in_work(work_dir_abs, "data/contract_min.json"),
                 ],
             )
+            _verify_run_bundle_contracts(run_id, state.get("execution_contract") or {}, work_dir_abs)
             since_epoch = state.get("run_start_epoch")
             copy_run_artifacts(
                 run_id,
                 [
-                    "data",
-                    "analysis",
-                    "models",
-                    "plots",
-                    os.path.join("static", "plots"),
+                    _abs_in_work(work_dir_abs, "data"),
+                    _abs_in_work(work_dir_abs, "analysis"),
+                    _abs_in_work(work_dir_abs, "models"),
+                    _abs_in_work(work_dir_abs, "plots"),
+                    _abs_in_work(work_dir_abs, os.path.join("static", "plots")),
                 ],
                 since_epoch=since_epoch,
             )
-            report_sources = ["report", "reports"]
+            report_sources = [
+                _abs_in_work(work_dir_abs, "report"),
+                _abs_in_work(work_dir_abs, "reports"),
+            ]
             pdf_path = report_state.get("pdf_path") or state.get("pdf_path")
             if pdf_path:
-                report_sources.append(pdf_path)
+                report_sources.append(
+                    pdf_path if os.path.isabs(pdf_path) else _abs_in_work(work_dir_abs, pdf_path)
+                )
             copy_run_reports(run_id, report_sources, since_epoch=since_epoch)
             if pdf_path and state.get("run_bundle_dir"):
                 try:
