@@ -10,6 +10,7 @@ from string import Template
 import json
 from typing import Dict, Any, Optional, List
 from src.utils.prompting import render_prompt
+from src.utils.senior_protocol import SENIOR_TRANSLATION_PROTOCOL
 from src.utils.csv_dialect import (
     load_output_dialect,
     sniff_csv_dialect,
@@ -543,6 +544,9 @@ class BusinessTranslatorAgent:
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
         run_summary = _safe_load_json("data/run_summary.json") or {}
+        run_facts_pack = state.get("run_facts_pack") or _safe_load_json("data/run_facts_pack.json") or {}
+        if not isinstance(run_facts_pack, dict):
+            run_facts_pack = {}
         recommendations_preview = _safe_load_json("reports/recommendations_preview.json") or {}
         metrics_payload = _safe_load_json("data/metrics.json") or {}
         weights_path = _first_artifact_path(artifact_index, "weights")
@@ -685,8 +689,10 @@ class BusinessTranslatorAgent:
 
         def _summarize_run():
             if not run_summary:
+                if run_facts_pack:
+                    return {"status": None, "run_outcome": None, "run_facts_pack": run_facts_pack}
                 return "No run_summary.json."
-            return {
+            payload = {
                 "status": run_summary.get("status"),
                 "run_outcome": run_summary.get("run_outcome"),
                 "failed_gates": run_summary.get("failed_gates", []),
@@ -696,6 +702,9 @@ class BusinessTranslatorAgent:
                 "ceiling_reason": run_summary.get("ceiling_reason"),
                 "baseline_vs_model": run_summary.get("baseline_vs_model", []),
             }
+            if run_facts_pack:
+                payload["run_facts_pack"] = run_facts_pack
+            return payload
 
         def _summarize_gate_context():
             gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context") or {}
@@ -883,6 +892,9 @@ class BusinessTranslatorAgent:
         
         TONE: Professional, evidence-driven, decisive. Avoid unnecessary jargon.
         STYLE: Prioritize decision, evidence, risks, and next actions. No fluff.
+
+        === SENIOR TRANSLATION PROTOCOL ===
+        $senior_translation_protocol
         
         *** FORMATTING CONSTRAINTS (CRITICAL) ***
         1. **LANGUAGE:** DETECT the language of the 'Business Objective' in the state. GENERATE THE REPORT IN THAT SAME LANGUAGE. (If objective is Spanish, output Spanish).
@@ -1069,6 +1081,7 @@ class BusinessTranslatorAgent:
             compliance=compliance,
             executive_decision_label=executive_decision_label,
             error_condition=error_condition_str,
+            senior_translation_protocol=SENIOR_TRANSLATION_PROTOCOL,
             visuals_context_json=visuals_context_json,
             analysis_type=analysis_type,
             contract_context=json.dumps(contract_context, ensure_ascii=False),

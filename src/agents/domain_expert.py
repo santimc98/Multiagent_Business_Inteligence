@@ -4,6 +4,7 @@ import re
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from openai import OpenAI
+from src.utils.senior_protocol import SENIOR_STRATEGY_PROTOCOL
 
 load_dotenv()
 
@@ -38,6 +39,9 @@ class DomainExpertAgent:
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Industry Expert and Business Analyst.
         Your goal is to critique technical data science proposals and select the one that delivers maximum BUSINESS VALUE.
+
+        === SENIOR STRATEGY PROTOCOL ===
+        $senior_strategy_protocol
         
         *** BUSINESS OBJECTIVE ***
         "$business_objective"
@@ -53,14 +57,14 @@ class DomainExpertAgent:
         1. **Business Alignment:** Does it directly answer the business question? (High score) or just explore data? (Low score).
         2. **Technical Feasibility:** Do we have the data? Is the approach realistic given dataset size and complexity?
         3. **Implementability:** Can our AI engineers (ML + Data) execute this with their capabilities?
-           - Consider dataset size from data summary (small n = harder for complex models)
-           - Penalize strategies that require capabilities engineers lack (e.g. causal inference with n<500)
+           - Consider dataset scale hints from the data summary (small/medium/large).
+           - Penalize complex techniques when data scale is small or limited.
            - Reward strategies with fallback plans for complex approaches
         4. **Risk Assessment:** Overfitting risk? "Black box" non-explainability where transparency is needed?
         
         Implementability Guidelines:
-        - Small datasets (n<500) + Complex techniques (causal, elasticity) = Lower score (-1 to -2 pts)
-        - Large datasets (n>=500) + Standard techniques (LR, RF, segmentation) = Higher score
+        - Small or limited scale + Complex techniques (causal, elasticity) = Lower score (-1 to -2 pts)
+        - Medium/large scale + Standard techniques (LR, RF, segmentation) = Higher score
         - Strategies with explicit fallbacks = Bonus (+0.5 pts) for risk mitigation
         
         *** OUTPUT FORMAT ***
@@ -83,7 +87,8 @@ class DomainExpertAgent:
             SYSTEM_PROMPT_TEMPLATE,
             business_objective=business_objective,
             data_summary=data_summary,
-            strategies_text=strategies_text
+            strategies_text=strategies_text,
+            senior_strategy_protocol=SENIOR_STRATEGY_PROTOCOL,
         )
         self.last_prompt = system_prompt
         

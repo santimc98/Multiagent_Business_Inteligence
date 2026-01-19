@@ -58,13 +58,16 @@ def test_manifest_roundtrip_upload():
         assert mock_instance.files.write.call_count >= 3 # csv + manifest*2
         
         # 2. Verify Code Patching
-        # The code passed to run_code should have the remote path
-        args, _ = mock_instance.run_code.call_args
-        executed_code = args[0]
+        # The code written to the sandbox should include manifest bindings
+        code_payloads = [
+            args[1]
+            for args, _ in mock_instance.files.write.call_args_list
+            if len(args) >= 2 and isinstance(args[1], str)
+        ]
+        executed_code = "\n".join(code_payloads)
         
+        assert "MANIFEST_PATH" in executed_code
         assert "cleaning_manifest.json" in executed_code
-        # Ensure older path is NOT present if we replaced it (assuming input had it)
-        # But input didn't have it in this simple string. Let's make input have it
         
 def test_manifest_patching_logic():
     state = {
@@ -91,13 +94,15 @@ def test_manifest_patching_logic():
         # Capture executed code
         result = execute_code(state)
         
-        # Verify run_code called
-        if not mock_instance.run_code.called:
-            pytest.fail("sandbox.run_code was NOT called. Execution logic skipped?")
-            
-        args, _ = mock_instance.run_code.call_args
-        executed_code = args[0]
+        # Verify code was uploaded and patched
+        code_payloads = [
+            args[1]
+            for args, _ in mock_instance.files.write.call_args_list
+            if len(args) >= 2 and isinstance(args[1], str)
+        ]
+        executed_code = "\n".join(code_payloads)
         
-        assert "/cleaning_manifest.json" in executed_code
+        assert "MANIFEST_PATH" in executed_code
         assert "/home/user/run/testrun/ml_engineer/" in executed_code
-        assert "data/cleaning_manifest.json" not in executed_code # Replaced
+        assert "open('data/cleaning_manifest.json')" not in executed_code
+        assert "pd.read_csv('./data/cleaned_data.csv')" not in executed_code

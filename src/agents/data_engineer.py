@@ -1,10 +1,12 @@
 import os
 import re
 import ast
+import json
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.code_extract import extract_code_block
+from src.utils.senior_protocol import SENIOR_ENGINEERING_PROTOCOL
 from openai import OpenAI
 
 load_dotenv()
@@ -89,7 +91,6 @@ class DataEngineerAgent:
         Generates a Python script to clean and standardize the dataset.
         """
         from src.utils.prompting import render_prompt
-        import json
 
         contract = contract_min or execution_contract or {}
         contract_json = json.dumps(contract, indent=2)
@@ -106,6 +107,9 @@ class DataEngineerAgent:
         # SYSTEM TEMPLATE with PYTHON SYNTAX GOTCHAS (Fix CAUSA RAÍZ 3)
         SYSTEM_TEMPLATE = """
         You are a Senior Data Engineer. Produce a robust cleaning SCRIPT for downstream ML.
+
+        === SENIOR ENGINEERING PROTOCOL ===
+        $senior_engineering_protocol
         
         *** HARD CONSTRAINTS (VIOLATION = FAILURE) ***
         1. OUTPUT VALID PYTHON CODE ONLY (no markdown/code fences).
@@ -123,6 +127,12 @@ class DataEngineerAgent:
            nulls_before = original_nulls; nulls_after_na = int(cleaned.isna().sum()); filled_nulls = original_nulls.
         9. SAFE READ: You MUST read input with pd.read_csv(..., dtype=str, low_memory=False) to preserve ID fidelity.
            If you choose not to use dtype=str, you MUST define dtype/converters for identifier-like columns (id/key/cod/entity).
+
+        COMMENT BLOCK REQUIREMENT:
+        - At the top of the script, include comment sections:
+          # Decision Log:
+          # Assumptions:
+          # Risks & Checks:
 
         *** SCOPE OF WORK (NON-NEGOTIABLE) ***
         - Output ONLY: data/cleaned_data.csv and data/cleaning_manifest.json.
@@ -184,6 +194,7 @@ class DataEngineerAgent:
             contract_min_context=contract_json,
             de_view_context=de_view_json,
             data_engineer_runbook=de_runbook_json,
+            senior_engineering_protocol=SENIOR_ENGINEERING_PROTOCOL,
         )
         self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE
         print(f"DEBUG: DE System Prompt Len: {len(system_prompt)}")

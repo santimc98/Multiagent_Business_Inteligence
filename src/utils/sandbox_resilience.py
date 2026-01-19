@@ -228,12 +228,19 @@ def run_code_with_optional_timeout(sandbox: Any, code: str, timeout_s: Optional[
     """
     run_code = getattr(sandbox, "run_code", None)
     if callable(run_code):
-        sig = inspect.signature(run_code)
-        if "timeout" in sig.parameters:
+        supports_timeout = False
+        try:
+            sig = inspect.signature(run_code)
+            supports_timeout = "timeout" in sig.parameters
+        except (ValueError, TypeError):
+            supports_timeout = False
+        if supports_timeout:
             if timeout_s is not None:
                 return run_code(code, timeout=timeout_s)
             return run_code(code)
         if timeout_s is None:
+            return run_code(code)
+        if timeout_s is not None and timeout_s <= 120:
             return run_code(code)
 
     return _run_code_via_commands_run(sandbox, code, timeout_s=timeout_s)

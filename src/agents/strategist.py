@@ -5,6 +5,7 @@ from typing import Dict, Any, List
 from dotenv import load_dotenv
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from src.utils.senior_protocol import SENIOR_STRATEGY_PROTOCOL
 
 load_dotenv()
 
@@ -49,6 +50,9 @@ class StrategistAgent:
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Chief Data Strategist inside a multi-agent system. Your goal is to craft ONE optimal strategy
         that downstream AI engineers can execute successfully.
+
+        === SENIOR STRATEGY PROTOCOL ===
+        $senior_strategy_protocol
 
         *** DATASET SUMMARY ***
         $data_summary
@@ -121,15 +125,15 @@ class StrategistAgent:
         ⚠️ Limited: Complex feature engineering, advanced imputation strategies
         ❌ Cannot: External data joins, API calls, database writes
         
-        Dataset Size Guidelines (UNIVERSAL):
-        - If n < 200: Recommend DESCRIPTIVE approaches (segmentation, summary statistics, simple viz)
-        - If n < 500: Recommend SIMPLE PREDICTIVE (baseline models, segmentation + LR, avoid complex causal)
-        - If n >= 500: Full modeling freedom (complex models, elasticity, causal if data supports)
+        Dataset Scale Guidance (UNIVERSAL):
+        - Use dataset_scale_hints or the data summary to infer small/medium/large.
+        - Small or limited scale: favor simple, interpretable approaches; penalize complexity.
+        - Medium or large scale: allow more complex methods if justified, but prefer robust baselines.
         
         Strategy Complexity Rules:
-        1. Small datasets (n<500): Prefer simple, interpretable models (LR, KMeans) over complex (GBM, causal)
+        1. Small or limited datasets: Prefer simple, interpretable models over complex methods.
         2. If proposing COMPLEX techniques (elasticity modeling, causal inference, multi-stage optimization):
-           → Include FALLBACK to simpler approach (e.g., "If modeling fails, use descriptive segmentation")
+           → Include FALLBACK to a simpler approach if data limits apply.
         3. Always consider: Can this be implemented with available data and engineer capabilities?
         
         Implementation Feasibility Check:
@@ -184,12 +188,14 @@ class StrategistAgent:
           }
         - "required_columns": Use EXACT column names from the dataset summary.
         - "objective_reasoning" is MANDATORY and must connect business goal → objective_type.
+        - "reasoning" must include: why this fits the objective, what could fail, and a fallback if data limits apply.
         """
         
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
             data_summary=data_summary,
-            user_request=user_request
+            user_request=user_request,
+            senior_strategy_protocol=SENIOR_STRATEGY_PROTOCOL,
         )
         self.last_prompt = system_prompt
         

@@ -142,6 +142,7 @@ from src.utils.recommendations_preview import build_recommendations_preview
 from src.utils.label_enrichment import enrich_outputs
 from src.utils.ml_validation import validate_model_metrics_consistency, validate_metrics_ci_consistency
 from src.utils.json_sanitize import dump_json
+from src.utils.run_facts_pack import build_run_facts_pack, format_run_facts_block
 from src.utils.sandbox_paths import (
     CANONICAL_RAW_REL,
     CANONICAL_CLEANED_REL,
@@ -291,6 +292,49 @@ def _truncate_text(text: str, max_len: int = 18000, head_len: int = 10000, tail_
     if safe_head + safe_tail < max_len:
         safe_head = max_len - safe_tail
     return text[:safe_head] + "\n...[TRUNCATED]...\n" + text[-safe_tail:]
+
+
+def _refresh_run_facts_pack(state: Dict[str, Any]) -> None:
+    if not isinstance(state, dict):
+        return
+    try:
+        run_facts = build_run_facts_pack(state)
+    except Exception as err:
+        print(f"Warning: failed to build run_facts_pack: {err}")
+        return
+    state["run_facts_pack"] = run_facts
+    try:
+        state["run_facts_block"] = format_run_facts_block(run_facts)
+    except Exception:
+        state["run_facts_block"] = ""
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/run_facts_pack.json", run_facts)
+    except Exception as err:
+        print(f"Warning: failed to persist run_facts_pack.json: {err}")
+    try:
+        run_bundle_dir = state.get("run_bundle_dir")
+        src_path = os.path.abspath(os.path.join("data", "run_facts_pack.json"))
+        if run_bundle_dir and os.path.exists(src_path):
+            dest_path = os.path.join(run_bundle_dir, "artifacts", "run_facts_pack.json")
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            shutil.copy2(src_path, dest_path)
+    except Exception as err:
+        print(f"Warning: failed to copy run_facts_pack.json into bundle: {err}")
+
+
+def _append_run_facts_block(text: str, state: Dict[str, Any]) -> str:
+    if not isinstance(state, dict):
+        return text
+    block = state.get("run_facts_block")
+    if not block:
+        _refresh_run_facts_pack(state)
+        block = state.get("run_facts_block")
+    if not block:
+        return text
+    if text:
+        return f"{text}\n\n{block}"
+    return block
 
 _ABORT_EVENT = threading.Event()
 
@@ -5900,6 +5944,9 @@ class AgentState(TypedDict):
     csv_decimal: str
     dataset_scale_hints: Dict[str, Any]
     dataset_scale: str
+    column_inventory: List[str]
+    run_facts_pack: Dict[str, Any]
+    run_facts_block: str
     # Reviewer State
     review_verdict: str
     review_feedback: str
@@ -6052,6 +6099,12 @@ def run_steward(state: AgentState) -> AgentState:
     encoding = result.get('encoding', 'utf-8')
     sep = result.get('sep', ',')
     decimal = result.get('decimal', '.')
+    if isinstance(state, dict):
+        state["data_summary"] = summary
+        state["csv_encoding"] = encoding
+        state["csv_sep"] = sep
+        state["csv_decimal"] = decimal
+        _refresh_run_facts_pack(state)
     write_manifest_partial(
         run_id=run_id,
         manifest_path=os.path.join(run_dir, "run_manifest.json"),
@@ -6138,6 +6191,7 @@ def run_steward(state: AgentState) -> AgentState:
         if "dataset_profile" in result:
             steward_payload["dataset_profile"] = result.get("dataset_profile")
     steward_payload = _add_workspace_metadata(steward_payload, state, orig_cwd_pre, run_dir)
+    _refresh_run_facts_pack(steward_payload)
     return steward_payload
 
 def run_strategist(state: AgentState) -> AgentState:
@@ -6148,7 +6202,8 @@ def run_strategist(state: AgentState) -> AgentState:
 
     # Strategist now returns a dict with "strategies": [list of 3]
     user_context = state.get("strategist_context_override") or state.get("business_objective", "")
-    result = strategist.generate_strategies(state['data_summary'], user_context)
+    data_summary = _append_run_facts_block(state.get("data_summary", ""), state)
+    result = strategist.generate_strategies(data_summary, user_context)
     run_id = state.get("run_id")
     if run_id:
         log_agent_snapshot(
@@ -6156,7 +6211,7 @@ def run_strategist(state: AgentState) -> AgentState:
             "strategist",
             prompt=getattr(strategist, "last_prompt", None),
             response=getattr(strategist, "last_response", None) or result,
-            context={"data_summary": state.get("data_summary", ""), "user_context": user_context},
+            context={"data_summary": data_summary, "user_context": user_context},
         )
     strategies_list = result.get('strategies', [])
     strategy_spec = result.get("strategy_spec", {})
@@ -6195,7 +6250,7 @@ def run_domain_expert(state: AgentState) -> AgentState:
     strategies_wrapper = state.get('strategies', {})
     strategies_list = strategies_wrapper.get('strategies', [])
     business_objective = state.get("business_objective", "")
-    data_summary = state.get('data_summary', '')
+    data_summary = _append_run_facts_block(state.get('data_summary', ''), state)
 
     # Deliberation Step
     evaluation = domain_expert.evaluate_strategies(data_summary, business_objective, strategies_list)
@@ -6457,6 +6512,13 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 result["max_runtime_fix_attempts"] = max(1, int(runtime_fix_max))
             except Exception:
                 pass
+    result["column_inventory"] = column_inventory
+    merged_state = dict(state or {})
+    merged_state.update(result)
+    _refresh_run_facts_pack(merged_state)
+    if merged_state.get("run_facts_pack"):
+        result["run_facts_pack"] = merged_state.get("run_facts_pack")
+        result["run_facts_block"] = merged_state.get("run_facts_block")
     if run_id:
         log_agent_snapshot(
             run_id,
@@ -6595,6 +6657,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
     # except Exception as e:
     #     print(f"Warning: could not read raw snippet for DE: {e}")
 
+    data_engineer_audit_override = _append_run_facts_block(data_engineer_audit_override, state)
     state["data_engineer_audit_override"] = data_engineer_audit_override
     contract_min = state.get("execution_contract_min") or _load_json_safe("data/contract_min.json") or {}
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
@@ -7032,6 +7095,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
         local_cleaned_path = "data/cleaned_data.csv"
         local_manifest_path = "data/cleaning_manifest.json"
         output_log = ""
+        downloaded_cleaned_content = None
+        downloaded_paths: List[str] = []
         if is_plan:
             try:
                 plan_exec = dict(plan_payload or {})
@@ -7117,210 +7182,206 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
                         f"os.chdir(r\"{run_root}\")\n"
                     )
-                code = working_dir_injection + code
-                print("Executing Cleaning Script in Sandbox...")
-                script_path = f"{run_root}/cleaning.py"
-                sandbox.files.write(script_path, code)
-                execution = run_python_file_with_optional_timeout(
-                    sandbox,
-                    script_path,
-                    timeout_s=DE_TIMEOUT_S,
-                    workdir=run_root,
-                )
+                    code = working_dir_injection + code
+                    print("Executing Cleaning Script in Sandbox...")
+                    script_path = f"{run_root}/cleaning.py"
+                    sandbox.files.write(script_path, code)
+                    execution = run_python_file_with_optional_timeout(
+                        sandbox,
+                        script_path,
+                        timeout_s=DE_TIMEOUT_S,
+                        workdir=run_root,
+                    )
 
-                # Capture Output
-                stdout_text = "\n".join(execution.logs.stdout or [])
-                stderr_text = "\n".join(execution.logs.stderr or [])
-                output_log = ""
-                if stdout_text:
-                    output_log += stdout_text
-                if stderr_text:
-                    output_log += stderr_text
-                try:
-                    os.makedirs("artifacts", exist_ok=True)
-                    with open(os.path.join("artifacts", "data_engineer_sandbox_last.log"), "w", encoding="utf-8") as f_log:
-                        f_log.write(output_log or "")
-                except Exception as log_err:
-                    print(f"Warning: failed to persist data_engineer_sandbox_last.log: {log_err}")
-
-                if execution.error:
-                    error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
-                    print(f"Cleaning Failed in Sandbox: {error_details}")
-                    error_payload = {
-                        "stage": "execution_error",
-                        "exception_type": execution.error.name,
-                        "exception_msg": execution.error.value,
-                        "traceback": execution.error.traceback,
-                        "attempt": attempt_id,
-                    }
+                    # Capture Output
+                    stdout_text = "\n".join(execution.logs.stdout or [])
+                    stderr_text = "\n".join(execution.logs.stderr or [])
+                    output_log = ""
+                    if stdout_text:
+                        output_log += stdout_text
+                    if stderr_text:
+                        output_log += stderr_text
                     try:
                         os.makedirs("artifacts", exist_ok=True)
-                        with open(
-                            os.path.join("artifacts", "data_engineer_sandbox_last_error.json"),
-                            "w",
-                            encoding="utf-8",
-                        ) as f_err:
-                            json.dump(error_payload, f_err, indent=2, ensure_ascii=True)
-                    except Exception as err:
-                        print(f"Warning: failed to persist data_engineer_sandbox_last_error.json: {err}")
-                    outputs_listing = []
-                    try:
-                        listing_proc = sandbox.commands.run(
-                            f"sh -c 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
-                        )
-                        if listing_proc.exit_code == 0:
-                            outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
-                    except Exception:
+                        with open(os.path.join("artifacts", "data_engineer_sandbox_last.log"), "w", encoding="utf-8") as f_log:
+                            f_log.write(output_log or "")
+                    except Exception as log_err:
+                        print(f"Warning: failed to persist data_engineer_sandbox_last.log: {log_err}")
+
+                    if execution.error:
+                        error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+                        print(f"Cleaning Failed in Sandbox: {error_details}")
+                        error_payload = {
+                            "stage": "execution_error",
+                            "exception_type": execution.error.name,
+                            "exception_msg": execution.error.value,
+                            "traceback": execution.error.traceback,
+                            "attempt": attempt_id,
+                        }
+                        try:
+                            os.makedirs("artifacts", exist_ok=True)
+                            with open(
+                                os.path.join("artifacts", "data_engineer_sandbox_last_error.json"),
+                                "w",
+                                encoding="utf-8",
+                            ) as f_err:
+                                json.dump(error_payload, f_err, indent=2, ensure_ascii=True)
+                        except Exception as err:
+                            print(f"Warning: failed to persist data_engineer_sandbox_last_error.json: {err}")
                         outputs_listing = []
-                    if run_id:
-                        log_sandbox_attempt(
-                            run_id,
-                            step_name,
-                            attempt_id,
-                            code=code,
-                            stdout=stdout_text,
-                            stderr=stderr_text,
-                            outputs_listing=outputs_listing,
-                            downloaded_paths=[],
-                            exit_code=getattr(execution, "exit_code", None),
-                            error_tail=execution.error.traceback if execution.error else None,
-                            success=False,
-                            stage="execution_error",
-                            exception_type=execution.error.name,
-                            exception_msg=str(execution.error.value),
-                        )
-                    contract = state.get("execution_contract", {}) or {}
-                    derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
-                    if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
-                            new_state = dict(state)
-                            new_state["de_missing_derived_retry_done"] = True
-                            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                            try:
-                                override += (
-                                    "\n\nDERIVED_COLUMN_MISSING_GUARD: "
-                                    f"{derived_cols} are derived. Do not treat them as required input columns. "
-                                    "Only enforce source='input' columns after canonicalization; derive the rest."
-                                )
-                            except Exception:
-                                pass
-                            new_state["data_engineer_audit_override"] = override
-                            print("Derived column missing guard: retrying Data Engineer with derived-column guidance.")
-                            return run_data_engineer(new_state)
-                    if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
-                            new_state = dict(state)
-                            new_state["de_actual_column_guard_retry_done"] = True
-                            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                            try:
-                                override += (
-                                    "\n\nVALIDATION_PRINT_GUARD: Use actual = str(result.get('actual_column') or 'MISSING') "
-                                    "before slicing; do not subscript None."
-                                )
-                            except Exception:
-                                pass
-                            new_state["data_engineer_audit_override"] = override
-                            print("Validation print guard: retrying Data Engineer with None-safe formatting.")
-                            return run_data_engineer(new_state)
-                    if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
-                            if not state.get("de_dtype_guard_retry_done"):
+                        try:
+                            listing_proc = sandbox.commands.run(
+                                f"sh -c 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+                            )
+                            if listing_proc.exit_code == 0:
+                                outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
+                        except Exception:
+                            outputs_listing = []
+                        if run_id:
+                            log_sandbox_attempt(
+                                run_id,
+                                step_name,
+                                attempt_id,
+                                code=code,
+                                stdout=stdout_text,
+                                stderr=stderr_text,
+                                outputs_listing=outputs_listing,
+                                downloaded_paths=[],
+                                exit_code=getattr(execution, "exit_code", None),
+                                error_tail=execution.error.traceback if execution.error else None,
+                                success=False,
+                                stage="execution_error",
+                                exception_type=execution.error.name,
+                                exception_msg=str(execution.error.value),
+                            )
+                        contract = state.get("execution_contract", {}) or {}
+                        derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
+                        if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
                                 new_state = dict(state)
-                                new_state["de_dtype_guard_retry_done"] = True
+                                new_state["de_missing_derived_retry_done"] = True
                                 override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                                 try:
                                     override += (
-                                        "\n\nDUPLICATE_COLUMN_GUARD: When reading dtype, handle duplicate column labels. "
-                                        "Use series = df[actual_col]; if isinstance(series, pd.DataFrame), "
-                                        "use series = series.iloc[:, 0] and log a warning."
+                                        "\n\nDERIVED_COLUMN_MISSING_GUARD: "
+                                        f"{derived_cols} are derived. Do not treat them as required input columns. "
+                                        "Only enforce source='input' columns after canonicalization; derive the rest."
                                     )
                                 except Exception:
                                     pass
                                 new_state["data_engineer_audit_override"] = override
-                                print("Duplicate column dtype guard: retrying Data Engineer.")
+                                print("Derived column missing guard: retrying Data Engineer with derived-column guidance.")
                                 return run_data_engineer(new_state)
-                    if not state.get("de_runtime_retry_done"):
-                            new_state = dict(state)
-                            new_state["de_runtime_retry_done"] = True
-                            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                            try:
-                                override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
-                                failure_cause = _infer_de_failure_cause(error_details)
-                                if failure_cause:
-                                    override += "\nWHY_IT_HAPPENED: " + failure_cause
-                                diagnosis_lines = _build_de_runtime_diagnosis(error_details)
-                                if diagnosis_lines:
-                                    override += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
-                                explainer_text = ""
+                        if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
+                                new_state = dict(state)
+                                new_state["de_actual_column_guard_retry_done"] = True
+                                override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                                 try:
-                                    required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
-                                    header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
-                                    norm_map = {}
-                                    for col in header_cols:
-                                        normed = _norm_name(col)
-                                        if normed and normed not in norm_map:
-                                            norm_map[normed] = col
-                                    required_raw_map = _build_required_raw_map(required_input, norm_map)
-                                    explainer_ctx = {
-                                        "strategy_title": selected.get("title", "") if selected else "",
-                                        "csv_dialect": input_dialect,
-                                        "required_input_columns": required_input,
-                                        "required_raw_header_map": required_raw_map,
-                                    }
-                                    explainer_text = failure_explainer.explain_data_engineer_failure(
-                                        code=code,
-                                        error_details=error_details,
-                                        context=explainer_ctx,
+                                    override += (
+                                        "\n\nVALIDATION_PRINT_GUARD: Use actual = str(result.get('actual_column') or 'MISSING') "
+                                        "before slicing; do not subscript None."
                                     )
-                                except Exception as explainer_err:
-                                    print(f"Warning: failure explainer failed: {explainer_err}")
-                                    explainer_text = ""
-                                if explainer_text:
-                                    override += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                                except Exception:
+                                    pass
+                                new_state["data_engineer_audit_override"] = override
+                                print("Validation print guard: retrying Data Engineer with None-safe formatting.")
+                                return run_data_engineer(new_state)
+                        if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
+                                if not state.get("de_dtype_guard_retry_done"):
+                                    new_state = dict(state)
+                                    new_state["de_dtype_guard_retry_done"] = True
+                                    override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                                     try:
-                                        os.makedirs("artifacts", exist_ok=True)
-                                        with open(
-                                            os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
-                                            "w",
-                                            encoding="utf-8",
-                                        ) as f_exp:
-                                            f_exp.write(explainer_text.strip())
-                                    except Exception as exp_err:
-                                        print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
-                            except Exception:
-                                pass
-                            new_state["data_engineer_audit_override"] = override
-                            print("Runtime error guard: retrying Data Engineer with error context.")
-                            return run_data_engineer(new_state)
-                    return {
-                        "cleaning_code": code,
-                        "cleaned_data_preview": "Error: Cleaning Failed",
-                        "error_message": f"Sandbox Cleaning Failed: {error_details}",
-                        "budget_counters": counters,
-                    }
-
-                    # 4. Verification & Download
-                    # Check if cleaned file exists
-                    ls_check = run_cmd_with_retry(sandbox, f"ls {run_root}/data/cleaned_data.csv", retries=2)
-                    if ls_check.exit_code != 0:
+                                        override += (
+                                            "\n\nDUPLICATE_COLUMN_GUARD: When reading dtype, handle duplicate column labels. "
+                                            "Use series = df[actual_col]; if isinstance(series, pd.DataFrame), "
+                                            "use series = series.iloc[:, 0] and log a warning."
+                                        )
+                                    except Exception:
+                                        pass
+                                    new_state["data_engineer_audit_override"] = override
+                                    print("Duplicate column dtype guard: retrying Data Engineer.")
+                                    return run_data_engineer(new_state)
+                        if not state.get("de_runtime_retry_done"):
+                                new_state = dict(state)
+                                new_state["de_runtime_retry_done"] = True
+                                override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                                try:
+                                    override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
+                                    failure_cause = _infer_de_failure_cause(error_details)
+                                    if failure_cause:
+                                        override += "\nWHY_IT_HAPPENED: " + failure_cause
+                                    diagnosis_lines = _build_de_runtime_diagnosis(error_details)
+                                    if diagnosis_lines:
+                                        override += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
+                                    explainer_text = ""
+                                    try:
+                                        required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+                                        header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+                                        norm_map = {}
+                                        for col in header_cols:
+                                            normed = _norm_name(col)
+                                            if normed and normed not in norm_map:
+                                                norm_map[normed] = col
+                                        required_raw_map = _build_required_raw_map(required_input, norm_map)
+                                        explainer_ctx = {
+                                            "strategy_title": selected.get("title", "") if selected else "",
+                                            "csv_dialect": input_dialect,
+                                            "required_input_columns": required_input,
+                                            "required_raw_header_map": required_raw_map,
+                                        }
+                                        explainer_text = failure_explainer.explain_data_engineer_failure(
+                                            code=code,
+                                            error_details=error_details,
+                                            context=explainer_ctx,
+                                        )
+                                    except Exception as explainer_err:
+                                        print(f"Warning: failure explainer failed: {explainer_err}")
+                                        explainer_text = ""
+                                    if explainer_text:
+                                        override += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                                        try:
+                                            os.makedirs("artifacts", exist_ok=True)
+                                            with open(
+                                                os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
+                                                "w",
+                                                encoding="utf-8",
+                                            ) as f_exp:
+                                                f_exp.write(explainer_text.strip())
+                                        except Exception as exp_err:
+                                            print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
+                                except Exception:
+                                    pass
+                                new_state["data_engineer_audit_override"] = override
+                                print("Runtime error guard: retrying Data Engineer with error context.")
+                                return run_data_engineer(new_state)
                         return {
                             "cleaning_code": code,
-                            "cleaned_data_preview": "Error: File Not Created",
-                            "error_message": f"Cleaning script finished but data/cleaned_data.csv was not found.\nLogs:\n{output_log}",
+                            "cleaned_data_preview": "Error: Cleaning Failed",
+                            "error_message": f"Sandbox Cleaning Failed: {error_details}",
                             "budget_counters": counters,
                         }
 
-                    # Persist DE artifact
-                    try:
-                        os.makedirs("artifacts", exist_ok=True)
-                        with open(os.path.join("artifacts", "data_engineer_last.py"), "w", encoding="utf-8") as f_art:
-                            f_art.write(code)
-                    except Exception as art_err:
-                        print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
+                        # 4. Verification & Download
+                        # Check if cleaned file exists
+                        ls_check = run_cmd_with_retry(sandbox, f"ls {run_root}/data/cleaned_data.csv", retries=2)
+                        ls_failed = bool(getattr(ls_check, "exit_code", 1) != 0)
+                        if ls_failed:
+                            print("Warning: cleaned_data.csv not confirmed by ls; attempting download anyway.")
 
-                    downloaded_paths = []
+                        # Persist DE artifact
+                        try:
+                            os.makedirs("artifacts", exist_ok=True)
+                            with open(os.path.join("artifacts", "data_engineer_last.py"), "w", encoding="utf-8") as f_art:
+                                f_art.write(code)
+                        except Exception as art_err:
+                            print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
 
-                    # Download Result (CSV) using centralized helper
-                    print("Downloading cleaned data...")
-                    local_cleaned_path = "data/cleaned_data.csv"
-                    os.makedirs("data", exist_ok=True)
+                        downloaded_paths = []
+
+                        # Download Result (CSV) using centralized helper
+                        print("Downloading cleaned data...")
+                        local_cleaned_path = "data/cleaned_data.csv"
+                        os.makedirs("data", exist_ok=True)
 
                     csv_content = safe_download_bytes(sandbox, f"{run_root}/data/cleaned_data.csv")
                     if csv_content is None:
@@ -7330,178 +7391,179 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "error_message": "Failed to download cleaned data from sandbox",
                             "budget_counters": counters,
                         }
+                    downloaded_cleaned_content = csv_content
                     with open(local_cleaned_path, "wb") as f_local:
                         f_local.write(csv_content)
                     if os.path.exists(local_cleaned_path):
                         downloaded_paths.append(local_cleaned_path)
 
-                    # Download Manifest (JSON) - Roundtrip Support using centralized helper
-                    print("Downloading cleaning manifest...")
-                    local_manifest_path = "data/cleaning_manifest.json"
-                    manifest_content = safe_download_bytes(sandbox, f"{run_root}/data/cleaning_manifest.json")
-                    if manifest_content is not None:
-                        with open(local_manifest_path, "wb") as f_local:
-                            f_local.write(manifest_content)
-                    else:
-                        print("Warning: Manifest download failed (not found?). Creating default.")
-                        # Create default manifest if missing
-                        default_manifest = {
-                            "input_dialect": {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal},
-                            "output_dialect": {"encoding": "utf-8", "sep": ",", "decimal": "."},
-                            "generated_by": "Host Fallback"
-                        }
-                        with open(local_manifest_path, "w") as f_def:
-                            json.dump(default_manifest, f_def)
-                    if os.path.exists(local_manifest_path):
-                        downloaded_paths.append(local_manifest_path)
-                    try:
-                        os.makedirs("artifacts", exist_ok=True)
-                        with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
-                            with open(local_manifest_path, "rb") as f_src:
-                                f_copy.write(f_src.read())
-                    except Exception as copy_err:
-                        print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
+                        # Download Manifest (JSON) - Roundtrip Support using centralized helper
+                        print("Downloading cleaning manifest...")
+                        local_manifest_path = "data/cleaning_manifest.json"
+                        manifest_content = safe_download_bytes(sandbox, f"{run_root}/data/cleaning_manifest.json")
+                        if manifest_content is not None:
+                            with open(local_manifest_path, "wb") as f_local:
+                                f_local.write(manifest_content)
+                        else:
+                            print("Warning: Manifest download failed (not found?). Creating default.")
+                            # Create default manifest if missing
+                            default_manifest = {
+                                "input_dialect": {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal},
+                                "output_dialect": {"encoding": "utf-8", "sep": ",", "decimal": "."},
+                                "generated_by": "Host Fallback"
+                            }
+                            with open(local_manifest_path, "w") as f_def:
+                                json.dump(default_manifest, f_def)
+                        if os.path.exists(local_manifest_path):
+                            downloaded_paths.append(local_manifest_path)
+                        try:
+                            os.makedirs("artifacts", exist_ok=True)
+                            with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
+                                with open(local_manifest_path, "rb") as f_src:
+                                    f_copy.write(f_src.read())
+                        except Exception as copy_err:
+                            print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
 
-                    manifest_data = {}
-                    try:
-                        with open(local_manifest_path, "r", encoding="utf-8") as f_manifest:
-                            manifest_data = json.load(f_manifest)
-                    except Exception:
                         manifest_data = {}
-                    manifest_alerts = _extract_manifest_alerts(
-                        manifest_data,
-                        _resolve_contract_columns(state.get("execution_contract", {}), sources={"derived", "output"})
-                    )
-                    if manifest_alerts and not state.get("de_manifest_guard_retry_done"):
-                        new_state = dict(state)
-                        new_state["de_manifest_guard_retry_done"] = True
-                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                        payload = "MANIFEST_ALERTS:\n" + "\n".join(f"- {alert}" for alert in manifest_alerts)
-                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-                        print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
-                        return run_data_engineer(new_state)
-
-                    outputs_listing = []
-                    try:
-                        listing_proc = sandbox.commands.run(
-                            f"sh -c 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+                        try:
+                            with open(local_manifest_path, "r", encoding="utf-8") as f_manifest:
+                                manifest_data = json.load(f_manifest)
+                        except Exception:
+                            manifest_data = {}
+                        manifest_alerts = _extract_manifest_alerts(
+                            manifest_data,
+                            _resolve_contract_columns(state.get("execution_contract", {}), sources={"derived", "output"})
                         )
-                        if listing_proc.exit_code == 0:
-                            outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
-                    except Exception:
+                        if manifest_alerts and not state.get("de_manifest_guard_retry_done"):
+                            new_state = dict(state)
+                            new_state["de_manifest_guard_retry_done"] = True
+                            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                            payload = "MANIFEST_ALERTS:\n" + "\n".join(f"- {alert}" for alert in manifest_alerts)
+                            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                            print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
+                            return run_data_engineer(new_state)
+
                         outputs_listing = []
-                    if run_id:
-                        log_sandbox_attempt(
-                            run_id,
-                            step_name,
-                            attempt_id,
-                            code=code,
-                            stdout=stdout_text,
-                            stderr=stderr_text,
-                            outputs_listing=outputs_listing,
-                            downloaded_paths=downloaded_paths,
-                            exit_code=getattr(execution, "exit_code", None),
-                            error_tail=(execution.error.traceback if execution.error else None),
-                            success=True,
-                            stage="completed",
-                        )
+                        try:
+                            listing_proc = sandbox.commands.run(
+                                f"sh -c 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+                            )
+                            if listing_proc.exit_code == 0:
+                                outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
+                        except Exception:
+                            outputs_listing = []
+                        if run_id:
+                            log_sandbox_attempt(
+                                run_id,
+                                step_name,
+                                attempt_id,
+                                code=code,
+                                stdout=stdout_text,
+                                stderr=stderr_text,
+                                outputs_listing=outputs_listing,
+                                downloaded_paths=downloaded_paths,
+                                exit_code=getattr(execution, "exit_code", None),
+                                error_tail=(execution.error.traceback if execution.error else None),
+                                success=True,
+                                stage="completed",
+                            )
 
-                    required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
-                    raw_rows = _count_raw_rows(csv_path, csv_encoding, csv_sep, csv_decimal)
-                    cleaned_encoding = None
-                    try:
-                        cleaned_encoding = (
-                            manifest_data.get("output_dialect", {}).get("encoding")
-                            if isinstance(manifest_data.get("output_dialect"), dict)
-                            else None
-                        )
-                    except Exception:
+                        required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+                        raw_rows = _count_raw_rows(csv_path, csv_encoding, csv_sep, csv_decimal)
                         cleaned_encoding = None
-                    cleaned_encoding = cleaned_encoding or "utf-8"
-                    cleaned_sep = None
-                    cleaned_decimal = None
-                    try:
-                        if isinstance(manifest_data.get("output_dialect"), dict):
-                            cleaned_sep = manifest_data["output_dialect"].get("sep")
-                            cleaned_decimal = manifest_data["output_dialect"].get("decimal")
-                    except Exception:
+                        try:
+                            cleaned_encoding = (
+                                manifest_data.get("output_dialect", {}).get("encoding")
+                                if isinstance(manifest_data.get("output_dialect"), dict)
+                                else None
+                            )
+                        except Exception:
+                            cleaned_encoding = None
+                        cleaned_encoding = cleaned_encoding or "utf-8"
                         cleaned_sep = None
                         cleaned_decimal = None
-                    cleaned_rows = _count_raw_rows(local_cleaned_path, cleaned_encoding, cleaned_sep, cleaned_decimal)
-                    row_drop_summary = _summarize_row_drop(
-                        manifest_data,
-                        required_input,
-                        initial_override=raw_rows,
-                        after_override=cleaned_rows,
-                    )
-                    if row_drop_summary and not state.get("de_row_drop_retry_done"):
-                        new_state = dict(state)
-                        new_state["de_row_drop_retry_done"] = True
-                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                        payload = (
-                            "CLEANING_RECOVERY_ALERT:\n"
-                            f"- rows_initial={row_drop_summary.get('initial')}\n"
-                            f"- rows_after={row_drop_summary.get('after')}\n"
-                            f"- drop_frac={row_drop_summary.get('drop_frac')}\n"
-                        )
-                        suspects = row_drop_summary.get("suspects") or []
-                        if suspects:
-                            payload += "SUSPECT_CONVERSIONS:\n" + json.dumps(suspects, ensure_ascii=True)
-                            try:
-                                header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
-                                norm_map = {}
-                                for col in header_cols:
-                                    normed = _norm_name(col)
-                                    if normed and normed not in norm_map:
-                                        norm_map[normed] = col
-                                suspect_cols = [item.get("column") for item in suspects if item.get("column")]
-                                sample_context = _build_required_sample_context(
-                                    csv_path, input_dialect, suspect_cols, norm_map, max_rows=200
-                                )
-                                if sample_context:
-                                    payload = f"{payload}\n\n{sample_context}"
-                            except Exception:
-                                pass
                         try:
-                            explainer_text = failure_explainer.explain_data_engineer_failure(
-                                code=code,
-                                error_details=payload,
-                                context={
-                                    "strategy_title": selected.get("title", "") if selected else "",
-                                    "csv_dialect": input_dialect,
-                                    "required_input_columns": required_input,
-                                    "row_drop_summary": row_drop_summary,
-                                },
+                            if isinstance(manifest_data.get("output_dialect"), dict):
+                                cleaned_sep = manifest_data["output_dialect"].get("sep")
+                                cleaned_decimal = manifest_data["output_dialect"].get("decimal")
+                        except Exception:
+                            cleaned_sep = None
+                            cleaned_decimal = None
+                        cleaned_rows = _count_raw_rows(local_cleaned_path, cleaned_encoding, cleaned_sep, cleaned_decimal)
+                        row_drop_summary = _summarize_row_drop(
+                            manifest_data,
+                            required_input,
+                            initial_override=raw_rows,
+                            after_override=cleaned_rows,
+                        )
+                        if row_drop_summary and not state.get("de_row_drop_retry_done"):
+                            new_state = dict(state)
+                            new_state["de_row_drop_retry_done"] = True
+                            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                            payload = (
+                                "CLEANING_RECOVERY_ALERT:\n"
+                                f"- rows_initial={row_drop_summary.get('initial')}\n"
+                                f"- rows_after={row_drop_summary.get('after')}\n"
+                                f"- drop_frac={row_drop_summary.get('drop_frac')}\n"
                             )
-                        except Exception as explainer_err:
-                            print(f"Warning: failure explainer failed: {explainer_err}")
-                            explainer_text = ""
-                        if explainer_text:
-                            payload = payload + "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                            suspects = row_drop_summary.get("suspects") or []
+                            if suspects:
+                                payload += "SUSPECT_CONVERSIONS:\n" + json.dumps(suspects, ensure_ascii=True)
+                                try:
+                                    header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+                                    norm_map = {}
+                                    for col in header_cols:
+                                        normed = _norm_name(col)
+                                        if normed and normed not in norm_map:
+                                            norm_map[normed] = col
+                                    suspect_cols = [item.get("column") for item in suspects if item.get("column")]
+                                    sample_context = _build_required_sample_context(
+                                        csv_path, input_dialect, suspect_cols, norm_map, max_rows=200
+                                    )
+                                    if sample_context:
+                                        payload = f"{payload}\n\n{sample_context}"
+                                except Exception:
+                                    pass
                             try:
-                                os.makedirs("artifacts", exist_ok=True)
-                                with open(
-                                    os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
-                                    "w",
-                                    encoding="utf-8",
-                                ) as f_exp:
-                                    f_exp.write(explainer_text.strip())
-                            except Exception as exp_err:
-                                print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
-                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-                        print("ROW_DROP_GUARD: retrying Data Engineer with recovery context.")
-                        return run_data_engineer(new_state)
+                                explainer_text = failure_explainer.explain_data_engineer_failure(
+                                    code=code,
+                                    error_details=payload,
+                                    context={
+                                        "strategy_title": selected.get("title", "") if selected else "",
+                                        "csv_dialect": input_dialect,
+                                        "required_input_columns": required_input,
+                                        "row_drop_summary": row_drop_summary,
+                                    },
+                                )
+                            except Exception as explainer_err:
+                                print(f"Warning: failure explainer failed: {explainer_err}")
+                                explainer_text = ""
+                            if explainer_text:
+                                payload = payload + "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                                try:
+                                    os.makedirs("artifacts", exist_ok=True)
+                                    with open(
+                                        os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
+                                        "w",
+                                        encoding="utf-8",
+                                    ) as f_exp:
+                                        f_exp.write(explainer_text.strip())
+                                except Exception as exp_err:
+                                    print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
+                            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                            print("ROW_DROP_GUARD: retrying Data Engineer with recovery context.")
+                            return run_data_engineer(new_state)
 
-                    print("Cleaning Success (Artifacts Downloaded).")
+                        print("Cleaning Success (Artifacts Downloaded).")
 
-                    # Apply output_dialect for downstream reads
-                    csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
-                        local_manifest_path, csv_sep, csv_decimal, csv_encoding
-                    )
-                    if dialect_updated:
-                        print(f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
+                        # Apply output_dialect for downstream reads
+                        csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
+                            local_manifest_path, csv_sep, csv_decimal, csv_encoding
+                        )
+                        if dialect_updated:
+                            print(f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
 
-                break  # Sandbox execution successful, exit retry loop
+                    break  # Sandbox execution successful, exit retry loop
               except Exception as e:
                 error_payload = {
                     "stage": "exception",
@@ -7553,13 +7615,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 raise
 
 
+        if not os.path.exists(local_cleaned_path) and downloaded_cleaned_content:
+            try:
+                os.makedirs(os.path.dirname(local_cleaned_path) or ".", exist_ok=True)
+                with open(local_cleaned_path, "wb") as f_local:
+                    f_local.write(downloaded_cleaned_content)
+            except Exception as write_err:
+                print(f"Warning: failed to restore cleaned data: {write_err}")
         if not os.path.exists(local_cleaned_path):
-            return {
-                "cleaning_code": code,
-                "cleaned_data_preview": "Error: File Not Created",
-                "error_message": f"Cleaning finished but {local_cleaned_path} was not found.\nLogs:\n{output_log}",
-                "budget_counters": counters,
-            }
+            print(f"Warning: cleaned data missing at {local_cleaned_path}; proceeding to reviewer checks.")
         if not os.path.exists(local_manifest_path):
             default_manifest = {
                 "input_dialect": {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal},
@@ -8155,17 +8219,24 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 },
             )
 
-        return {
-             "cleaning_code": code,
-             "cleaned_data_preview": preview,
-             "csv_sep": csv_sep,
-             "csv_decimal": csv_decimal,
-             "csv_encoding": csv_encoding,
-             "leakage_audit_summary": leakage_audit_summary,
-             "budget_counters": counters,
-             "dataset_scale_hints": dataset_scale_hints,
-             "dataset_scale": dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None,
-         }
+        result = {
+            "cleaning_code": code,
+            "cleaned_data_preview": preview,
+            "csv_sep": csv_sep,
+            "csv_decimal": csv_decimal,
+            "csv_encoding": csv_encoding,
+            "leakage_audit_summary": leakage_audit_summary,
+            "budget_counters": counters,
+            "dataset_scale_hints": dataset_scale_hints,
+            "dataset_scale": dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None,
+        }
+        merged_state = dict(state or {})
+        merged_state.update(result)
+        _refresh_run_facts_pack(merged_state)
+        if merged_state.get("run_facts_pack"):
+            result["run_facts_pack"] = merged_state.get("run_facts_pack")
+            result["run_facts_block"] = merged_state.get("run_facts_block")
+        return result
 
     except Exception as e:
         print(f"Cleaning Execution Error (System): {e}")
@@ -8560,6 +8631,7 @@ def run_engineer(state: AgentState) -> AgentState:
                     log_run_event(run_id, "ml_context_ops_preview", {"preview": ops_preview})
             except Exception as ops_err:
                 print(f"Warning: failed to persist ml_engineer_context_ops.txt: {ops_err}")
+        data_audit_context = _append_run_facts_block(data_audit_context, state)
         data_audit_context = _truncate_text(data_audit_context)
         iteration_memory_block = _truncate_text(iteration_memory_block, max_len=6000, head_len=3500, tail_len=2000)
         kwargs["data_audit_context"] = data_audit_context

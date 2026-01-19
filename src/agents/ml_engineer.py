@@ -10,6 +10,10 @@ import json
 import ast
 from src.utils.prompting import render_prompt
 from src.utils.code_extract import extract_code_block, is_syntax_valid
+from src.utils.senior_protocol import (
+    SENIOR_ENGINEERING_PROTOCOL,
+    SENIOR_REASONING_PROTOCOL_GENERAL,
+)
 
 # NOTE: scan_code_safety referenced by tests as a required safety mechanism.
 # ML code executes in sandbox; keep the reference for integration checks.
@@ -262,6 +266,8 @@ class MLEngineerAgent:
                 "decisioning_policy_notes": decisioning_policy_notes,
                 "decisioning_columns_text": decisioning_columns_text,
                 "visual_requirements_context": visual_requirements_context,
+                "senior_reasoning_protocol": SENIOR_REASONING_PROTOCOL_GENERAL,
+                "senior_engineering_protocol": SENIOR_ENGINEERING_PROTOCOL,
             }
         )
         return render_prompt(template, **merged)
@@ -718,6 +724,12 @@ class MLEngineerAgent:
         SYSTEM_PROMPT_TEMPLATE = """
          You are a Senior ML Engineer for tabular Data Science.
 
+         === SENIOR REASONING PROTOCOL ===
+         $senior_reasoning_protocol
+
+         === SENIOR ENGINEERING PROTOCOL ===
+         $senior_engineering_protocol
+
          MISSION
          - Produce ONE robust, runnable Python SCRIPT that loads cleaned dataset from $data_path, trains/evaluates according to Execution Contract, and writes required artifacts.
          - Adapt to each dataset and objective. Do not follow a rigid recipe; follow contract + data.
@@ -817,6 +829,13 @@ class MLEngineerAgent:
               preprocessor1 = ColumnTransformer(...)
               preprocessor2 = ColumnTransformer(...)
               # or: preprocessor2 = sklearn.base.clone(preprocessor1)
+
+         COMMENT BLOCK REQUIREMENT:
+         - At the top of the script, include comment sections:
+           # Decision Log:
+           # Assumptions:
+           # Trade-offs:
+           # Risks:
         
         UNIVERSAL FEATURE USAGE RULE (CONTRACT-DRIVEN):
         - Each phase (segmentation/modeling/optimization) MUST use ONLY features allowed by the contract.
