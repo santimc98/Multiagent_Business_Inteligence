@@ -4,6 +4,54 @@ import os
 from typing import Any, Dict, List, Optional
 
 from src.utils.dataset_size import estimate_rows_fast
+from src.utils.column_sets import summarize_column_sets
+
+COLUMN_LIST_POINTER = "Full list in data/column_inventory.json; use selectors in data/column_sets.json"
+
+
+def summarize_long_list(items: List[Any], head: int = 12, tail: int = 6) -> Dict[str, Any]:
+    items = [str(item) for item in items if item is not None]
+    if len(items) <= head + tail:
+        return {"count": len(items), "head": items, "tail": []}
+    return {"count": len(items), "head": items[:head], "tail": items[-tail:]}
+
+
+def compress_long_lists(
+    payload: Any,
+    threshold: int = 80,
+    head: int = 12,
+    tail: int = 6,
+) -> tuple[Any, bool]:
+    compressed = False
+
+    def _should_compress(value: list[Any]) -> bool:
+        if len(value) <= threshold:
+            return False
+        for item in value:
+            if item is None:
+                continue
+            if not isinstance(item, (str, int, float)):
+                return False
+        return True
+
+    def _compress(value: Any) -> Any:
+        nonlocal compressed
+        if isinstance(value, dict):
+            return {key: _compress(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            if _should_compress(items):
+                summary = summarize_long_list(items, head=head, tail=tail)
+                summary["note"] = COLUMN_LIST_POINTER
+                compressed = True
+                return summary
+            return [_compress(item) for item in items]
+        return value
+
+    compressed_payload = _compress(payload)
+    if compressed and isinstance(compressed_payload, dict):
+        compressed_payload.setdefault("column_list_reference", COLUMN_LIST_POINTER)
+    return compressed_payload, compressed
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -17,6 +65,26 @@ def _limit_list(items: List[Any], max_items: int = 25) -> List[Any]:
     trimmed = items[:max_items]
     trimmed.append(f"...({remainder} more)")
     return trimmed
+
+
+def _summarize_if_long(items: List[Any], threshold: int = 80) -> Any:
+    items = [str(item) for item in items if item is not None]
+    if len(items) > threshold:
+        summary = summarize_long_list(items)
+        summary["note"] = COLUMN_LIST_POINTER
+        return summary
+    return items
+
+
+def _extract_columns(value: Any) -> List[str]:
+    if isinstance(value, dict):
+        columns = value.get("columns")
+        if isinstance(columns, list):
+            return [str(col) for col in columns if col]
+        return []
+    if isinstance(value, list):
+        return [str(col) for col in value if col]
+    return []
 
 
 def _resolve_work_dir(state: Dict[str, Any]) -> Optional[str]:
@@ -112,14 +180,12 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
     contract = state.get("execution_contract") or {}
 
     dataset_scale_hints = state.get("dataset_scale_hints") if isinstance(state.get("dataset_scale_hints"), dict) else {}
-    column_inventory = (
+    column_inventory = _extract_columns(
         state.get("column_inventory")
         or state.get("cleaned_column_inventory")
         or (state.get("ml_context_snapshot") or {}).get("cleaned_column_inventory")
         or []
     )
-    if not isinstance(column_inventory, list):
-        column_inventory = []
 
     rows_est = None
     if isinstance(dataset_scale_hints, dict):
@@ -148,6 +214,11 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
     if not decisioning_columns:
         decisioning_columns = _extract_decisioning_columns(contract if isinstance(contract, dict) else {})
 
+    column_sets = state.get("column_sets")
+    if not isinstance(column_sets, dict) or not column_sets:
+        column_sets = _safe_load_json(_first_existing_path(state, os.path.join("data", "column_sets.json")) or "")
+    column_sets_summary = summarize_column_sets(column_sets) if isinstance(column_sets, dict) else ""
+
     artifacts: Dict[str, Any] = {}
     metrics_path = _first_existing_path(state, os.path.join("data", "metrics.json"))
     alignment_path = _first_existing_path(state, os.path.join("data", "alignment_check.json"))
@@ -163,7 +234,8 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
         sep = state.get("csv_sep") or ","
         scored_header = _read_csv_header(scored_path, sep)
         if scored_header:
-            scored_info["header"] = _limit_list([str(col) for col in scored_header if col], max_items=40)
+            scored_columns = [str(col) for col in scored_header if col]
+            scored_info["header"] = _summarize_if_long(scored_columns)
             scored_info["header_cols"] = len(scored_header)
         artifacts["data/scored_rows.csv"] = scored_info
     else:
@@ -204,6 +276,8 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
         "data/cleaned_data.csv",
         "data/output_contract_report.json",
         "data/dataset_semantics.json",
+        "data/column_sets.json",
+        "data/column_inventory.json",
         "data/insights.json",
     ]:
         if len(evidence_index) >= 8:
@@ -217,9 +291,11 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
         "run_id": state.get("run_id"),
         "dataset_scale": dataset_scale,
         "dialect": dialect,
-        "required_outputs": _limit_list(required_outputs, max_items=40),
-        "decisioning_required_columns": _limit_list(decisioning_columns, max_items=40),
+        "required_outputs": _summarize_if_long(required_outputs),
+        "decisioning_required_columns": _summarize_if_long(decisioning_columns),
+        "column_sets_summary": column_sets_summary,
         "artifacts": artifacts,
         "evidence_index": evidence_index,
     }
+    payload, _ = compress_long_lists(payload)
     return "CONTEXT_PACK_JSON:\n" + json.dumps(payload, indent=2, ensure_ascii=True)

@@ -98,6 +98,12 @@ Before generating the contract:
   * impact
   * contract_updates (explicit changes to canonical_columns, artifact schemas, derived plan, gates)
 
+WIDE DATASET POLICY (NO ENUMERATION)
+If the dataset is wide (roughly >200 columns):
+* Do NOT enumerate huge column lists in the contract.
+* Use feature_selectors or column sets to describe groups deterministically (see dataset semantics/column sets summary).
+* Keep canonical_columns concise; avoid listing hundreds of names.
+
 EXECUTION CONSTRAINTS (ENVIRONMENT)
 Determine constraints based on env_constraints input; if not provided, default to "unknown_or_forbidden" for safety (do not over-assume).
 

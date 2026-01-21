@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from src.utils.run_logger import register_run_log
+from src.utils.context_pack import compress_long_lists
 from src.utils.contract_v41 import get_required_outputs
 from src.utils.review_status import normalize_status as normalize_review_status
 
@@ -193,6 +194,27 @@ def log_agent_snapshot(
     run_dir = get_run_dir(run_id)
     if not run_dir:
         return
+    if prompt:
+        try:
+            size_path = os.path.join(run_dir, "work", "data", "prompt_sizes.json")
+            _ensure_dir(os.path.dirname(size_path))
+            existing: Dict[str, Any] = {}
+            if os.path.exists(size_path):
+                with open(size_path, "r", encoding="utf-8") as handle:
+                    existing = json.load(handle) if handle.readable() else {}
+            if not isinstance(existing, dict):
+                existing = {}
+            agents = existing.get("agents") if isinstance(existing.get("agents"), dict) else {}
+            entries = existing.get("entries") if isinstance(existing.get("entries"), list) else []
+            prompt_len = len(str(prompt))
+            agents.setdefault(agent, []).append(prompt_len)
+            entries.append({"agent": agent, "chars": prompt_len})
+            existing["agents"] = agents
+            existing["entries"] = entries[-200:]
+            with open(size_path, "w", encoding="utf-8") as handle:
+                json.dump(existing, handle, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
     base = os.path.join(run_dir, "agents", agent)
     if attempt is not None:
         base = os.path.join(base, f"iteration_{attempt}")
@@ -205,7 +227,11 @@ def log_agent_snapshot(
         else:
             _write_text(os.path.join(base, "response.txt"), str(response))
     if context is not None:
-        _write_json(os.path.join(base, "context.json"), context)
+        try:
+            safe_context = compress_long_lists(context)[0]
+        except Exception:
+            safe_context = context
+        _write_json(os.path.join(base, "context.json"), safe_context)
     if script:
         _write_text(os.path.join(base, "script.py"), script)
     if verdicts is not None:

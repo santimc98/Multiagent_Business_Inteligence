@@ -282,12 +282,14 @@ class MLEngineerAgent:
         gate_context: Dict[str, Any] | None,
         ml_view: Dict[str, Any] | None = None,
     ) -> str:
-        contract_min = self._compact_execution_contract(execution_contract or {})
-        allowed_columns = self._resolve_allowed_columns_for_prompt(execution_contract or {})
+        from src.utils.context_pack import compress_long_lists
+
+        contract_min = compress_long_lists(self._compact_execution_contract(execution_contract or {}))[0]
+        allowed_columns = compress_long_lists(self._resolve_allowed_columns_for_prompt(execution_contract or {}))[0]
         allowed_patterns = self._resolve_allowed_name_patterns_for_prompt(execution_contract or {})
         feedback_blocks = self._select_feedback_blocks(feedback_history, gate_context, max_blocks=2)
         ml_view = ml_view or {}
-        ml_view_json = json.dumps(ml_view, indent=2)
+        ml_view_json = json.dumps(compress_long_lists(ml_view)[0], indent=2)
         plot_spec_json = json.dumps(ml_view.get("plot_spec", {}), indent=2)
         decisioning_requirements_context, decisioning_columns_text, decisioning_policy_notes = (
             self._extract_decisioning_context(ml_view, execution_contract)
@@ -759,6 +761,14 @@ class MLEngineerAgent:
            * Secondary scoring subset (if any)
            * Evidence (e.g., null_frac or partition evidence from dataset_semantics.json)
 
+         WIDE DATASET HANDLING (NO COLUMN ENUMERATION)
+         - If data/column_sets.json exists, use src.utils.column_sets.expand_column_sets at runtime to build feature lists.
+         - Avoid enumerating hundreds of columns in code or prompts; rely on selectors + explicit_columns in column_sets.json.
+         - If column_sets.json is missing, fall back to contract-driven column selection logic.
+         - Do NOT hardcode prefixes (e.g., startswith("pixel") or similar). Always use selectors or data-driven inference.
+         - If no selectors are available, use all numeric columns except explicit outcome/id/partition columns and forbidden/audit-only features.
+         - Decision Log must include n_features_used and feature_source ("column_sets" or "fallback_numeric").
+
          ROW-LEVEL EXPLANATIONS (MANDATORY IF CONTRACT REQUIRES DRIVERS/EXPLANATIONS)
          - Each row must have top_drivers with 2-3 drivers and direction (e.g., "Age low (down), Income high (up)").
          - Allowed methods (choose ONE, justify in comments):
@@ -1130,6 +1140,8 @@ class MLEngineerAgent:
 
         """
 
+        from src.utils.context_pack import compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
+
         ml_view = ml_view or {}
         required_outputs = ml_view.get("required_outputs") or (execution_contract or {}).get("required_outputs", []) or []
         raw_deliverables = (execution_contract or {}).get("spec_extraction", {}).get("deliverables", [])
@@ -1151,34 +1163,56 @@ class MLEngineerAgent:
         if not deliverables and required_outputs:
             deliverables = [{"path": path, "required": True} for path in required_outputs if path]
         required_deliverables = [item.get("path") for item in deliverables if item.get("required") and item.get("path")]
-        deliverables_json = json.dumps(deliverables, indent=2)
+        deliverables_json = json.dumps(compress_long_lists(deliverables)[0], indent=2)
         
         ml_runbook_json = json.dumps(
-            (execution_contract or {}).get("role_runbooks", {}).get("ml_engineer", {}),
+            compress_long_lists((execution_contract or {}).get("role_runbooks", {}).get("ml_engineer", {}))[0],
             indent=2,
         )
         spec_extraction_json = json.dumps(
-            (execution_contract or {}).get("spec_extraction", {}),
+            compress_long_lists((execution_contract or {}).get("spec_extraction", {}))[0],
             indent=2,
         )
         execution_contract_compact = self._compact_execution_contract(execution_contract or {})
-        ml_view_json = json.dumps(ml_view, indent=2)
-        plot_spec_json = json.dumps(ml_view.get("plot_spec", {}), indent=2)
-        evaluation_spec_json = json.dumps((execution_contract or {}).get("evaluation_spec", {}), indent=2)
+        execution_contract_compact = compress_long_lists(execution_contract_compact)[0]
+        ml_view_payload = compress_long_lists(ml_view)[0]
+        ml_view_json = json.dumps(ml_view_payload, indent=2)
+        plot_spec_json = json.dumps(compress_long_lists(ml_view.get("plot_spec", {}))[0], indent=2)
+        evaluation_spec_json = json.dumps(
+            compress_long_lists((execution_contract or {}).get("evaluation_spec", {}))[0],
+            indent=2,
+        )
+        required_columns_payload = strategy.get('required_columns', [])
+        if isinstance(required_columns_payload, list) and len(required_columns_payload) > 80:
+            required_columns_payload = summarize_long_list(required_columns_payload)
+            required_columns_payload["note"] = COLUMN_LIST_POINTER
+
         render_kwargs = dict(
             business_objective=business_objective,
             strategy_title=strategy.get('title', 'Unknown'),
             analysis_type=str(strategy.get('analysis_type', 'predictive')).upper(),
             hypothesis=strategy.get('hypothesis', 'N/A'),
-            required_columns=json.dumps(strategy.get('required_columns', [])),
+            required_columns=json.dumps(required_columns_payload),
             deliverables_json=deliverables_json,
             canonical_columns=json.dumps(
                 execution_contract_compact.get("canonical_columns", (execution_contract or {}).get("canonical_columns", []))
             ),
-            business_alignment_json=json.dumps((execution_contract or {}).get("business_alignment", {}), indent=2),
-            alignment_requirements_json=json.dumps((execution_contract or {}).get("alignment_requirements", []), indent=2),
-            feature_semantics_json=json.dumps((execution_contract or {}).get("feature_semantics", []), indent=2),
-            business_sanity_checks_json=json.dumps((execution_contract or {}).get("business_sanity_checks", []), indent=2),
+            business_alignment_json=json.dumps(
+                compress_long_lists((execution_contract or {}).get("business_alignment", {}))[0],
+                indent=2,
+            ),
+            alignment_requirements_json=json.dumps(
+                compress_long_lists((execution_contract or {}).get("alignment_requirements", []))[0],
+                indent=2,
+            ),
+            feature_semantics_json=json.dumps(
+                compress_long_lists((execution_contract or {}).get("feature_semantics", []))[0],
+                indent=2,
+            ),
+            business_sanity_checks_json=json.dumps(
+                compress_long_lists((execution_contract or {}).get("business_sanity_checks", []))[0],
+                indent=2,
+            ),
             data_path=data_path,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
@@ -1191,10 +1225,10 @@ class MLEngineerAgent:
             evaluation_spec_json=evaluation_spec_json,
             spec_extraction_json=spec_extraction_json,
             ml_engineer_runbook=ml_runbook_json,
-            feature_availability_json=json.dumps(feature_availability or [], indent=2),
+            feature_availability_json=json.dumps(compress_long_lists(feature_availability or [])[0], indent=2),
             availability_summary=availability_summary or "",
-            signal_summary_json=json.dumps(signal_summary or {}, indent=2),
-            iteration_memory_json=json.dumps(iteration_memory or [], indent=2),
+            signal_summary_json=json.dumps(compress_long_lists(signal_summary or {})[0], indent=2),
+            iteration_memory_json=json.dumps(compress_long_lists(iteration_memory or [])[0], indent=2),
             iteration_memory_block=iteration_memory_block or "",
             dataset_scale=dataset_scale,
         )

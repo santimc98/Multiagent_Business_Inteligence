@@ -69,6 +69,81 @@ def _parse_datetime_ratio(series: pd.Series) -> float:
     return float(parsed.notna().mean())
 
 
+def scan_column_missingness(
+    csv_path: str,
+    dialect: Dict[str, Any],
+    col: str,
+    chunksize: int = 200000,
+    max_unique: int = 20,
+) -> Dict[str, Any]:
+    total_count = 0
+    missing_count = 0
+    unique_values: List[str] = []
+    unique_seen: set[str] = set()
+    if not csv_path or not col:
+        return {
+            "column": col,
+            "total_count": 0,
+            "missing_count": 0,
+            "non_missing_count": 0,
+            "null_frac_exact": None,
+            "unique_values_sample": [],
+        }
+    sep = dialect.get("sep") or ","
+    decimal = dialect.get("decimal") or "."
+    encoding = dialect.get("encoding") or "utf-8"
+    try:
+        reader = pd.read_csv(
+            csv_path,
+            usecols=[col],
+            sep=sep,
+            decimal=decimal,
+            encoding=encoding,
+            dtype="string",
+            keep_default_na=False,
+            chunksize=max(1, int(chunksize)),
+            low_memory=False,
+        )
+    except Exception:
+        return {
+            "column": col,
+            "total_count": 0,
+            "missing_count": 0,
+            "non_missing_count": 0,
+            "null_frac_exact": None,
+            "unique_values_sample": [],
+        }
+
+    for chunk in reader:
+        if col not in chunk.columns:
+            continue
+        series = chunk[col]
+        total_count += int(series.shape[0])
+        cleaned = series.astype("string").str.strip()
+        lowered = cleaned.str.lower()
+        missing_mask = series.isna() | (lowered == "") | lowered.isin(_NULL_STRINGS)
+        missing_count += int(missing_mask.sum())
+        if len(unique_values) < max_unique:
+            for raw_val in cleaned[~missing_mask].tolist():
+                if raw_val in unique_seen:
+                    continue
+                unique_seen.add(raw_val)
+                unique_values.append(str(raw_val))
+                if len(unique_values) >= max_unique:
+                    break
+
+    non_missing_count = max(total_count - missing_count, 0)
+    null_frac_exact = float(missing_count / total_count) if total_count else None
+    return {
+        "column": col,
+        "total_count": int(total_count),
+        "missing_count": int(missing_count),
+        "non_missing_count": int(non_missing_count),
+        "null_frac_exact": null_frac_exact,
+        "unique_values_sample": unique_values,
+    }
+
+
 def _analyze_column(series: pd.Series, decimal: str) -> Dict[str, Any]:
     mask = _null_mask(series)
     total = int(series.shape[0]) if series is not None else 0
@@ -143,6 +218,9 @@ def infer_dataset_semantics(
             "primary_target": None,
             "target_unclear": False,
             "target_unclear_reason": "",
+            "target_null_frac_exact": None,
+            "target_missing_count_exact": None,
+            "target_total_count_exact": None,
         },
         "partition_analysis": {"partition_columns": [], "per_partition_counts": {}},
         "leakage_risks": {"correlated_with_target": [], "suspicious_name_columns": []},
@@ -363,9 +441,7 @@ def infer_dataset_semantics(
     if contract_targets:
         primary_target = contract_targets[0]
     elif target_candidates:
-        highest_score = max((item.get("score", 0.0) for item in target_candidates), default=0.0)
-        if highest_score >= _CONFIDENCE_THRESHOLDS["medium"]:
-            primary_target = target_candidates[0].get("column")
+        primary_target = target_candidates[0].get("column")
 
     if not contract_targets:
         if not target_candidates:
@@ -377,13 +453,35 @@ def infer_dataset_semantics(
                 result["target_analysis"]["target_unclear"] = True
                 result["target_analysis"]["target_unclear_reason"] = "all heuristics scored below medium confidence"
 
-    if primary_target and primary_target in column_stats:
-        stats = column_stats[primary_target]
-        null_frac = float(stats.get("null_frac", 0.0))
-        partial_labels = null_frac > 0.0 and null_frac < 1.0
-        result["target_analysis"]["partial_label_detected"] = partial_labels
-        result["target_analysis"]["labeled_row_heuristic"] = f"target_notnull:{primary_target}"
+    target_scan = {}
+    if primary_target:
+        target_scan = scan_column_missingness(
+            csv_path=csv_path,
+            dialect={"sep": sep, "decimal": decimal, "encoding": encoding},
+            col=primary_target,
+            chunksize=200000,
+            max_unique=10,
+        )
+        if target_scan.get("total_count"):
+            result["target_analysis"]["target_null_frac_exact"] = target_scan.get("null_frac_exact")
+            result["target_analysis"]["target_missing_count_exact"] = target_scan.get("missing_count")
+            result["target_analysis"]["target_total_count_exact"] = target_scan.get("total_count")
         result["target_analysis"]["primary_target"] = primary_target
+
+    partial_labels = False
+    if primary_target:
+        null_frac_exact = result["target_analysis"].get("target_null_frac_exact")
+        if null_frac_exact is not None:
+            partial_labels = 0.0 < float(null_frac_exact) < 1.0
+        elif primary_target in column_stats:
+            stats = column_stats[primary_target]
+            null_frac = float(stats.get("null_frac", 0.0))
+            partial_labels = 0.0 < null_frac < 1.0
+        result["target_analysis"]["partial_label_detected"] = partial_labels
+        if null_frac_exact is not None or primary_target in column_stats:
+            result["target_analysis"]["labeled_row_heuristic"] = f"target_notnull:{primary_target}"
+        else:
+            result["target_analysis"]["labeled_row_heuristic"] = "target_detected_but_not_in_sample"
     elif target_candidates:
         result["target_analysis"]["labeled_row_heuristic"] = "target_detected_but_not_in_sample"
 
@@ -408,6 +506,35 @@ def infer_dataset_semantics(
 
     result["partition_analysis"]["partition_columns"] = partition_columns
     result["partition_analysis"]["per_partition_counts"] = per_partition_counts
+
+    missingness_notes: List[str] = []
+    if primary_target and result["target_analysis"]["partial_label_detected"]:
+        candidate_partitions = []
+        for col in columns:
+            stats = column_stats.get(col, {})
+            if not stats:
+                continue
+            if stats.get("n_unique", 0) <= 20 and _has_token(col, _PARTITION_NAME_TOKENS):
+                candidate_partitions.append(col)
+        found_partition_hint = False
+        for col in candidate_partitions[:3]:
+            scan = scan_column_missingness(
+                csv_path=csv_path,
+                dialect={"sep": sep, "decimal": decimal, "encoding": encoding},
+                col=col,
+                chunksize=200000,
+                max_unique=12,
+            )
+            values = scan.get("unique_values_sample") or []
+            if values:
+                missingness_notes.append(
+                    f"Missing target may be by-design for scoring subset; candidate partition column: {col} with values {values}"
+                )
+                found_partition_hint = True
+        if not found_partition_hint:
+            missingness_notes.append(
+                "Missing target detected but no explicit partition column found; treat as partial labels; train on labeled rows."
+            )
 
     column_roles: Dict[str, str] = {}
     dropped_high_card = []
@@ -491,6 +618,8 @@ def infer_dataset_semantics(
         missing_contract = [col for col in contract_targets if col not in contract_targets_present]
         if missing_contract:
             notes.append(f"Contract outcomes missing from sample/header: {missing_contract[:5]}")
+    if result["target_analysis"].get("target_total_count_exact"):
+        notes.append("Exact target missingness computed via chunk scan (usecols).")
     if target_candidates:
         notes.append("Target candidates inferred from contract/heuristics.")
     else:
@@ -523,6 +652,8 @@ def infer_dataset_semantics(
         notes.append(f"Suspicious name tokens: {suspicious_names[:5]}")
     if correlated:
         notes.append("High correlation candidates identified in sample.")
+    if missingness_notes:
+        notes.extend(missingness_notes)
 
     result["notes"] = notes[:15]
     return result
@@ -618,13 +749,27 @@ def summarize_dataset_semantics(
     leakage_names = semantics.get("leakage_risks", {}).get("suspicious_name_columns") or []
     correlated = semantics.get("leakage_risks", {}).get("correlated_with_target") or []
     corr_cols = [item.get("column") for item in correlated if item.get("column")]
+    target_unclear = bool(semantics.get("target_analysis", {}).get("target_unclear"))
+    target_unclear_reason = semantics.get("target_analysis", {}).get("target_unclear_reason") or ""
     partial_labels = semantics.get("target_analysis", {}).get("partial_label_detected")
     labeled_heuristic = semantics.get("target_analysis", {}).get("labeled_row_heuristic") or "unknown"
+    null_frac_exact = semantics.get("target_analysis", {}).get("target_null_frac_exact")
+    total_exact = semantics.get("target_analysis", {}).get("target_total_count_exact")
+    missing_exact = semantics.get("target_analysis", {}).get("target_missing_count_exact")
 
     lines = []
     lines.append("DATASET_SEMANTICS_SUMMARY:")
     lines.append(f"- target_candidates: {target_details[:5] if target_details else 'none'}")
+    if target_unclear:
+        reason = f" ({target_unclear_reason})" if target_unclear_reason else ""
+        lines.append(f"- target_unclear: True{reason}")
     lines.append(f"- partial_label_detected: {bool(partial_labels)}")
+    if null_frac_exact is not None:
+        ratio = round(float(null_frac_exact), 6)
+        if total_exact is not None and missing_exact is not None:
+            lines.append(f"- target_null_frac_exact: {ratio} ({missing_exact}/{total_exact})")
+        else:
+            lines.append(f"- target_null_frac_exact: {ratio}")
     lines.append(f"- labeled_row_heuristic: {labeled_heuristic}")
     lines.append(f"- partition_columns: {partition_cols[:5] if partition_cols else 'none'}")
     lines.append(f"- training_rows_rule: {training_mask.get('training_rows_rule', 'use all rows')}")

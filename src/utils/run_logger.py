@@ -4,6 +4,7 @@ import json
 from datetime import datetime, UTC
 from typing import Dict, Any, Optional
 
+from src.utils.context_pack import compress_long_lists
 LOG_PATHS: Dict[str, str] = {}
 
 
@@ -43,11 +44,15 @@ def init_run_log(run_id: str, metadata: Optional[Dict[str, Any]] = None, log_dir
 def log_run_event(run_id: str, event_type: str, payload: Dict[str, Any], log_dir: str = "logs") -> None:
     path = get_log_path(run_id, log_dir=log_dir)
     _ensure_parent_dir(path)  # CLAVE
-
+    safe_payload = payload
+    try:
+        safe_payload, _ = compress_long_lists(payload)
+    except Exception:
+        safe_payload = payload
     event = {
         "timestamp": datetime.now(UTC).isoformat(),
         "event": event_type,
-        "payload": payload,
+        "payload": safe_payload,
     }
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")

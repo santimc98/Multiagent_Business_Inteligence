@@ -32,7 +32,8 @@ def test_incomplete_reprompt_context_has_contract_and_outputs(monkeypatch):
     )
     assert "CONTRACT_MIN_CONTEXT" in context
     assert "REQUIRED OUTPUTS" in context
-    assert len(context) > 3000
+    assert len(context) > 1500
+    assert "column_list_reference" in context
     assert "..." not in context
 
 

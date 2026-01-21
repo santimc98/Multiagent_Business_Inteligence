@@ -6,6 +6,7 @@ import re
 import json
 import hashlib
 import csv
+import math
 import threading
 import time
 import fnmatch
@@ -145,12 +146,13 @@ from src.utils.label_enrichment import enrich_outputs
 from src.utils.ml_validation import validate_model_metrics_consistency, validate_metrics_ci_consistency
 from src.utils.json_sanitize import dump_json
 from src.utils.run_facts_pack import build_run_facts_pack, format_run_facts_block
-from src.utils.context_pack import build_context_pack
+from src.utils.context_pack import build_context_pack, compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
 from src.utils.dataset_semantics import (
     infer_dataset_semantics,
     choose_training_mask,
     summarize_dataset_semantics,
 )
+from src.utils.column_sets import build_column_sets, summarize_column_sets
 from src.utils.sandbox_paths import (
     CANONICAL_RAW_REL,
     CANONICAL_CLEANED_REL,
@@ -349,11 +351,15 @@ def _prepend_dataset_semantics_summary(text: str, state: Dict[str, Any]) -> str:
     if not isinstance(state, dict):
         return text
     summary = state.get("dataset_semantics_summary")
-    if not summary:
+    column_sets_summary = state.get("column_sets_summary")
+    combined = summary or ""
+    if column_sets_summary:
+        combined = f"{combined}\n{column_sets_summary}" if combined else column_sets_summary
+    if not combined:
         return text
     if text:
-        return f"{summary}\n\n{text}"
-    return summary
+        return f"{combined}\n\n{text}"
+    return combined
 
 _ABORT_EVENT = threading.Event()
 
@@ -1212,12 +1218,26 @@ def _build_signal_summary_context(
                 }
             if stats:
                 if target_raw and target_canon:
-                    exact_ratio = _compute_exact_non_null_ratio(csv_path, dialect, target_raw)
+                    exact_ratio = None
+                    exact_total = None
+                    exact_missing = None
+                    if isinstance(dataset_semantics, dict):
+                        target_info = dataset_semantics.get("target_analysis") or {}
+                        if isinstance(target_info, dict) and target_info.get("target_null_frac_exact") is not None:
+                            exact_ratio = 1.0 - float(target_info.get("target_null_frac_exact"))
+                            exact_total = target_info.get("target_total_count_exact")
+                            exact_missing = target_info.get("target_missing_count_exact")
+                    if exact_ratio is None:
+                        exact_ratio = _compute_exact_non_null_ratio(csv_path, dialect, target_raw)
                     if exact_ratio is not None:
                         for canon, payload in stats.items():
                             if payload.get("raw_column") == target_raw or canon == target_canon:
                                 payload.pop("sample_non_null_ratio", None)
                                 payload["exact_non_null_ratio"] = exact_ratio
+                                if exact_total is not None:
+                                    payload["exact_total_count"] = exact_total
+                                if exact_missing is not None:
+                                    payload["exact_missing_count"] = exact_missing
                                 break
                         else:
                             summary["target_column_stats"] = {
@@ -1225,6 +1245,10 @@ def _build_signal_summary_context(
                                 "raw_column": target_raw,
                                 "exact_non_null_ratio": exact_ratio,
                             }
+                            if exact_total is not None:
+                                summary["target_column_stats"]["exact_total_count"] = exact_total
+                            if exact_missing is not None:
+                                summary["target_column_stats"]["exact_missing_count"] = exact_missing
                 summary["required_column_sample_stats"] = stats
         required_raw = set(canon_to_raw.values())
         candidate_cols = [col for col in header_cols if col not in required_raw]
@@ -2721,6 +2745,7 @@ def _classify_iteration_type(
         "CODE_AUDIT_REJECTED",
         "OUTPUT_CONTRACT_MISSING",
         "METRICS_SCHEMA_INCONSISTENT",  # Malformed metrics data = code error, not low metrics
+        "BASELINE_CHECK_FAILED",
     ]):
         return "compliance"
     return "metric"
@@ -5402,6 +5427,211 @@ def _is_baseline_metric_name(name: str) -> bool:
     key = _normalize_metric_key(name)
     return any(token in key for token in ["baseline", "dummy", "naive", "null", "default"])
 
+_BASELINE_NULL_STRINGS = {"", "na", "n/a", "nan", "null", "none", "nat"}
+
+
+def _resolve_primary_target_column(
+    evaluation_spec: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+    contract_min: Dict[str, Any] | None,
+) -> str | None:
+    if isinstance(evaluation_spec, dict):
+        for key in ("target", "target_column", "target_name", "outcome", "label"):
+            val = evaluation_spec.get(key)
+            if isinstance(val, list) and val:
+                val = val[0]
+            if isinstance(val, str) and val.strip():
+                return val
+        outcome_cols = evaluation_spec.get("outcome_columns")
+        if isinstance(outcome_cols, list) and outcome_cols:
+            if isinstance(outcome_cols[0], str) and outcome_cols[0].strip():
+                return outcome_cols[0]
+    for source in (contract_min, contract):
+        if not isinstance(source, dict):
+            continue
+        outcome_cols = get_outcome_columns(source)
+        if outcome_cols:
+            return outcome_cols[0]
+        for key in ("target_column", "target", "outcome"):
+            val = source.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+    return None
+
+
+def _baseline_metric_type(metric_name: str) -> str | None:
+    norm = _normalize_metric_key(metric_name)
+    if not norm:
+        return None
+    if "rmsle" in norm:
+        return "rmsle"
+    if "rmse" in norm:
+        return "rmse"
+    if "auc" in norm:
+        return "auc"
+    if "gini" in norm:
+        return "gini"
+    if "accuracy" in norm or norm.endswith("acc"):
+        return "accuracy"
+    return None
+
+
+def _baseline_margin(metric_type: str) -> float:
+    if metric_type == "accuracy":
+        return 0.02
+    if metric_type == "auc":
+        return 0.01
+    return 1e-4
+
+
+def _scan_target_for_baseline(
+    csv_path: str,
+    dialect: Dict[str, Any],
+    target_col: str,
+    metric_type: str,
+    chunksize: int = 200000,
+) -> Dict[str, Any]:
+    if not csv_path or not target_col or not metric_type:
+        return {}
+    sep = dialect.get("sep") or ","
+    decimal = dialect.get("decimal") or "."
+    encoding = dialect.get("encoding") or "utf-8"
+    try:
+        header = pd.read_csv(csv_path, nrows=0, sep=sep, decimal=decimal, encoding=encoding)
+        if target_col not in header.columns:
+            return {}
+    except Exception:
+        return {}
+
+    if metric_type == "auc":
+        return {"baseline": 0.5}
+    if metric_type == "gini":
+        return {"baseline": 0.0}
+
+    try:
+        reader = pd.read_csv(
+            csv_path,
+            usecols=[target_col],
+            sep=sep,
+            decimal=decimal,
+            encoding=encoding,
+            dtype="string",
+            keep_default_na=False,
+            chunksize=max(1, int(chunksize)),
+            low_memory=False,
+        )
+    except Exception:
+        return {}
+
+    total_count = 0
+    label_counts: Dict[str, int] = {}
+    mean = 0.0
+    m2 = 0.0
+
+    for chunk in reader:
+        if target_col not in chunk.columns:
+            continue
+        series = chunk[target_col]
+        cleaned = series.astype("string").str.strip()
+        lowered = cleaned.str.lower()
+        missing_mask = series.isna() | (lowered == "") | lowered.isin(_BASELINE_NULL_STRINGS)
+        values = cleaned[~missing_mask]
+        if values.empty:
+            continue
+
+        if metric_type == "accuracy":
+            total_count += int(values.shape[0])
+            counts = values.value_counts()
+            for label, count in counts.items():
+                label_counts[str(label)] = label_counts.get(str(label), 0) + int(count)
+            continue
+
+        numeric_strings = values
+        if decimal and decimal != ".":
+            numeric_strings = numeric_strings.str.replace(decimal, ".", regex=False)
+        numeric = pd.to_numeric(numeric_strings, errors="coerce").dropna()
+        if metric_type == "rmsle":
+            numeric = numeric[numeric >= 0]
+            if not numeric.empty:
+                numeric = numeric.map(math.log1p)
+        if numeric.empty:
+            continue
+        for val in numeric.tolist():
+            total_count += 1
+            delta = float(val) - mean
+            mean += delta / total_count
+            delta2 = float(val) - mean
+            m2 += delta * delta2
+
+    if metric_type == "accuracy":
+        if total_count <= 0 or not label_counts:
+            return {}
+        baseline = max(label_counts.values()) / total_count
+        return {"baseline": float(baseline), "n_rows": int(total_count), "n_classes": len(label_counts)}
+
+    if total_count <= 0:
+        return {}
+    variance = m2 / total_count if total_count else 0.0
+    baseline = math.sqrt(max(variance, 0.0))
+    return {"baseline": float(baseline), "n_rows": int(total_count)}
+
+
+def _evaluate_baseline_sanity_check(
+    state: Dict[str, Any],
+    evaluation_spec: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+    contract_min: Dict[str, Any] | None,
+    primary_metric_snapshot: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    snapshot = primary_metric_snapshot if isinstance(primary_metric_snapshot, dict) else {}
+    metric_name = snapshot.get("primary_metric_name")
+    metric_value = snapshot.get("primary_metric_value")
+    if not metric_name or not _is_number(metric_value):
+        return {}
+    metric_type = _baseline_metric_type(str(metric_name))
+    if not metric_type:
+        return {}
+    target_col = _resolve_primary_target_column(evaluation_spec, contract, contract_min)
+    if not target_col:
+        return {}
+    csv_path = state.get("ml_data_path") or "data/cleaned_data.csv"
+    if not os.path.exists(csv_path) and os.path.exists("data/cleaned_full.csv"):
+        csv_path = "data/cleaned_full.csv"
+    if not os.path.exists(csv_path):
+        return {}
+    dialect = {
+        "sep": state.get("csv_sep") or ",",
+        "decimal": state.get("csv_decimal") or ".",
+        "encoding": state.get("csv_encoding") or "utf-8",
+    }
+    baseline_info = _scan_target_for_baseline(csv_path, dialect, target_col, metric_type)
+    baseline_value = baseline_info.get("baseline")
+    if not _is_number(baseline_value):
+        return {}
+    margin = _baseline_margin(metric_type)
+    higher_is_better = _metric_higher_is_better(str(metric_name))
+    if higher_is_better:
+        threshold = float(baseline_value) + margin
+        failed = float(metric_value) <= threshold
+        comparator = "<="
+    else:
+        threshold = float(baseline_value) - margin
+        failed = float(metric_value) >= threshold
+        comparator = ">="
+    return {
+        "failed": failed,
+        "metric_name": str(metric_name),
+        "metric_value": float(metric_value),
+        "baseline_value": float(baseline_value),
+        "margin": float(margin),
+        "threshold": float(threshold),
+        "comparator": comparator,
+        "metric_type": metric_type,
+        "target_col": target_col,
+        "data_path": csv_path,
+        "rows_used": baseline_info.get("n_rows"),
+    }
+
 def _objective_metric_priority(objective_type: str) -> List[str]:
     objective = str(objective_type or "unknown").lower()
     if "classif" in objective:
@@ -6323,8 +6553,34 @@ def run_steward(state: AgentState) -> AgentState:
     dataset_semantics = {}
     dataset_training_mask = {}
     dataset_semantics_summary = ""
+    column_sets = {}
+    column_sets_summary = ""
     try:
         dialect_payload = {"encoding": encoding, "sep": sep, "decimal": decimal}
+        header_cols = []
+        try:
+            import pandas as pd
+            header_df = pd.read_csv(csv_path, nrows=0, sep=sep, decimal=decimal, encoding=encoding)
+            header_cols = header_df.columns.tolist()
+        except Exception as header_err:
+            print(f"Warning: failed to read CSV header: {header_err}")
+        if header_cols:
+            try:
+                column_inventory_payload = {
+                    "n_columns": len(header_cols),
+                    "columns": header_cols,
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "source_csv": csv_path,
+                }
+                dump_json("data/column_inventory.json", column_inventory_payload)
+            except Exception as inv_err:
+                print(f"Warning: failed to persist column_inventory.json: {inv_err}")
+            if isinstance(state, dict):
+                state["column_inventory"] = {
+                    "n_columns": len(header_cols),
+                    "columns": header_cols,
+                }
+                state["column_inventory_columns"] = header_cols
         contract_min = state.get("execution_contract_min") or _load_json_safe("data/contract_min.json") or {}
         text_context = state.get("business_objective") if isinstance(state, dict) else ""
         if not text_context and isinstance(contract_min, dict):
@@ -6352,9 +6608,14 @@ def run_steward(state: AgentState) -> AgentState:
             print(f"Warning: failed to load dataset sample for training mask: {sample_err}")
         dataset_training_mask = choose_training_mask(df_sample, dataset_semantics, contract_min)
         dataset_semantics_summary = summarize_dataset_semantics(dataset_semantics, dataset_training_mask)
+        if header_cols:
+            column_sets = build_column_sets(header_cols, roles=dataset_semantics.get("column_roles"))
+            column_sets_summary = summarize_column_sets(column_sets)
         try:
             os.makedirs("data", exist_ok=True)
             dump_json("data/dataset_semantics.json", dataset_semantics)
+            if column_sets:
+                dump_json("data/column_sets.json", column_sets)
         except Exception as sem_write_err:
             print(f"Warning: failed to persist dataset_semantics.json: {sem_write_err}")
     except Exception as sem_err:
@@ -6363,6 +6624,8 @@ def run_steward(state: AgentState) -> AgentState:
         state["dataset_semantics"] = dataset_semantics
         state["dataset_training_mask"] = dataset_training_mask
         state["dataset_semantics_summary"] = dataset_semantics_summary
+        state["column_sets"] = column_sets
+        state["column_sets_summary"] = column_sets_summary
 
     log_run_event(
         run_id,
@@ -6387,6 +6650,8 @@ def run_steward(state: AgentState) -> AgentState:
         "dataset_semantics": dataset_semantics,
         "dataset_training_mask": dataset_training_mask,
         "dataset_semantics_summary": dataset_semantics_summary,
+        "column_sets": column_sets,
+        "column_sets_summary": column_sets_summary,
         "iteration_count": 0,
         "compliance_iterations": 0,
         "metric_iterations": 0,
@@ -6727,6 +6992,32 @@ def run_execution_planner(state: AgentState) -> AgentState:
             )
         except Exception:
             contract_min = None
+    column_inventory_state = state.get("column_inventory") if isinstance(state, dict) else None
+    n_columns = None
+    if isinstance(column_inventory_state, dict):
+        n_columns = column_inventory_state.get("n_columns")
+    if n_columns is None:
+        n_columns = len(column_inventory)
+    if n_columns and n_columns > 200:
+        dataset_truth_ref = {
+            "column_inventory_path": "data/column_inventory.json",
+            "column_sets_path": "data/column_sets.json",
+            "n_columns": int(n_columns),
+        }
+        if isinstance(contract, dict):
+            contract["dataset_truth_ref"] = dataset_truth_ref
+        if isinstance(contract_min, dict):
+            contract_min["dataset_truth_ref"] = dataset_truth_ref
+            explicit_columns = []
+            column_sets = state.get("column_sets") if isinstance(state, dict) else {}
+            if isinstance(column_sets, dict):
+                explicit_columns = [str(c) for c in (column_sets.get("explicit_columns") or []) if c]
+            if explicit_columns:
+                contract_min["canonical_columns"] = explicit_columns
+                contract_min["available_columns"] = explicit_columns
+            else:
+                contract_min["canonical_columns"] = []
+                contract_min["available_columns"] = []
     dataset_semantics = state.get("dataset_semantics") if isinstance(state, dict) else {}
     dataset_training_mask = state.get("dataset_training_mask") if isinstance(state, dict) else {}
     partial_labels = bool(
@@ -6873,7 +7164,13 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 result["max_runtime_fix_attempts"] = max(1, int(runtime_fix_max))
             except Exception:
                 pass
-    result["column_inventory"] = column_inventory
+    if isinstance(state.get("column_inventory"), dict):
+        result["column_inventory"] = state.get("column_inventory")
+    else:
+        result["column_inventory"] = {
+            "n_columns": len(column_inventory),
+            "columns": column_inventory,
+        }
     merged_state = dict(state or {})
     merged_state.update(result)
     _refresh_run_facts_pack(merged_state)
@@ -6995,12 +7292,16 @@ def run_data_engineer(state: AgentState) -> AgentState:
             normed = _norm_name(col)
             if normed and normed not in norm_map:
                 norm_map[normed] = col
-        header_context = (
-            "COLUMN_INVENTORY_RAW: "
-            + json.dumps(header_cols, ensure_ascii=False)
-            + "\nNORMALIZED_HEADER_MAP: "
-            + json.dumps(norm_map, ensure_ascii=False)
-        )
+        inventory_payload: Dict[str, Any] = {"column_inventory_raw": header_cols}
+        if len(header_cols) > 80:
+            norm_items = [f"{k}->{v}" for k, v in norm_map.items()]
+            norm_summary = summarize_long_list(norm_items)
+            norm_summary["note"] = COLUMN_LIST_POINTER
+            inventory_payload["normalized_header_map"] = norm_summary
+        else:
+            inventory_payload["normalized_header_map"] = norm_map
+        inventory_payload, _ = compress_long_lists(inventory_payload)
+        header_context = "COLUMN_INVENTORY_CONTEXT: " + json.dumps(inventory_payload, ensure_ascii=False)
         data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, header_context)
         required_raw_map = _build_required_raw_map(required_cols, norm_map)
         if required_raw_map:
@@ -8311,6 +8612,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             cleaning_view_copy["output_dialect"] = output_dialect
                         if isinstance(input_dialect, dict):
                             cleaning_view_copy["input_dialect"] = input_dialect
+                        cleaning_view_copy = compress_long_lists(cleaning_view_copy)[0]
                         review_result = cleaning_reviewer.review_cleaning(
                             cleaning_view_copy,
                             cleaned_csv_path=local_cleaned_path,
@@ -8339,6 +8641,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             review_context["input_dialect"] = input_dialect
                         if context_pack:
                             review_context["context_pack"] = context_pack
+                        review_context = compress_long_lists(review_context)[0]
                         review_result = cleaning_reviewer.review_cleaning(review_context)
                         review_context_payload = review_context
                     try:
@@ -8865,7 +9168,8 @@ def run_engineer(state: AgentState) -> AgentState:
                 "feature_availability": feature_availability,
             }
             context_ops_blocks.append(
-                "FEATURE_AVAILABILITY_CONTEXT:\n" + json.dumps(availability_payload, ensure_ascii=True)
+                "FEATURE_AVAILABILITY_CONTEXT:\n"
+                + json.dumps(compress_long_lists(availability_payload)[0], ensure_ascii=True)
             )
         if iteration_memory:
             memory_slice = iteration_memory[-2:]
@@ -8874,12 +9178,13 @@ def run_engineer(state: AgentState) -> AgentState:
             )
         if contract_min:
             context_ops_blocks.append(
-                "CONTRACT_MIN_CONTEXT:\n" + json.dumps(contract_min, ensure_ascii=True)
+                "CONTRACT_MIN_CONTEXT:\n"
+                + json.dumps(compress_long_lists(contract_min)[0], ensure_ascii=True)
             )
         ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
         if isinstance(ml_view, dict) and ml_view:
             context_ops_blocks.append(
-                "ML_VIEW_CONTEXT:\n" + json.dumps(ml_view, ensure_ascii=True)
+                "ML_VIEW_CONTEXT:\n" + json.dumps(compress_long_lists(ml_view)[0], ensure_ascii=True)
             )
         if header_cols:
             norm_map = {}
@@ -8897,15 +9202,21 @@ def run_engineer(state: AgentState) -> AgentState:
                     derived_present = [c for c in derived_cols if c in set(header_cols)]
             except Exception:
                 derived_present = []
-            header_context = (
-                "CLEANED_COLUMN_INVENTORY_RAW: "
-                + json.dumps(header_cols, ensure_ascii=False)
-                + "\nNORMALIZED_CLEANED_HEADER_MAP: "
-                + json.dumps(norm_map, ensure_ascii=False)
-                + "\nCLEANED_ALIASING_COLLISIONS: "
-                + json.dumps(aliasing, ensure_ascii=False)
-                + "\nDERIVED_COLUMNS_PRESENT: "
-                + json.dumps(derived_present, ensure_ascii=False)
+            cleaned_payload: Dict[str, Any] = {
+                "cleaned_column_inventory_raw": header_cols,
+                "cleaned_aliasing_collisions": aliasing,
+                "derived_columns_present": derived_present,
+            }
+            if len(header_cols) > 80:
+                norm_items = [f"{k}->{v}" for k, v in norm_map.items()]
+                norm_summary = summarize_long_list(norm_items)
+                norm_summary["note"] = COLUMN_LIST_POINTER
+                cleaned_payload["normalized_cleaned_header_map"] = norm_summary
+            else:
+                cleaned_payload["normalized_cleaned_header_map"] = norm_map
+            cleaned_payload, _ = compress_long_lists(cleaned_payload)
+            header_context = "CLEANED_COLUMN_INVENTORY_CONTEXT: " + json.dumps(
+                cleaned_payload, ensure_ascii=False
             )
             data_audit_context = _merge_de_audit_override(data_audit_context, header_context)
             kwargs["data_audit_context"] = data_audit_context
@@ -9181,6 +9492,8 @@ def run_reviewer(state: AgentState) -> AgentState:
     if dataset_semantics_summary and isinstance(reviewer_view, dict):
         reviewer_view = dict(reviewer_view)
         reviewer_view["dataset_semantics_summary"] = dataset_semantics_summary
+    if isinstance(reviewer_view, dict):
+        reviewer_view = compress_long_lists(reviewer_view)[0]
     analysis_type = reviewer_view.get("objective_type") or strategy.get('analysis_type', 'predictive')
     strategy_context = reviewer_view.get("strategy_summary") or ""
     business_objective = ""
@@ -9346,9 +9659,10 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                             ml_data_path = path
                             break
         qa_context["ml_data_path"] = ml_data_path or "data/cleaned_data.csv"
+        qa_context_prompt = compress_long_lists(qa_context)[0] if isinstance(qa_context, dict) else qa_context
         if contract_source == "qa_view":
             try:
-                qa_len = len(json.dumps(qa_context, ensure_ascii=True))
+                qa_len = len(json.dumps(qa_context_prompt, ensure_ascii=True))
                 print(f"Using QA_VIEW_CONTEXT length={qa_len}")
                 if run_id:
                     log_run_event(run_id, "qa_view_context", {"length": qa_len})
@@ -9397,7 +9711,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             }
 
         try:
-            qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context)
+            qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context_prompt)
         except TypeError:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective)
 
@@ -10749,6 +11063,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     strategy_context = f"Strategy: {strategy.get('title')}\nType: {strategy.get('analysis_type')}\nRules: {strategy.get('reasoning')}"
     business_objective = state.get('business_objective', '')
     evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
+    contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
 
     eval_result = reviewer.evaluate_results(execution_output, business_objective, strategy_context, evaluation_spec)
 
@@ -11040,6 +11355,55 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         metric_history.append(primary_metric_snapshot)
         metric_history = metric_history[-20:]
 
+    baseline_check = {}
+    try:
+        baseline_check = _evaluate_baseline_sanity_check(
+            state=state if isinstance(state, dict) else {},
+            evaluation_spec=evaluation_spec if isinstance(evaluation_spec, dict) else None,
+            contract=contract if isinstance(contract, dict) else None,
+            contract_min=contract_min if isinstance(contract_min, dict) else None,
+            primary_metric_snapshot=primary_metric_snapshot if isinstance(primary_metric_snapshot, dict) else None,
+        )
+    except Exception as baseline_err:
+        print(f"Warning: baseline sanity check failed: {baseline_err}")
+        baseline_check = {}
+    if baseline_check and baseline_check.get("failed"):
+        baseline_allowed = False
+        for source in (
+            evaluation_spec if isinstance(evaluation_spec, dict) else None,
+            contract if isinstance(contract, dict) else None,
+            contract_min if isinstance(contract_min, dict) else None,
+        ):
+            if isinstance(source, dict) and source.get("baseline_allowed") is True:
+                baseline_allowed = True
+                break
+        reporting_policy = contract.get("reporting_policy") if isinstance(contract, dict) else {}
+        if isinstance(reporting_policy, dict) and reporting_policy.get("baseline_allowed") is True:
+            baseline_allowed = True
+        metric_name = baseline_check.get("metric_name")
+        metric_value = baseline_check.get("metric_value")
+        baseline_value = baseline_check.get("baseline_value")
+        margin = baseline_check.get("margin")
+        comparator = baseline_check.get("comparator")
+        threshold = baseline_check.get("threshold")
+        target_col = baseline_check.get("target_col")
+        rows_used = baseline_check.get("rows_used")
+        rows_note = f", rows={rows_used}" if rows_used is not None else ""
+        msg = (
+            "BASELINE_CHECK_FAILED: "
+            f"primary_metric={metric_name} value={metric_value:.4f} "
+            f"{comparator} baseline_threshold={threshold:.4f} "
+            f"(baseline={baseline_value:.4f}, margin={margin:.4f}, target={target_col}{rows_note})"
+        )
+        if baseline_allowed:
+            msg = f"{msg} (baseline_allowed)"
+            if status != "NEEDS_IMPROVEMENT":
+                status = "APPROVE_WITH_WARNINGS"
+        else:
+            status = "NEEDS_IMPROVEMENT"
+        new_history.append(msg)
+        feedback = f"{feedback}\n{msg}" if feedback else msg
+
     if _detect_refscore_alias(execution_output, contract):
         status = "NEEDS_IMPROVEMENT"
         alias_msg = (
@@ -11056,7 +11420,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     audit_rejected = False
     hard_qa_gate_reject = False
     qa_view = state.get("qa_view") or (state.get("contract_views") or {}).get("qa_view")
-    contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
     if isinstance(qa_view, dict) and qa_view:
         qa_context = dict(qa_view)
         qa_context["_contract_source"] = "qa_view"
@@ -11066,6 +11429,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     else:
         qa_context = {"_contract_source": "fallback"}
     qa_context["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
+    qa_context_prompt = compress_long_lists(qa_context)[0] if isinstance(qa_context, dict) else qa_context
     hard_qa_gates: set[str] = set()
     for gate in qa_context.get("qa_gates", []) if isinstance(qa_context, dict) else []:
         if isinstance(gate, dict):
@@ -11084,11 +11448,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             if ok:
                 reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
                 if not isinstance(reviewer_view, dict) or not reviewer_view:
-                    reviewer_view = build_reviewer_view(
-                        contract,
-                        _load_json_safe("data/contract_min.json") or {},
-                        state.get("artifact_index") or [],
-                    )
+                reviewer_view = build_reviewer_view(
+                    contract,
+                    _load_json_safe("data/contract_min.json") or {},
+                    state.get("artifact_index") or [],
+                )
+                if isinstance(reviewer_view, dict):
+                    reviewer_view = compress_long_lists(reviewer_view)[0]
                 review_result = reviewer.review_code(
                     code,
                     analysis_type,
@@ -11110,7 +11476,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             review_counters = counters
             qa_result = None
             if ok:
-                qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context)
+                qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context_prompt)
                 if qa_result and qa_result.get("status") != "APPROVED":
                     review_warnings.append(
                         f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
@@ -11725,6 +12091,8 @@ def run_translator(state: AgentState) -> AgentState:
     if context_pack and isinstance(translator_view, dict):
         translator_view = dict(translator_view)
         translator_view["context_pack"] = context_pack
+    if isinstance(translator_view, dict):
+        translator_view = compress_long_lists(translator_view)[0]
     report_state["translator_view"] = translator_view
     if context_pack:
         report_state["context_pack"] = context_pack

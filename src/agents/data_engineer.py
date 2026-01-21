@@ -94,18 +94,20 @@ class DataEngineerAgent:
         from src.utils.prompting import render_prompt
 
         contract = contract_min or execution_contract or {}
-        contract_json = json.dumps(contract, indent=2)
+        from src.utils.context_pack import compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
+
+        contract_json = json.dumps(compress_long_lists(contract)[0], indent=2)
         de_view = de_view or {}
-        de_view_json = json.dumps(de_view, indent=2)
+        de_view_json = json.dumps(compress_long_lists(de_view)[0], indent=2)
         cleaning_gates = get_cleaning_gates(contract) or get_cleaning_gates(execution_contract or {}) or []
-        cleaning_gates_json = json.dumps(cleaning_gates, indent=2)
+        cleaning_gates_json = json.dumps(compress_long_lists(cleaning_gates)[0], indent=2)
 
         # --- FIX CAUSA RAÍZ 1: Leer runbook correcto V4.1 ---
         # Primero intentar clave canónica V4.1, luego fallback a legacy
         de_runbook = contract.get("data_engineer_runbook")
         if not de_runbook:
             de_runbook = (contract.get("role_runbooks") or {}).get("data_engineer", {})
-        de_runbook_json = json.dumps(de_runbook, indent=2)
+        de_runbook_json = json.dumps(compress_long_lists(de_runbook)[0], indent=2)
 
         # SYSTEM TEMPLATE with PYTHON SYNTAX GOTCHAS (Fix CAUSA RAÍZ 3)
         SYSTEM_TEMPLATE = """
@@ -142,9 +144,14 @@ class DataEngineerAgent:
         - MUST NOT: compute scores, case assignment, weight fitting, regression/optimization, correlations, rank checks.
         - MUST: parse types, normalize numeric formats, preserve canonical column names.
         - Manifest MUST include: output_dialect, row_counts, conversions.
-        - Do NOT impute outcome/target columns. If a target is partially missing, preserve missingness.
+        - Do NOT impute outcome/target columns. If dataset_semantics.json shows partial labels, preserve missingness.
         - Preserve partition/split columns if they exist or are detected in the Dataset Semantics Summary.
         - If you create a partition column (split/fold/bucket), document it in the manifest and do not drop it.
+        - For wide datasets, avoid enumerating all columns in code comments or logic. If data/column_sets.json exists, use src.utils.column_sets.expand_column_sets to manage column lists; fall back gracefully if the file is missing.
+        - Do NOT drop columns just because they are missing from a truncated list; use selectors + explicit columns from column_sets.json when available.
+        - If column_sets.json is present, preserve all columns matched by its selectors plus explicit_columns unless the contract explicitly forbids them.
+        - Never assume canonical_columns is the full inventory on wide datasets. Use data/column_inventory.json + data/column_sets.json as source of truth when present.
+        - cleaned_data.csv should retain nearly all feature columns; only drop columns if they are explicitly forbidden, constant, or 100% missing and the contract allows it.
 
         *** PYTHON SYNTAX GOTCHAS (CRITICAL) ***
         - Column names starting with a digit (e.g., '1stYearAmount') are NOT valid Python identifiers.
@@ -183,6 +190,7 @@ class DataEngineerAgent:
         - Print a CLEANING_VALIDATION section that reports dtype and null_frac for each required column (no advanced metrics).
         - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
         - If a derived column has derived_owner='ml_engineer', do NOT create placeholders; leave it absent and document in the manifest.
+        - Manifest audit counts: include n_cols_in, n_cols_out, kept_by_selectors_count, dropped_forbidden_count, dropped_constant_count.
 
         *** GATE CHECKLIST (CONTRACT-DRIVEN) ***
         - Enumerate cleaning_gates by column and requirement (max_null_fraction, allow_nulls, required_columns, etc.).
@@ -194,6 +202,15 @@ class DataEngineerAgent:
         USER_TEMPLATE = "Generate the cleaning script following Principles."
 
         # Rendering
+        required_columns_payload = de_view.get("required_columns") or strategy.get("required_columns", [])
+        if isinstance(required_columns_payload, list) and len(required_columns_payload) > 80:
+            required_columns_payload = summarize_long_list(required_columns_payload)
+            required_columns_payload["note"] = COLUMN_LIST_POINTER
+        optional_passthrough_payload = de_view.get("optional_passthrough_columns") or []
+        if isinstance(optional_passthrough_payload, list) and len(optional_passthrough_payload) > 80:
+            optional_passthrough_payload = summarize_long_list(optional_passthrough_payload)
+            optional_passthrough_payload["note"] = COLUMN_LIST_POINTER
+
         system_prompt = render_prompt(
             SYSTEM_TEMPLATE,
             input_path=input_path,
@@ -201,8 +218,8 @@ class DataEngineerAgent:
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
             business_objective=business_objective,
-            required_columns=json.dumps(de_view.get("required_columns") or strategy.get("required_columns", [])),
-            optional_passthrough_columns=json.dumps(de_view.get("optional_passthrough_columns") or []),
+            required_columns=json.dumps(required_columns_payload),
+            optional_passthrough_columns=json.dumps(optional_passthrough_payload),
             data_audit=data_audit,
             contract_min_context=contract_json,
             de_view_context=de_view_json,

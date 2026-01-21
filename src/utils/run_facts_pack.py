@@ -75,7 +75,10 @@ def _extract_columns_sample(state: Dict[str, Any], max_cols: int = 40) -> Dict[s
         or _as_dict(state.get("ml_context_snapshot")).get("cleaned_column_inventory")
         or []
     )
-    columns_list = [str(c) for c in _as_list(columns) if c]
+    if isinstance(columns, dict):
+        columns_list = [str(c) for c in _as_list(columns.get("columns")) if c]
+    else:
+        columns_list = [str(c) for c in _as_list(columns) if c]
     return {
         "n_cols": len(columns_list) if columns_list else None,
         "sample": columns_list[:max_cols],
