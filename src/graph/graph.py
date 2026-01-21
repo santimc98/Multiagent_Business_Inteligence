@@ -11448,11 +11448,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             if ok:
                 reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
                 if not isinstance(reviewer_view, dict) or not reviewer_view:
-                reviewer_view = build_reviewer_view(
-                    contract,
-                    _load_json_safe("data/contract_min.json") or {},
-                    state.get("artifact_index") or [],
-                )
+                    reviewer_view = build_reviewer_view(
+                        contract,
+                        _load_json_safe("data/contract_min.json") or {},
+                        state.get("artifact_index") or [],
+                    )
                 if isinstance(reviewer_view, dict):
                     reviewer_view = compress_long_lists(reviewer_view)[0]
                 review_result = reviewer.review_code(
