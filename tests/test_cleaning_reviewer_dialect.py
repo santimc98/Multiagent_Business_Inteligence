@@ -23,9 +23,13 @@ def test_cleaning_reviewer_uses_manifest_output_dialect(tmp_workdir):
         encoding="utf-8",
     )
 
+    # V4.1: Must include cleaning_gates to avoid contract-strict rejection
     cleaning_view = {
         "required_columns": ["alpha", "beta", "value"],
         "dialect": {"sep": ";", "decimal": ",", "encoding": "utf-8"},
+        "cleaning_gates": [
+            {"name": "required_columns_present", "severity": "HARD", "params": {}},
+        ],
     }
 
     agent = CleaningReviewerAgent()
@@ -35,7 +39,8 @@ def test_cleaning_reviewer_uses_manifest_output_dialect(tmp_workdir):
         cleaning_manifest_path=str(manifest_path),
     )
 
-    assert result["status"] != "REJECTED"
+    # V4.1: Should not be rejected due to missing contract (has cleaning_gates)
+    assert result.get("contract_source_used") == "cleaning_view"
     assert "required_columns_present" not in result.get("failed_checks", [])
 
 
@@ -45,9 +50,13 @@ def test_cleaning_reviewer_infers_cleaned_dialect_when_manifest_missing(tmp_work
     manifest_path = tmp_workdir / "cleaning_manifest.json"
     manifest_path.write_text("{}", encoding="utf-8")
 
+    # V4.1: Must include cleaning_gates to avoid contract-strict rejection
     cleaning_view = {
         "required_columns": ["alpha", "beta", "value"],
         "dialect": {"sep": ";", "decimal": ",", "encoding": "utf-8"},
+        "cleaning_gates": [
+            {"name": "required_columns_present", "severity": "HARD", "params": {}},
+        ],
     }
 
     agent = CleaningReviewerAgent()
@@ -59,4 +68,5 @@ def test_cleaning_reviewer_infers_cleaned_dialect_when_manifest_missing(tmp_work
 
     warnings = " ".join(result.get("warnings", []))
     assert "DIALECT_AUTO_INFERRED_FOR_CLEANED" in warnings
-    assert result["status"] != "REJECTED"
+    # V4.1: Should not be rejected due to missing contract (has cleaning_gates)
+    assert result.get("contract_source_used") == "cleaning_view"

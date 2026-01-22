@@ -14,8 +14,10 @@ from src.utils.reviewer_llm import init_reviewer_llm
 load_dotenv()
 
 _CLEANING_FALLBACK_WARNING = (
-    "CONTRACT_BROKEN_FALLBACK: cleaning_gates missing; please fix contract generation"
+    "CONTRACT_BROKEN_FALLBACK: cleaning_gates missing in cleaning_view; "
+    "contract generation must include cleaning_gates (V4.1)."
 )
+_CONTRACT_MISSING_CLEANING_GATES = "CONTRACT_MISSING_CLEANING_GATES"
 _LLM_DISABLED_WARNING = "LLM_DISABLED_NO_API_KEY"
 _LLM_PARSE_WARNING = "LLM_PARSE_FAILED"
 _LLM_CALL_WARNING = "LLM_CALL_FAILED"
@@ -138,13 +140,24 @@ def _parse_review_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[
 
 
 def _parse_legacy_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Parse context to extract cleaning_view and paths.
+
+    V4.1: Removed legacy required_columns fallback. Required columns should come from
+    cleaning_view (populated from artifact_requirements.clean_dataset.required_columns
+    or canonical_columns), not from loose legacy context keys.
+    """
     context = context if isinstance(context, dict) else {}
     cleaning_view = context.get("cleaning_view") if isinstance(context.get("cleaning_view"), dict) else {}
 
+    # V4.1: Only allow cleaning_gates from cleaning_view or explicit context key
     if not cleaning_view.get("cleaning_gates") and isinstance(context.get("cleaning_gates"), list):
         cleaning_view["cleaning_gates"] = context.get("cleaning_gates")
-    if not cleaning_view.get("required_columns") and context.get("required_columns"):
-        cleaning_view["required_columns"] = context.get("required_columns")
+
+    # V4.1: REMOVED legacy required_columns fallback
+    # Required columns must come from cleaning_view (contract-driven), not loose context
+
+    # Dialect handling (still allowed for compatibility)
     if not cleaning_view.get("input_dialect"):
         input_dialect = context.get("input_dialect")
         if isinstance(input_dialect, dict):
@@ -264,7 +277,9 @@ def _review_cleaning_impl(
 
     if not client or provider == "none":
         deterministic_result["warnings"].append(_LLM_DISABLED_WARNING)
-        return normalize_cleaning_reviewer_result(deterministic_result), "LLM_DISABLED", "deterministic"
+        # V4.1: Enforce contract-strict rejection before returning
+        final_result = _enforce_contract_strict_rejection(normalize_cleaning_reviewer_result(deterministic_result))
+        return final_result, "LLM_DISABLED", "deterministic"
 
     prompt, payload = _build_llm_prompt(
         gates=gates,
@@ -298,12 +313,16 @@ def _review_cleaning_impl(
             content = response.choices[0].message.content
     except Exception as exc:
         deterministic_result["warnings"].append(f"{_LLM_CALL_WARNING}: {exc}")
-        return normalize_cleaning_reviewer_result(deterministic_result), prompt, str(exc)
+        # V4.1: Enforce contract-strict rejection before returning
+        final_result = _enforce_contract_strict_rejection(normalize_cleaning_reviewer_result(deterministic_result))
+        return final_result, prompt, str(exc)
 
     parsed = _parse_llm_json(content)
     if not parsed:
         deterministic_result["warnings"].append(_LLM_PARSE_WARNING)
-        return normalize_cleaning_reviewer_result(deterministic_result), prompt, content
+        # V4.1: Enforce contract-strict rejection before returning
+        final_result = _enforce_contract_strict_rejection(normalize_cleaning_reviewer_result(deterministic_result))
+        return final_result, prompt, content
 
     merged = _merge_llm_with_deterministic(
         llm_result=parsed,
@@ -312,7 +331,9 @@ def _review_cleaning_impl(
         contract_source_used=contract_source_used,
         warnings=warnings,
     )
-    return normalize_cleaning_reviewer_result(merged), prompt, content
+    # V4.1: Enforce contract-strict rejection before returning (LLM cannot override)
+    final_result = _enforce_contract_strict_rejection(normalize_cleaning_reviewer_result(merged))
+    return final_result, prompt, content
 
 
 def _exception_result(exc: Exception) -> Dict[str, Any]:
@@ -328,6 +349,58 @@ def _exception_result(exc: Exception) -> Dict[str, Any]:
         "gate_results": [],
         "contract_source_used": "error",
     }
+
+
+def _enforce_contract_strict_rejection(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    V4.1 Contract-Strict Mode: If cleaning_gates were missing from cleaning_view
+    (contract_source_used == "fallback"), force REJECTED regardless of gate outcomes.
+
+    This ensures the pipeline fails fast and triggers contract regeneration.
+    """
+    contract_source = result.get("contract_source_used", "")
+    if contract_source != "fallback":
+        return result
+
+    # Force REJECTED - contract is broken
+    result["status"] = "REJECTED"
+
+    # Add hard failure if not already present
+    hard_failures = result.get("hard_failures", [])
+    if not isinstance(hard_failures, list):
+        hard_failures = []
+    if _CONTRACT_MISSING_CLEANING_GATES not in hard_failures:
+        hard_failures.append(_CONTRACT_MISSING_CLEANING_GATES)
+    result["hard_failures"] = hard_failures
+
+    # Add to failed_checks
+    failed_checks = result.get("failed_checks", [])
+    if not isinstance(failed_checks, list):
+        failed_checks = []
+    if _CONTRACT_MISSING_CLEANING_GATES not in failed_checks:
+        failed_checks.append(_CONTRACT_MISSING_CLEANING_GATES)
+    result["failed_checks"] = failed_checks
+
+    # Add required fix
+    required_fixes = result.get("required_fixes", [])
+    if not isinstance(required_fixes, list):
+        required_fixes = []
+    contract_fix = "Regenerate Execution Contract to include cleaning_gates in cleaning_view (V4.1)."
+    if contract_fix not in required_fixes:
+        required_fixes.insert(0, contract_fix)
+    result["required_fixes"] = required_fixes
+
+    # Update feedback to explain the rejection
+    existing_feedback = result.get("feedback", "")
+    contract_feedback = (
+        "CONTRACT INCOMPLETE: cleaning_gates missing from cleaning_view. "
+        "Cannot validate cleaning without contract-defined gates. "
+        "Regenerate execution contract with cleaning_gates."
+    )
+    if contract_feedback not in existing_feedback:
+        result["feedback"] = contract_feedback + (" " + existing_feedback if existing_feedback else "")
+
+    return result
 
 
 def _merge_cleaning_gates(view: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str, List[str]]:

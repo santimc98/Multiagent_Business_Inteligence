@@ -30,9 +30,21 @@ def test_graph_saves_cleaned_full_and_audit(tmp_workdir, monkeypatch):
         {"output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"}}
     ).encode("utf-8")
 
+    # V4.1: Mock cleaning reviewer to pass (contract-strict mode rejects without cleaning_gates)
+    mock_cleaning_result = {
+        "status": "APPROVED",
+        "feedback": "Test mock approval",
+        "failed_checks": [],
+        "required_fixes": [],
+        "warnings": [],
+        "hard_failures": [],
+        "soft_failures": [],
+        "contract_source_used": "cleaning_view",
+    }
     with patch("src.graph.graph.Sandbox") as MockSandbox, \
          patch("src.graph.graph.scan_code_safety", return_value=(True, [])), \
          patch("src.graph.graph.data_engineer.generate_cleaning_script", return_value="print('clean')"), \
+         patch("src.graph.graph.cleaning_reviewer.review_cleaning", return_value=mock_cleaning_result), \
          patch.dict(os.environ, {"E2B_API_KEY": "dummy", "DEEPSEEK_API_KEY": "dummy", "GOOGLE_API_KEY": "dummy"}):
 
         mock_instance = MockSandbox.create.return_value.__enter__.return_value

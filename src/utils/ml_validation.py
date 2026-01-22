@@ -2,12 +2,15 @@ import ast
 import re
 from typing import Dict, Any, List
 
+from src.utils.contract_v41 import get_decision_columns
+
+
 def validate_decision_variable_isolation(
     code: str,
     execution_contract: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Validates appropriate use of decision variables based on problem type.
+    V4.1: Validates appropriate use of decision variables based on problem type.
 
     CONTEXT-AWARE VALIDATION (reads from execution_contract):
     - For PRICE OPTIMIZATION (maximize revenue = price × P(success|price)):
@@ -15,9 +18,14 @@ def validate_decision_variable_isolation(
     - For RESOURCE ALLOCATION (assign X units to maximize outcome):
       Decision variable should NOT be in features (not causal)
 
+    V4.1: Uses get_decision_columns() accessor to extract decision variables from:
+      - decision_columns (top-level)
+      - column_roles["decision"] (V4.1 role->list format)
+    No fallback to legacy feature_availability.
+
     Args:
         code: Generated Python code to validate
-        execution_contract: Contract with objective_analysis and column_roles
+        execution_contract: V4.1 contract with objective_analysis and column_roles
 
     Returns:
         {
@@ -49,29 +57,9 @@ def validate_decision_variable_isolation(
         # This is NOT leakage - it's the causal mechanism we're modeling
         return {"passed": True, "error_message": "", "violated_variables": []}
 
-    # 3. For other optimization types, extract decision variables from contract
-    # Use column_roles (v4.1) or fallback to feature_availability (legacy)
-    decision_vars = []
-
-    column_roles = execution_contract.get("column_roles", {})
-    if isinstance(column_roles, dict):
-        for col_name, col_info in column_roles.items():
-            if isinstance(col_info, dict):
-                role = str(col_info.get("role", "")).lower()
-                if role == "decision":
-                    decision_vars.append(col_name)
-
-    # Fallback to legacy feature_availability if column_roles not found
-    if not decision_vars:
-        feature_availability = execution_contract.get("feature_availability", [])
-        if isinstance(feature_availability, list):
-            for item in feature_availability:
-                if isinstance(item, dict):
-                    avail = str(item.get("availability", "")).lower()
-                    if avail in ["decision", "post-decision"]:
-                        col = item.get("column")
-                        if col:
-                            decision_vars.append(col)
+    # 3. V4.1: Extract decision variables using accessor (no legacy fallback)
+    # get_decision_columns handles both decision_columns and column_roles["decision"]
+    decision_vars = get_decision_columns(execution_contract)
 
     if not decision_vars:
         return {"passed": True, "error_message": "", "violated_variables": []}
