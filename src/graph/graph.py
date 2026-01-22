@@ -85,6 +85,7 @@ from src.utils.contract_v41 import (
     get_validation_requirements,
     get_qa_gates,
     get_reviewer_gates,
+    get_decision_columns,
 )
 from src.utils.contract_views import (
     build_de_view,
@@ -545,19 +546,17 @@ def _stage_illustrative_assets(
     deliverable_lookup: Dict[str, Dict[str, Any]] = {}
     schema_paths: set[str] = set()
     if isinstance(contract, dict):
-        # V4.1: Use artifact_requirements instead of spec_extraction
+        # V4.1: Use artifact_requirements only (no legacy artifact_schemas)
         artifacts = get_artifact_requirements(contract)
         required_files = artifacts.get("required_files", [])
         if isinstance(required_files, list):
             for path in required_files:
                 if path:
                     deliverable_lookup[str(path)] = {"path": str(path), "required": True}
-        schema = contract.get("artifact_schemas")
+        # V4.1: Use file_schemas from artifact_requirements
         file_schemas = artifacts.get("file_schemas")
-        if not isinstance(schema, dict) and isinstance(file_schemas, dict):
-            schema = file_schemas
-        if isinstance(schema, dict):
-            schema_paths = {str(path) for path in schema.keys() if path}
+        if isinstance(file_schemas, dict):
+            schema_paths = {str(path) for path in file_schemas.keys() if path}
 
     def _score_summary_candidate(rel_path: str, dest_path: str) -> float:
         deliverable = deliverable_lookup.get(rel_path, {})
@@ -904,16 +903,7 @@ def _resolve_requirement_meta(contract: Dict[str, Any], col: str) -> Dict[str, A
         if _norm_name(c) == norm_col:
             return {"name": c, "required": False, "nullable": True}
 
-    # Fallback to legacy data_requirements for backwards compatibility
-    reqs = contract.get("data_requirements", [])
-    if isinstance(reqs, list):
-        for req in reqs:
-            if not isinstance(req, dict):
-                continue
-            name = req.get("canonical_name") or req.get("name") or req.get("column")
-            if name and _norm_name(name) == norm_col:
-                return req
-
+    # V4.1: No legacy data_requirements fallback
     # Default: if not found in canonical, assume it might be optional or extra
     return {}
 
@@ -1318,39 +1308,22 @@ def _build_required_raw_map(
 
 def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
-    V4.1: Canonical columns ARE inputs. Returns contract ready for input processing.
-    Legacy: Filter data_requirements to source='input'.
+    V4.1: Canonical columns ARE inputs. Returns contract as-is.
+    No legacy data_requirements filtering needed.
     """
     if not isinstance(contract, dict):
         return {}
-    new_contract = dict(contract)
+    return dict(contract)
 
-    # Legacy cleanup
-    reqs = contract.get("data_requirements", []) or []
-    if reqs:
-        filtered = [r for r in reqs if isinstance(r, dict) and r.get("source", "input") == "input"]
-        new_contract["data_requirements"] = filtered
-
-    return new_contract
 
 def _filter_contract_for_data_engineer(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     V4.1: Data Engineer uses canonical_columns (inputs) and dialect.
+    No legacy data_requirements filtering needed.
     """
     if not isinstance(contract, dict):
         return {}
-
-    # In V4.1, contract is already structured by role ownership (DataEng owns loading/cleaning)
-    # We just return the contract; the agent runbook handles the rest.
-    new_contract = dict(contract)
-
-    # Legacy legacy cleanup
-    reqs = contract.get("data_requirements", []) or []
-    if reqs:
-        filtered = [r for r in reqs if isinstance(r, dict) and r.get("source", "input") == "input"]
-        new_contract["data_requirements"] = filtered
-
-    return new_contract
+    return dict(contract)
 
 
 def build_de_objective(contract: Dict[str, Any]) -> str:
@@ -1368,27 +1341,12 @@ def build_de_objective(contract: Dict[str, Any]) -> str:
 
 
 def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str, Any]) -> List[str]:
-    """V4.1: Prefer canonical_columns, fallback to data_requirements for backwards compatibility."""
+    """V4.1: Use canonical_columns only. No legacy data_requirements fallback."""
     if contract and isinstance(contract, dict):
-        # V4.1: Try canonical_columns first
         canonical = get_canonical_columns(contract)
         if canonical:
             return canonical
-
-        # Legacy fallback: data_requirements with source='input'
-        contract_reqs = contract.get("data_requirements", []) or []
-        if contract_reqs:
-            resolved = []
-            for req in contract_reqs:
-                if not isinstance(req, dict):
-                    continue
-                if req.get("source", "input") != "input":
-                    continue
-                name = req.get("canonical_name") or req.get("name")
-                if name:
-                    resolved.append(name)
-            if resolved:
-                return resolved
+    # Fallback to strategy if contract has no canonical_columns
     return strategy.get("required_columns", []) if strategy else []
 
 def _resolve_contract_deliverables(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1404,15 +1362,12 @@ def _resolve_contract_deliverables(contract: Dict[str, Any]) -> List[Dict[str, A
         # Convert to list of dicts for compatibility with existing graph logic
         return [{"path": p, "required": True} for p in outputs]
 
-    # Legacy Fallback
-    spec = contract.get("spec_extraction") or {}
-    deliverables = spec.get("deliverables")
-    if isinstance(deliverables, list):
-        return deliverables
+    # V4.1: No legacy spec_extraction fallback
     return []
 
+
 def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
-    """V4.1: Use available_columns/canonical_columns instead of data_requirements source filtering."""
+    """V4.1: Use canonical_columns for input, derived_columns for derived. No legacy fallback."""
     if not contract or not isinstance(contract, dict):
         return []
 
@@ -1426,20 +1381,9 @@ def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None
         from src.utils.contract_v41 import get_derived_column_names
         return get_derived_column_names(contract)
 
-    # Legacy Fallback
-    reqs = contract.get("data_requirements", []) or []
-    out: List[str] = []
-    for req in reqs:
-        if not isinstance(req, dict):
-            continue
-        name = req.get("canonical_name") or req.get("name")
-        if not name:
-            continue
-        source = req.get("source", "input") or "input"
-        if sources is None or source in sources:
-            out.append(name)
-    return out
-    return out
+    # Default: return canonical columns (input columns)
+    from src.utils.contract_v41 import get_canonical_columns
+    return get_canonical_columns(contract)
 
 def _resolve_allowed_columns_for_gate(
     state: Dict[str, Any],
@@ -1466,14 +1410,7 @@ def _resolve_allowed_columns_for_gate(
         from src.utils.contract_v41 import get_derived_column_names
         derived_cols = get_derived_column_names(contract)
         allowed.extend([str(c) for c in derived_cols if c])
-
-        # Minimal legacy fallback for data_requirements
-        data_reqs = contract.get("data_requirements", []) or []
-        if isinstance(data_reqs, list):
-            for req in data_reqs:
-                if isinstance(req, dict) and req.get("source") == "derived":
-                     name = req.get("canonical_name") or req.get("name")
-                     if name: allowed.append(str(name))
+        # V4.1: No legacy data_requirements fallback
 
     if not allowed:
         profile = state.get("profile") or state.get("dataset_profile")
@@ -1493,6 +1430,7 @@ def _resolve_allowed_columns_for_gate(
     return deduped
 
 def _resolve_allowed_patterns_for_gate(contract: Any) -> List[str]:
+    """V4.1: Use artifact_requirements.file_schemas only. No legacy fallback."""
     patterns: List[str] = []
     if not isinstance(contract, dict):
         return patterns
@@ -1500,12 +1438,7 @@ def _resolve_allowed_patterns_for_gate(contract: Any) -> List[str]:
     if not isinstance(artifact_requirements, dict):
         artifact_requirements = {}
     schema = artifact_requirements.get("file_schemas")
-    if not isinstance(schema, dict):
-        # Legacy Fallback
-        spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
-        schema = spec.get("artifact_schemas") if isinstance(spec, dict) else None
-        if not isinstance(schema, dict):
-            schema = contract.get("artifact_schemas") if isinstance(contract.get("artifact_schemas"), dict) else None
+    # V4.1: No legacy spec_extraction or artifact_schemas fallback
     if isinstance(schema, dict):
         scored_schema = schema.get("data/scored_rows.csv")
         if isinstance(scored_schema, dict):
@@ -1515,23 +1448,19 @@ def _resolve_allowed_patterns_for_gate(contract: Any) -> List[str]:
     return patterns
 
 def _resolve_contract_columns_for_cleaning(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
+    """V4.1: Use canonical_columns for cleaning. No legacy data_requirements."""
     if not contract or not isinstance(contract, dict):
         return []
-    reqs = contract.get("data_requirements", []) or []
-    out: List[str] = []
-    for req in reqs:
-        if not isinstance(req, dict):
-            continue
-        name = req.get("canonical_name") or req.get("name")
-        if not name:
-            continue
-        source = req.get("source", "input") or "input"
-        owner = (req.get("derived_owner") or "").lower()
-        if source == "derived" and owner == "ml_engineer":
-            continue
-        if sources is None or source in sources:
-            out.append(name)
-    return out
+    # V4.1: Cleaning uses canonical_columns + optional_passthrough_columns from artifact_requirements
+    from src.utils.contract_v41 import get_canonical_columns, get_artifact_requirements
+    columns = list(get_canonical_columns(contract))
+    artifacts = get_artifact_requirements(contract)
+    schema_binding = artifacts.get("schema_binding", {})
+    if isinstance(schema_binding, dict):
+        passthrough = schema_binding.get("optional_passthrough_columns", [])
+        if isinstance(passthrough, list):
+            columns.extend([str(c) for c in passthrough if c])
+    return columns
 
 def _is_glob_pattern(path: str) -> bool:
     if not path:
@@ -1826,15 +1755,12 @@ def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any
         derived_cols = contract.get("derived_columns", [])
 
     column_roles = contract.get("column_roles", {})
-    decision_variables = contract.get("decision_variables")
-    if not isinstance(decision_variables, list) or not decision_variables:
-        if isinstance(column_roles, dict):
-            inferred = [
-                str(col)
-                for col, role in column_roles.items()
-                if col and str(role).strip().lower() == "decision"
-            ]
-            decision_variables = inferred
+    # V4.1: Use get_decision_columns accessor, NOT contract.get("decision_variables")
+    decision_variables = get_decision_columns(contract) or []
+    if not decision_variables:
+        # Fallback: infer from column_roles if accessor returns empty
+        roles = get_column_roles(contract) or {}
+        decision_variables = roles.get("decision", []) or []
 
     allowed_sets_full = contract.get("allowed_feature_sets")
     if not isinstance(allowed_sets_full, dict):
@@ -1885,14 +1811,14 @@ def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any
         "business_objective": contract.get("business_objective"),
         # Use normalized required_outputs
         "required_outputs": _resolve_required_outputs(contract),
-        "data_requirements": contract.get("data_requirements", []) or [],
+        # V4.1: No data_requirements - use canonical_columns instead
         "alignment_requirements": alignment,
         "canonical_columns": contract.get("canonical_columns", []) or [],
         "column_roles": column_roles if isinstance(column_roles, dict) else {},
-        "decision_variables": decision_variables if isinstance(decision_variables, list) else [],
+        # V4.1: Use decision_columns from column_roles, NOT legacy decision_variables
+        "decision_columns": decision_variables if isinstance(decision_variables, list) else [],
         "derived_columns": derived_cols if isinstance(derived_cols, list) else [],
-        "feature_availability": contract.get("feature_availability", []) or [],
-        "availability_summary": contract.get("availability_summary", ""),
+        # V4.1: Removed legacy keys (feature_availability, availability_summary)
         "evaluation_spec": eval_spec,
         # V4.1 fields
         "artifact_requirements": contract.get("artifact_requirements", {}),
@@ -2263,67 +2189,13 @@ def _ensure_contract_deliverable(
     description: str | None = None,
     schema: Dict[str, Any] | None = None,  # ← NEW: optional schema
 ) -> Dict[str, Any]:
+    """V4.1: Add required outputs to required_outputs only. No spec_extraction."""
     if not isinstance(contract, dict):
         return {}
     if not path:
         return contract
-    spec = contract.get("spec_extraction")
-    if not isinstance(spec, dict):
-        spec = {}
-    deliverables = spec.get("deliverables")
-    if not isinstance(deliverables, list):
-        deliverables = []
 
-    normalized: List[Dict[str, Any]] = []
-    for item in deliverables:
-        if isinstance(item, dict):
-            normalized.append(item)
-        elif isinstance(item, str):
-            normalized.append(
-                {
-                    "id": _deliverable_id_from_path(item),
-                    "path": item,
-                    "required": True,
-                    "kind": _infer_deliverable_kind(item),
-                    "description": "Requested deliverable.",
-                }
-            )
-    deliverables = normalized
-
-    existing = None
-    for item in deliverables:
-        if item.get("path") == path:
-            existing = item
-            break
-    if existing:
-        existing["required"] = bool(required)
-        if kind:
-            existing["kind"] = kind
-        if description:
-            existing["description"] = description
-        if schema:  # ← NEW: attach schema if provided
-            existing["schema"] = schema
-        if not existing.get("id"):
-            existing["id"] = _deliverable_id_from_path(path)
-    else:
-        new_deliverable = {
-            "id": _deliverable_id_from_path(path),
-            "path": path,
-            "required": bool(required),
-            "kind": kind or _infer_deliverable_kind(path),
-            "description": description or "Requested deliverable.",
-        }
-        if schema:  # ← NEW: attach schema if provided
-            new_deliverable["schema"] = schema
-        deliverables.append(new_deliverable)
-
-
-    spec["deliverables"] = deliverables
-    contract["spec_extraction"] = spec
-
-    # --- FIX: DO NOT OVERWRITE required_outputs ---
-    # Treat existing required_outputs as source-of-truth.
-    # Only ADD new required paths (dedupe).
+    # V4.1: Use required_outputs directly, no spec_extraction
     existing_outputs = contract.get("required_outputs")
     if not isinstance(existing_outputs, list):
         existing_outputs = []
@@ -2331,7 +2203,7 @@ def _ensure_contract_deliverable(
     seen: set[str] = set(_normalize_output_path(p) for p in existing_outputs if p)
     merged_outputs = [_normalize_output_path(p) for p in existing_outputs if p]
 
-    # Add new required deliverables not already in required_outputs
+    # Add new required path if not already present
     if required:
         norm_path = _normalize_output_path(path)
         if norm_path not in seen:
@@ -2344,28 +2216,19 @@ def _ensure_scored_rows_output(
     contract: Dict[str, Any],
     evaluation_spec: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    """V4.1: Ensure scored_rows.csv in required_outputs. No spec_extraction."""
     if not isinstance(contract, dict):
         return {}
-    spec = contract.get("spec_extraction") or {}
-    deliverables = spec.get("deliverables")
+
     required_outputs = contract.get("required_outputs", []) or []
     requires_row_scoring = False
     if isinstance(evaluation_spec, dict):
         requires_row_scoring = bool(evaluation_spec.get("requires_row_scoring"))
-    explicit_required = False
-    if isinstance(deliverables, list):
-        for item in deliverables:
-            if isinstance(item, dict) and item.get("path") == "data/scored_rows.csv":
-                if bool(item.get("required")):
-                    explicit_required = True
-                break
-            if isinstance(item, str) and item == "data/scored_rows.csv":
-                explicit_required = True
-                break
-    if "data/scored_rows.csv" in required_outputs:
-        explicit_required = True
+
+    explicit_required = "data/scored_rows.csv" in required_outputs
+
     if explicit_required or requires_row_scoring:
-        # ← NEW: Generate universal schema for scored_rows.csv
+        # Generate universal schema for scored_rows.csv
         scored_rows_schema = _infer_scored_rows_schema(contract, evaluation_spec)
 
         contract = _ensure_contract_deliverable(
@@ -2374,34 +2237,15 @@ def _ensure_scored_rows_output(
             required=True,
             kind="dataset",
             description="Row-level scores and key features.",
-            schema=scored_rows_schema,  # ← NEW: attach inferred schema
+            schema=scored_rows_schema,
         )
         return contract
-    if isinstance(deliverables, list):
-        for item in deliverables:
-            if isinstance(item, dict) and item.get("path") == "data/scored_rows.csv":
-                item["required"] = False
-        required_outputs = []
-        seen: set[str] = set()
-        for item in deliverables:
-            if isinstance(item, dict) and item.get("required"):
-                path = item.get("path")
-            elif isinstance(item, str):
-                path = item
-            else:
-                path = None
-            if not path or path in seen:
-                continue
-            seen.add(path)
-            required_outputs.append(path)
-        contract["required_outputs"] = required_outputs
-        spec["deliverables"] = deliverables
-        contract["spec_extraction"] = spec
-    else:
-        if "data/scored_rows.csv" in required_outputs:
-            contract["required_outputs"] = [
-                path for path in required_outputs if path != "data/scored_rows.csv"
-            ]
+
+    # If not required, remove from required_outputs if present
+    if "data/scored_rows.csv" in required_outputs:
+        contract["required_outputs"] = [
+            path for path in required_outputs if path != "data/scored_rows.csv"
+        ]
     return contract
 
 
@@ -2433,15 +2277,16 @@ def _case_alignment_skip_reason(
     contract: Dict[str, Any] | None,
     evaluation_spec: Dict[str, Any] | None = None,
 ) -> str:
+    """V4.1: Check case_taxonomy, case_key, case_columns from contract root only."""
     if not isinstance(contract, dict):
         contract = {}
-    spec = contract.get("spec_extraction") or {}
-    if not isinstance(spec, dict):
-        spec = {}
-    case_taxonomy = spec.get("case_taxonomy") if isinstance(spec.get("case_taxonomy"), list) else []
-    case_key = spec.get("case_key")
-    case_columns = spec.get("case_columns")
+    # V4.1: Use top-level keys only, no spec_extraction
+    case_taxonomy = contract.get("case_taxonomy") if isinstance(contract.get("case_taxonomy"), list) else []
+    case_key = contract.get("case_key")
+    case_columns = contract.get("case_columns")
     if isinstance(evaluation_spec, dict):
+        if not case_taxonomy:
+            case_taxonomy = evaluation_spec.get("case_taxonomy") if isinstance(evaluation_spec.get("case_taxonomy"), list) else []
         case_key = case_key or evaluation_spec.get("case_key")
         case_columns = case_columns or evaluation_spec.get("case_columns")
 
@@ -2487,20 +2332,13 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     V4.1 CUTOVER: Minimal normalization only.
 
     Contract is now IMMUTABLE after Execution Planner generates it.
-    We only normalize quality_gates structure for backward compatibility.
-    All other fields are preserved as-is from V4.1 schema.
+    All V4.1 fields are preserved as-is. No legacy key handling.
     """
     if not isinstance(contract, dict):
         return {}
     normalized = dict(contract)
 
-    # Only normalize quality_gates structure (for backward compat)
-    quality_gates = normalized.get("quality_gates")
-    if isinstance(quality_gates, list):
-        normalized["quality_gates_raw"] = quality_gates
-        normalized["quality_gates"] = {}
-    elif not isinstance(quality_gates, dict):
-        normalized["quality_gates"] = {}
+    # V4.1: No legacy quality_gates normalization - use qa_gates instead
 
     # Ensure basic required structures exist (non-invasive)
     if not isinstance(normalized.get("business_alignment"), dict):
@@ -2514,8 +2352,7 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(normalized.get("evaluation_spec"), dict):
         normalized["evaluation_spec"] = {}
 
-    # V4.1: DO NOT touch spec_extraction, data_requirements, or role_runbooks
-    # The contract comes from Execution Planner with V4.1 schema already populated
+    # V4.1: Contract comes from Execution Planner with legacy keys already stripped
 
     return normalized
 
@@ -2870,18 +2707,21 @@ def _validate_strategy_lock(state: Dict[str, Any]) -> tuple[bool, Dict[str, Any]
     return True, {"reason": "no_drift"}
 
 def _detect_refscore_alias(execution_output: str, contract: Dict[str, Any]) -> bool:
+    """V4.1: Check derived_columns and column_roles for refscore pattern."""
     if not execution_output or not isinstance(contract, dict):
         return False
     derived_target = False
-    for req in contract.get("data_requirements", []) or []:
-        if not isinstance(req, dict):
-            continue
-        name = (req.get("canonical_name") or req.get("name") or "").lower()
-        role = (req.get("role") or "").lower()
-        source = (req.get("source") or "input").lower()
-        if role == "target" and "refscore" in name and source == "derived":
+
+    # V4.1: Check derived_columns for refscore
+    from src.utils.contract_v41 import get_derived_column_names, get_column_roles
+    derived_cols = get_derived_column_names(contract)
+    outcome_roles = get_column_roles(contract).get("outcome", [])
+
+    for col in derived_cols:
+        if "refscore" in str(col).lower() and col in outcome_roles:
             derived_target = True
             break
+
     if not derived_target:
         return False
     alias_patterns = [
@@ -3815,46 +3655,34 @@ def _has_derived_target_guard(code_lower: str, column_name: str) -> bool:
     return "not in df.columns" in code_lower
 
 def _collect_derived_targets(contract: Dict[str, Any]) -> List[str]:
+    """V4.1: Collect derived columns that are targets using V4.1 schema only."""
     derived_targets: List[str] = []
     if not isinstance(contract, dict):
         return derived_targets
-    reqs = contract.get("data_requirements", []) or []
-    for req in reqs:
-        if not isinstance(req, dict):
-            continue
-        if str(req.get("role", "")).lower() != "target":
-            continue
-        if str(req.get("source", "input")).lower() != "derived":
-            continue
-        name = req.get("canonical_name") or req.get("name")
-        if name and name not in derived_targets:
-            derived_targets.append(name)
-    # V4.1 Priority
-    # V4.1 Priority
+
+    # V4.1: Get derived columns and outcome columns
+    from src.utils.contract_v41 import get_derived_column_names, get_outcome_columns
+    derived_cols = set(get_derived_column_names(contract))
+    outcome_cols = get_outcome_columns(contract)
+
+    # Derived targets = intersection of derived columns and outcome columns
+    for col in outcome_cols:
+        if col in derived_cols and col not in derived_targets:
+            derived_targets.append(col)
+
+    # Also check feature_engineering_plan for target columns
     fep = contract.get("feature_engineering_plan")
-    if not isinstance(fep, dict):
-        fep = {}
-    derived_cols = fep.get("derived_columns") or []
-
-    spec = contract.get("spec_extraction")
-    if not isinstance(spec, dict):
-        spec = {}
-
-    if not derived_cols:
-        derived_cols = spec.get("derived_columns") or []
-    derived_names: List[str] = []
-    for col in derived_cols:
-        if isinstance(col, dict):
-            name = col.get("name") or col.get("canonical_name")
-        elif isinstance(col, str):
-            name = col
-        else:
+    if isinstance(fep, dict):
+        fep_derived = fep.get("derived_columns") or []
+        for col in fep_derived:
             name = None
-        if name and name not in derived_names:
-            derived_names.append(name)
-    target_name = spec.get("target_column")
-    if target_name and target_name in derived_names and target_name not in derived_targets:
-        derived_targets.append(target_name)
+            if isinstance(col, dict):
+                name = col.get("name") or col.get("canonical_name")
+            elif isinstance(col, str):
+                name = col
+            if name and name in outcome_cols and name not in derived_targets:
+                derived_targets.append(name)
+
     return derived_targets
 
 def _missing_required_output_refs(code: str, outputs: List[str]) -> List[str]:
@@ -4941,14 +4769,9 @@ def _artifact_alignment_gate(
 
     schema = {}
     if isinstance(contract, dict):
-        # V4.1 Priority first
+        # V4.1: Use artifact_requirements.file_schemas only, no legacy fallback
         reqs = contract.get("artifact_requirements") or {}
         schema = _normalize_schema(reqs.get("file_schemas"))
-        if not schema:
-             schema = _normalize_schema(contract.get("artifact_schemas"))
-        if not schema:
-            spec = contract.get("spec_extraction") or {}
-            schema = _normalize_schema(spec.get("artifact_schemas"))
     scored_schema = schema.get("data/scored_rows.csv") if isinstance(schema, dict) else {}
     allowed_extra = scored_schema.get("allowed_extra_columns") if isinstance(scored_schema, dict) else None
     allowed_patterns = scored_schema.get("allowed_name_patterns") if isinstance(scored_schema, dict) else None
@@ -6983,8 +6806,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
             objective_type = eval_spec.get("objective_type")
     dataset_profile = build_dataset_profile(data_summary, column_inventory)
     execution_plan = build_execution_plan(str(objective_type or "unknown"), dataset_profile)
-    if isinstance(contract, dict):
-        contract["execution_plan"] = execution_plan
+    # V4.1: Do NOT write execution_plan to contract (legacy key)
     reporting_policy = {}
     try:
         reporting_policy = build_reporting_policy(execution_plan, strategy)
@@ -7179,8 +7001,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
         )
     policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
     result = {"execution_contract": contract}
-    if execution_plan:
-        result["execution_plan"] = execution_plan
+    # V4.1: Do NOT add execution_plan to result (legacy key)
     if evaluation_spec:
         result["evaluation_spec"] = evaluation_spec
     if isinstance(contract_min, dict) and contract_min:
@@ -8739,8 +8560,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
             derived_evidence = {}
             if contract_derived_cols:
                 col_by_norm = {_norm_name(c): c for c in df_mapped.columns}
-                spec = contract.get("spec_extraction", {}) if isinstance(contract, dict) else {}
-                spec_derived = spec.get("derived_columns", []) if isinstance(spec, dict) else []
+                # V4.1: Use derived_columns from contract root or feature_engineering_plan
+                v41_derived = contract.get("derived_columns", []) if isinstance(contract, dict) else []
+                if not v41_derived:
+                    fep = contract.get("feature_engineering_plan", {}) if isinstance(contract, dict) else {}
+                    v41_derived = fep.get("derived_columns", []) if isinstance(fep, dict) else []
+                spec_derived = v41_derived if isinstance(v41_derived, list) else []
                 for derived_name in contract_derived_cols:
                     norm_name = _norm_name(derived_name)
                     actual_name = col_by_norm.get(norm_name)
@@ -9115,8 +8940,7 @@ def run_engineer(state: AgentState) -> AgentState:
             header_cols = _read_csv_header(data_path, csv_encoding, csv_sep)
             note = f"ML_DATA_PATH_FALLBACK: using cleaned_full.csv due to missing required columns {missing_required[:5]}"
             data_audit_context = _merge_de_audit_override(data_audit_context, note)
-    feature_availability = (execution_contract or {}).get("feature_availability", [])
-    availability_summary = (execution_contract or {}).get("availability_summary", "")
+    # V4.1: Removed legacy feature_availability and availability_summary
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
     iteration_memory_block = state.get("ml_iteration_memory_block", "")
     iter_id = int(state.get("iteration_count", 0)) + 1
@@ -9152,8 +8976,7 @@ def run_engineer(state: AgentState) -> AgentState:
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
             business_objective=business_objective,
-            feature_availability=feature_availability,
-            availability_summary=availability_summary,
+            # V4.1: Removed feature_availability and availability_summary from kwargs
             signal_summary={},
             iteration_memory=iteration_memory,
             iteration_memory_block=iteration_memory_block,
@@ -9193,15 +9016,7 @@ def run_engineer(state: AgentState) -> AgentState:
             f"chunk_size={dataset_scale_hints.get('chunk_size') or 'unknown'}"
         )
         context_ops_blocks.append(scale_line)
-        if feature_availability or availability_summary:
-            availability_payload = {
-                "availability_summary": availability_summary,
-                "feature_availability": feature_availability,
-            }
-            context_ops_blocks.append(
-                "FEATURE_AVAILABILITY_CONTEXT:\n"
-                + json.dumps(compress_long_lists(availability_payload)[0], ensure_ascii=True)
-            )
+        # V4.1: Removed feature_availability and availability_summary blocks
         if iteration_memory:
             memory_slice = iteration_memory[-2:]
             context_ops_blocks.append(
@@ -9340,8 +9155,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "dataset_semantics_summary": dataset_semantics_summary,
                 "dataset_training_mask": state.get("dataset_training_mask"),
                 "context_pack": context_pack,
-                "feature_availability": feature_availability,
-                "availability_summary": availability_summary,
+                # V4.1: Removed feature_availability and availability_summary
                 "dataset_scale_hints": dataset_scale_hints,
                 "signal_summary": kwargs.get("signal_summary", {}),
                 "iteration_memory": iteration_memory,
@@ -9894,14 +9708,27 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             for i in issues
             if i not in {"TARGET_NOT_IN_X", "TARGET_VARIANCE_GUARD", "CROSS_VALIDATION_REQUIRED", "TIME_SERIES_SPLIT_REQUIRED"}
         ]
-    required_columns = contract.get("required_columns") or strategy.get("required_columns", []) or []
-    feature_availability = contract.get("feature_availability", []) or []
+    # V4.1 Resolution for key columns
+    contract_min = state.get("execution_contract_min") or {}
+    base_cols = contract_min.get("relevant_columns")
+    if not base_cols:
+         base_cols = get_canonical_columns(contract) or []
+    
+    key_columns = list(base_cols)[:30]
+    
+    # Strategy refinement
+    strategy_req = strategy.get("required_columns")
+    if isinstance(strategy_req, list) and strategy_req:
+        canonical = get_canonical_columns(contract) or []
+        intersect = [c for c in strategy_req if c in canonical]
+        if intersect:
+            key_columns = list(intersect)[:30]
+            
+    required_columns = key_columns # Map for downstream consistency
+    roles = get_column_roles(contract) or {}
+    pre_decision_cols = roles.get("pre_decision", []) or []
+    decision_vars = roles.get("decision", []) or []
     evaluation_spec = state.get("evaluation_spec") or contract.get("evaluation_spec") or {}
-    pre_decision_cols = [
-        item.get("column")
-        for item in feature_availability
-        if isinstance(item, dict) and str(item.get("availability", "")).lower() == "pre-decision"
-    ]
     required_outputs = contract.get("required_outputs", []) or []
     if not flags["requires_row_scoring"]:
         required_outputs = [
@@ -9941,11 +9768,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             if missing_seg:
                 issues.append("SEGMENT_FEATURES_INCOMPLETE")
     model_features = _extract_named_string_list(code, ["MODEL_FEATURES", "model_features"])
-    decision_vars = [
-        item.get("column")
-        for item in feature_availability
-        if isinstance(item, dict) and str(item.get("availability", "")).lower() == "decision"
-    ]
+    # decision_vars already computed from roles
     model_required = False
     if isinstance(evaluation_spec, dict):
         obj_type = str(evaluation_spec.get("objective_type") or "").lower()

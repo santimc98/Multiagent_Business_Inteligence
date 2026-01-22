@@ -654,18 +654,23 @@ class BusinessTranslatorAgent:
             return f"Issues by severity: {severity_counts}; Top3: {top}"
 
         def _summarize_contract():
+            """V4.1: Summarize contract using V4.1 keys only, no legacy keys."""
             if not contract:
                 return "No execution contract."
             return {
                 "strategy_title": contract.get("strategy_title"),
                 "business_objective": contract.get("business_objective"),
                 "required_outputs": contract.get("required_outputs", []),
-                "validations": contract.get("validations", []),
-                "quality_gates": contract.get("quality_gates", {}),
+                "canonical_columns_count": len(contract.get("canonical_columns", []) or []),
+                "derived_columns_count": len(contract.get("derived_columns", []) or []),
+                "validation_requirements": contract.get("validation_requirements", {}),
+                "qa_gates": contract.get("qa_gates", []),
+                "cleaning_gates": contract.get("cleaning_gates", []),
+                "reviewer_gates": contract.get("reviewer_gates", []),
                 "business_alignment": contract.get("business_alignment", {}),
-                "spec_extraction": contract.get("spec_extraction", {}),
                 "iteration_policy": contract.get("iteration_policy", {}),
-                "execution_plan": contract.get("execution_plan", {}),
+                "decisioning_requirements": contract.get("decisioning_requirements", {}),
+                "reporting_policy": contract.get("reporting_policy", {}),
             }
 
         def _summarize_output_contract():

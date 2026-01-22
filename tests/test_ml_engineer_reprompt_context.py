@@ -15,11 +15,14 @@ def test_incomplete_reprompt_context_has_contract_and_outputs(monkeypatch):
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", FakeOpenAI)
 
     agent = MLEngineerAgent()
+    # V4.1: Use canonical_columns and artifact_requirements instead of legacy keys
     contract = {
-        "required_columns": [f"col_{i}" for i in range(300)],
+        "canonical_columns": [f"col_{i}" for i in range(300)],
         "required_outputs": ["data/metrics.json", "data/alignment_check.json"],
-        "artifact_schemas": {
-            "data/scored_rows.csv": {"allowed_name_patterns": ["^segment_.*"]}
+        "artifact_requirements": {
+            "required_files": [
+                {"path": "data/scored_rows.csv", "allowed_name_patterns": ["^segment_.*"]}
+            ]
         },
     }
     context = agent._build_incomplete_reprompt_context(
@@ -32,7 +35,8 @@ def test_incomplete_reprompt_context_has_contract_and_outputs(monkeypatch):
     )
     assert "CONTRACT_MIN_CONTEXT" in context
     assert "REQUIRED OUTPUTS" in context
-    assert len(context) > 1500
+    # V4.1: Context may be smaller without legacy keys; adjust threshold
+    assert len(context) > 1000
     assert "column_list_reference" in context
     assert "..." not in context
 

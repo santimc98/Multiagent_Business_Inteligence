@@ -11,8 +11,206 @@ All accessors:
   - Gracefully handle null/unknown values in outcome/decision columns.
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Set
 from src.utils.contract_validator import is_probably_path
+
+
+# ============================================================================
+# V4.1 CONTRACT GUARD – Enforcement of legacy field removal
+# ============================================================================
+
+# V4.1 Contract Version - Single source of truth
+CONTRACT_VERSION_V41: str = "4.1"
+
+# Legacy keys that MUST NOT appear in V4.1 contracts
+LEGACY_KEYS: Set[str] = {
+    "spec_extraction",
+    "data_requirements",
+    "role_runbooks",
+    "validations",
+    "quality_gates",
+    "execution_plan",
+    "artifact_schemas",
+    "required_columns",
+    "feature_availability",
+    "decision_variables",
+    "availability_summary",  # V4.1: Removed - no longer generated or consumed
+}
+
+
+def normalize_contract_version(version: Any) -> str:
+    """
+    Normalize contract version to V4.1 format.
+
+    Accepts: "4.1", 4.1, 41, "41", 2, "2" -> returns "4.1"
+    Returns CONTRACT_VERSION_V41 for any recognized version or None.
+    """
+    if version is None:
+        return CONTRACT_VERSION_V41
+
+    # Handle string versions
+    if isinstance(version, str):
+        v = version.strip().lower()
+        if v in ("4.1", "v4.1", "41", "v41"):
+            return CONTRACT_VERSION_V41
+        # Legacy version 2 -> upgrade to 4.1
+        if v in ("2", "2.0", "v2"):
+            return CONTRACT_VERSION_V41
+
+    # Handle numeric versions
+    if isinstance(version, (int, float)):
+        if version in (4.1, 41, 2, 2.0):
+            return CONTRACT_VERSION_V41
+
+    # Default: return V4.1
+    return CONTRACT_VERSION_V41
+
+# Allowed top-level keys in V4.1 contracts (for strict validation)
+ALLOWED_TOP_LEVEL_KEYS_V41: Set[str] = {
+    # Core identification
+    "contract_version",
+    "strategy_title",
+    "business_objective",
+    # Column specifications
+    "available_columns",
+    "canonical_columns",
+    "derived_columns",
+    "column_roles",
+    "outcome_columns",
+    "decision_columns",
+    # Feature management
+    "allowed_feature_sets",
+    "feature_selectors",
+    "feature_engineering_plan",
+    # Requirements & validation
+    "preprocessing_requirements",
+    "validation_requirements",
+    "artifact_requirements",
+    "required_outputs",
+    # Gates (V4.1 style)
+    "qa_gates",
+    "cleaning_gates",
+    "reviewer_gates",
+    # Runbooks (V4.1 style - direct, not nested under role_runbooks)
+    "data_engineer_runbook",
+    "ml_engineer_runbook",
+    # Analysis & constraints
+    "objective_analysis",
+    "data_analysis",
+    "execution_constraints",
+    "segmentation_constraints",
+    "optimization_specification",
+    "leakage_execution_plan",
+    # Policies & handling
+    "reporting_policy",
+    "decisioning_requirements",
+    "omitted_columns_policy",
+    "missing_columns_handling",
+    "output_dialect",
+    "visualization_requirements",
+    # Data modes
+    "data_limited_mode",
+    "training_rows_rule",
+    "scoring_rows_rule",
+    "secondary_scoring_subset",
+    "data_partitioning_notes",
+    # Metadata
+    "iteration_policy",
+    "unknowns",
+    "assumptions",
+    "notes_for_engineers",
+    # Ancillary (allowed but not required)
+    "business_alignment",
+    "compliance_checklist",
+    "alignment_requirements",
+    "evaluation_spec",  # V4.1 evaluation spec (not legacy)
+}
+
+
+def assert_no_legacy_keys(contract: Dict[str, Any], where: str = "") -> None:
+    """
+    Assert that the contract contains no legacy keys.
+
+    Raises ValueError if any legacy key is found.
+
+    Args:
+        contract: The contract dictionary to validate.
+        where: Optional context string for error messages (e.g., "execution_planner:final_contract").
+    """
+    if not isinstance(contract, dict):
+        return
+
+    found_legacy = LEGACY_KEYS & set(contract.keys())
+    if found_legacy:
+        location = f" at {where}" if where else ""
+        raise ValueError(
+            f"V4.1 Contract Violation{location}: Legacy keys found: {sorted(found_legacy)}. "
+            f"These keys must be removed for V4.1 compliance."
+        )
+
+
+def warn_legacy_keys(contract: Dict[str, Any], where: str = "") -> List[str]:
+    """
+    Check for legacy keys and return a list of found keys (non-raising version).
+
+    Args:
+        contract: The contract dictionary to validate.
+        where: Optional context string for logging.
+
+    Returns:
+        List of legacy keys found (empty if none).
+    """
+    if not isinstance(contract, dict):
+        return []
+
+    found_legacy = sorted(LEGACY_KEYS & set(contract.keys()))
+    if found_legacy and where:
+        print(f"WARNING: Legacy keys found at {where}: {found_legacy}")
+    return found_legacy
+
+
+def assert_only_allowed_v41_keys(contract: Dict[str, Any], strict: bool = False) -> List[str]:
+    """
+    Check that contract only contains allowed V4.1 keys.
+
+    Args:
+        contract: The contract dictionary to validate.
+        strict: If True, raises ValueError on unknown keys. If False, just returns the list.
+
+    Returns:
+        List of unknown/unexpected keys found.
+    """
+    if not isinstance(contract, dict):
+        return []
+
+    contract_keys = set(contract.keys())
+    unknown_keys = sorted(contract_keys - ALLOWED_TOP_LEVEL_KEYS_V41 - LEGACY_KEYS)
+
+    if strict and unknown_keys:
+        raise ValueError(
+            f"V4.1 Contract Violation: Unknown keys found: {unknown_keys}. "
+            f"Only allowed V4.1 keys are permitted."
+        )
+
+    return unknown_keys
+
+
+def strip_legacy_keys(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return a new contract dict with all legacy keys removed.
+
+    Does NOT mutate the original contract.
+
+    Args:
+        contract: The contract dictionary to clean.
+
+    Returns:
+        New dictionary with legacy keys removed.
+    """
+    if not isinstance(contract, dict):
+        return {}
+
+    return {k: v for k, v in contract.items() if k not in LEGACY_KEYS}
 
 
 def get_available_columns(contract: Dict[str, Any]) -> List[str]:

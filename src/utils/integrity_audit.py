@@ -180,7 +180,7 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
     
     # V4.1: Build requirements from V4.1 keys
     requirements = _build_requirements_from_v41(contract)
-    validations = contract.get("validations", []) or []
+    # V4.1: No legacy validations - use validation_requirements instead
     artifacts = get_artifact_requirements(contract)
     schema_binding = artifacts.get("schema_binding") if isinstance(artifacts, dict) else {}
     optional_cols = schema_binding.get("optional_passthrough_columns", []) if isinstance(schema_binding, dict) else []
@@ -348,8 +348,10 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
                     }
                 )
 
-    # Additional validations
-    for val in validations:
+    # V4.1: Additional validations from validation_requirements (not legacy validations)
+    val_reqs = get_validation_requirements(contract)
+    additional_validations = val_reqs.get("additional_checks", []) if isinstance(val_reqs, dict) else []
+    for val in additional_validations:
         if isinstance(val, str):
             metric = "spearman" if "spearman" in val.lower() else ("kendall" if "kendall" in val.lower() else None)
             detail = f"Contract validation requested: {val}"

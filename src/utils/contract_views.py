@@ -327,18 +327,21 @@ def _normalize_artifact_index(entries: Any) -> List[Dict[str, Any]]:
 
 
 def _resolve_objective_type(contract_min: Dict[str, Any], contract_full: Dict[str, Any], required_outputs: List[str]) -> str:
+    # V4.1: Check objective_analysis.problem_type first (primary source)
+    for source in (contract_min, contract_full):
+        obj_analysis = source.get("objective_analysis") if isinstance(source, dict) else None
+        if isinstance(obj_analysis, dict) and obj_analysis.get("problem_type"):
+            return str(obj_analysis.get("problem_type"))
+
+    # Fallback: check evaluation_spec.objective_type (V4.1 evaluation spec)
     for source in (contract_min, contract_full):
         eval_spec = source.get("evaluation_spec") if isinstance(source, dict) else None
         if isinstance(eval_spec, dict):
             obj = eval_spec.get("objective_type")
             if obj:
                 return str(obj)
-    plan = contract_full.get("execution_plan") if isinstance(contract_full, dict) else None
-    if isinstance(plan, dict) and plan.get("objective_type"):
-        return str(plan.get("objective_type"))
-    obj_analysis = contract_full.get("objective_analysis") if isinstance(contract_full, dict) else None
-    if isinstance(obj_analysis, dict) and obj_analysis.get("problem_type"):
-        return str(obj_analysis.get("problem_type"))
+
+    # V4.1: NO fallback to legacy execution_plan - infer from outputs instead
     return _infer_objective_from_outputs(required_outputs)
 
 
@@ -510,12 +513,11 @@ def _resolve_optional_outputs(contract_min: Dict[str, Any], contract_full: Dict[
 
 
 def _resolve_case_rules(contract_full: Dict[str, Any]) -> Any:
+    # V4.1: Only use direct case_rules/case_taxonomy keys, no spec_extraction fallback
     for path in (
         ("case_rules",),
         ("case_taxonomy",),
-        ("spec_extraction", "case_taxonomy"),
         ("evaluation_spec", "case_taxonomy"),
-        ("spec_extraction", "case_rules"),
     ):
         cursor: Any = contract_full
         for key in path:

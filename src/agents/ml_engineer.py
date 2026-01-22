@@ -90,27 +90,25 @@ class MLEngineerAgent:
     def _compact_execution_contract(self, contract: Dict[str, Any] | None) -> Dict[str, Any]:
         """
         Extract relevant V4.1 fields for ML Engineer prompt.
-        Excludes legacy spec_extraction and role_runbooks.
+        V4.1 CUTOVER: No legacy keys (data_requirements, spec_extraction, role_runbooks).
         """
         if not isinstance(contract, dict):
             return {}
-        
-        # V4.1 keys relevant for ML Engineer
+
+        # V4.1 keys relevant for ML Engineer (no legacy keys)
         keep_keys = [
             "contract_version",
             "strategy_title",
             "business_objective",
-            "required_columns",
+            "canonical_columns",  # V4.1: replaces required_columns/data_requirements
             "required_outputs",
-            "data_requirements",
             "alignment_requirements",
             "business_alignment",
             "feature_semantics",
             "business_sanity_checks",
             "column_roles",
-            "decision_variables",
-            "feature_availability",
-            "availability_summary",
+            "column_roles",
+            # V4.1: availability_summary removed
             "required_dependencies",
             "compliance_checklist",
             # V4.1 specific
@@ -123,43 +121,39 @@ class MLEngineerAgent:
             "ml_engineer_runbook",
             "derived_columns",
         ]
-        
+
         compact: Dict[str, Any] = {}
         for key in keep_keys:
             if key in contract:
                 compact[key] = contract.get(key)
-        
+
         # Truncate large lists
         for key in ["canonical_columns", "column_mapping_rules", "column_mapping"]:
             vals = contract.get(key)
             if isinstance(vals, list) and vals:
                 compact[key] = vals[:80]
-        
-        # Ensure ml_engineer_runbook is present (V4.1 priority)
-        if "ml_engineer_runbook" not in compact or not compact.get("ml_engineer_runbook"):
-            # Fallback: try role_runbooks.ml_engineer (legacy shim)
-            role_runbooks = contract.get("role_runbooks")
-            if isinstance(role_runbooks, dict):
-                compact["ml_engineer_runbook"] = role_runbooks.get("ml_engineer", {})
-        
+
+        # V4.1: Use ml_engineer_runbook only, no legacy role_runbooks fallback
+
         return compact
 
     def _resolve_allowed_columns_for_prompt(self, contract: Dict[str, Any] | None) -> List[str]:
+        """V4.1: Use canonical_columns only, no legacy required_columns."""
         if not isinstance(contract, dict):
             return []
         cols: List[str] = []
-        for key in ("required_columns", "canonical_columns"):
-            values = contract.get(key)
-            if isinstance(values, list):
-                cols.extend([str(v) for v in values if v])
-        feature_availability = contract.get("feature_availability")
-        if isinstance(feature_availability, list):
-            for item in feature_availability:
-                if isinstance(item, dict) and item.get("column"):
-                    cols.append(str(item.get("column")))
-        decision_vars = contract.get("decision_variables")
-        if isinstance(decision_vars, list):
-            cols.extend([str(v) for v in decision_vars if v])
+        # V4.1: Only use canonical_columns (no legacy required_columns)
+        canonical = contract.get("canonical_columns")
+        if isinstance(canonical, list):
+            cols.extend([str(v) for v in canonical if v])
+        # Also include derived_columns
+        derived = contract.get("derived_columns")
+        if isinstance(derived, list):
+            for item in derived:
+                if isinstance(item, str) and item:
+                    cols.append(item)
+                elif isinstance(item, dict) and item.get("name"):
+                    cols.append(str(item.get("name")))
         seen = set()
         deduped = []
         for col in cols:
@@ -173,13 +167,12 @@ class MLEngineerAgent:
         return deduped
 
     def _resolve_allowed_name_patterns_for_prompt(self, contract: Dict[str, Any] | None) -> List[str]:
+        """V4.1: Use artifact_requirements.file_schemas only, no legacy fallback."""
         if not isinstance(contract, dict):
             return []
-        schema = contract.get("artifact_schemas")
-        if not isinstance(schema, dict):
-            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else None
-            if isinstance(spec, dict):
-                schema = spec.get("artifact_schemas")
+        # V4.1: Use artifact_requirements.file_schemas
+        artifact_reqs = contract.get("artifact_requirements", {})
+        schema = artifact_reqs.get("file_schemas") if isinstance(artifact_reqs, dict) else {}
         if not isinstance(schema, dict):
             return []
         scored_schema = schema.get("data/scored_rows.csv")
@@ -714,8 +707,7 @@ class MLEngineerAgent:
         business_objective: str = "",
         execution_contract: Dict[str, Any] | None = None,
         ml_view: Dict[str, Any] | None = None,
-        feature_availability: List[Dict[str, Any]] | None = None,
-        availability_summary: str = "",
+        # V4.1: availability_summary parameter removed
         signal_summary: Dict[str, Any] | None = None,
         iteration_memory: List[Dict[str, Any]] | None = None,
         iteration_memory_block: str = "",
@@ -859,14 +851,14 @@ class MLEngineerAgent:
            - ABSOLUTE PROHIBITION: Do NOT implement fallback logic like "if not os.path.exists(filepath): generate dummy data".
              The file WILL exist. If it doesn't, let pd.read_csv() raise FileNotFoundError. NO synthetic fallbacks.
         5) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
-        6) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (data_requirements with source='derived' or spec_extraction.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
+        6) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (contract.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
         6b) Do NOT overwrite data/cleaned_data.csv. Treat it as immutable input; write derived datasets to data/model_input.csv or data/features.csv.
         7) NEVER fabricate synthetic rows/features (pd.DataFrame({}) from literals, faker, sklearn.datasets.make_*, etc.).
            - Bootstrap/CV resampling of the OBSERVED rows is allowed (and expected when validation_requirements asks for bootstrap).
            - Randomness is permitted ONLY for resampling indices; do not generate new feature values from distributions.
-        8) scored_rows.csv may include canonical columns plus contract-approved derived outputs (target/prediction/probability/segment/optimal values) ONLY if explicitly declared in data_requirements or spec_extraction. Any other derived columns must go to a separate artifact file.
+        8) scored_rows.csv may include canonical columns plus contract-approved derived outputs (target/prediction/probability/segment/optimal values) ONLY if explicitly declared in artifact_requirements.scored_rows_schema.allowed_extra_columns or allowed_name_patterns. Any other derived columns must go to a separate artifact file.
         9) Start the script with a short comment block labeled PLAN describing: (1) dialect loading from cleaning_manifest.json, (2) detected columns, (3) row_id construction, (4) scored_rows columns, and (5) where extra derived artifacts go.
-        10) Define CONTRACT_COLUMNS from the Execution Contract (prefer data_requirements source=input; else canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
+        10) Define CONTRACT_COLUMNS from the Execution Contract (use canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
         11) LEAKAGE ZERO-TOLERANCE: Check 'allowed_feature_sets' in the contract. Any column listed as 'audit_only_features' or 'forbidden_for_modeling' MUST be excluded from X (features). Use them ONLY for audit/metrics calculation. Violation = REJECTION.
         12) PIPELINE ISOLATION: If you define multiple models/pipelines, do NOT reuse the same preprocessor/transformer across pipelines.
             - Create separate preprocessors or clone them.
@@ -980,9 +972,6 @@ class MLEngineerAgent:
         - Deliverables: $deliverables_json
         - Canonical Columns: $canonical_columns
         - Required Features: $required_columns
-        - Feature Availability: $feature_availability_json
-        - Availability Summary: $availability_summary
-        - Spec Extraction: $spec_extraction_json
         - Evaluation Spec: $evaluation_spec_json
         - Feature Semantics: $feature_semantics_json
         - Business sanity checks: $business_sanity_checks_json
@@ -998,7 +987,7 @@ class MLEngineerAgent:
         - Do not import any other deps.
 
         CAUSAL REASONING FOR OPTIMIZATION
-        - Consultation: check feature_availability in contract. Variables marked 'decision' or 'post-decision' CANNOT be features.
+        - Consultation: check column_roles in contract. Variables marked 'decision' or 'post-decision' CANNOT be features.
         - Logic: If a model needs the decision_variable to predict, it cannot recommend it for new cases (unknown at prediction time).
         - Modeling: Predict outcome using pre-decision features (F1, F2). Model decision_variable effect separately (curves/elasticity).
         - Examples:
@@ -1031,7 +1020,7 @@ class MLEngineerAgent:
         - Do NOT attempt to split columns or change dialect mid-script.
 
         Step 1) Feasibility gate:
-        - Identify target from contract/spec_extraction. If missing/unmappable -> raise ValueError with a clear message.
+        - Identify target from contract.column_roles or contract.outcome_columns. If missing/unmappable -> raise ValueError with a clear message.
         - Build y as a pandas Series and enforce ONE variance guard:
         if y.nunique() <= 1: raise ValueError("CRITICAL: Target variable has no variation.")
         - Never add noise/jitter.
@@ -1083,8 +1072,8 @@ class MLEngineerAgent:
         - required artifacts,
         - derived targets/columns behavior.
         - Print a "MAPPING SUMMARY" block with canonical columns, selected features, and any derived outputs used.
-        - Only enforce segmentation/weights/pricing logic IF deliverables require those outputs or decision_variables exist.
-        (Example: if a required deliverable includes "data/weights.json" or execution_contract.decision_variables present -> run the corresponding logic; else skip.)
+        - Only enforce segmentation/weights/pricing logic IF deliverables require those outputs or decision_columns exist.
+        (Example: if a required deliverable includes "data/weights.json" or decision_columns are present -> run the corresponding logic; else skip.)
         - If price sensitivity curves or optimal pricing guide are required, they must NOT be empty.
           If segment-level estimation is too sparse, fallback to global curves or coarser segments; never emit empty artifacts.
 
@@ -1144,35 +1133,19 @@ class MLEngineerAgent:
 
         ml_view = ml_view or {}
         required_outputs = ml_view.get("required_outputs") or (execution_contract or {}).get("required_outputs", []) or []
-        raw_deliverables = (execution_contract or {}).get("spec_extraction", {}).get("deliverables", [])
+        # V4.1: Build deliverables from required_outputs, no spec_extraction
         deliverables: List[Dict[str, Any]] = []
-        if isinstance(raw_deliverables, list):
-            for item in raw_deliverables:
-                if isinstance(item, dict) and item.get("path"):
-                    deliverables.append(
-                        {
-                            "id": item.get("id"),
-                            "path": item.get("path"),
-                            "required": bool(item.get("required", True)),
-                            "kind": item.get("kind"),
-                            "description": item.get("description"),
-                        }
-                    )
-                elif isinstance(item, str):
-                    deliverables.append({"path": item, "required": True})
-        if not deliverables and required_outputs:
+        if required_outputs:
             deliverables = [{"path": path, "required": True} for path in required_outputs if path]
         required_deliverables = [item.get("path") for item in deliverables if item.get("required") and item.get("path")]
         deliverables_json = json.dumps(compress_long_lists(deliverables)[0], indent=2)
         
+        # V4.1: Use ml_engineer_runbook directly, no legacy role_runbooks
         ml_runbook_json = json.dumps(
-            compress_long_lists((execution_contract or {}).get("role_runbooks", {}).get("ml_engineer", {}))[0],
+            compress_long_lists((execution_contract or {}).get("ml_engineer_runbook", {}))[0],
             indent=2,
         )
-        spec_extraction_json = json.dumps(
-            compress_long_lists((execution_contract or {}).get("spec_extraction", {}))[0],
-            indent=2,
-        )
+        # V4.1: No spec_extraction - removed
         execution_contract_compact = self._compact_execution_contract(execution_contract or {})
         execution_contract_compact = compress_long_lists(execution_contract_compact)[0]
         ml_view_payload = compress_long_lists(ml_view)[0]
@@ -1223,10 +1196,8 @@ class MLEngineerAgent:
             ml_view_context=ml_view_json,
             plot_spec_context=plot_spec_json,
             evaluation_spec_json=evaluation_spec_json,
-            spec_extraction_json=spec_extraction_json,
             ml_engineer_runbook=ml_runbook_json,
-            feature_availability_json=json.dumps(compress_long_lists(feature_availability or [])[0], indent=2),
-            availability_summary=availability_summary or "",
+            # V4.1: availability_summary removed
             signal_summary_json=json.dumps(compress_long_lists(signal_summary or {})[0], indent=2),
             iteration_memory_json=json.dumps(compress_long_lists(iteration_memory or [])[0], indent=2),
             iteration_memory_block=iteration_memory_block or "",

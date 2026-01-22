@@ -307,9 +307,17 @@ def build_case_alignment_report(
 ) -> Dict[str, Any]:
     data_paths = data_paths or []
     contract = contract or {}
-    gates = contract.get("quality_gates") or {}
-    if not isinstance(gates, dict):
-        gates = {}
+    # V4.1: Use qa_gates instead of legacy quality_gates
+    from src.utils.contract_v41 import get_qa_gates
+    qa_gates = get_qa_gates(contract)
+
+    # Extract thresholds from qa_gates if available
+    gates: Dict[str, Any] = {}
+    for gate in qa_gates:
+        if isinstance(gate, dict):
+            params = gate.get("params", {})
+            if isinstance(params, dict):
+                gates.update(params)
 
     defaults = {
         "spearman_min": None,

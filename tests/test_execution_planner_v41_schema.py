@@ -36,7 +36,7 @@ def test_fallback_contains_all_v41_keys():
     for key in required_keys:
         assert key in contract, f"Missing required V4.1 key: {key}"
     
-    assert contract["contract_version"] == 2
+    assert contract["contract_version"] == "4.1"
     assert contract["available_columns"] == ["Col1", "Col2"]
     assert contract["strategy_title"] == "Test Strategy"
 
@@ -49,7 +49,7 @@ def test_create_v41_skeleton_basic():
         column_inventory=["Col1", "Col2", "Col3"]
     )
     
-    assert skeleton["contract_version"] == 2
+    assert skeleton["contract_version"] == "4.1"
     assert skeleton["strategy_title"] == "Test"
     assert skeleton["available_columns"] == ["Col1", "Col2", "Col3"]
     # canonical_columns should be filtered required_columns that exist in inventory
@@ -102,7 +102,7 @@ def test_no_legacy_schema_version():
     )
     
     assert contract.get("contract_version") != 1
-    assert contract.get("contract_version") == 2
+    assert contract.get("contract_version") == "4.1"
 
 
 def test_output_dialect_propagation():

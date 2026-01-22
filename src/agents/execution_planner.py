@@ -19,6 +19,11 @@ from src.utils.contract_v41 import (
     get_column_roles,
     get_derived_column_names,
     get_required_outputs,
+    strip_legacy_keys,
+    assert_no_legacy_keys,
+    assert_only_allowed_v41_keys,
+    LEGACY_KEYS,
+    CONTRACT_VERSION_V41,
 )
 from src.utils.run_bundle import get_run_dir
 from src.utils.feature_selectors import infer_feature_selectors, compact_column_representation
@@ -769,7 +774,7 @@ def _create_v41_skeleton(
         )
 
     return {
-        "contract_version": 2,
+        "contract_version": CONTRACT_VERSION_V41,
         "strategy_title": strategy_title,
         "business_objective": business_objective or "",
         
@@ -1395,8 +1400,9 @@ def build_contract_min(
     if not isinstance(data_partitioning_notes, list):
         data_partitioning_notes = []
 
+    from src.utils.contract_v41 import CONTRACT_VERSION_V41, normalize_contract_version
     contract_min = {
-        "contract_version": contract.get("contract_version", 2),
+        "contract_version": normalize_contract_version(contract.get("contract_version")),
         "strategy_title": contract.get("strategy_title") or strategy_dict.get("title", ""),
         "business_objective": business_objective,
         "canonical_columns": canonical_columns,
@@ -1440,17 +1446,19 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
     """
     Validates and fills missing V4.1 schema keys.
     Adds to 'unknowns' array when filling defaults.
-    
+
     Args:
         contract: Contract dict from LLM
         strict: If True, raise error on missing keys (for tests)
-    
+
     Returns:
         Contract with all V4.1 keys present
     """
+    from src.utils.contract_v41 import CONTRACT_VERSION_V41, normalize_contract_version
+
     if not isinstance(contract, dict):
         return contract
-    
+
     required_keys = [
         "contract_version", "strategy_title", "business_objective",
         "missing_columns_handling", "execution_constraints",
@@ -1465,20 +1473,20 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
         "required_outputs", "iteration_policy", "unknowns",
         "assumptions", "notes_for_engineers"
     ]
-    
+
     repairs = []
-    
+
     for key in required_keys:
         if key not in contract:
             if strict:
                 raise ValueError(f"Missing required V4.1 key: {key}")
-            
+
             # Fill with safe default
             if key == "contract_version":
-                contract[key] = 2
+                contract[key] = CONTRACT_VERSION_V41
             elif key in ("optimization_specification", "segmentation_constraints"):
                 contract[key] = None
-            elif key in ("unknowns", "assumptions", "notes_for_engineers", "available_columns", 
+            elif key in ("unknowns", "assumptions", "notes_for_engineers", "available_columns",
                          "canonical_columns", "derived_columns", "required_outputs"):
                 contract[key] = []
             elif key in ("qa_gates", "cleaning_gates", "reviewer_gates"):
@@ -1487,25 +1495,30 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
                 contract[key] = ""
             else:
                 contract[key] = {}
-            
+
             repairs.append(f"Added missing key: {key}")
-    
+
     # Ensure unknowns is a list
     unknowns = contract.get("unknowns")
     if not isinstance(unknowns, list):
         unknowns = []
         contract["unknowns"] = unknowns
 
+    # Normalize contract version to V4.1
     version = contract.get("contract_version")
-    if version != 2:
-        contract["contract_version"] = 2
+    normalized_version = normalize_contract_version(version)
+    if version != normalized_version:
+        old_version = version
+        contract["contract_version"] = normalized_version
         unknowns.append({
-            "item": "Normalized contract_version to 2",
+            "item": f"Normalized contract_version from {old_version} to {normalized_version}",
             "impact": "Schema validation enforced V4.1 version",
             "mitigation": "Review LLM output quality",
             "requires_verification": False
         })
-    
+    elif version is None:
+        contract["contract_version"] = CONTRACT_VERSION_V41
+
     # Add repair notes to unknowns
     for repair in repairs:
         unknowns.append({
@@ -1514,7 +1527,7 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
             "mitigation": "Review LLM output quality",
             "requires_verification": False
         })
-    
+
     return contract
 
 
@@ -1580,14 +1593,22 @@ def validate_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
             ]
             required_columns = schema_binding["required_columns"]
         else:
-            # Fallback to canonical_columns if available, else strategy-level required_columns (legacy)
-            fallback_columns = canonical_columns or contract.get("required_columns") or []
-            if isinstance(fallback_columns, list) and fallback_columns:
-                schema_binding["required_columns"] = [str(col) for col in fallback_columns if col]
+            # V4.1: Use ONLY canonical_columns as fallback, NO legacy required_columns
+            if isinstance(canonical_columns, list) and canonical_columns:
+                schema_binding["required_columns"] = [str(col) for col in canonical_columns if col]
                 required_columns = schema_binding["required_columns"]
             else:
+                # No canonical columns available - record as unknown
                 schema_binding["required_columns"] = []
                 required_columns = []
+                unknowns = contract.setdefault("unknowns", [])
+                if isinstance(unknowns, list):
+                    unknowns.append({
+                        "item": "artifact_requirements.schema_binding.required_columns is empty",
+                        "impact": "No columns specified for clean dataset validation",
+                        "mitigation": "Ensure canonical_columns is populated in contract",
+                        "requires_verification": True
+                    })
 
     # Validate required_columns
     valid_required = []
@@ -2937,18 +2958,22 @@ class ExecutionPlannerAgent:
             return contract
 
         def _propagate_business_alignment(contract: Dict[str, Any]) -> Dict[str, Any]:
+            """V4.1: Propagate business_alignment to direct runbook keys, not legacy role_runbooks."""
             if not isinstance(contract, dict):
                 return contract
             ba = contract.get("business_alignment")
             if not isinstance(ba, dict):
                 return contract
-            runbooks = contract.get("role_runbooks")
-            if isinstance(runbooks, dict):
-                ml_runbook = runbooks.get("ml_engineer")
-                if isinstance(ml_runbook, dict):
-                    ml_runbook["business_alignment"] = ba
-                    runbooks["ml_engineer"] = ml_runbook
-                    contract["role_runbooks"] = runbooks
+            # V4.1: Use direct ml_engineer_runbook, not role_runbooks
+            ml_runbook = contract.get("ml_engineer_runbook")
+            if isinstance(ml_runbook, dict):
+                ml_runbook["business_alignment"] = ba
+                contract["ml_engineer_runbook"] = ml_runbook
+            # Also propagate to data_engineer_runbook if needed
+            de_runbook = contract.get("data_engineer_runbook")
+            if isinstance(de_runbook, dict):
+                de_runbook["business_alignment"] = ba
+                contract["data_engineer_runbook"] = de_runbook
             return contract
 
         def _ensure_case_id_requirement(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -4351,19 +4376,7 @@ class ExecutionPlannerAgent:
                         }
                     )
             contract["feature_availability"] = availability
-            if not contract.get("availability_summary"):
-                counts = {"pre_decision": 0, "decision": 0, "outcome": 0, "post_decision-audit_only": 0}
-                for item in availability:
-                    if not isinstance(item, dict):
-                        continue
-                    label = item.get("availability")
-                    if label in counts:
-                        counts[label] += 1
-                contract["availability_summary"] = (
-                    "Auto-generated availability summary: "
-                    f"pre_decision={counts['pre_decision']}, decision={counts['decision']}, "
-                    f"outcome={counts['outcome']}, post_decision-audit_only={counts['post_decision-audit_only']}."
-                )
+            # V4.1: availability_summary removed - no longer generated
             return contract
 
         def _attach_leakage_policy_detail(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -4745,13 +4758,7 @@ class ExecutionPlannerAgent:
                         "Decision variable controlled by the business; usable for optimization or elasticity modeling.",
                     )
                 contract["feature_availability"] = feature_availability
-
-                summary = contract.get("availability_summary") or ""
-                if "decision" not in summary.lower():
-                    summary = (summary + " " if summary else "") + (
-                        "Decision variables may be used in optimization/elasticity modeling when available."
-                    )
-                contract["availability_summary"] = summary
+                # V4.1: availability_summary removed - no longer generated
 
                 sentinel_value = _extract_missing_sentinel(combined_text)
                 if sentinel_value is not None:
@@ -4780,12 +4787,12 @@ class ExecutionPlannerAgent:
             return contract
 
         def _ensure_availability_reasoning(contract: Dict[str, Any]) -> Dict[str, Any]:
+            # V4.1: availability_summary removed - only ensure feature_availability if needed
             if not isinstance(contract, dict):
                 return contract
             if "feature_availability" not in contract:
                 contract["feature_availability"] = []
-            if "availability_summary" not in contract:
-                contract["availability_summary"] = ""
+            # V4.1: availability_summary removed - do NOT set it
             return contract
 
         def _attach_counterfactual_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -4798,14 +4805,11 @@ class ExecutionPlannerAgent:
                 return contract
             spec = contract.get("spec_extraction") or {}
             case_taxonomy = spec.get("case_taxonomy") if isinstance(spec.get("case_taxonomy"), list) else []
-            availability_summary = contract.get("availability_summary") or ""
+            # V4.1: availability_summary and data_requirements removed
             feature_availability = contract.get("feature_availability") or []
-            reqs = contract.get("data_requirements") or []
             combined_text = " ".join(
                 [
-                    availability_summary,
                     json.dumps(feature_availability, ensure_ascii=True) if isinstance(feature_availability, list) else "",
-                    json.dumps(reqs, ensure_ascii=True) if isinstance(reqs, list) else "",
                     data_summary or "",
                 ]
             ).lower()
@@ -5063,14 +5067,29 @@ class ExecutionPlannerAgent:
                     usage_payload[key] = value
             return usage_payload or {"value": str(raw_usage)}
 
+        def _finalize_and_persist(contract, contract_min, where):
+            from src.utils.contract_v41 import strip_legacy_keys, assert_no_legacy_keys, assert_only_allowed_v41_keys
+            contract = ensure_v41_schema(contract, strict=False)
+            contract = strip_legacy_keys(contract)
+            if contract_min:
+                contract_min = strip_legacy_keys(contract_min)
+            assert_no_legacy_keys(contract, where=where)
+            unknown = assert_only_allowed_v41_keys(contract, strict=False)
+            if unknown:
+                print(f"WARNING: Unknown keys in contract: {unknown}")
+                u = contract.setdefault("unknowns", [])
+                if isinstance(u, list):
+                    u.append({"item": f"Unknown top-level keys detected: {unknown}", "impact":"May not be recognized", "mitigation":"Update allowed keys if needed", "requires_verification": False})
+            _persist_contracts(contract, contract_min)
+            return contract
+
         if not self.client:
             contract = _fallback()
             contract = _attach_reporting_policy(contract)
             contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns)
             contract = _sync_execution_contract_outputs(contract, contract_min)
             self.last_contract_min = contract_min
-            _persist_contracts(contract, contract_min)
-            return contract
+            return _finalize_and_persist(contract, contract_min, where="execution_planner:no_client")
 
         strategy_json = json.dumps(strategy, indent=2)
         column_inventory_count = len(column_inventory or [])
@@ -5328,21 +5347,15 @@ domain_expert_critique:
         if contract.get("ml_engineer_runbook"):
             contract["ml_engineer_runbook"] = _sanitize_runbook(contract["ml_engineer_runbook"])
 
-        if "role_runbooks" not in contract or not isinstance(contract.get("role_runbooks"), dict):
-            contract["role_runbooks"] = {}
-        if contract.get("data_engineer_runbook"):
-            contract["role_runbooks"]["data_engineer"] = contract["data_engineer_runbook"]
-        if contract.get("ml_engineer_runbook"):
-            contract["role_runbooks"]["ml_engineer"] = contract["ml_engineer_runbook"]
+        # V4.1: Do NOT write role_runbooks - use direct data_engineer_runbook/ml_engineer_runbook keys
 
         contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns)
         contract = _sync_execution_contract_outputs(contract, contract_min)
         self.last_contract_min = contract_min
-        _persist_contracts(contract, contract_min)
 
         if llm_success and planner_diag:
             print(f"SUCCESS: Execution Planner succeeded on attempt {planner_diag[-1]['attempt_index']}")
-        return contract
+        return _finalize_and_persist(contract, contract_min, where="execution_planner:final_contract")
 
     def generate_evaluation_spec(
         self,

@@ -20,9 +20,10 @@ def test_case_alignment_gate_detects_violations(tmp_path: Path):
     weights = tmp_path / "weights.json"
     weights.write_text(json.dumps({"weights": {"a": 0.9, "b": 0.1}}))
 
+    # V4.1: Use qa_gates (list of gate objects) and outcome_columns
     contract = {
-        "quality_gates": {"spearman_min": 0.85, "violations_max": 0},
-        "data_requirements": [{"name": "refscore", "role": "target"}],
+        "qa_gates": [{"name": "case_alignment", "severity": "HARD", "params": {"spearman_min": 0.85, "violations_max": 0}}],
+        "outcome_columns": ["refscore"],
     }
     report = build_case_alignment_report(
         contract=contract,
@@ -46,9 +47,10 @@ def test_case_alignment_gate_passes_with_monotonic_scores(tmp_path: Path):
     weights = tmp_path / "weights.json"
     weights.write_text(json.dumps({"weights": {"a": 0.5, "b": 0.5}}))
 
+    # V4.1: Use qa_gates (list of gate objects) and outcome_columns
     contract = {
-        "quality_gates": {"spearman_min": 0.8, "violations_max": 0},
-        "data_requirements": [{"name": "refscore", "role": "target"}],
+        "qa_gates": [{"name": "case_alignment", "severity": "HARD", "params": {"spearman_min": 0.8, "violations_max": 0}}],
+        "outcome_columns": ["refscore"],
     }
     report = build_case_alignment_report(
         contract=contract,
@@ -71,7 +73,8 @@ def test_case_alignment_adjacent_violations_ignore_ties(tmp_path: Path):
     weights = tmp_path / "weights.json"
     weights.write_text(json.dumps({"weights": {"a": 0.5, "b": 0.5}}))
 
-    contract = {"data_requirements": [{"name": "refscore", "role": "target"}]}
+    # V4.1: Use outcome_columns instead of data_requirements
+    contract = {"outcome_columns": ["refscore"]}
     report = build_case_alignment_report(
         contract=contract,
         case_summary_path=str(case_summary),
@@ -90,7 +93,7 @@ def test_case_alignment_inactive_share_in_top(tmp_path: Path):
     weights = tmp_path / "weights.json"
     weights.write_text(json.dumps({"weights": {"a": 0.5, "b": 0.5}}))
 
-    contract = {"data_requirements": [{"name": "refscore", "role": "target"}]}
+    contract = {"outcome_columns": ["refscore"]}
     report = build_case_alignment_report(
         contract=contract,
         case_summary_path=str(case_summary),
@@ -108,7 +111,8 @@ def test_case_alignment_row_level_weight_suffix_mapping(tmp_path: Path):
     weights = tmp_path / "weights.json"
     weights.write_text(json.dumps({"weights": {"w1_featurea": 1.0}}))
 
-    contract = {"data_requirements": [{"name": "RefScore", "role": "target"}]}
+    # V4.1: Use outcome_columns instead of data_requirements
+    contract = {"outcome_columns": ["RefScore"]}
     report = build_case_alignment_report(
         contract=contract,
         case_summary_path=str(tmp_path / "missing.csv"),

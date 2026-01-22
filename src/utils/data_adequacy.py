@@ -652,15 +652,20 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         else:
             reg_proxy = _best_regression_proxy(cleaned, target_series, feature_cols)
 
-    quality_gates = contract.get("quality_gates", {}) if isinstance(contract, dict) else {}
-    if not isinstance(quality_gates, dict):
-        quality_gates = {}
-    if not quality_gates and isinstance(contract, dict):
-        raw_gates = contract.get("quality_gates_raw")
-        if isinstance(raw_gates, list):
-            for item in raw_gates:
-                if isinstance(item, dict) and item.get("metric") is not None and item.get("threshold") is not None:
-                    quality_gates[str(item["metric"])] = item["threshold"]
+    # V4.1: Use qa_gates instead of legacy quality_gates
+    from src.utils.contract_v41 import get_qa_gates
+    qa_gates = get_qa_gates(contract) if isinstance(contract, dict) else []
+    quality_gates: Dict[str, Any] = {}
+    for gate in qa_gates:
+        if isinstance(gate, dict):
+            params = gate.get("params", {})
+            if isinstance(params, dict):
+                quality_gates.update(params)
+            # Also check for metric/threshold format
+            metric = gate.get("metric")
+            threshold = gate.get("threshold")
+            if metric is not None and threshold is not None:
+                quality_gates[str(metric)] = threshold
     min_segment_size = quality_gates.get("min_segment_size")
     small_segment_frac, small_segment_count = _segment_coverage(case_summary, min_segment_size)
     gate_alignment = _align_quality_gates(quality_gates, metric_pool)

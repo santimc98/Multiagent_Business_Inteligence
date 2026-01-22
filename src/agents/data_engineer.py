@@ -102,11 +102,8 @@ class DataEngineerAgent:
         cleaning_gates = get_cleaning_gates(contract) or get_cleaning_gates(execution_contract or {}) or []
         cleaning_gates_json = json.dumps(compress_long_lists(cleaning_gates)[0], indent=2)
 
-        # --- FIX CAUSA RAÍZ 1: Leer runbook correcto V4.1 ---
-        # Primero intentar clave canónica V4.1, luego fallback a legacy
-        de_runbook = contract.get("data_engineer_runbook")
-        if not de_runbook:
-            de_runbook = (contract.get("role_runbooks") or {}).get("data_engineer", {})
+        # V4.1: Use data_engineer_runbook only, no legacy role_runbooks fallback
+        de_runbook = contract.get("data_engineer_runbook") or {}
         de_runbook_json = json.dumps(compress_long_lists(de_runbook)[0], indent=2)
 
         # SYSTEM TEMPLATE with PYTHON SYNTAX GOTCHAS (Fix CAUSA RAÍZ 3)

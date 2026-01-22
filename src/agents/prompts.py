@@ -327,7 +327,7 @@ COMPLETE OUTPUT SCHEMA (JSON ONLY)
 Your output MUST be a valid JSON object with these top-level keys:
 
 {
-"contract_version": 2,
+"contract_version": "4.1",
 "strategy_title": "<FROM_strategy.title>",
 "business_objective": "<FROM_business_objective>",
 
