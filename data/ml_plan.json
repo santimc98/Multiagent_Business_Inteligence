@@ -1,0 +1,25 @@
+{
+  "training_rows_policy": "use_all_rows",
+  "split_column": null,
+  "split_values": [],
+  "evidence": [],
+  "metric_policy": {
+    "primary_metric": "accuracy",
+    "report_with_cv": true,
+    "confidence_intervals": true
+  },
+  "leakage_policy": {
+    "flags_detected": 0,
+    "action": "none_detected",
+    "flagged_columns": []
+  },
+  "cv_policy": {
+    "strategy": "KFold",
+    "n_splits": 5,
+    "shuffle": true
+  },
+  "notes": [
+    "Data has unknown rows, unknown columns"
+  ],
+  "generated_at": null
+}

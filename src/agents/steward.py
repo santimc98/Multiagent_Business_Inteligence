@@ -683,3 +683,209 @@ def write_dataset_profile(profile: Dict[str, Any], path: str = "data/dataset_pro
             _json.dump(profile, f, indent=2, ensure_ascii=True)
     except Exception:
         return
+
+
+# ============================================================================
+# SENIOR REASONING: UNIVERSAL DATA PROFILE (Evidence Layer)
+# ============================================================================
+
+# Tokens that suggest a column is used for train/test splitting
+SPLIT_CANDIDATE_TOKENS = {"split", "set", "fold", "train", "test", "partition", "is_train", "is_test"}
+
+
+def build_data_profile(
+    df: pd.DataFrame,
+    contract: Dict[str, Any] | None = None,
+    analysis_type: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Build a universal data_profile.json for senior reasoning.
+
+    This is the EVIDENCE LAYER - objective facts about the data.
+    It does NOT make decisions; it provides evidence for ml_plan.json.
+
+    Args:
+        df: The cleaned DataFrame to profile
+        contract: Optional execution contract (for outcome_columns, column_roles)
+        analysis_type: Optional analysis type (classification, regression, etc.)
+
+    Returns:
+        Dictionary with universal profile including:
+        - basic_stats: rows, cols, dtypes
+        - missingness: per-column missing fraction (top 30)
+        - outcome_analysis: if contract has outcome_columns
+        - split_candidates: columns whose names suggest split/fold usage
+        - constant_columns: columns with <= 1 unique value
+        - high_cardinality_columns: columns with unique ratio > 0.95
+        - leakage_flags: potential leakage indicators
+    """
+    contract = contract or {}
+    columns = [str(c) for c in df.columns]
+    n_rows = int(df.shape[0])
+    n_cols = int(df.shape[1])
+
+    # 1. Basic stats: dtypes
+    dtypes_map = {}
+    for col in columns:
+        dtypes_map[col] = str(df[col].dtype)
+
+    # 2. Missingness (top 30 by missing fraction)
+    from src.utils.missing import is_effectively_missing_series
+    missingness = {}
+    for col in columns:
+        try:
+            miss_frac = float(is_effectively_missing_series(df[col]).mean())
+        except Exception:
+            miss_frac = float(df[col].isna().mean())
+        missingness[col] = round(miss_frac, 4)
+    # Sort by missingness descending, take top 30
+    sorted_miss = sorted(missingness.items(), key=lambda x: x[1], reverse=True)
+    missingness_top30 = dict(sorted_miss[:30])
+
+    # 3. Outcome analysis (if contract specifies outcome_columns)
+    outcome_analysis = {}
+    outcome_cols = []
+    if contract.get("outcome_columns"):
+        raw_outcomes = contract.get("outcome_columns")
+        if isinstance(raw_outcomes, list):
+            outcome_cols = [str(c) for c in raw_outcomes if c and str(c).lower() != "unknown"]
+        elif isinstance(raw_outcomes, str) and raw_outcomes.lower() != "unknown":
+            outcome_cols = [raw_outcomes]
+    # Fallback: column_roles["outcome"]
+    if not outcome_cols:
+        roles = contract.get("column_roles", {})
+        if isinstance(roles, dict):
+            outcome_from_roles = roles.get("outcome", [])
+            if isinstance(outcome_from_roles, list):
+                outcome_cols = [str(c) for c in outcome_from_roles if c]
+            elif isinstance(outcome_from_roles, str):
+                outcome_cols = [outcome_from_roles]
+
+    for outcome_col in outcome_cols:
+        if outcome_col not in df.columns:
+            outcome_analysis[outcome_col] = {"present": False, "error": "column_not_found"}
+            continue
+        series = df[outcome_col]
+        non_null_count = int(series.notna().sum())
+        total_count = int(len(series))
+        null_frac = round(1.0 - (non_null_count / total_count) if total_count > 0 else 0, 4)
+        analysis_entry = {
+            "present": True,
+            "non_null_count": non_null_count,
+            "total_count": total_count,
+            "null_frac": null_frac,
+        }
+        # Determine if classification or regression
+        n_unique = int(series.nunique(dropna=True))
+        inferred_type = analysis_type or ""
+        if not inferred_type:
+            # Heuristic: if <= 20 unique values, likely classification
+            if n_unique <= 20:
+                inferred_type = "classification"
+            else:
+                inferred_type = "regression"
+        analysis_entry["inferred_type"] = inferred_type
+        analysis_entry["n_unique"] = n_unique
+
+        if inferred_type == "classification":
+            # Class counts (capped at 30 classes)
+            try:
+                counts = series.dropna().value_counts().head(30)
+                class_counts = {str(k): int(v) for k, v in counts.items()}
+                analysis_entry["n_classes"] = n_unique
+                analysis_entry["class_counts"] = class_counts
+            except Exception:
+                pass
+        else:
+            # Regression: quantiles
+            try:
+                numeric_series = pd.to_numeric(series, errors="coerce").dropna()
+                if len(numeric_series) > 0:
+                    quantiles = {
+                        "min": float(numeric_series.min()),
+                        "q25": float(numeric_series.quantile(0.25)),
+                        "median": float(numeric_series.median()),
+                        "q75": float(numeric_series.quantile(0.75)),
+                        "max": float(numeric_series.max()),
+                    }
+                    analysis_entry["quantiles"] = quantiles
+            except Exception:
+                pass
+        outcome_analysis[outcome_col] = analysis_entry
+
+    # 4. Split candidates: columns with tokens like split/set/fold/train/test/partition
+    split_candidates = []
+    for col in columns:
+        col_lower = col.lower().replace("_", " ").replace("-", " ")
+        tokens = set(col_lower.split())
+        if tokens & SPLIT_CANDIDATE_TOKENS:
+            # Gather unique values evidence
+            try:
+                uniques = df[col].dropna().unique()[:20].tolist()
+                uniques_str = [str(v) for v in uniques]
+            except Exception:
+                uniques_str = []
+            split_candidates.append({
+                "column": col,
+                "unique_values_sample": uniques_str,
+            })
+
+    # 5. Constant columns (unique values <= 1)
+    constant_columns = []
+    for col in columns:
+        n_uniq = df[col].nunique(dropna=True)
+        if n_uniq <= 1:
+            constant_columns.append(col)
+
+    # 6. High cardinality columns (unique ratio > 0.95 and > 50 uniques)
+    high_cardinality_columns = []
+    for col in columns:
+        n_uniq = df[col].nunique(dropna=True)
+        unique_ratio = n_uniq / n_rows if n_rows > 0 else 0
+        if unique_ratio > 0.95 and n_uniq > 50:
+            high_cardinality_columns.append({
+                "column": col,
+                "n_unique": n_uniq,
+                "unique_ratio": round(unique_ratio, 4),
+            })
+
+    # 7. Leakage flags: if outcome column name appears elsewhere as feature
+    leakage_flags = []
+    outcome_names_lower = {c.lower() for c in outcome_cols}
+    for col in columns:
+        col_lower = col.lower()
+        # Check if outcome name is substring of another column (potential derived leakage)
+        for outcome in outcome_names_lower:
+            if outcome in col_lower and col not in outcome_cols:
+                leakage_flags.append({
+                    "column": col,
+                    "reason": f"name_contains_outcome:{outcome}",
+                    "severity": "SOFT",
+                })
+
+    profile = {
+        "basic_stats": {
+            "n_rows": n_rows,
+            "n_cols": n_cols,
+            "columns": columns,
+        },
+        "dtypes": dtypes_map,
+        "missingness_top30": missingness_top30,
+        "outcome_analysis": outcome_analysis,
+        "split_candidates": split_candidates,
+        "constant_columns": constant_columns,
+        "high_cardinality_columns": high_cardinality_columns,
+        "leakage_flags": leakage_flags,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+    return profile
+
+
+def write_data_profile(profile: Dict[str, Any], path: str = "work/artifacts/data_profile.json") -> None:
+    """Write data_profile.json to the specified path."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, indent=2, ensure_ascii=True)
+    except Exception as e:
+        print(f"Warning: failed to write data_profile.json: {e}")

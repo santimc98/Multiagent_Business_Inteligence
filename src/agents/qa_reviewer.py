@@ -1057,6 +1057,38 @@ def run_static_qa_checks(
             "Explain high R2/low MAE and include assert_no_deterministic_target_leakage before training.",
         )
 
+    # SENIOR REASONING: Plan ↔ Code coherence validation
+    require_plan_coherence = "plan_code_coherence" in qa_gate_set
+    ml_plan = (evaluation_spec or {}).get("ml_plan")
+    data_profile = (evaluation_spec or {}).get("data_profile")
+    coherence_result = None
+    if ml_plan and require_plan_coherence:
+        try:
+            from src.utils.ml_plan_validation import validate_plan_code_coherence
+            coherence_result = validate_plan_code_coherence(ml_plan, code, data_profile)
+            if coherence_result and not coherence_result.get("passed", True):
+                for violation in coherence_result.get("violations", []):
+                    _flag(
+                        "plan_code_coherence",
+                        violation,
+                        "Fix code to implement the ml_plan.json training_rows_policy and metric_policy correctly.",
+                    )
+            if coherence_result and coherence_result.get("warnings"):
+                for warning in coherence_result.get("warnings", []):
+                    warnings.append(f"PLAN_COHERENCE: {warning}")
+        except Exception as coh_err:
+            warnings.append(f"Plan coherence check failed: {coh_err}")
+    elif ml_plan and not require_plan_coherence:
+        # Run coherence check as warning-only even if gate not required
+        try:
+            from src.utils.ml_plan_validation import validate_plan_code_coherence
+            coherence_result = validate_plan_code_coherence(ml_plan, code, data_profile)
+            if coherence_result and coherence_result.get("warnings"):
+                for warning in coherence_result.get("warnings", []):
+                    warnings.append(f"PLAN_COHERENCE: {warning}")
+        except Exception:
+            pass
+
     facts_payload = facts if isinstance(facts, dict) else collect_static_qa_facts(code)
     facts_payload["has_read_csv"] = scanner.has_read_csv
     facts_payload["has_synthetic_data"] = synthetic_detected
@@ -1066,6 +1098,8 @@ def run_static_qa_checks(
     facts_payload["hard_failures"] = hard_failures
     facts_payload["soft_failures"] = soft_failures
     facts_payload["contract_source_used"] = contract_source_used
+    if coherence_result:
+        facts_payload["plan_code_coherence"] = coherence_result
     if gate_warnings:
         facts_payload["warnings"] = list(gate_warnings)
 

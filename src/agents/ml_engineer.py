@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -693,6 +694,231 @@ class MLEngineerAgent:
             deduped.append(reason)
         return deduped
 
+    def _execute_llm_call(self, sys_prompt: str, usr_prompt: str, temperature: float = 0.1) -> str:
+        """Helper to execute LLM call with current provider."""
+        model_name = self.model_name
+        
+        # Determine label
+        if self.provider in {"google", "gemini"}:
+            provider_label = "Google"
+        elif self.provider == "zai":
+            provider_label = "Z.ai"
+        elif self.provider == "openrouter":
+            provider_label = "OpenRouter"
+        else:
+            provider_label = "DeepSeek"
+            
+        self.last_prompt = sys_prompt + "\n\nUSER:\n" + usr_prompt
+        print(f"DEBUG: ML Engineer (Plan) calling {provider_label} Model ({model_name})...")
+        
+        try:
+            if self.provider == "zai":
+                from src.utils.llm_throttle import glm_call_slot
+                with glm_call_slot():
+                    response = self.client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": usr_prompt}
+                        ],
+                        temperature=temperature,
+                    )
+                return response.choices[0].message.content
+            elif self.provider == "openrouter":
+                response = self.client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": usr_prompt}
+                    ],
+                    temperature=temperature,
+                )
+                return response.choices[0].message.content
+            elif self.provider in {"google", "gemini"}:
+                full_prompt = sys_prompt + "\n\nUSER INPUT:\n" + usr_prompt
+                from google.genai import types
+                
+                # Thinking config logic
+                thinking_level = (os.getenv("ML_ENGINEER_THINKING_LEVEL") or "high").strip().lower()
+                if thinking_level not in {"minimal", "low", "medium", "high"}:
+                    thinking_level = "high"
+                    
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=temperature,
+                        top_p=0.9,
+                        top_k=40,
+                        max_output_tokens=8192,
+                        candidate_count=1,
+                        thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
+                        safety_settings=[
+                            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+                            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+                            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+                        ],
+                    ),
+                )
+                return getattr(response, "text", "")
+            else:
+                # Deepseek or fallback
+                response = self.client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": usr_prompt}
+                    ],
+                    temperature=temperature,
+                )
+                return response.choices[0].message.content
+        except Exception as e:
+            # Check for 504
+            if "504" in str(e):
+                raise ConnectionError("LLM Server Timeout (504 Received)")
+            raise e
+
+    def generate_ml_plan(
+        self,
+        data_profile: Dict[str, Any],
+        execution_contract: Dict[str, Any] | None = None,
+        strategy: Dict[str, Any] | None = None,
+        business_objective: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Generate ml_plan.json using LLM reasoning (Facts -> Plan).
+        """
+        contract = execution_contract or {}
+        profile = data_profile or {}
+        strategy = strategy or {}
+
+        PLAN_PROMPT = """
+        You are a Senior ML Engineer. Your task is to reason about the data facts and contract requirements to produce a Robust ML Plan.
+
+        *** DATA FACTS (Facts Only) ***
+        $data_profile_json
+
+        *** EXECUTION CONTRACT ***
+        $execution_contract_json
+
+        *** STRATEGY ***
+        $strategy_json
+
+        *** BUSINESS OBJECTIVE ***
+        "$business_objective"
+
+        *** INSTRUCTIONS ***
+        1. Analyze 'outcome_analysis' to check for partial labels. If >1% missing, set training_rows_policy to "only_rows_with_label".
+        2. Check 'split_candidates'. If a split column exists in candidates AND contract doesn't forbid it (see 'training_rows_rule'), consider "use_split_column".
+        3. Check 'evaluation_spec' in contract. If primary_metric is set, use it. If not, infer from strategy.analysis_type.
+        4. Check 'leakage_flags'. If present, policy action should be "exclude_flagged_columns".
+        5. DO NOT invent rules. Base every decision on 'evidence' found in the data_profile.
+
+        *** REQUIRED OUTPUT (JSON ONLY) ***
+        Return a single JSON object (no markdown) with this schema:
+        {
+          "training_rows_policy": "use_all_rows | only_rows_with_label | use_split_column | custom",
+          "training_rows_rule": "string rule if custom or null",
+          "split_column": "col_name or null",
+          "metric_policy": {
+              "primary_metric": "string",
+              "report_with_cv": true,
+              "notes": "string"
+          },
+          "cv_policy": {
+              "strategy": "StratifiedKFold | KFold | TimeSeriesSplit | GroupKFold",
+              "n_splits": 5,
+              "shuffle": true,
+              "notes": "string"
+          },
+          "leakage_policy": {
+              "action": "none | exclude_flagged_columns",
+              "flagged_columns": ["col1", "col2"],
+              "notes": "string"
+          },
+          "evidence": ["list", "of", "facts", "from", "profile"],
+          "assumptions": [],
+          "open_questions": []
+        }
+        """
+        
+        from src.utils.context_pack import compress_long_lists
+        
+        # Prepare context (compacted by caller, but we ensure JSON dump is safe)
+        render_kwargs = {
+            "data_profile_json": json.dumps(compress_long_lists(profile)[0], indent=2),
+            "execution_contract_json": json.dumps(self._compact_execution_contract(contract), indent=2),
+            "strategy_json": json.dumps(strategy, indent=2),
+            "business_objective": business_objective,
+        }
+        
+        system_prompt = render_prompt(PLAN_PROMPT, **render_kwargs)
+        user_prompt = "Generate the ML Plan JSON now."
+        
+        try:
+            # First attempt
+            response = self._execute_llm_call(system_prompt, user_prompt, temperature=0.1)
+            self.last_response = response
+            parsed = self._parse_json_response(response)
+            ml_plan = self._normalize_ml_plan(parsed)
+            if ml_plan:
+                return ml_plan
+            
+            # Retry attempt
+            print("Warning: ML Plan generation returned invalid JSON, retrying...")
+            response = self._execute_llm_call(system_prompt, user_prompt + "\nCRITICAL: Return VALID JSON ONLY. No text.", temperature=0.1)
+            self.last_response = response
+            parsed = self._parse_json_response(response)
+            ml_plan = self._normalize_ml_plan(parsed)
+            if ml_plan:
+                return ml_plan
+            
+            return {}
+
+        except Exception as e:
+            print(f"ML Engineer Plan Gen Error: {e}")
+            return {}
+
+    def _parse_json_response(self, text: str) -> Any:
+        try:
+            cleaned = text.strip()
+            # Remove markdown fences
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json")[1].split("```")[0].strip()
+            elif "```" in cleaned:
+                # Fallback for generic block
+                parts = cleaned.split("```")
+                if len(parts) >= 2:
+                     cleaned = parts[1].strip()
+            
+            # More robust regex
+            import re
+            json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            if json_match:
+                cleaned = json_match.group(0)
+            return json.loads(cleaned)
+        except Exception:
+            return None
+
+    def _normalize_ml_plan(self, parsed: Any) -> Dict[str, Any] | None:
+        if isinstance(parsed, list):
+            # If list, take first element if dict
+            if parsed and isinstance(parsed[0], dict):
+                parsed = parsed[0]
+            else:
+                return None
+        
+        if not isinstance(parsed, dict):
+            return None
+            
+        # Basic schema validation (relaxed)
+        required_keys = ["training_rows_policy", "metric_policy", "cv_policy"]
+        if not all(k in parsed for k in required_keys):
+            return None
+            
+        return parsed
+
     def generate_code(
         self,
         strategy: Dict[str, Any],
@@ -728,6 +954,7 @@ class MLEngineerAgent:
          - Produce ONE robust, runnable Python SCRIPT that loads cleaned dataset from $data_path, trains/evaluates according to Execution Contract, and writes required artifacts.
          - Adapt to each dataset and objective. Do not follow a rigid recipe; follow contract + data.
          - If Evaluation Spec says requires_target=false, DO NOT train a supervised model. Produce descriptive/segmentation insights and still write data/metrics.json with model_trained=false.
+         - CRITICAL: If 'ML_PLAN_CONTEXT' is present (in Data Audit), you MUST implement that plan exactly (training_rows_policy, metric_policy, cv_policy). Do not deviate.
 
          TRAINING DATA SELECTION (STEWARD-DRIVEN)
          - Read execution_contract (or contract_min) for outcome_columns and optional fields:

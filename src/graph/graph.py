@@ -8890,6 +8890,50 @@ def run_engineer(state: AgentState) -> AgentState:
 
     strategy = state.get('selected_strategy')
 
+    # SENIOR REASONING: Build data_profile.json on first iteration
+    iteration_count = state.get("iteration_count", 0)
+    data_profile = state.get("data_profile")
+    if not data_profile and iteration_count == 0:
+        try:
+            from src.agents.steward import build_data_profile, write_data_profile
+            cleaned_csv_path = "data/cleaned_data.csv"
+            if os.path.exists(cleaned_csv_path):
+                csv_sep = state.get("csv_sep", ",")
+                csv_decimal = state.get("csv_decimal", ".")
+                csv_encoding = state.get("csv_encoding", "utf-8")
+                df_profile = pd.read_csv(
+                    cleaned_csv_path,
+                    sep=csv_sep,
+                    decimal=csv_decimal,
+                    encoding=csv_encoding,
+                    nrows=5000,
+                    low_memory=False,
+                )
+                execution_contract = state.get("execution_contract") or _load_json_safe("data/execution_contract.json")
+                analysis_type = (strategy or {}).get("analysis_type")
+                data_profile = build_data_profile(df_profile, execution_contract, analysis_type)
+                # Save to artifacts
+                os.makedirs("work/artifacts", exist_ok=True)
+                write_data_profile(data_profile, "work/artifacts/data_profile.json")
+                # Also save to data/ for easy access
+                os.makedirs("data", exist_ok=True)
+                write_data_profile(data_profile, "data/data_profile.json")
+                state["data_profile"] = data_profile
+                state["data_profile_path"] = "work/artifacts/data_profile.json"
+                print(f"DATA_PROFILE: Built profile with {data_profile.get('basic_stats', {}).get('n_rows', 0)} rows, "
+                      f"{len(data_profile.get('outcome_analysis', {}))} outcome cols analyzed")
+                if run_id:
+                    log_run_event(run_id, "data_profile_built", {
+                        "n_rows": data_profile.get("basic_stats", {}).get("n_rows"),
+                        "n_cols": data_profile.get("basic_stats", {}).get("n_cols"),
+                        "split_candidates": len(data_profile.get("split_candidates", [])),
+                        "outcome_cols": list(data_profile.get("outcome_analysis", {}).keys()),
+                    })
+        except Exception as profile_err:
+            print(f"Warning: failed to build data_profile: {profile_err}")
+            if run_id:
+                log_run_event(run_id, "data_profile_failed", {"error": str(profile_err)})
+
     # Pass input context
     data_path = "data/cleaned_data.csv"
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
@@ -9205,6 +9249,47 @@ def run_engineer(state: AgentState) -> AgentState:
         iteration_memory_block = _truncate_text(iteration_memory_block, max_len=6000, head_len=3500, tail_len=2000)
         kwargs["data_audit_context"] = data_audit_context
         kwargs["iteration_memory_block"] = iteration_memory_block
+
+        # SENIOR REASONING: Generate ml_plan.json on first iteration
+        ml_plan = state.get("ml_plan")
+        iter_count = int(state.get("iteration_count", 0))
+        if not ml_plan and iter_count == 0:
+            try:
+                from src.utils.data_profile_compact import compact_data_profile_for_llm
+                data_profile = state.get("data_profile")
+                ml_plan = ml_engineer.generate_ml_plan(
+                    data_profile=compact_data_profile_for_llm(data_profile or {}),
+                    execution_contract=execution_contract,
+                    strategy=strategy,
+                    business_objective=business_objective,
+                )
+                # Save ml_plan to artifacts
+                os.makedirs("work/artifacts", exist_ok=True)
+                dump_json("work/artifacts/ml_plan.json", ml_plan)
+                os.makedirs("data", exist_ok=True)
+                dump_json("data/ml_plan.json", ml_plan)
+                state["ml_plan"] = ml_plan
+                state["ml_plan_path"] = "work/artifacts/ml_plan.json"
+                print(f"ML_PLAN: Generated plan with training_rows_policy='{ml_plan.get('training_rows_policy')}', "
+                      f"metric='{ml_plan.get('metric_policy', {}).get('primary_metric')}'")
+                if run_id:
+                    log_run_event(run_id, "ml_plan_generated", {
+                        "training_rows_policy": ml_plan.get("training_rows_policy"),
+                        "metric_policy": ml_plan.get("metric_policy"),
+                        "cv_policy": ml_plan.get("cv_policy"),
+                    })
+            except Exception as plan_err:
+                print(f"Warning: failed to generate ml_plan: {plan_err}")
+                ml_plan = {}
+                if run_id:
+                    log_run_event(run_id, "ml_plan_failed", {"error": str(plan_err)})
+
+        # Inject ml_plan into data_audit_context for the LLM
+        if ml_plan:
+            plan_context = "ML_PLAN_CONTEXT (DECISION PLAN - implement this exactly):\n" + json.dumps(ml_plan, indent=2)
+            data_audit_context = _merge_de_audit_override(data_audit_context, plan_context)
+            kwargs["data_audit_context"] = data_audit_context
+
         code = ml_engineer.generate_code(**kwargs)
         try:
             os.makedirs("artifacts", exist_ok=True)
@@ -9278,6 +9363,11 @@ def run_engineer(state: AgentState) -> AgentState:
             },
             "budget_counters": counters,
             "strategy_lock_snapshot": strategy_lock_snapshot,
+            # SENIOR REASONING: Include data_profile and ml_plan
+            "data_profile": state.get("data_profile"),
+            "data_profile_path": state.get("data_profile_path"),
+            "ml_plan": ml_plan if 'ml_plan' in dir() else state.get("ml_plan"),
+            "ml_plan_path": state.get("ml_plan_path"),
         }
     except Exception as e:
         msg = f"CRITICAL: ML Engineer crashed in host: {str(e)}"
@@ -9509,6 +9599,12 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         qa_context["_contract_source"] = contract_source
         if context_pack:
             qa_context["context_pack"] = context_pack
+
+        # Wire ML Plan for QA coherence check (Senior Reasoning)
+        qa_context.setdefault("evaluation_spec", {})
+        if isinstance(qa_context["evaluation_spec"], dict):
+             qa_context["evaluation_spec"]["ml_plan"] = state.get("ml_plan") or {}
+             qa_context["evaluation_spec"]["data_profile"] = state.get("data_profile") or {}
         dataset_semantics_summary = state.get("dataset_semantics_summary")
         if dataset_semantics_summary:
             qa_context["dataset_semantics_summary"] = dataset_semantics_summary
