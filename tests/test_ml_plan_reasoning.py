@@ -40,10 +40,10 @@ class TestMLPlanGeneration:
         assert self.agent._execute_llm_call.call_count == 2
 
     def test_generate_ml_plan_total_failure(self):
-        """Test fallback to empty dict."""
+        """Test fallback on failure."""
         self.agent._execute_llm_call.side_effect = Exception("API Error")
         plan = self.agent.generate_ml_plan({})
-        assert plan == {}
+        assert plan["plan_source"] == "llm_error"
 
 class TestQAReviewerWiring:
     @patch('src.graph.graph.collect_static_qa_facts', return_value={})

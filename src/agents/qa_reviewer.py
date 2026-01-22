@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
+from src.utils.ml_plan_validation import validate_ml_plan_constraints
 
 load_dotenv()
 
@@ -141,6 +142,23 @@ class QAReviewerAgent:
         Conducts a strict Quality Assurance audit on the generated code.
         Focus: Mapping integrity, Leakage prevention, Safety, consistency.
         """
+        # Validate ML Plan constraints (Fail-Fast)
+        if evaluation_spec and "ml_plan" in evaluation_spec:
+            ml_plan = evaluation_spec["ml_plan"]
+            data_profile = evaluation_spec.get("data_profile", {})
+            # Run constraint check
+            check = validate_ml_plan_constraints(ml_plan, data_profile, {}, strategy)
+            if not check["ok"]:
+                msg = f"ML_PLAN_INVALID: {'; '.join(check['violations'])}"
+                return {
+                    "status": "REJECTED",
+                    "feedback": msg,
+                    "failed_gates": ["ML_PLAN_INVALID"],
+                    "required_fixes": ["Regenerate ML plan with initialized ML Engineer / ensure LLM call works"],
+                    "hard_failures": ["ML_PLAN_INVALID"],
+                    "evidence": [],
+                }
+
         static_facts = collect_static_qa_facts(code)
         static_result = run_static_qa_checks(code, evaluation_spec, static_facts)
         try:
@@ -933,6 +951,44 @@ def run_static_qa_checks(
     if gate_warnings:
         for warning in gate_warnings:
             print(warning)
+
+    # SENIOR REASONING: Fail-fast if ML plan is invalid/incomplete
+    ml_plan = (evaluation_spec or {}).get("ml_plan")
+    data_profile = (evaluation_spec or {}).get("data_profile")
+    strategy = (evaluation_spec or {}).get("strategy")
+    contract = (evaluation_spec or {}).get("contract")
+    if ml_plan:
+        plan_validation = validate_ml_plan_constraints(
+            ml_plan, data_profile, contract, strategy
+        )
+        if not plan_validation.get("ok", True):
+            violations = plan_validation.get("violations", [])
+            plan_source = ml_plan.get("plan_source", "unknown")
+            # Fail-fast: reject if plan_source indicates LLM failure or missing init
+            if plan_source in ("missing_llm_init", "llm_error", "fallback"):
+                return {
+                    "status": "REJECTED",
+                    "feedback": f"ML plan is invalid (source={plan_source}). Cannot proceed with code evaluation.",
+                    "failed_gates": ["ML_PLAN_INVALID"],
+                    "required_fixes": [
+                        "Regenerate ML plan with initialized ML Engineer.",
+                        "Ensure LLM call works properly.",
+                        "Plan must include training_rows_policy + metric_policy from LLM.",
+                    ],
+                    "facts": {
+                        "ml_plan_validation": plan_validation,
+                        "plan_source": plan_source,
+                    },
+                    "warnings": violations + gate_warnings,
+                    "qa_gates_evaluated": qa_gate_names,
+                    "hard_failures": ["ML_PLAN_INVALID"],
+                    "soft_failures": [],
+                    "contract_source_used": contract_source_used,
+                }
+            # If plan_source is "llm" but has violations, add as warnings not hard failure
+            elif violations:
+                gate_warnings.extend([f"ML_PLAN_CONSTRAINT: {v}" for v in violations])
+
     require_variance_guard = "target_variance_guard" in qa_gate_set
     require_leakage_guard = "leakage_prevention" in qa_gate_set
     require_dialect_guard = "dialect_mismatch_handling" in qa_gate_set

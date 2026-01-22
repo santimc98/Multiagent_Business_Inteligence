@@ -20,6 +20,54 @@ from src.utils.senior_protocol import (
 # ML code executes in sandbox; keep the reference for integration checks.
 _scan_code_safety_ref = "scan_code_safety"
 
+# ============================================================================
+# ML PLAN SCHEMA CONSTANTS (TAREA 1)
+# ============================================================================
+
+REQUIRED_PLAN_KEYS = [
+    "training_rows_policy",
+    "metric_policy",
+    "cv_policy",
+    "scoring_policy",
+    "leakage_policy",
+    "notes",
+    "plan_source",
+]
+
+DEFAULT_PLAN: Dict[str, Any] = {
+    "training_rows_policy": "unspecified",
+    "training_rows_rule": None,
+    "split_column": None,
+    "metric_policy": {
+        "primary_metric": "unspecified",
+        "secondary_metrics": [],
+        "report_with_cv": True,
+        "notes": "",
+    },
+    "cv_policy": {
+        "strategy": "unspecified",
+        "n_splits": 5,
+        "shuffle": True,
+        "stratified": None,
+        "notes": "",
+    },
+    "scoring_policy": {
+        "generate_scores": True,
+        "score_rows": "unspecified",
+    },
+    "leakage_policy": {
+        "action": "unspecified",
+        "flagged_columns": [],
+        "notes": "",
+    },
+    "evidence": [],
+    "assumptions": [],
+    "open_questions": [],
+    "notes": [],
+    "plan_source": "fallback",
+}
+
+
 class MLEngineerAgent:
     def __init__(self, api_key: str = None):
         """
@@ -785,100 +833,153 @@ class MLEngineerAgent:
         execution_contract: Dict[str, Any] | None = None,
         strategy: Dict[str, Any] | None = None,
         business_objective: str = "",
+        llm_call: Any = None,
     ) -> Dict[str, Any]:
         """
         Generate ml_plan.json using LLM reasoning (Facts -> Plan).
+
+        NEVER returns {} - always returns a complete plan with all REQUIRED_PLAN_KEYS.
+
+        Args:
+            data_profile: Data profile with facts (outcome_analysis, split_candidates, etc.)
+            execution_contract: V4.1 execution contract
+            strategy: Selected strategy dict
+            business_objective: Business objective string
+            llm_call: Optional callable for LLM call injection (for testing).
+                      Signature: llm_call(system_prompt, user_prompt) -> str
+
+        Returns:
+            Complete ML plan dict (never empty)
         """
+        import copy
         contract = execution_contract or {}
         profile = data_profile or {}
-        strategy = strategy or {}
+        strategy_dict = strategy or {}
 
         PLAN_PROMPT = """
-        You are a Senior ML Engineer. Your task is to reason about the data facts and contract requirements to produce a Robust ML Plan.
+You are a Senior ML Engineer. Your task is to reason about the data facts and contract requirements to produce a Robust ML Plan.
 
-        *** DATA FACTS (Facts Only) ***
-        $data_profile_json
+*** DATA FACTS (Facts Only) ***
+$data_profile_json
 
-        *** EXECUTION CONTRACT ***
-        $execution_contract_json
+*** EXECUTION CONTRACT ***
+$execution_contract_json
 
-        *** STRATEGY ***
-        $strategy_json
+*** STRATEGY ***
+$strategy_json
 
-        *** BUSINESS OBJECTIVE ***
-        "$business_objective"
+*** BUSINESS OBJECTIVE ***
+"$business_objective"
 
-        *** INSTRUCTIONS ***
-        1. Analyze 'outcome_analysis' to check for partial labels. If >1% missing, set training_rows_policy to "only_rows_with_label".
-        2. Check 'split_candidates'. If a split column exists in candidates AND contract doesn't forbid it (see 'training_rows_rule'), consider "use_split_column".
-        3. Check 'evaluation_spec' in contract. If primary_metric is set, use it. If not, infer from strategy.analysis_type.
-        4. Check 'leakage_flags'. If present, policy action should be "exclude_flagged_columns".
-        5. DO NOT invent rules. Base every decision on 'evidence' found in the data_profile.
+*** UNIVERSAL CONSTRAINTS (apply always) ***
+1. If outcome_analysis shows any outcome column with null_frac > 0, you CANNOT use "use_all_rows" for training_rows_policy.
+   Reason: You cannot compute loss/metric on rows without labels.
+2. If strategy.analysis_type == "classification", metric_policy.primary_metric MUST be a classification metric (roc_auc, accuracy, f1, precision, recall, log_loss).
+3. If strategy.analysis_type == "regression", metric_policy.primary_metric MUST be a regression metric (rmse, mae, r2, mse, mape).
+4. If leakage_flags exist in data_profile, leakage_policy.action should be "exclude_flagged_columns" unless contract explicitly allows them.
 
-        *** REQUIRED OUTPUT (JSON ONLY) ***
-        Return a single JSON object (no markdown) with this schema:
-        {
-          "training_rows_policy": "use_all_rows | only_rows_with_label | use_split_column | custom",
-          "training_rows_rule": "string rule if custom or null",
-          "split_column": "col_name or null",
-          "metric_policy": {
-              "primary_metric": "string",
-              "report_with_cv": true,
-              "notes": "string"
-          },
-          "cv_policy": {
-              "strategy": "StratifiedKFold | KFold | TimeSeriesSplit | GroupKFold",
-              "n_splits": 5,
-              "shuffle": true,
-              "notes": "string"
-          },
-          "leakage_policy": {
-              "action": "none | exclude_flagged_columns",
-              "flagged_columns": ["col1", "col2"],
-              "notes": "string"
-          },
-          "evidence": ["list", "of", "facts", "from", "profile"],
-          "assumptions": [],
-          "open_questions": []
-        }
-        """
-        
+*** INSTRUCTIONS ***
+1. Analyze 'outcome_analysis' to check for partial labels. If null_frac > 0 for any outcome, set training_rows_policy to "only_rows_with_label".
+2. Check 'split_candidates'. If a split column exists AND has values like 'train'/'test', consider "use_split_column".
+3. Check 'evaluation_spec' in contract. If primary_metric is set, use it. Otherwise infer from strategy.analysis_type.
+4. DO NOT invent rules. Base every decision on 'evidence' found in the data_profile.
+5. List all evidence used in the 'evidence' field.
+
+*** REQUIRED OUTPUT (JSON ONLY, NO MARKDOWN) ***
+{
+  "training_rows_policy": "use_all_rows | only_rows_with_label | use_split_column | custom",
+  "training_rows_rule": "string rule if custom, or null",
+  "split_column": "col_name or null",
+  "metric_policy": {
+      "primary_metric": "metric_name",
+      "secondary_metrics": [],
+      "report_with_cv": true,
+      "notes": "brief justification"
+  },
+  "cv_policy": {
+      "strategy": "StratifiedKFold | KFold | TimeSeriesSplit | GroupKFold | auto",
+      "n_splits": 5,
+      "shuffle": true,
+      "stratified": true,
+      "notes": "brief justification"
+  },
+  "scoring_policy": {
+      "generate_scores": true,
+      "score_rows": "all | labeled_only | unlabeled_only"
+  },
+  "leakage_policy": {
+      "action": "none | exclude_flagged_columns | manual_review",
+      "flagged_columns": [],
+      "notes": "brief justification"
+  },
+  "evidence": ["fact1 from profile", "fact2 from profile"],
+  "assumptions": [],
+  "open_questions": [],
+  "notes": ["brief reasoning notes"]
+}
+"""
+
+        # Check if we can make LLM calls
+        has_llm_init = getattr(self, "model_name", None) is not None
+        can_execute_llm = has_llm_init or llm_call is not None
+
+        if not can_execute_llm:
+            # Agent not initialized, cannot call LLM
+            result = self._normalize_ml_plan(None, source="missing_llm_init")
+            result["notes"] = ["Agent not initialized; cannot call LLM. Using fallback defaults."]
+            return result
+
         from src.utils.context_pack import compress_long_lists
-        
-        # Prepare context (compacted by caller, but we ensure JSON dump is safe)
-        render_kwargs = {
-            "data_profile_json": json.dumps(compress_long_lists(profile)[0], indent=2),
-            "execution_contract_json": json.dumps(self._compact_execution_contract(contract), indent=2),
-            "strategy_json": json.dumps(strategy, indent=2),
-            "business_objective": business_objective,
-        }
-        
+
+        # Prepare context
+        try:
+            render_kwargs = {
+                "data_profile_json": json.dumps(compress_long_lists(profile)[0], indent=2),
+                "execution_contract_json": json.dumps(self._compact_execution_contract(contract), indent=2),
+                "strategy_json": json.dumps(strategy_dict, indent=2),
+                "business_objective": business_objective,
+            }
+        except Exception as render_err:
+            result = self._normalize_ml_plan(None, source="render_error")
+            result["notes"] = [f"Failed to render prompt context: {render_err}"]
+            return result
+
         system_prompt = render_prompt(PLAN_PROMPT, **render_kwargs)
         user_prompt = "Generate the ML Plan JSON now."
-        
+
+        # Determine which LLM call function to use
+        if llm_call is not None:
+            execute_call = llm_call
+        else:
+            execute_call = lambda sys, usr: self._execute_llm_call(sys, usr, temperature=0.1)
+
         try:
             # First attempt
-            response = self._execute_llm_call(system_prompt, user_prompt, temperature=0.1)
-            self.last_response = response
+            response = execute_call(system_prompt, user_prompt)
+            if hasattr(self, 'last_response'):
+                self.last_response = response
             parsed = self._parse_json_response(response)
-            ml_plan = self._normalize_ml_plan(parsed)
-            if ml_plan:
+            ml_plan = self._normalize_ml_plan(parsed, source="llm")
+
+            # Check if we got meaningful data
+            if ml_plan.get("training_rows_policy") != "unspecified":
                 return ml_plan
-            
+
             # Retry attempt
-            print("Warning: ML Plan generation returned invalid JSON, retrying...")
-            response = self._execute_llm_call(system_prompt, user_prompt + "\nCRITICAL: Return VALID JSON ONLY. No text.", temperature=0.1)
-            self.last_response = response
+            print("Warning: ML Plan generation returned incomplete JSON, retrying...")
+            response = execute_call(system_prompt, user_prompt + "\nCRITICAL: Return VALID JSON ONLY. No markdown.")
+            if hasattr(self, 'last_response'):
+                self.last_response = response
             parsed = self._parse_json_response(response)
-            ml_plan = self._normalize_ml_plan(parsed)
-            if ml_plan:
-                return ml_plan
-            
-            return {}
+            ml_plan = self._normalize_ml_plan(parsed, source="llm_retry")
+
+            return ml_plan
 
         except Exception as e:
             print(f"ML Engineer Plan Gen Error: {e}")
-            return {}
+            result = self._normalize_ml_plan(None, source="llm_error")
+            result["notes"] = [f"LLM call failed: {e}"]
+            return result
 
     def _parse_json_response(self, text: str) -> Any:
         try:
@@ -901,23 +1002,142 @@ class MLEngineerAgent:
         except Exception:
             return None
 
-    def _normalize_ml_plan(self, parsed: Any) -> Dict[str, Any] | None:
+    def _normalize_ml_plan(self, parsed: Any, source: str = "llm") -> Dict[str, Any]:
+        """
+        Normalize parsed LLM response to a complete ML plan.
+
+        NEVER returns {} or None - always returns a complete plan with all required keys.
+
+        Args:
+            parsed: Raw parsed response (can be dict, list, None, etc.)
+            source: Plan source label (e.g., "llm", "fallback", "missing_llm_init")
+
+        Returns:
+            Complete ML plan dict with all REQUIRED_PLAN_KEYS
+        """
+        import copy
+
+        # Start with a copy of DEFAULT_PLAN
+        result = copy.deepcopy(DEFAULT_PLAN)
+        result["plan_source"] = source
+
+        # Handle list input
         if isinstance(parsed, list):
-            # If list, take first element if dict
             if parsed and isinstance(parsed[0], dict):
                 parsed = parsed[0]
             else:
-                return None
-        
+                result["notes"] = ["Parsed response was list but could not extract dict"]
+                return result
+
+        # Handle non-dict input
         if not isinstance(parsed, dict):
-            return None
-            
-        # Basic schema validation (relaxed)
-        required_keys = ["training_rows_policy", "metric_policy", "cv_policy"]
-        if not all(k in parsed for k in required_keys):
-            return None
-            
-        return parsed
+            result["notes"] = [f"Parsed response was {type(parsed).__name__}, using defaults"]
+            return result
+
+        # Merge parsed values into result
+        # training_rows_policy
+        if "training_rows_policy" in parsed and isinstance(parsed["training_rows_policy"], str):
+            result["training_rows_policy"] = parsed["training_rows_policy"]
+
+        # training_rows_rule
+        if "training_rows_rule" in parsed:
+            result["training_rows_rule"] = parsed["training_rows_rule"]
+
+        # split_column
+        if "split_column" in parsed:
+            result["split_column"] = parsed["split_column"]
+
+        # metric_policy
+        if "metric_policy" in parsed:
+            mp = parsed["metric_policy"]
+            if isinstance(mp, dict):
+                if "primary_metric" in mp:
+                    result["metric_policy"]["primary_metric"] = str(mp["primary_metric"])
+                if "secondary_metrics" in mp and isinstance(mp["secondary_metrics"], list):
+                    result["metric_policy"]["secondary_metrics"] = mp["secondary_metrics"]
+                if "report_with_cv" in mp:
+                    result["metric_policy"]["report_with_cv"] = bool(mp["report_with_cv"])
+                if "notes" in mp:
+                    result["metric_policy"]["notes"] = str(mp.get("notes", ""))
+            elif isinstance(mp, str):
+                # Handle case where metric_policy is just a string
+                result["metric_policy"]["primary_metric"] = mp
+
+        # cv_policy
+        if "cv_policy" in parsed:
+            cp = parsed["cv_policy"]
+            if isinstance(cp, dict):
+                if "strategy" in cp:
+                    result["cv_policy"]["strategy"] = str(cp["strategy"])
+                if "n_splits" in cp:
+                    try:
+                        result["cv_policy"]["n_splits"] = int(cp["n_splits"])
+                    except (ValueError, TypeError):
+                        pass
+                if "shuffle" in cp:
+                    result["cv_policy"]["shuffle"] = bool(cp["shuffle"])
+                if "stratified" in cp:
+                    result["cv_policy"]["stratified"] = cp["stratified"]
+                if "notes" in cp:
+                    result["cv_policy"]["notes"] = str(cp.get("notes", ""))
+
+        # scoring_policy
+        if "scoring_policy" in parsed:
+            sp = parsed["scoring_policy"]
+            if isinstance(sp, dict):
+                if "generate_scores" in sp:
+                    result["scoring_policy"]["generate_scores"] = bool(sp["generate_scores"])
+                if "score_rows" in sp:
+                    result["scoring_policy"]["score_rows"] = str(sp["score_rows"])
+
+        # leakage_policy
+        if "leakage_policy" in parsed:
+            lp = parsed["leakage_policy"]
+            if isinstance(lp, dict):
+                if "action" in lp:
+                    result["leakage_policy"]["action"] = str(lp["action"])
+                if "flagged_columns" in lp and isinstance(lp["flagged_columns"], list):
+                    result["leakage_policy"]["flagged_columns"] = lp["flagged_columns"]
+                if "notes" in lp:
+                    result["leakage_policy"]["notes"] = str(lp.get("notes", ""))
+
+        # evidence
+        if "evidence" in parsed:
+            ev = parsed["evidence"]
+            if isinstance(ev, list):
+                result["evidence"] = ev
+            elif isinstance(ev, str):
+                result["evidence"] = [ev]
+
+        # assumptions
+        if "assumptions" in parsed:
+            assum = parsed["assumptions"]
+            if isinstance(assum, list):
+                result["assumptions"] = assum
+            elif isinstance(assum, str):
+                result["assumptions"] = [assum]
+
+        # open_questions
+        if "open_questions" in parsed:
+            oq = parsed["open_questions"]
+            if isinstance(oq, list):
+                result["open_questions"] = oq
+            elif isinstance(oq, str):
+                result["open_questions"] = [oq]
+
+        # notes
+        if "notes" in parsed:
+            notes = parsed["notes"]
+            if isinstance(notes, list):
+                result["notes"] = notes
+            elif isinstance(notes, str):
+                result["notes"] = [notes]
+
+        # Set plan_source to "llm" if we got valid data
+        if result["training_rows_policy"] != "unspecified":
+            result["plan_source"] = source
+
+        return result
 
     def generate_code(
         self,

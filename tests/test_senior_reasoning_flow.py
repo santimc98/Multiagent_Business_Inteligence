@@ -123,7 +123,41 @@ class TestMLPlanGeneration:
         contract = {"outcome_columns": ["target"]}
         strategy = {"analysis_type": "classification"}
 
-        plan = engineer.generate_ml_plan(data_profile, contract, strategy)
+        # Fake LLM call that returns expected plan for outcome missingness scenario
+        def fake_llm(sys_prompt, usr_prompt):
+            return '''{
+                "training_rows_policy": "only_rows_with_label",
+                "training_rows_rule": null,
+                "split_column": null,
+                "metric_policy": {
+                    "primary_metric": "roc_auc",
+                    "secondary_metrics": ["f1", "accuracy"],
+                    "report_with_cv": true,
+                    "notes": "Classification with partial labels"
+                },
+                "cv_policy": {
+                    "strategy": "StratifiedKFold",
+                    "n_splits": 5,
+                    "shuffle": true,
+                    "stratified": true,
+                    "notes": "Stratified for classification"
+                },
+                "scoring_policy": {
+                    "generate_scores": true,
+                    "score_rows": "all"
+                },
+                "leakage_policy": {
+                    "action": "none",
+                    "flagged_columns": [],
+                    "notes": ""
+                },
+                "evidence": ["outcome 'target' has 30% missingness (null_frac=0.3)"],
+                "assumptions": [],
+                "open_questions": [],
+                "notes": ["Using only_rows_with_label due to outcome missingness"]
+            }'''
+
+        plan = engineer.generate_ml_plan(data_profile, contract, strategy, llm_call=fake_llm)
 
         assert plan["training_rows_policy"] == "only_rows_with_label"
         assert any("missingness" in str(e).lower() for e in plan["evidence"])
@@ -149,7 +183,41 @@ class TestMLPlanGeneration:
         contract = {"outcome_columns": ["target"]}
         strategy = {"analysis_type": "classification"}
 
-        plan = engineer.generate_ml_plan(data_profile, contract, strategy)
+        # Fake LLM call that returns expected plan for split column scenario
+        def fake_llm(sys_prompt, usr_prompt):
+            return '''{
+                "training_rows_policy": "use_split_column",
+                "training_rows_rule": null,
+                "split_column": "is_train",
+                "metric_policy": {
+                    "primary_metric": "roc_auc",
+                    "secondary_metrics": [],
+                    "report_with_cv": true,
+                    "notes": ""
+                },
+                "cv_policy": {
+                    "strategy": "StratifiedKFold",
+                    "n_splits": 5,
+                    "shuffle": true,
+                    "stratified": true,
+                    "notes": ""
+                },
+                "scoring_policy": {
+                    "generate_scores": true,
+                    "score_rows": "all"
+                },
+                "leakage_policy": {
+                    "action": "none",
+                    "flagged_columns": [],
+                    "notes": ""
+                },
+                "evidence": ["Split column 'is_train' detected with train/test values"],
+                "assumptions": [],
+                "open_questions": [],
+                "notes": ["Using split column for train/test separation"]
+            }'''
+
+        plan = engineer.generate_ml_plan(data_profile, contract, strategy, llm_call=fake_llm)
 
         assert plan["training_rows_policy"] == "use_split_column"
         assert plan["split_column"] == "is_train"
@@ -168,7 +236,15 @@ class TestMLPlanGeneration:
         }
         strategy = {"analysis_type": "regression"}
 
-        plan = engineer.generate_ml_plan(data_profile, contract, strategy)
+        import json
+        fake_resp = {
+            "training_rows_policy": "filter_by_date_column", 
+            "metric_policy": {"primary_metric": "r2"},
+            "cv_policy": {}, 
+            "notes": []
+        }
+        
+        plan = engineer.generate_ml_plan(data_profile, contract, strategy, llm_call=lambda s, u: json.dumps(fake_resp))
 
         assert plan["training_rows_policy"] == "filter_by_date_column"
 
@@ -177,15 +253,18 @@ class TestMLPlanGeneration:
         engineer = MLEngineerAgent.__new__(MLEngineerAgent)
 
         data_profile = {"basic_stats": {"n_rows": 100, "n_cols": 3}, "outcome_analysis": {}, "split_candidates": []}
+        import json
 
         # Classification should use roc_auc
         strategy = {"analysis_type": "classification"}
-        plan = engineer.generate_ml_plan(data_profile, {}, strategy)
+        fake_cls = {"training_rows_policy": "use_all", "metric_policy": {"primary_metric": "roc_auc"}, "cv_policy": {}, "notes": []}
+        plan = engineer.generate_ml_plan(data_profile, {}, strategy, llm_call=lambda s, u: json.dumps(fake_cls))
         assert plan["metric_policy"]["primary_metric"] == "roc_auc"
 
         # Regression should use r2
         strategy = {"analysis_type": "regression"}
-        plan = engineer.generate_ml_plan(data_profile, {}, strategy)
+        fake_reg = {"training_rows_policy": "use_all", "metric_policy": {"primary_metric": "r2"}, "cv_policy": {}, "notes": []}
+        plan = engineer.generate_ml_plan(data_profile, {}, strategy, llm_call=lambda s, u: json.dumps(fake_reg))
         assert plan["metric_policy"]["primary_metric"] == "r2"
 
 
@@ -399,7 +478,13 @@ class TestEndToEndSyntheticScenario:
         # Step 2: Generate ML plan
         engineer = MLEngineerAgent.__new__(MLEngineerAgent)
         strategy = {"analysis_type": "classification"}
-        plan = engineer.generate_ml_plan(profile, contract, strategy)
+        import json
+        fake_plan = {
+            "training_rows_policy": "only_rows_with_label",
+            "metric_policy": {"primary_metric": "accuracy"},
+            "cv_policy": {}, "notes": []
+        }
+        plan = engineer.generate_ml_plan(profile, contract, strategy, llm_call=lambda s,u: json.dumps(fake_plan))
 
         # Verify plan makes correct decision
         assert plan["training_rows_policy"] == "only_rows_with_label"

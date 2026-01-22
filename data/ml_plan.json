@@ -1,25 +1,35 @@
 {
   "training_rows_policy": "use_all_rows",
+  "training_rows_rule": null,
   "split_column": null,
-  "split_values": [],
-  "evidence": [],
   "metric_policy": {
-    "primary_metric": "accuracy",
+    "primary_metric": "auc_roc",
     "report_with_cv": true,
-    "confidence_intervals": true
-  },
-  "leakage_policy": {
-    "flags_detected": 0,
-    "action": "none_detected",
-    "flagged_columns": []
+    "notes": "Inferred from predictive strategy type (propensity modeling) and contract requirements for AUC_ROC."
   },
   "cv_policy": {
-    "strategy": "KFold",
+    "strategy": "StratifiedKFold",
     "n_splits": 5,
-    "shuffle": true
+    "shuffle": true,
+    "notes": "Standard for binary classification to ensure target class distribution is preserved across folds."
   },
-  "notes": [
-    "Data has unknown rows, unknown columns"
+  "leakage_policy": {
+    "action": "none",
+    "flagged_columns": [],
+    "notes": "No leakage flags found in data profile. Runtime audit per contract (correlation_with_target) will be executed."
+  },
+  "evidence": [
+    "outcome_analysis is empty (no evidence of >1% missing labels)",
+    "split_candidates is empty (no split column identified)",
+    "leakage_flags is empty (no pre-flagged columns)",
+    "strategy analysis_type is 'predictive'",
+    "contract requires 'auc_roc' in metrics.json"
   ],
-  "generated_at": null
+  "assumptions": [
+    "Data profile was empty, assuming standard supervised learning setup with complete labels.",
+    "Target variable is binary based on business objective (propensity to convert)."
+  ],
+  "open_questions": [
+    "Why is the data profile empty? (Proceeding with defaults)"
+  ]
 }
