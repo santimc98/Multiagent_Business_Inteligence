@@ -7017,6 +7017,24 @@ def run_execution_planner(state: AgentState) -> AgentState:
             ],
         )
         _verify_run_bundle_contracts(run_id, contract, work_dir_abs)
+
+    # DATA_PROFILE PREFLIGHT: Create data_profile.json early so it's available
+    # even if DE/ML abort. This is the first opportunity after contract is persisted.
+    try:
+        from src.utils.data_profile_preflight import ensure_data_profile_artifact
+        analysis_type = (strategy or {}).get("analysis_type")
+        _dp, _dp_source = ensure_data_profile_artifact(
+            state=state,
+            contract=contract,
+            analysis_type=analysis_type,
+            work_dir_abs=work_dir_abs,
+            run_id=run_id,
+        )
+        if _dp:
+            _refresh_run_facts_pack(state)
+    except Exception as dp_err:
+        print(f"Warning: data_profile preflight failed: {dp_err}")
+
     view_payload = _build_contract_views(state if isinstance(state, dict) else {}, contract, contract_min)
     if view_payload.get("contract_views"):
         try:
@@ -7116,6 +7134,26 @@ def run_data_engineer(state: AgentState) -> AgentState:
     state["data_engineer_attempt"] = attempt_id
     if run_id:
         log_run_event(run_id, "data_engineer_start", {})
+
+    # DATA_PROFILE PREFLIGHT (belt & suspenders): Ensure data_profile exists
+    # This catches cases where execution_planner preflight didn't run or failed
+    if not state.get("data_profile"):
+        try:
+            from src.utils.data_profile_preflight import ensure_data_profile_artifact
+            contract = state.get("execution_contract", {})
+            strategy = state.get("selected_strategy", {})
+            analysis_type = strategy.get("analysis_type") if strategy else None
+            work_dir_abs = _resolve_work_dir_abs(state)
+            ensure_data_profile_artifact(
+                state=state,
+                contract=contract,
+                analysis_type=analysis_type,
+                work_dir_abs=work_dir_abs,
+                run_id=run_id,
+            )
+        except Exception as dp_err:
+            print(f"Warning: data_profile preflight (DE) failed: {dp_err}")
+
 
     selected = state.get('selected_strategy')
     if not selected:
@@ -8952,87 +8990,27 @@ def run_engineer(state: AgentState) -> AgentState:
 
     strategy = state.get('selected_strategy')
 
-    # SENIOR REASONING: Build data_profile.json on first iteration
-    # UNIFIED EVIDENCE: Use dataset_profile.json as source of truth when available
+    # SENIOR REASONING: Ensure data_profile.json exists (final fallback)
+    # Uses unified helper - should be a no-op if preflight already ran
     iteration_count = state.get("iteration_count", 0)
-    data_profile = state.get("data_profile")
-    if not data_profile and iteration_count == 0:
+    if not state.get("data_profile") and iteration_count == 0:
         try:
-            from src.agents.steward import build_data_profile, write_data_profile
-            from src.utils.data_profile_compact import convert_dataset_profile_to_data_profile
-
-            execution_contract = state.get("execution_contract") or _load_json_safe("data/execution_contract.json")
+            from src.utils.data_profile_preflight import ensure_data_profile_artifact
+            contract = state.get("execution_contract") or _load_json_safe("data/execution_contract.json")
             analysis_type = (strategy or {}).get("analysis_type")
-            profile_source = "unknown"
-
-            # PRIORITY 1: Try to load dataset_profile.json (canonical source)
-            # NOTE: Paths are relative to workspace root (cwd), NOT to work/
-            dataset_profile_paths = [
-                "data/dataset_profile.json",
-            ]
-            dataset_profile = None
-            dataset_profile_path_used = None
-            for dsp_path in dataset_profile_paths:
-                if os.path.exists(dsp_path):
-                    dataset_profile = _load_json_safe(dsp_path)
-                    if dataset_profile and isinstance(dataset_profile, dict) and dataset_profile.get("rows"):
-                        dataset_profile_path_used = dsp_path
-                        break
-                    dataset_profile = None
-
-            if dataset_profile:
-                # Convert dataset_profile to data_profile schema
-                data_profile = convert_dataset_profile_to_data_profile(
-                    dataset_profile, execution_contract, analysis_type
-                )
-                profile_source = "converted_from_dataset_profile"
-                print(f"DATA_PROFILE: Converted from {dataset_profile_path_used}")
-            else:
-                # FALLBACK: Build from cleaned_data.csv (less ideal - evidence may diverge)
-                cleaned_csv_path = "data/cleaned_data.csv"
-                if os.path.exists(cleaned_csv_path):
-                    csv_sep = state.get("csv_sep", ",")
-                    csv_decimal = state.get("csv_decimal", ".")
-                    csv_encoding = state.get("csv_encoding", "utf-8")
-                    df_profile = pd.read_csv(
-                        cleaned_csv_path,
-                        sep=csv_sep,
-                        decimal=csv_decimal,
-                        encoding=csv_encoding,
-                        nrows=5000,
-                        low_memory=False,
-                    )
-                    data_profile = build_data_profile(df_profile, execution_contract, analysis_type)
-                    profile_source = "built_from_csv_fallback"
-                    print(f"DATA_PROFILE: Built from CSV (fallback - dataset_profile.json not found)")
-
-            if data_profile:
-                # Ensure canonical directory exists (relative to workspace root)
-                os.makedirs("data", exist_ok=True)
-
-                # Save to data/ (canonical location for run bundle capture)
-                write_data_profile(data_profile, "data/data_profile.json")
-
-                state["data_profile"] = data_profile
-                state["data_profile_path"] = "data/data_profile.json"
-                state["data_profile_source"] = profile_source
-
-                print(f"DATA_PROFILE: {profile_source} - {data_profile.get('basic_stats', {}).get('n_rows', 0)} rows, "
-                      f"{len(data_profile.get('outcome_analysis', {}))} outcome cols, "
-                      f"{len(data_profile.get('split_candidates', []))} split candidates")
-
-                if run_id:
-                    log_run_event(run_id, "data_profile_built", {
-                        "source": profile_source,
-                        "n_rows": data_profile.get("basic_stats", {}).get("n_rows"),
-                        "n_cols": data_profile.get("basic_stats", {}).get("n_cols"),
-                        "split_candidates": len(data_profile.get("split_candidates", [])),
-                        "outcome_cols": list(data_profile.get("outcome_analysis", {}).keys()),
-                    })
+            work_dir_abs = _resolve_work_dir_abs(state)
+            ensure_data_profile_artifact(
+                state=state,
+                contract=contract,
+                analysis_type=analysis_type,
+                work_dir_abs=work_dir_abs,
+                run_id=run_id,
+            )
         except Exception as profile_err:
             print(f"Warning: failed to build data_profile: {profile_err}")
             if run_id:
                 log_run_event(run_id, "data_profile_failed", {"error": str(profile_err)})
+
 
     # Pass input context
     data_path = "data/cleaned_data.csv"
