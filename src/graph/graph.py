@@ -9578,6 +9578,9 @@ def run_reviewer(state: AgentState) -> AgentState:
             "failed_gates": review.get('failed_gates', []),
             "required_fixes": _expand_required_fixes(review.get('required_fixes', []), review.get('failed_gates', []))
         }
+        # Include hard_failures in gate_context if present
+        if review.get('hard_failures'):
+            gate_context["hard_failures"] = review.get('hard_failures', [])
         fix_block = _build_fix_instructions(gate_context["required_fixes"])
         if fix_block:
             gate_context["edit_instructions"] = fix_block
@@ -9739,6 +9742,10 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                 "failed_gates": failed_gates,
                 "required_fixes": _expand_required_fixes(required_fixes, failed_gates),
             }
+            # Include hard_failures from static QA in gate_context
+            static_hard_failures = static_result.get("hard_failures", [])
+            if static_hard_failures:
+                gate_context["hard_failures"] = static_hard_failures
             fix_block = _build_fix_instructions(gate_context["required_fixes"])
             if fix_block:
                 gate_context["edit_instructions"] = fix_block
@@ -9795,6 +9802,10 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             "failed_gates": failed_gates,
             "required_fixes": _expand_required_fixes(required_fixes, failed_gates)
         }
+        # Include hard_failures in gate_context if present
+        hard_failures = qa_result.get("hard_failures") or []
+        if hard_failures:
+            gate_context["hard_failures"] = hard_failures
         fix_block = _build_fix_instructions(gate_context["required_fixes"])
         if fix_block:
             gate_context["edit_instructions"] = fix_block

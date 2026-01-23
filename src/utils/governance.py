@@ -1,9 +1,13 @@
 import json
 import os
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from src.utils.json_sanitize import dump_json
+from src.utils.governance_reducer import (
+    compute_governance_verdict,
+    derive_run_outcome,
+)
 
 
 def _safe_load_json(path: str) -> Dict[str, Any]:
@@ -181,23 +185,38 @@ def write_governance_report(state: Dict[str, Any], path: str = "data/governance_
 
 
 def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build run summary with unified governance verdict.
+
+    Uses the governance reducer to derive a deterministic overall_status
+    and run_outcome from multiple compliance sources.
+    """
     case_alignment = _safe_load_json("data/case_alignment_report.json")
     output_contract = _safe_load_json("data/output_contract_report.json")
     data_adequacy = _safe_load_json("data/data_adequacy_report.json")
     alignment_check = _safe_load_json("data/alignment_check.json")
     integrity = _safe_load_json("data/integrity_audit_report.json")
+
+    # Status from state (for backward compatibility)
     status = state.get("last_successful_review_verdict") or state.get("review_verdict") or "UNKNOWN"
-    failed_gates = []
+
+    # Collect failed_gates from multiple sources (legacy logic preserved)
+    failed_gates: List[str] = []
     gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context")
     if isinstance(gate_context, dict):
-        failed_gates = gate_context.get("failed_gates", []) or []
+        failed_gates = list(gate_context.get("failed_gates", []) or [])
+
     if isinstance(case_alignment, dict) and case_alignment.get("status") == "FAIL":
         failed_gates.extend(case_alignment.get("failures", []))
+
     if isinstance(output_contract, dict) and output_contract.get("missing"):
         failed_gates.append("output_contract_missing")
+
     pipeline_aborted = state.get("pipeline_aborted_reason")
     if pipeline_aborted:
         failed_gates.append(f"pipeline_aborted:{pipeline_aborted}")
+
+    # Integrity critical count (preserved for backward compatibility)
     integrity_issues = integrity.get("issues", []) if isinstance(integrity, dict) else []
     integrity_critical_count = sum(
         1
@@ -206,9 +225,8 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     )
     if integrity_critical_count > 0:
         failed_gates.append("integrity_critical")
-        integrity_flagged = True
-    else:
-        integrity_flagged = False
+
+    # Data adequacy summary (preserved)
     adequacy_summary = {}
     if isinstance(data_adequacy, dict):
         alignment = data_adequacy.get("quality_gates_alignment", {}) if isinstance(data_adequacy, dict) else {}
@@ -230,13 +248,17 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
             "threshold_reached": data_adequacy.get("threshold_reached"),
             "quality_gates_alignment": alignment_summary,
         }
-    warnings = []
+
+    # Warnings (preserved)
+    warnings: List[str] = []
     if state.get("qa_budget_exceeded"):
         warnings.append("QA_INCOMPLETE: QA budget exceeded; QA audit skipped.")
+
+    # Contract and metrics for ceiling detection (preserved)
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
     metrics_report = _safe_load_json("data/metrics.json")
     weights_report = _safe_load_json("data/weights.json")
-    metric_pool = {}
+    metric_pool: Dict[str, float] = {}
     metric_pool.update(_flatten_metrics(metrics_report))
     metric_pool.update(_flatten_metrics(weights_report))
     baseline_vs_model = _extract_baseline_vs_model(metric_pool)
@@ -248,6 +270,47 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         "cv_std": float(os.getenv("CEILING_CV_STD", "0.05")),
     }
     ceiling_info = _detect_metric_ceiling(baseline_vs_model, data_adequacy, thresholds)
+
+    # =========================================================================
+    # NEW: Unified Governance Verdict via Reducer
+    # =========================================================================
+    governance_verdict = compute_governance_verdict(
+        output_contract_report=output_contract,
+        state=state,
+        integrity_report=integrity,
+    )
+
+    # Merge hard_failures and reasons from reducer
+    reducer_hard_failures = governance_verdict.get("hard_failures", [])
+    reducer_failed_gates = governance_verdict.get("failed_gates", [])
+    reducer_reasons = governance_verdict.get("reasons", [])
+    overall_status_global = governance_verdict.get("overall_status", "ok")
+
+    # Merge reducer failed_gates into legacy failed_gates
+    for gate in reducer_failed_gates:
+        if gate and gate not in failed_gates:
+            failed_gates.append(gate)
+
+    # Counterfactual policy check
+    counterfactual_policy = ""
+    if isinstance(contract, dict):
+        counterfactual_policy = str(contract.get("counterfactual_policy") or "")
+    observational_only = counterfactual_policy == "observational_only"
+    ceiling_detected = bool(ceiling_info.get("metric_ceiling_detected"))
+
+    # =========================================================================
+    # Run Outcome Derivation (unified via reducer)
+    # =========================================================================
+    run_outcome = derive_run_outcome(
+        governance_verdict=governance_verdict,
+        ceiling_detected=ceiling_detected,
+        observational_only=observational_only,
+    )
+
+    # =========================================================================
+    # LEGACY FALLBACK: Preserve existing critical token detection as secondary check
+    # This ensures no regression while transitioning to reducer-based logic
+    # =========================================================================
     failed_gates_lower = [str(item).lower() for item in failed_gates if item]
     critical_tokens = [
         "synthetic",
@@ -260,23 +323,22 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     ]
     critical_hit = any(any(tok in gate for tok in critical_tokens) for gate in failed_gates_lower)
     output_missing = bool(isinstance(output_contract, dict) and output_contract.get("missing"))
+    integrity_flagged = integrity_critical_count > 0
+
+    # Secondary NO_GO check (legacy signals that might not be in reducer yet)
     if (
-        output_missing
-        or critical_hit
-        or integrity_flagged
-        or status in {"REJECTED", "FAIL", "CRASH"}
-        or pipeline_aborted
-        or state.get("data_engineer_failed")
+        run_outcome != "NO_GO"
+        and (
+            output_missing
+            or critical_hit
+            or integrity_flagged
+            or status in {"REJECTED", "FAIL", "CRASH"}
+            or pipeline_aborted
+            or state.get("data_engineer_failed")
+        )
     ):
         run_outcome = "NO_GO"
-    else:
-        counterfactual_policy = ""
-        if isinstance(contract, dict):
-            counterfactual_policy = str(contract.get("counterfactual_policy") or "")
-        if ceiling_info.get("metric_ceiling_detected") or counterfactual_policy == "observational_only":
-            run_outcome = "GO_WITH_LIMITATIONS"
-        else:
-            run_outcome = "GO"
+
     return {
         "run_id": state.get("run_id"),
         "status": status,
@@ -285,7 +347,7 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         "warnings": warnings,
         "budget_counters": state.get("budget_counters", {}),
         "data_adequacy": adequacy_summary,
-        "metric_ceiling_detected": ceiling_info.get("metric_ceiling_detected"),
+        "metric_ceiling_detected": ceiling_detected,
         "ceiling_reason": ceiling_info.get("ceiling_reason"),
         "baseline_vs_model": baseline_vs_model.get("pairs", []),
         "metrics": {
@@ -299,4 +361,8 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         } if isinstance(alignment_check, dict) and alignment_check else {},
         "integrity_critical_count": integrity_critical_count,
         "contract_views": _collect_contract_views(),
+        # NEW: Governance verdict fields for traceability
+        "overall_status_global": overall_status_global,
+        "hard_failures": reducer_hard_failures,
+        "governance_reasons": reducer_reasons,
     }
