@@ -8891,39 +8891,80 @@ def run_engineer(state: AgentState) -> AgentState:
     strategy = state.get('selected_strategy')
 
     # SENIOR REASONING: Build data_profile.json on first iteration
+    # UNIFIED EVIDENCE: Use dataset_profile.json as source of truth when available
     iteration_count = state.get("iteration_count", 0)
     data_profile = state.get("data_profile")
     if not data_profile and iteration_count == 0:
         try:
             from src.agents.steward import build_data_profile, write_data_profile
-            cleaned_csv_path = "data/cleaned_data.csv"
-            if os.path.exists(cleaned_csv_path):
-                csv_sep = state.get("csv_sep", ",")
-                csv_decimal = state.get("csv_decimal", ".")
-                csv_encoding = state.get("csv_encoding", "utf-8")
-                df_profile = pd.read_csv(
-                    cleaned_csv_path,
-                    sep=csv_sep,
-                    decimal=csv_decimal,
-                    encoding=csv_encoding,
-                    nrows=5000,
-                    low_memory=False,
+            from src.utils.data_profile_compact import convert_dataset_profile_to_data_profile
+
+            execution_contract = state.get("execution_contract") or _load_json_safe("data/execution_contract.json")
+            analysis_type = (strategy or {}).get("analysis_type")
+            profile_source = "unknown"
+
+            # PRIORITY 1: Try to load dataset_profile.json (canonical source)
+            dataset_profile_paths = [
+                "work/data/dataset_profile.json",
+                "data/dataset_profile.json",
+            ]
+            dataset_profile = None
+            dataset_profile_path_used = None
+            for dsp_path in dataset_profile_paths:
+                if os.path.exists(dsp_path):
+                    dataset_profile = _load_json_safe(dsp_path)
+                    if dataset_profile and isinstance(dataset_profile, dict) and dataset_profile.get("rows"):
+                        dataset_profile_path_used = dsp_path
+                        break
+                    dataset_profile = None
+
+            if dataset_profile:
+                # Convert dataset_profile to data_profile schema
+                data_profile = convert_dataset_profile_to_data_profile(
+                    dataset_profile, execution_contract, analysis_type
                 )
-                execution_contract = state.get("execution_contract") or _load_json_safe("data/execution_contract.json")
-                analysis_type = (strategy or {}).get("analysis_type")
-                data_profile = build_data_profile(df_profile, execution_contract, analysis_type)
-                # Save to artifacts
+                profile_source = "converted_from_dataset_profile"
+                print(f"DATA_PROFILE: Converted from {dataset_profile_path_used}")
+            else:
+                # FALLBACK: Build from cleaned_data.csv (less ideal - evidence may diverge)
+                cleaned_csv_path = "data/cleaned_data.csv"
+                if os.path.exists(cleaned_csv_path):
+                    csv_sep = state.get("csv_sep", ",")
+                    csv_decimal = state.get("csv_decimal", ".")
+                    csv_encoding = state.get("csv_encoding", "utf-8")
+                    df_profile = pd.read_csv(
+                        cleaned_csv_path,
+                        sep=csv_sep,
+                        decimal=csv_decimal,
+                        encoding=csv_encoding,
+                        nrows=5000,
+                        low_memory=False,
+                    )
+                    data_profile = build_data_profile(df_profile, execution_contract, analysis_type)
+                    profile_source = "built_from_csv_fallback"
+                    print(f"DATA_PROFILE: Built from CSV (fallback - dataset_profile.json not found)")
+
+            if data_profile:
+                # Ensure canonical directories exist
+                os.makedirs("work/data", exist_ok=True)
                 os.makedirs("work/artifacts", exist_ok=True)
+
+                # Save to work/data/ (canonical location for run bundle)
+                write_data_profile(data_profile, "work/data/data_profile.json")
+                # Also save to work/artifacts for backwards compatibility
                 write_data_profile(data_profile, "work/artifacts/data_profile.json")
-                # Also save to data/ for easy access
-                os.makedirs("data", exist_ok=True)
-                write_data_profile(data_profile, "data/data_profile.json")
+
                 state["data_profile"] = data_profile
-                state["data_profile_path"] = "work/artifacts/data_profile.json"
-                print(f"DATA_PROFILE: Built profile with {data_profile.get('basic_stats', {}).get('n_rows', 0)} rows, "
-                      f"{len(data_profile.get('outcome_analysis', {}))} outcome cols analyzed")
+                state["data_profile_path"] = "work/data/data_profile.json"
+                state["data_profile_source"] = profile_source
+
+                print(f"DATA_PROFILE: {profile_source} - {data_profile.get('basic_stats', {}).get('n_rows', 0)} rows, "
+                      f"{len(data_profile.get('outcome_analysis', {}))} outcome cols, "
+                      f"{len(data_profile.get('split_candidates', []))} split candidates")
+
                 if run_id:
                     log_run_event(run_id, "data_profile_built", {
+                        "source": profile_source,
                         "n_rows": data_profile.get("basic_stats", {}).get("n_rows"),
                         "n_cols": data_profile.get("basic_stats", {}).get("n_cols"),
                         "split_candidates": len(data_profile.get("split_candidates", [])),
@@ -9257,26 +9298,42 @@ def run_engineer(state: AgentState) -> AgentState:
             try:
                 from src.utils.data_profile_compact import compact_data_profile_for_llm
                 data_profile = state.get("data_profile")
+                analysis_type = (strategy or {}).get("analysis_type")
+
+                # Compact profile for LLM (supports auto-conversion from dataset_profile schema)
+                compact_profile = compact_data_profile_for_llm(
+                    data_profile or {},
+                    contract=execution_contract,
+                    analysis_type=analysis_type,
+                )
+
                 ml_plan = ml_engineer.generate_ml_plan(
-                    data_profile=compact_data_profile_for_llm(data_profile or {}),
+                    data_profile=compact_profile,
                     execution_contract=execution_contract,
                     strategy=strategy,
                     business_objective=business_objective,
                 )
-                # Save ml_plan to artifacts
+
+                # Save ml_plan to canonical locations
+                os.makedirs("work/data", exist_ok=True)
+                dump_json("work/data/ml_plan.json", ml_plan)
                 os.makedirs("work/artifacts", exist_ok=True)
                 dump_json("work/artifacts/ml_plan.json", ml_plan)
-                os.makedirs("data", exist_ok=True)
-                dump_json("data/ml_plan.json", ml_plan)
+
                 state["ml_plan"] = ml_plan
-                state["ml_plan_path"] = "work/artifacts/ml_plan.json"
+                state["ml_plan_path"] = "work/data/ml_plan.json"
+
                 print(f"ML_PLAN: Generated plan with training_rows_policy='{ml_plan.get('training_rows_policy')}', "
-                      f"metric='{ml_plan.get('metric_policy', {}).get('primary_metric')}'")
+                      f"metric='{ml_plan.get('metric_policy', {}).get('primary_metric')}', "
+                      f"source='{ml_plan.get('plan_source', 'unknown')}'")
+
                 if run_id:
                     log_run_event(run_id, "ml_plan_generated", {
                         "training_rows_policy": ml_plan.get("training_rows_policy"),
                         "metric_policy": ml_plan.get("metric_policy"),
                         "cv_policy": ml_plan.get("cv_policy"),
+                        "plan_source": ml_plan.get("plan_source"),
+                        "evidence_used": ml_plan.get("evidence_used"),
                     })
             except Exception as plan_err:
                 print(f"Warning: failed to generate ml_plan: {plan_err}")

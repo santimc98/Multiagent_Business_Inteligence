@@ -64,6 +64,7 @@ DEFAULT_PLAN: Dict[str, Any] = {
     "assumptions": [],
     "open_questions": [],
     "notes": [],
+    "evidence_used": {},  # Structured evidence digest for QA coherence checks
     "plan_source": "fallback",
 }
 
@@ -859,7 +860,7 @@ class MLEngineerAgent:
         PLAN_PROMPT = """
 You are a Senior ML Engineer. Your task is to reason about the data facts and contract requirements to produce a Robust ML Plan.
 
-*** DATA FACTS (Facts Only) ***
+*** DATA FACTS (Facts Only - CANONICAL EVIDENCE) ***
 $data_profile_json
 
 *** EXECUTION CONTRACT ***
@@ -877,13 +878,14 @@ $strategy_json
 2. If strategy.analysis_type == "classification", metric_policy.primary_metric MUST be a classification metric (roc_auc, accuracy, f1, precision, recall, log_loss).
 3. If strategy.analysis_type == "regression", metric_policy.primary_metric MUST be a regression metric (rmse, mae, r2, mse, mape).
 4. If leakage_flags exist in data_profile, leakage_policy.action should be "exclude_flagged_columns" unless contract explicitly allows them.
+5. METRIC SOURCE PRIORITY: Use contract.validation_requirements.primary_metric if set. Otherwise use evaluation_spec.primary_metric. Otherwise infer from analysis_type.
 
 *** INSTRUCTIONS ***
 1. Analyze 'outcome_analysis' to check for partial labels. If null_frac > 0 for any outcome, set training_rows_policy to "only_rows_with_label".
-2. Check 'split_candidates'. If a split column exists AND has values like 'train'/'test', consider "use_split_column".
-3. Check 'evaluation_spec' in contract. If primary_metric is set, use it. Otherwise infer from strategy.analysis_type.
+2. Check 'split_candidates'. If a split column exists AND has values like 'train'/'test', consider "use_split_column". If you choose NOT to use it, explain why in evidence_used.split_evaluation.
+3. Check contract for primary_metric (validation_requirements.primary_metric or evaluation_spec.primary_metric). Use that exact metric.
 4. DO NOT invent rules. Base every decision on 'evidence' found in the data_profile.
-5. List all evidence used in the 'evidence' field.
+5. CRITICAL: Populate 'evidence_used' with STRUCTURED facts you used for decisions. This enables QA to verify coherence.
 
 *** REQUIRED OUTPUT (JSON ONLY, NO MARKDOWN) ***
 {
@@ -911,6 +913,13 @@ $strategy_json
       "action": "none | exclude_flagged_columns | manual_review",
       "flagged_columns": [],
       "notes": "brief justification"
+  },
+  "evidence_used": {
+      "outcome_null_frac": {"column": "target_col", "null_frac": 0.3},
+      "split_candidates": [{"column": "__split", "values": ["train", "test"]}],
+      "split_evaluation": "used split column because..." or "ignored split because...",
+      "contract_primary_metric": "roc_auc or null if not specified",
+      "analysis_type": "classification"
   },
   "evidence": ["fact1 from profile", "fact2 from profile"],
   "assumptions": [],
@@ -1132,6 +1141,17 @@ $strategy_json
                 result["notes"] = notes
             elif isinstance(notes, str):
                 result["notes"] = [notes]
+
+        # evidence_used (structured evidence digest for QA coherence checks)
+        if "evidence_used" in parsed:
+            eu = parsed["evidence_used"]
+            if isinstance(eu, dict):
+                result["evidence_used"] = eu
+            else:
+                result["evidence_used"] = {}
+        else:
+            # Ensure evidence_used always exists (even if empty) for QA
+            result["evidence_used"] = {}
 
         # Set plan_source to "llm" if we got valid data
         if result["training_rows_policy"] != "unspecified":

@@ -102,3 +102,7 @@ data/combined_mercari.csv
 data/combined_*.csv
 
 data/ml_plan.json
+data/data_profile.json
+
+# Work directory (runtime artifacts)
+work/
