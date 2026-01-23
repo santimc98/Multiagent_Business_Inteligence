@@ -3704,6 +3704,11 @@ def dialect_guard_violations(code: str, csv_sep: str, csv_decimal: str, csv_enco
     """
     AST-based guard to ensure pd.read_csv (first call or the one reading expected_path) sets sep/decimal/encoding.
     Only rejects when keywords are missing or literal strings mismatch the provided dialect.
+
+    Special handling for **kwargs:
+    - If the call has **kwargs (keyword with arg=None), missing params do NOT generate violations
+      (because **kwargs might supply them at runtime).
+    - Literal mismatches still generate violations even with **kwargs present.
     """
     import ast
 
@@ -3741,6 +3746,9 @@ def dialect_guard_violations(code: str, csv_sep: str, csv_decimal: str, csv_enco
     if target_call is None:
         target_call = calls[0]
 
+    # Check for **kwargs (keyword with arg=None)
+    has_kwargs = any(kw.arg is None for kw in target_call.keywords)
+
     expected = {
         "sep": csv_sep,
         "decimal": csv_decimal,
@@ -3762,7 +3770,9 @@ def dialect_guard_violations(code: str, csv_sep: str, csv_decimal: str, csv_enco
 
     for param, expected_value in expected.items():
         if param not in kw_map:
-            violations.append(f"pd.read_csv missing {param}= for dialect")
+            # Parameter missing - only violation if no **kwargs to potentially supply it
+            if not has_kwargs:
+                violations.append(f"pd.read_csv missing {param}= for dialect")
             continue
         val_node = kw_map[param]
         if isinstance(val_node, ast.Constant) and isinstance(val_node.value, str):
@@ -7607,13 +7617,52 @@ def run_data_engineer(state: AgentState) -> AgentState:
             }
 
     # Dialect enforcement guard: ensure pd.read_csv uses provided dialect
+    # With AUTOPATCH: try to fix missing/wrong dialect params before consuming LLM retry
     dialect_issues = []
     if not is_plan:
         dialect_issues = dialect_guard_violations(code, csv_sep, csv_decimal, csv_encoding, expected_path="data/raw.csv")
+
+        # AUTOPATCH: Try to fix dialect issues automatically before retry/abort
+        if dialect_issues and not state.get("de_dialect_autopatched"):
+            try:
+                from src.utils.dialect_code_patch import patch_read_csv_dialect
+                patched_code, patch_notes, changed = patch_read_csv_dialect(
+                    code, csv_sep, csv_decimal, csv_encoding, expected_path="data/raw.csv"
+                )
+                if changed:
+                    # Re-validate after patching
+                    recheck = dialect_guard_violations(patched_code, csv_sep, csv_decimal, csv_encoding, expected_path="data/raw.csv")
+                    if not recheck:
+                        # Autopatch succeeded - use patched code
+                        code = patched_code
+                        dialect_issues = []
+                        print(f"✅ DIALECT_AUTOPATCH: Fixed dialect issues: {patch_notes}")
+                        if run_id:
+                            log_run_event(run_id, "data_engineer_dialect_autopatched", {
+                                "notes": patch_notes,
+                                "sep": csv_sep,
+                                "decimal": csv_decimal,
+                                "encoding": csv_encoding,
+                            })
+                        # Persist autopatched script for audit
+                        try:
+                            os.makedirs("artifacts", exist_ok=True)
+                            with open("artifacts/data_engineer_last_autopatched.py", "w", encoding="utf-8") as f_ap:
+                                f_ap.write(patched_code)
+                        except Exception:
+                            pass
+                    else:
+                        # Autopatch didn't fully resolve - update issues for retry/abort
+                        dialect_issues = recheck
+                        print(f"⚠️ DIALECT_AUTOPATCH: Partial fix applied but issues remain: {recheck}")
+            except Exception as patch_err:
+                print(f"⚠️ DIALECT_AUTOPATCH: Failed to apply autopatch: {patch_err}")
+
     if dialect_issues:
         if not state.get("de_dialect_retry_done"):
             new_state = dict(state)
             new_state["de_dialect_retry_done"] = True
+            new_state["de_dialect_autopatched"] = True  # Mark that autopatch was attempted
             override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
             try:
                 override += "\n\nDIALECT_GUARD:\n" + "\n".join(dialect_issues)
