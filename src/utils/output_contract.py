@@ -346,3 +346,75 @@ def check_artifact_requirements(
         "scored_rows_report": scored_rows_report,
         "summary": summary,
     }
+
+
+def build_output_contract_report(
+    contract: Dict[str, Any],
+    work_dir: str = ".",
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Build a comprehensive output contract report combining:
+      - required outputs presence check (backward compatible)
+      - artifact requirements schema validation (new)
+
+    This is the unified entry point for output_contract_report.json generation.
+
+    Args:
+        contract: The execution contract (V4.1)
+        work_dir: Working directory for file checks
+        reason: Optional abort/failure reason
+
+    Returns:
+        {
+            # Backward compatible keys
+            "present": [...],
+            "missing": [...],
+            "missing_optional": [...],
+            "summary": str,
+            # New keys
+            "artifact_requirements_report": {...},
+            "overall_status": "ok" | "warning" | "error",
+            # Optional
+            "reason": str (if provided)
+        }
+    """
+    # Import here to avoid circular imports
+    from src.utils.contract_v41 import get_required_outputs, get_artifact_requirements
+
+    # 1) Check required outputs presence (backward compatible)
+    required_outputs = get_required_outputs(contract) if isinstance(contract, dict) else []
+    required_outputs_report = check_required_outputs(required_outputs)
+
+    # 2) Check artifact requirements with schema validation
+    artifact_req = get_artifact_requirements(contract) if isinstance(contract, dict) else {}
+    artifact_report = check_artifact_requirements(artifact_req, work_dir=work_dir)
+
+    # 3) Build unified report
+    report: Dict[str, Any] = {
+        # Backward compatible keys
+        "present": required_outputs_report.get("present", []),
+        "missing": required_outputs_report.get("missing", []),
+        "missing_optional": required_outputs_report.get("missing_optional", []),
+        "summary": required_outputs_report.get("summary", ""),
+        # New keys
+        "artifact_requirements_report": artifact_report,
+    }
+
+    # 4) Derive overall_status
+    # Error if: artifact_report has error OR missing files in required outputs
+    if artifact_report.get("status") == "error" or report["missing"]:
+        overall_status = "error"
+    elif artifact_report.get("status") == "warning":
+        overall_status = "warning"
+    else:
+        overall_status = "ok"
+
+    report["overall_status"] = overall_status
+
+    # 5) Include reason if provided
+    if reason:
+        report["reason"] = reason
+
+    return report
+

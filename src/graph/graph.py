@@ -516,12 +516,25 @@ def _persist_output_contract_report(
     reason: str | None = None,
     path: str = "data/output_contract_report.json",
 ) -> Dict[str, Any]:
+    """
+    Persist output contract report with real compliance checking.
+    
+    Includes:
+      - Required outputs presence (backward compatible: present/missing/summary)
+      - Artifact requirements schema validation (artifact_requirements_report)
+      - Overall status derivation
+    """
+    from src.utils.output_contract import build_output_contract_report
+    
     contract = state.get("execution_contract", {}) if isinstance(state, dict) else {}
-    # V4.1: Use get_required_outputs accessor
-    output_contract = get_required_outputs(contract)
-    report = check_required_outputs(output_contract)
-    if reason:
-        report["reason"] = reason
+    
+    # Build comprehensive report using the unified helper
+    report = build_output_contract_report(
+        contract=contract,
+        work_dir=".",  # Current working directory
+        reason=reason,
+    )
+    
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         dump_json(path, report)
