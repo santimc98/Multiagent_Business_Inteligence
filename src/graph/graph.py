@@ -64,7 +64,7 @@ from src.utils.cleaning_guards import (
     is_identifier_like,
 )
 from src.utils.integrity_audit import run_integrity_audit
-from src.utils.output_contract import check_required_outputs
+from src.utils.output_contract import check_required_outputs, get_csv_dialect
 from src.utils.sandbox_deps import (
     BASE_ALLOWLIST,
     EXTENDED_ALLOWLIST,
@@ -2586,8 +2586,17 @@ def _classify_iteration_type(
         return None
     if audit_rejected:
         return "compliance"
-    if oc_report and oc_report.get("missing"):
-        return "compliance"
+    if isinstance(oc_report, dict):
+        oc_overall = str(oc_report.get("overall_status") or "").lower()
+        if oc_overall == "error":
+            return "compliance"
+        artifact_report = oc_report.get("artifact_requirements_report")
+        if isinstance(artifact_report, dict):
+            artifact_status = str(artifact_report.get("status") or "").lower()
+            if artifact_status == "error":
+                return "compliance"
+        if oc_report.get("missing"):
+            return "compliance"
     if feedback and any(token in feedback for token in [
         "CODE_AUDIT_REJECTED",
         "OUTPUT_CONTRACT_MISSING",
@@ -2596,6 +2605,134 @@ def _classify_iteration_type(
     ]):
         return "compliance"
     return "metric"
+
+def _normalize_qa_gate_specs(raw_gates: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_gates, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for gate in raw_gates:
+        if isinstance(gate, dict):
+            name = gate.get("name") or gate.get("id") or gate.get("gate")
+            if not name:
+                continue
+            severity = gate.get("severity")
+            required = gate.get("required")
+            if severity is None and required is not None:
+                severity = "HARD" if bool(required) else "SOFT"
+            severity = str(severity).upper() if severity else "HARD"
+            if severity not in {"HARD", "SOFT"}:
+                severity = "HARD"
+            params = gate.get("params")
+            if not isinstance(params, dict):
+                params = {}
+            key = str(name).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append({"name": str(name), "severity": severity, "params": params})
+        elif isinstance(gate, str):
+            key = gate.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            normalized.append({"name": gate.strip(), "severity": "HARD", "params": {}})
+    return normalized
+
+def _merge_qa_gate_specs(*gate_lists: Any) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for gates in gate_lists:
+        for gate in _normalize_qa_gate_specs(gates):
+            name = gate.get("name")
+            if not name:
+                continue
+            key = str(name).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(gate)
+    return merged
+
+def _evaluate_column_presence_gates(
+    qa_gates: List[Dict[str, Any]],
+    work_dir: str = ".",
+) -> Dict[str, Any]:
+    failed_gates: List[str] = []
+    hard_failures: List[str] = []
+    required_fixes: List[str] = []
+    messages: List[str] = []
+
+    if not qa_gates:
+        return {
+            "failed_gates": failed_gates,
+            "hard_failures": hard_failures,
+            "required_fixes": required_fixes,
+            "messages": messages,
+        }
+
+    dialect = get_csv_dialect(work_dir)
+    sep = dialect.get("sep", ",") if isinstance(dialect, dict) else ","
+    encoding = dialect.get("encoding", "utf-8") if isinstance(dialect, dict) else "utf-8"
+
+    for gate in qa_gates:
+        if not isinstance(gate, dict):
+            continue
+        params = gate.get("params")
+        if not isinstance(params, dict):
+            continue
+        target_file = params.get("target_file") or params.get("target_path") or params.get("file")
+        column = params.get("column") or params.get("required_column")
+        if not target_file or not column:
+            continue
+        gate_name = gate.get("name") or gate.get("id") or gate.get("gate")
+        if not gate_name:
+            continue
+        severity = str(gate.get("severity") or "HARD").upper()
+
+        path = target_file
+        if work_dir and not os.path.isabs(path):
+            path = os.path.join(work_dir, target_file)
+
+        header: List[str] = []
+        missing_reason = None
+        if not os.path.exists(path):
+            missing_reason = f"target_file_not_found={target_file}"
+        else:
+            try:
+                with open(path, "r", encoding=encoding, errors="replace", newline="") as handle:
+                    reader = csv.reader(handle, delimiter=sep)
+                    header = next(reader, [])
+            except Exception as err:
+                missing_reason = f"header_read_error={err}"
+
+        if missing_reason:
+            msg = f"QA_GATE_{'FAIL' if severity == 'HARD' else 'WARN'}[{gate_name}]: {missing_reason}"
+            messages.append(msg)
+            if severity == "HARD":
+                failed_gates.append(str(gate_name))
+                hard_failures.append(str(gate_name))
+                required_fixes.append(
+                    f"Ensure {target_file} exists and includes column '{column}'."
+                )
+            continue
+
+        if column not in header:
+            msg = f"QA_GATE_FAIL[{gate_name}]: missing column '{column}' in {target_file}"
+            messages.append(msg)
+            if severity == "HARD":
+                failed_gates.append(str(gate_name))
+                hard_failures.append(str(gate_name))
+            required_fixes.append(
+                f"Add column '{column}' to {target_file} as required by QA gate {gate_name}."
+            )
+
+    return {
+        "failed_gates": failed_gates,
+        "hard_failures": hard_failures,
+        "required_fixes": required_fixes,
+        "messages": messages,
+    }
 
 def _normalize_allowed_feature_sets(feature_sets: Any) -> Any:
     """Normalize allowed_feature_sets for consistent comparison.
@@ -11286,22 +11423,16 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         status = "NEEDS_IMPROVEMENT"
         new_history.append(f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('failures')}")
 
-    # Output contract validation
+    # Output contract validation (schema-aware)
     contract = state.get("execution_contract", {}) or {}
-    deliverables = _resolve_contract_deliverables(contract)
-    output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
-    oc_report = check_required_outputs(output_contract)
-    try:
-        os.makedirs("data", exist_ok=True)
-        dump_json("data/output_contract_report.json", oc_report)
-    except Exception as oc_err:
-        print(f"Warning: failed to persist output_contract_report.json: {oc_err}")
-    if oc_report.get("missing"):
+    oc_report = _persist_output_contract_report(state, reason="result_evaluator")
+    oc_overall_status = str(oc_report.get("overall_status") or "").lower() if isinstance(oc_report, dict) else ""
+    if oc_overall_status == "error" or (isinstance(oc_report, dict) and oc_report.get("missing")):
         status = "NEEDS_IMPROVEMENT"
         miss_text = json.dumps(oc_report, indent=2)
-        feedback_missing = f"Missing required outputs per contract: {miss_text}"
+        feedback_missing = f"Output contract compliance error: {miss_text}"
         feedback = f"{feedback}\n{feedback_missing}" if feedback else feedback_missing
-        new_history.append(f"OUTPUT_CONTRACT_MISSING: {miss_text}")
+        new_history.append(f"OUTPUT_CONTRACT_ERROR: {miss_text}")
 
     alignment_failed_gates: List[str] = []
     alignment_check = _load_json_safe("data/alignment_check.json")
@@ -11491,6 +11622,12 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     review_counters = counters
     audit_rejected = False
     hard_qa_gate_reject = False
+    qa_rejected = False
+    qa_failed_gates: List[str] = []
+    qa_required_fixes: List[str] = []
+    qa_hard_failures: List[str] = []
+    qa_notes: List[str] = []
+    qa_notes_appended = False
     qa_view = state.get("qa_view") or (state.get("contract_views") or {}).get("qa_view")
     if isinstance(qa_view, dict) and qa_view:
         qa_context = dict(qa_view)
@@ -11502,15 +11639,29 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         qa_context = {"_contract_source": "fallback"}
     qa_context["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
     qa_context_prompt = compress_long_lists(qa_context)[0] if isinstance(qa_context, dict) else qa_context
-    hard_qa_gates: set[str] = set()
-    for gate in qa_context.get("qa_gates", []) if isinstance(qa_context, dict) else []:
-        if isinstance(gate, dict):
-            name = gate.get("name") or gate.get("id")
-            severity = str(gate.get("severity") or "").upper()
-            if name and severity == "HARD":
-                hard_qa_gates.add(str(name).lower())
-        elif isinstance(gate, str):
-            hard_qa_gates.add(gate.lower())
+
+    qa_gate_specs = _merge_qa_gate_specs(
+        (evaluation_spec or {}).get("qa_gates") if isinstance(evaluation_spec, dict) else None,
+        (evaluation_spec or {}).get("gates") if isinstance(evaluation_spec, dict) else None,
+        get_qa_gates(contract) if isinstance(contract, dict) else None,
+        qa_context.get("qa_gates") if isinstance(qa_context, dict) else None,
+    )
+    hard_qa_gates: set[str] = {
+        str(gate.get("name")).lower()
+        for gate in qa_gate_specs
+        if isinstance(gate, dict) and str(gate.get("severity") or "HARD").upper() == "HARD"
+    }
+
+    column_gate_eval = _evaluate_column_presence_gates(qa_gate_specs)
+    if column_gate_eval:
+        qa_notes.extend(column_gate_eval.get("messages", []))
+        qa_failed_gates.extend(column_gate_eval.get("failed_gates", []))
+        qa_required_fixes.extend(column_gate_eval.get("required_fixes", []))
+        qa_hard_failures.extend(column_gate_eval.get("hard_failures", []))
+        if column_gate_eval.get("hard_failures"):
+            hard_qa_gate_reject = True
+            audit_rejected = True
+
     if code:
         analysis_type = strategy.get("analysis_type", "predictive")
         review_warnings: List[str] = []
@@ -11553,20 +11704,32 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     review_warnings.append(
                         f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
                     )
-                if qa_result and qa_result.get("status") == "REJECTED":
-                    failed = qa_result.get("failed_gates", []) or []
-                    is_static = (
-                        qa_result.get("feedback") == "Static QA gate failures detected."
-                        or qa_result.get("facts") is not None
-                    )
-                    if is_static and any(str(g).lower() in hard_qa_gates for g in failed):
-                        hard_qa_gate_reject = True
+                if qa_result:
+                    qa_status = qa_result.get("status")
+                    if qa_status == "REJECTED":
+                        qa_rejected = True
                         audit_rejected = True
+                    qa_result_failed = qa_result.get("failed_gates", []) or []
+                    qa_result_required = qa_result.get("required_fixes", []) or []
+                    qa_result_hard = qa_result.get("hard_failures") or []
+                    qa_result_hard = [str(g) for g in qa_result_hard if g]
+                    for gate_name in qa_result_failed:
+                        if str(gate_name).lower() in hard_qa_gates and gate_name not in qa_result_hard:
+                            qa_result_hard.append(gate_name)
+                    if qa_result_hard:
+                        if any(str(g).lower() in hard_qa_gates for g in qa_result_hard):
+                            hard_qa_gate_reject = True
+                    qa_failed_gates.extend(qa_result_failed)
+                    qa_required_fixes.extend(qa_result_required)
+                    qa_hard_failures.extend(qa_result_hard)
             else:
                 review_warnings.append(f"QA_CODE_AUDIT_SKIPPED: {err_msg}")
                 state["qa_budget_exceeded"] = True
         except Exception as qa_err:
             review_warnings.append(f"QA_CODE_AUDIT_ERROR: {qa_err}")
+        if qa_notes:
+            review_warnings.extend(qa_notes)
+            qa_notes_appended = True
         if review_warnings:
             warn_text = "\n".join(review_warnings)
             feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
@@ -11575,6 +11738,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             warn_text = "QA_INCOMPLETE: QA budget exceeded; QA audit skipped."
             feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
             new_history.append(warn_text)
+
+    if qa_notes and not qa_notes_appended:
+        warn_text = "\n".join(qa_notes)
+        feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
+        new_history.append(warn_text)
+
+    if qa_rejected and not qa_hard_failures:
+        qa_hard_failures.append("qa_rejected")
 
     if audit_rejected:
         status = "NEEDS_IMPROVEMENT"
@@ -11596,7 +11767,20 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         if case_alignment_required and case_report.get("status") == "FAIL"
         else []
     )
+    qa_failed_gates = list(dict.fromkeys([str(g) for g in qa_failed_gates if g]))
+    qa_required_fixes = list(dict.fromkeys([str(f) for f in qa_required_fixes if f]))
+    qa_hard_failures = list(dict.fromkeys([str(h) for h in qa_hard_failures if h]))
+    if qa_rejected and not qa_failed_gates:
+        qa_failed_gates.append("QA_CODE_AUDIT")
+    if qa_failed_gates:
+        for gate in qa_failed_gates:
+            if gate not in failed_gates:
+                failed_gates.append(gate)
     required_fixes = _expand_required_fixes(failed_gates, failed_gates)
+    if qa_required_fixes:
+        for fix in qa_required_fixes:
+            if fix not in required_fixes:
+                required_fixes.append(fix)
     if alignment_failed_gates:
         for item in alignment_failed_gates:
             if item not in failed_gates:
@@ -11616,6 +11800,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "failed_gates": failed_gates,
         "required_fixes": required_fixes,
     }
+    existing_hard_failures = [str(h) for h in (state.get("hard_failures") or []) if h]
+    merged_hard_failures = list(dict.fromkeys(existing_hard_failures + qa_hard_failures))
+    if merged_hard_failures:
+        gate_context["hard_failures"] = merged_hard_failures
     fix_block = _build_fix_instructions(required_fixes)
     if fix_block:
         gate_context["edit_instructions"] = fix_block
@@ -11629,7 +11817,15 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     # METRIC ITERATION DISABLED: Force downgrade to APPROVE_WITH_WARNINGS for metric-only issues.
     # This stops the metric retry loop while preserving compliance/runtime retries.
     metric_iteration_disabled = False
-    if status == "NEEDS_IMPROVEMENT" and iteration_type == "metric":
+    oc_error = oc_overall_status == "error"
+    has_hard_failures = bool(merged_hard_failures)
+    if (
+        status == "NEEDS_IMPROVEMENT"
+        and iteration_type == "metric"
+        and not audit_rejected
+        and not has_hard_failures
+        and not oc_error
+    ):
         status = "APPROVE_WITH_WARNINGS"
         metric_disable_msg = "(Metric iteration disabled: reporting limitations & next steps only.)"
         feedback = f"{feedback}\n{metric_disable_msg}" if feedback else metric_disable_msg
@@ -11650,6 +11846,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         # Note: metric branch removed since iteration_type="metric" is now downgraded above
 
     review_feedback = feedback or state.get("review_feedback", "")
+    qa_summary = None
+    if qa_failed_gates or qa_required_fixes or qa_hard_failures or qa_rejected:
+        qa_summary = {
+            "status": "REJECTED" if (qa_rejected or qa_hard_failures) else "APPROVE_WITH_WARNINGS",
+            "failed_gates": qa_failed_gates,
+            "required_fixes": qa_required_fixes,
+            "hard_failures": qa_hard_failures,
+        }
     result_state = {
         "review_verdict": status,
         "review_feedback": review_feedback,
@@ -11674,6 +11878,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "hard_qa_gate_reject": hard_qa_gate_reject,
         "hard_qa_retry_count": hard_qa_retry_count,
     }
+    if merged_hard_failures:
+        result_state["hard_failures"] = merged_hard_failures
+    if qa_summary:
+        result_state["qa_last_result"] = qa_summary
     if retry_worth_it is not None:
         result_state["review_retry_worth_it"] = bool(retry_worth_it)
     if state.get("qa_budget_exceeded"):
