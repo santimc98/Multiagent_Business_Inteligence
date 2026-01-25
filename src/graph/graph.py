@@ -9280,6 +9280,8 @@ def run_engineer(state: AgentState) -> AgentState:
                     log_run_event(run_id, "ml_view_context", {"length": ml_view_len})
             except Exception:
                 pass
+        if "ml_plan" in sig.parameters:
+            kwargs["ml_plan"] = state.get("ml_plan") or {}
         aliasing = {}
         derived_present = []
         sample_context = ""

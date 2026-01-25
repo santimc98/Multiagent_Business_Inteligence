@@ -467,6 +467,99 @@ class MLEngineerAgent:
             issues.append(f"required_outputs_missing: {missing_outputs}")
         return issues
 
+    def _extract_training_context(
+        self,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+        ml_plan: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        contract = execution_contract or {}
+        view = ml_view or {}
+        plan = ml_plan or {}
+
+        outcome_columns = contract.get("outcome_columns")
+        if not isinstance(outcome_columns, list) or not outcome_columns:
+            outcome_columns = view.get("outcome_columns")
+        if not isinstance(outcome_columns, list):
+            outcome_columns = []
+
+        target_column = None
+        if outcome_columns:
+            target_column = str(outcome_columns[0])
+
+        training_rows_rule = contract.get("training_rows_rule") or view.get("training_rows_rule")
+        scoring_rows_rule = contract.get("scoring_rows_rule") or view.get("scoring_rows_rule")
+        secondary_scoring_subset = contract.get("secondary_scoring_subset") or view.get("secondary_scoring_subset")
+
+        training_rows_policy = plan.get("training_rows_policy")
+        split_column = plan.get("split_column")
+        if not isinstance(split_column, str):
+            split_column = None
+
+        return {
+            "target_column": target_column,
+            "training_rows_rule": training_rows_rule,
+            "scoring_rows_rule": scoring_rows_rule,
+            "secondary_scoring_subset": secondary_scoring_subset,
+            "training_rows_policy": training_rows_policy,
+            "split_column": split_column,
+        }
+
+    def _code_mentions_label_filter(self, code: str, target: str | None) -> bool:
+        if not code or not target:
+            return False
+        lower = code.lower()
+        target_lower = target.lower()
+        if f"{target_lower}.notna" in lower or f"{target_lower}.isna" in lower:
+            return True
+        if f"dropna(subset=['{target_lower}'" in lower or f'dropna(subset=["{target_lower}"' in lower:
+            return True
+        if f"dropna(subset=[{target_lower}" in lower:
+            return True
+        if "y = y.dropna" in lower or "y=y.dropna" in lower:
+            return True
+        if "np.isnan(y" in lower or "numpy.isnan(y" in lower or "pd.isna(y" in lower:
+            return True
+        if "train_mask" in lower and target_lower in lower:
+            return True
+        return False
+
+    def _code_mentions_split_usage(self, code: str, split_column: str | None) -> bool:
+        if not code or not split_column:
+            return False
+        return split_column.lower() in code.lower()
+
+    def _check_training_policy_compliance(
+        self,
+        code: str,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+        ml_plan: Dict[str, Any] | None,
+    ) -> List[str]:
+        issues: List[str] = []
+        context = self._extract_training_context(execution_contract, ml_view, ml_plan)
+        target = context.get("target_column")
+        training_rows_rule = context.get("training_rows_rule")
+        training_rows_policy = context.get("training_rows_policy")
+        split_column = context.get("split_column")
+
+        requires_label_filter = False
+        if isinstance(training_rows_policy, str) and training_rows_policy in {"only_rows_with_label"}:
+            requires_label_filter = True
+        if isinstance(training_rows_rule, str):
+            rule_lower = training_rows_rule.lower()
+            if any(token in rule_lower for token in ("not missing", "not null", "notna", "non-null")):
+                requires_label_filter = True
+
+        if requires_label_filter and not self._code_mentions_label_filter(code, target):
+            issues.append("training_rows_filter_missing")
+
+        requires_split = isinstance(training_rows_policy, str) and training_rows_policy == "use_split_column"
+        if requires_split and not self._code_mentions_split_usage(code, split_column):
+            issues.append("split_column_filter_missing")
+
+        return issues
+
     def _fix_data_path_in_code(self, code: str, correct_path: str) -> str:
         """
         Post-processing safety check: If LLM generated code with incorrect INPUT_FILE path,
@@ -1173,6 +1266,7 @@ $strategy_json
         business_objective: str = "",
         execution_contract: Dict[str, Any] | None = None,
         ml_view: Dict[str, Any] | None = None,
+        ml_plan: Dict[str, Any] | None = None,
         # V4.1: availability_summary parameter removed
         signal_summary: Dict[str, Any] | None = None,
         iteration_memory: List[Dict[str, Any]] | None = None,
@@ -1203,6 +1297,7 @@ $strategy_json
            * secondary_scoring_subset (optional)
            * data_partitioning_notes
          - If those rules exist, implement them exactly.
+         - If training_rows_policy is "only_rows_with_label" or "use_split_column", your code must explicitly filter train_df before fit().
          - Scoring guidance:
            * Always produce scored_rows.csv for the primary scoring_rows_rule.
            * If scoring_rows_rule says "use all rows", score all rows.
@@ -2000,6 +2095,57 @@ $strategy_json
                         "ML guardrail failed: synthetic/fallback patterns still present: "
                         + "; ".join(reasons)
                     )
+
+            training_issues = self._check_training_policy_compliance(
+                code=code,
+                execution_contract=execution_contract,
+                ml_view=ml_view,
+                ml_plan=ml_plan,
+            )
+            if training_issues:
+                context = self._extract_training_context(execution_contract, ml_view, ml_plan)
+                compliance_system = (
+                    "You are a senior ML engineer. Ensure the script implements the training "
+                    "row selection policy from the plan/contract. Return FULL python script only."
+                )
+                compliance_user = (
+                    "Plan/contract compliance issues detected:\n"
+                    + "\n".join([f"- {issue}" for issue in training_issues])
+                    + "\n\nTraining context:\n"
+                    + json.dumps(context, indent=2)
+                    + "\n\nCODE:\n"
+                    + self._truncate_code_for_patch(code)
+                    + "\n\nFix the training/scoring row selection so it matches the plan. "
+                    "Keep outputs and other logic intact."
+                )
+                repaired = call_with_retries(
+                    lambda: _call_model_with_prompts(
+                        compliance_system,
+                        compliance_user,
+                        0.0,
+                        self.last_model_used or self.model_name,
+                    ),
+                    max_retries=2,
+                    backoff_factor=2,
+                    initial_delay=1,
+                )
+                repaired = self._clean_code(repaired)
+                if is_syntax_valid(repaired):
+                    repaired = self._fix_data_path_in_code(repaired, data_path)
+                    repaired = self._fix_to_csv_dialect_in_code(repaired)
+                    remaining = self._check_training_policy_compliance(
+                        code=repaired,
+                        execution_contract=execution_contract,
+                        ml_view=ml_view,
+                        ml_plan=ml_plan,
+                    )
+                    if not remaining:
+                        code = repaired
+                    else:
+                        raise RuntimeError(
+                            "ML training policy compliance failed after repair: "
+                            + "; ".join(remaining)
+                        )
             return code
 
         except Exception as e:
