@@ -80,15 +80,24 @@ class CleaningReviewerAgent:
     def review_cleaning(self, *args, **kwargs) -> Dict[str, Any]:
         try:
             request = _parse_review_inputs(args, kwargs)
-            result, prompt, response = _review_cleaning_impl(
-                cleaning_view=request["cleaning_view"],
-                cleaned_csv_path=request["cleaned_csv_path"],
-                cleaning_manifest_path=request["cleaning_manifest_path"],
-                raw_csv_path=request.get("raw_csv_path"),
-                client=self.client,
-                model_name=self.model_name,
-                provider=self.provider,
-            )
+            if request.get("failure_context"):
+                result, prompt, response = _review_cleaning_failure(
+                    cleaning_view=request["cleaning_view"],
+                    failure_context=request.get("failure_context"),
+                    client=self.client,
+                    model_name=self.model_name,
+                    provider=self.provider,
+                )
+            else:
+                result, prompt, response = _review_cleaning_impl(
+                    cleaning_view=request["cleaning_view"],
+                    cleaned_csv_path=request["cleaned_csv_path"],
+                    cleaning_manifest_path=request["cleaning_manifest_path"],
+                    raw_csv_path=request.get("raw_csv_path"),
+                    client=self.client,
+                    model_name=self.model_name,
+                    provider=self.provider,
+                )
         except Exception as exc:
             result = _exception_result(exc)
             prompt = "cleaning_reviewer_exception"
@@ -131,11 +140,17 @@ def _parse_review_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[
         or kwargs.get("raw_csv_path")
         or kwargs.get("raw_path")
     )
+    failure_context = kwargs.get("failure_context")
+    if failure_context is None and isinstance(cleaning_view, dict):
+        maybe_failure = cleaning_view.get("failure_context")
+        if isinstance(maybe_failure, dict):
+            failure_context = maybe_failure
     return {
         "cleaning_view": cleaning_view,
         "cleaned_csv_path": str(cleaned_csv_path),
         "cleaning_manifest_path": str(cleaning_manifest_path),
         "raw_csv_path": str(raw_csv_path) if raw_csv_path else None,
+        "failure_context": failure_context if isinstance(failure_context, dict) else None,
     }
 
 
@@ -187,12 +202,82 @@ def _parse_legacy_context(context: Dict[str, Any]) -> Dict[str, Any]:
         or "data/cleaning_manifest.json"
     )
     raw_csv_path = context.get("raw_csv_path") or context.get("raw_path")
+    failure_context = context.get("failure_context") if isinstance(context, dict) else None
     return {
         "cleaning_view": cleaning_view,
         "cleaned_csv_path": str(cleaned_csv_path),
         "cleaning_manifest_path": str(cleaning_manifest_path),
         "raw_csv_path": str(raw_csv_path) if raw_csv_path else None,
+        "failure_context": failure_context if isinstance(failure_context, dict) else None,
     }
+
+
+def _review_cleaning_failure(
+    cleaning_view: Dict[str, Any],
+    failure_context: Optional[Dict[str, Any]],
+    client: Any,
+    model_name: str,
+    provider: str,
+) -> Tuple[Dict[str, Any], str, str]:
+    view = cleaning_view if isinstance(cleaning_view, dict) else {}
+    failure_context = failure_context if isinstance(failure_context, dict) else {}
+    error_details = str(failure_context.get("error_details") or "")
+    code = str(failure_context.get("code") or "")
+    stdout = str(failure_context.get("stdout") or "")
+    stderr = str(failure_context.get("stderr") or "")
+
+    root_line = ""
+    if error_details:
+        lines = [line for line in error_details.strip().splitlines() if line.strip()]
+        if lines:
+            root_line = lines[-1][:300]
+
+    required_fixes: List[str] = []
+    failed_checks: List[str] = ["CLEANING_RUNTIME_ERROR"]
+    warnings: List[str] = []
+    hard_failures: List[str] = ["CLEANING_RUNTIME_ERROR"]
+
+    if "numpy.ndarray" in error_details and ".str" in error_details:
+        required_fixes.append(
+            "Avoid assigning np.where results to a Series used with .str; keep a pandas Series "
+            "(use Series.where/mask or wrap back into a Series with the original index)."
+        )
+    if "KeyError" in error_details:
+        required_fixes.append(
+            "Check column name normalization and ensure referenced columns exist before access; "
+            "use a normalized header map for matching."
+        )
+    if "FileNotFoundError" in error_details:
+        required_fixes.append("Read the input from the provided input_path; avoid hardcoded paths.")
+    if not required_fixes:
+        required_fixes.append("Fix the runtime error and rerun the cleaning script without changing I/O paths.")
+
+    feedback = "Cleaning failed during execution."
+    if root_line:
+        feedback += f" Root cause: {root_line}"
+
+    result = {
+        "status": "REJECTED",
+        "feedback": feedback,
+        "failed_checks": failed_checks,
+        "required_fixes": required_fixes,
+        "warnings": warnings,
+        "cleaning_gates_evaluated": [],
+        "hard_failures": hard_failures,
+        "soft_failures": [],
+        "gate_results": [],
+        "contract_source_used": "runtime_error",
+        "evidence": {
+            "error_details": error_details[-2000:],
+            "stdout_tail": stdout[-1000:],
+            "stderr_tail": stderr[-1000:],
+            "code_tail": code[-1000:],
+        },
+    }
+
+    prompt = "cleaning_reviewer_runtime_failure"
+    response = json.dumps(result, ensure_ascii=False)
+    return result, prompt, response
 
 
 def _review_cleaning_impl(

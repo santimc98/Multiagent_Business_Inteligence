@@ -154,6 +154,7 @@ class DataEngineerAgent:
         - Column names starting with a digit (e.g., '1stYearAmount') are NOT valid Python identifiers.
         - NEVER use: df.assign(1stYearAmount=...) - This causes SyntaxError!
         - ALWAYS use: df.assign(**{'1stYearAmount': ...}) or df['1stYearAmount'] = ...
+        - np.where returns a NumPy array. If you need pandas .str operations, keep a Series (use Series.where/mask or wrap back into a Series before .str).
         - DO NOT rescale numeric columns (e.g., divide/multiply by 100) to "normalize ranges" in cleaning.
           Only parse. Rescaling is allowed ONLY if the column is percent-like with evidence:
           (name contains '%' OR raw samples contain '%'). "score" does NOT imply percent.

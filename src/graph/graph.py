@@ -8084,12 +8084,98 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     new_state["data_engineer_audit_override"] = override
                                     print("Duplicate column dtype guard: retrying Data Engineer.")
                                     return run_data_engineer(new_state)
+                        reviewer_payload = ""
+                        reviewer_result = None
+                        review_context_payload = None
+                        reviewer_done = False
+                        if cleaning_reviewer and not state.get("de_runtime_reviewer_done"):
+                                try:
+                                    context_pack = build_context_pack("cleaning_reviewer", state if isinstance(state, dict) else {})
+                                    failure_context = {
+                                        "error_details": error_details,
+                                        "code": code,
+                                        "stdout": stdout_text,
+                                        "stderr": stderr_text,
+                                        "attempt": attempt_id,
+                                    }
+                                    cleaning_view = state.get("cleaning_view") or (state.get("contract_views") or {}).get("cleaning_view")
+                                    if cleaning_view:
+                                        cleaning_view_copy = dict(cleaning_view)
+                                        if context_pack:
+                                            cleaning_view_copy["context_pack"] = context_pack
+                                        if isinstance(input_dialect, dict):
+                                            cleaning_view_copy["input_dialect"] = input_dialect
+                                        cleaning_view_copy = compress_long_lists(cleaning_view_copy)[0]
+                                        reviewer_result = cleaning_reviewer.review_cleaning(
+                                            cleaning_view_copy,
+                                            cleaned_csv_path=local_cleaned_path,
+                                            cleaning_manifest_path=local_manifest_path,
+                                            raw_csv_path=csv_path,
+                                            failure_context=failure_context,
+                                        )
+                                        review_context_payload = cleaning_view_copy
+                                    else:
+                                        contract = state.get("execution_contract", {}) or {}
+                                        contract_min = state.get("execution_contract_min", {}) or {}
+                                        review_context = {
+                                            "cleaning_view": {},
+                                            "cleaning_gates": contract.get("cleaning_gates")
+                                            or contract_min.get("cleaning_gates")
+                                            or [],
+                                            "required_columns": _resolve_required_input_columns(contract, selected),
+                                            "dialect": input_dialect,
+                                            "column_roles": contract.get("column_roles") if isinstance(contract, dict) else {},
+                                        }
+                                        if context_pack:
+                                            review_context["context_pack"] = context_pack
+                                        review_context = compress_long_lists(review_context)[0]
+                                        reviewer_result = cleaning_reviewer.review_cleaning(
+                                            review_context,
+                                            failure_context=failure_context,
+                                        )
+                                        review_context_payload = review_context
+                                    try:
+                                        os.makedirs("artifacts", exist_ok=True)
+                                        with open(
+                                            os.path.join("artifacts", "cleaning_reviewer_failure_report.json"),
+                                            "w",
+                                            encoding="utf-8",
+                                        ) as f_rep:
+                                            json.dump(reviewer_result, f_rep, indent=2, ensure_ascii=False)
+                                    except Exception:
+                                        pass
+                                    if run_id:
+                                        log_agent_snapshot(
+                                            run_id,
+                                            "cleaning_reviewer",
+                                            prompt=getattr(cleaning_reviewer, "last_prompt", None),
+                                            response=getattr(cleaning_reviewer, "last_response", None) or reviewer_result,
+                                            context=review_context_payload,
+                                            verdicts=reviewer_result,
+                                        )
+                                except Exception as review_err:
+                                    print(f"Warning: cleaning reviewer runtime audit failed: {review_err}")
+                        if isinstance(reviewer_result, dict):
+                                reviewer_done = True
+                                fixes = reviewer_result.get("required_fixes", [])
+                                fixes_text = ""
+                                if isinstance(fixes, list) and fixes:
+                                    fixes_text = "\nREQUIRED_FIXES:\n- " + "\n- ".join(str(item) for item in fixes)
+                                reviewer_payload = (
+                                    "CLEANING_REVIEWER_FAILURE_CONTEXT:\n"
+                                    + str(reviewer_result.get("feedback", "")).strip()
+                                    + fixes_text
+                                )
                         if not state.get("de_runtime_retry_done"):
                                 new_state = dict(state)
                                 new_state["de_runtime_retry_done"] = True
+                                if reviewer_done:
+                                    new_state["de_runtime_reviewer_done"] = True
                                 override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                                 try:
                                     override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
+                                    if reviewer_payload:
+                                        override += "\n\n" + reviewer_payload
                                     failure_cause = _infer_de_failure_cause(error_details)
                                     if failure_cause:
                                         override += "\nWHY_IT_HAPPENED: " + failure_cause

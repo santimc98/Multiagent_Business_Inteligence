@@ -70,3 +70,15 @@ def main(cols):
 """
     issues = data_engineer_preflight(code)
     assert any("stats.update" in issue for issue in issues)
+
+
+def test_data_engineer_preflight_flags_np_where_str_chain():
+    code = """
+import numpy as np
+def main(s):
+    s = np.where(s == "x", "-" + s, s)
+    s = s.str.replace("x", "y")
+    return s
+"""
+    issues = data_engineer_preflight(code)
+    assert any("np.where returns" in issue for issue in issues)

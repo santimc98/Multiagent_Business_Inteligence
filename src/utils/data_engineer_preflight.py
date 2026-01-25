@@ -53,6 +53,33 @@ def data_engineer_preflight(code: str) -> List[str]:
                     "any()/all() expects an iterable; avoid passing a single membership test (it returns a bool)."
                 )
                 break
+    # Guard against np.where returning ndarray followed by pandas .str usage
+    try:
+        np_where_vars: set[str] = set()
+        for line in code.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = re.match(r"^(\w+)\s*=\s*np\.where\s*\(", stripped)
+            if match:
+                np_where_vars.add(match.group(1))
+                continue
+            if not np_where_vars:
+                continue
+            # Clear vars that are re-wrapped into a Series
+            for var in list(np_where_vars):
+                if re.match(rf"^{re.escape(var)}\s*=\s*pd\.Series\s*\(", stripped) or re.match(
+                    rf"^{re.escape(var)}\s*=\s*pandas\.Series\s*\(", stripped
+                ):
+                    np_where_vars.discard(var)
+                    continue
+                if re.search(rf"\b{re.escape(var)}\.str\.", stripped):
+                    issues.append(
+                        "np.where returns a NumPy array; wrap back into a pandas Series (or use Series.where/mask) before .str operations."
+                    )
+                    return issues
+    except Exception:
+        pass
     # Guard against slicing None for actual_column in validation summaries
     if "actual_column" in code:
         for line in code.splitlines():
