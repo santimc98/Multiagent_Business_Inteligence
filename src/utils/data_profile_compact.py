@@ -158,12 +158,20 @@ def convert_dataset_profile_to_data_profile(
     data_profile = {
         "basic_stats": basic_stats,
         "dtypes": dtypes,
+        "missingness": missing_frac,
         "missingness_top30": missingness_top30,
         "outcome_analysis": outcome_analysis,
         "split_candidates": split_candidates,
         "constant_columns": constant_columns,
         "high_cardinality_columns": high_cardinality_columns,
         "leakage_flags": leakage_flags,
+        "cardinality": dataset_profile.get("cardinality", {}),
+        "numeric_summary": dataset_profile.get("numeric_summary", {}),
+        "text_summary": dataset_profile.get("text_summary", {}),
+        "duplicate_stats": dataset_profile.get("duplicate_stats", {}),
+        "sampling": dataset_profile.get("sampling", {}),
+        "dialect": dataset_profile.get("dialect", {}),
+        "pii_findings": dataset_profile.get("pii_findings", {}),
         "schema_version": "1.0",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "converted_from_dataset_profile",
@@ -296,6 +304,12 @@ def compact_data_profile_for_llm(
 
     # 7. High cardinality columns (useful for ID detection)
     compact["high_cardinality_columns"] = profile.get("high_cardinality_columns", [])
+
+    # 7.5 Duplicate stats (useful for data quality checks)
+    compact["duplicate_stats"] = profile.get("duplicate_stats", {})
+
+    # 7.6 Sampling metadata (helps interpret profile fidelity)
+    compact["sampling"] = profile.get("sampling", {})
 
     # 8. Column DTypes - Simplify
     dtypes = profile.get("dtypes", {})

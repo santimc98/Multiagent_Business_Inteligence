@@ -630,10 +630,75 @@ def build_dataset_profile(
     sample_size: int,
     pii_findings: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    def _safe_numeric_summary(series: pd.Series) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {}
+        try:
+            numeric = pd.to_numeric(series, errors="coerce")
+        except Exception:
+            return summary
+        count = int(numeric.notna().sum())
+        summary["count"] = count
+        if count == 0:
+            return summary
+        try:
+            summary.update(
+                {
+                    "mean": float(numeric.mean()),
+                    "std": float(numeric.std()),
+                    "min": float(numeric.min()),
+                    "q25": float(numeric.quantile(0.25)),
+                    "median": float(numeric.median()),
+                    "q75": float(numeric.quantile(0.75)),
+                    "max": float(numeric.max()),
+                }
+            )
+            summary["zero_frac"] = float((numeric == 0).mean())
+            summary["neg_frac"] = float((numeric < 0).mean())
+            summary["pos_frac"] = float((numeric > 0).mean())
+        except Exception:
+            return summary
+        return summary
+
+    def _safe_text_summary(series: pd.Series, max_samples: int = 5000) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {}
+        try:
+            values = series.dropna().astype(str)
+        except Exception:
+            return summary
+        if values.empty:
+            summary["count"] = 0
+            return summary
+        if len(values) > max_samples:
+            values = values.sample(max_samples, random_state=42)
+        lengths = values.str.len()
+        try:
+            summary["count"] = int(len(values))
+            summary["avg_len"] = float(lengths.mean())
+            summary["min_len"] = int(lengths.min())
+            summary["max_len"] = int(lengths.max())
+            summary["empty_frac"] = float((values.str.strip() == "").mean())
+            summary["whitespace_frac"] = float(
+                (values.str.len() != values.str.strip().str.len()).mean()
+            )
+            summary["numeric_like_ratio"] = float(
+                values.str.contains(r"^[\s\-\+]*[\d,.\s%]+$", regex=True).mean()
+            )
+            summary["percent_like_ratio"] = float(values.str.contains(r"%").mean())
+            try:
+                parsed = pd.to_datetime(values, errors="coerce", dayfirst=True)
+                summary["datetime_like_ratio"] = float(parsed.notna().mean())
+            except Exception:
+                summary["datetime_like_ratio"] = 0.0
+        except Exception:
+            return summary
+        return summary
+
     columns = [str(c) for c in df.columns]
     type_hints = {col: _infer_type_hint(df[col]) for col in columns}
     missing_frac: Dict[str, float] = {}
     cardinality: Dict[str, Any] = {}
+    numeric_summary: Dict[str, Any] = {}
+    text_summary: Dict[str, Any] = {}
 
     from src.utils.missing import is_effectively_missing_series
 
@@ -651,6 +716,20 @@ def build_dataset_profile(
         except Exception:
             top_values = []
         cardinality[col] = {"unique": n_unique, "top_values": top_values}
+        hint = type_hints.get(col)
+        if hint == "numeric":
+            numeric_summary[col] = _safe_numeric_summary(series)
+        elif hint in {"categorical", "datetime", "unknown"}:
+            text_summary[col] = _safe_text_summary(series)
+
+    duplicate_rows = 0
+    duplicate_frac = 0.0
+    try:
+        duplicate_rows = int(df.duplicated().sum())
+        duplicate_frac = float(duplicate_rows / max(len(df), 1))
+    except Exception:
+        duplicate_rows = 0
+        duplicate_frac = 0.0
 
     profile = {
         "rows": int(df.shape[0]),
@@ -659,6 +738,12 @@ def build_dataset_profile(
         "type_hints": type_hints,
         "missing_frac": missing_frac,
         "cardinality": cardinality,
+        "numeric_summary": numeric_summary,
+        "text_summary": text_summary,
+        "duplicate_stats": {
+            "row_dup_count": duplicate_rows,
+            "row_dup_frac": round(duplicate_frac, 6),
+        },
         "pii_findings": pii_findings or {"detected": False, "findings": []},
         "sampling": {
             "was_sampled": bool(was_sampled),

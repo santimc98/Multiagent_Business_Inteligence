@@ -708,6 +708,94 @@ def _ensure_missing_category_values(contract: Dict[str, Any]) -> Dict[str, Any]:
     return contract
 
 
+def _apply_sparse_optional_columns(
+    contract: Dict[str, Any],
+    data_profile: Dict[str, Any] | None,
+    threshold: float = 0.98,
+) -> Dict[str, Any]:
+    """
+    Mark ultra-sparse columns as optional passthrough based on data_profile missingness.
+    This prevents required-column guards from blocking on legitimately sparse features.
+    """
+    if not isinstance(contract, dict) or not isinstance(data_profile, dict):
+        return contract
+    missingness = data_profile.get("missingness_top30")
+    if not isinstance(missingness, dict) or not missingness:
+        return contract
+
+    try:
+        from src.utils.contract_v41 import get_outcome_columns, get_decision_columns, get_column_roles
+    except Exception:
+        return contract
+
+    outcomes = {str(c) for c in get_outcome_columns(contract)}
+    decisions = {str(c) for c in get_decision_columns(contract)}
+    roles = get_column_roles(contract)
+    identifiers = set()
+    if isinstance(roles, dict):
+        raw_ids = roles.get("identifiers") or roles.get("identifier") or []
+        if isinstance(raw_ids, list):
+            identifiers = {str(c) for c in raw_ids if c}
+        elif isinstance(raw_ids, str):
+            identifiers = {raw_ids}
+
+    canonical = contract.get("canonical_columns")
+    canonical_set = {str(c) for c in canonical} if isinstance(canonical, list) else set()
+
+    def _norm_name(name: Any) -> str:
+        return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
+
+    optional_candidates: List[str] = []
+    for col, frac in missingness.items():
+        try:
+            frac_val = float(frac)
+        except Exception:
+            continue
+        if frac_val < threshold:
+            continue
+        if canonical_set and str(col) not in canonical_set:
+            continue
+        if str(col) in outcomes or str(col) in decisions or str(col) in identifiers:
+            continue
+        optional_candidates.append(str(col))
+
+    if not optional_candidates:
+        return contract
+
+    artifact_reqs = contract.get("artifact_requirements")
+    if not isinstance(artifact_reqs, dict):
+        artifact_reqs = {}
+    schema_binding = artifact_reqs.get("schema_binding")
+    if not isinstance(schema_binding, dict):
+        schema_binding = {}
+    optional_cols = schema_binding.get("optional_passthrough_columns")
+    if not isinstance(optional_cols, list):
+        optional_cols = []
+
+    existing = {_norm_name(c): c for c in optional_cols if c}
+    for col in optional_candidates:
+        norm = _norm_name(col)
+        if norm in existing:
+            continue
+        optional_cols.append(col)
+        existing[norm] = col
+
+    schema_binding["optional_passthrough_columns"] = optional_cols
+    artifact_reqs["schema_binding"] = schema_binding
+    contract["artifact_requirements"] = artifact_reqs
+
+    notes = contract.get("notes_for_engineers")
+    if not isinstance(notes, list):
+        notes = []
+    notes.append({
+        "item": "Sparse columns treated as optional passthrough based on data_profile missingness.",
+        "columns": optional_candidates,
+        "null_frac_threshold": threshold,
+    })
+    contract["notes_for_engineers"] = notes
+    return contract
+
+
 def _strategy_mentions_resampling(strategy: Dict[str, Any], business_objective: str) -> bool:
     if not isinstance(strategy, dict):
         strategy = {}
@@ -3017,6 +3105,7 @@ class ExecutionPlannerAgent:
         output_dialect: Dict[str, str] | None = None,
         env_constraints: Dict[str, Any] | None = None,
         domain_expert_critique: str = "",
+        data_profile: Dict[str, Any] | None = None,
         run_id: str | None = None
     ) -> Dict[str, Any]:
         def _norm(name: str) -> str:
@@ -5657,6 +5746,7 @@ domain_expert_critique:
         contract = _ensure_benchmark_kpi_gate(contract, strategy, business_objective or "")
         contract["cleaning_gates"] = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
         contract = _ensure_missing_category_values(contract)
+        contract = _apply_sparse_optional_columns(contract, data_profile)
 
         if column_inventory and not contract.get("available_columns"):
             contract["available_columns"] = column_inventory

@@ -6901,6 +6901,28 @@ def run_execution_planner(state: AgentState) -> AgentState:
     context_pack = build_context_pack("execution_planner", state if isinstance(state, dict) else {})
     if context_pack:
         data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
+    # Provide compact data_profile context for the planner without mutating state["data_summary"].
+    data_summary_for_planner = data_summary
+    planner_data_profile = None
+    try:
+        from src.utils.data_profile_compact import (
+            convert_dataset_profile_to_data_profile,
+            compact_data_profile_for_llm,
+        )
+        work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
+        dataset_profile_path = _abs_in_work(work_dir_abs, "data/dataset_profile.json")
+        dataset_profile = _load_json_safe(dataset_profile_path)
+        if isinstance(dataset_profile, dict) and dataset_profile:
+            analysis_type = (strategy or {}).get("analysis_type") if isinstance(strategy, dict) else None
+            planner_data_profile = convert_dataset_profile_to_data_profile(
+                dataset_profile, {}, analysis_type
+            )
+            compact_profile = compact_data_profile_for_llm(planner_data_profile)
+            if compact_profile:
+                compact_payload = json.dumps(compact_profile, indent=2, ensure_ascii=False)
+                data_summary_for_planner = f"{data_summary}\n\nDATA_PROFILE_COMPACT_JSON:\n{compact_payload}"
+    except Exception:
+        planner_data_profile = None
     business_objective = state.get("business_objective", "")
     run_id = state.get("run_id")
     if run_id:
@@ -6953,12 +6975,13 @@ def run_execution_planner(state: AgentState) -> AgentState:
 
         contract = execution_planner.generate_contract(
             strategy=strategy,
-            data_summary=data_summary,
+            data_summary=data_summary_for_planner,
             business_objective=business_objective,
             column_inventory=column_inventory,
             output_dialect=output_dialect,
             env_constraints=env_constraints,
             domain_expert_critique=domain_expert_critique,
+            data_profile=planner_data_profile,
             run_id=run_id,
         )
     except Exception as e:
