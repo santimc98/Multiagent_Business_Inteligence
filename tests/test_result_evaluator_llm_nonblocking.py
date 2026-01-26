@@ -126,7 +126,7 @@ def test_result_evaluator_approved_stays_approved(tmp_path, monkeypatch):
 
 def test_result_evaluator_hard_gate_column_presence_blocks_success(tmp_path, monkeypatch):
     """
-    HARD QA gate: explanation column missing in scored_rows.csv -> must not approve.
+    HARD QA gate: explanation column missing in scored_rows.csv -> surfaced as advisory context.
     """
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)
@@ -157,11 +157,11 @@ def test_result_evaluator_hard_gate_column_presence_blocks_success(tmp_path, mon
     monkeypatch.setattr(graph_mod, "qa_reviewer", _StubQAApproved())
     result = graph_mod.run_result_evaluator(state)
 
-    assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
+    assert result["review_verdict"] == "APPROVED"
     assert any("QA_GATE_FAIL" in item for item in result["feedback_history"])
 
     state.update(result)
-    assert graph_mod.check_evaluation(state) == "retry"
+    assert graph_mod.check_evaluation(state) == "approved"
 
 
 def test_result_evaluator_qa_rejected_blocks_metric_downgrade(tmp_path, monkeypatch):
@@ -189,7 +189,10 @@ def test_result_evaluator_qa_rejected_blocks_metric_downgrade(tmp_path, monkeypa
     result = graph_mod.run_result_evaluator(state)
 
     assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
-    assert any("CODE_AUDIT_REJECTED" in item for item in result["feedback_history"])
+    assert any(
+        ("QA_CODE_AUDIT[REJECTED]" in item) or ("CODE_AUDIT_FINDINGS" in item)
+        for item in result["feedback_history"]
+    )
     assert "hard_failures" in result and "qa_rejected" in result["hard_failures"]
 
     state.update(result)

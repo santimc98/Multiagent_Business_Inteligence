@@ -85,6 +85,7 @@ class MLEngineerAgent:
         self.fallback_model_name = None
         self.last_model_used = None
         self.last_fallback_reason = None
+        self.last_training_policy_warnings = None
         if self.provider == "zai":
             self.api_key = api_key or os.getenv("ZAI_API_KEY") or os.getenv("GLM_API_KEY")
             if not self.api_key:
@@ -1180,10 +1181,10 @@ $strategy_json
                 self.last_response = response
             parsed = self._parse_json_response(response)
             ml_plan = self._normalize_ml_plan(parsed, source="llm")
-            ml_plan = self._derive_train_filter(ml_plan, profile, contract)
 
             # Check if we got meaningful data
             if ml_plan.get("training_rows_policy") != "unspecified":
+                ml_plan = self._derive_train_filter(ml_plan, profile, contract)
                 return ml_plan
 
             # Retry attempt
@@ -1496,6 +1497,17 @@ $strategy_json
         if tf_type == "custom_rule" and not train_filter.get("rule") and isinstance(training_rows_rule, str):
             train_filter["rule"] = training_rows_rule
 
+        known_policies = {"use_all_rows", "only_rows_with_label", "use_split_column", "custom", "unspecified"}
+        if not tf_type:
+            if training_rows_policy and training_rows_policy not in known_policies:
+                # Preserve explicit custom policy from LLM; do not infer a filter
+                result["train_filter"] = train_filter
+                return result
+            if training_rows_policy == "custom" and not isinstance(training_rows_rule, str):
+                # Preserve explicit custom policy without forcing defaults
+                result["train_filter"] = train_filter
+                return result
+
         if tf_type:
             # normalize column/value if missing
             if tf_type == "label_not_null":
@@ -1563,7 +1575,6 @@ $strategy_json
 
         # Align training_rows_policy with train_filter to remove ambiguity
         tf_type = str(train_filter.get("type") or "").strip().lower()
-        known_policies = {"use_all_rows", "only_rows_with_label", "use_split_column", "custom", "unspecified"}
         policy_is_known = training_rows_policy in known_policies or not training_rows_policy
         if policy_is_known:
             if tf_type == "split_equals":
@@ -2484,22 +2495,33 @@ $strategy_json
                     initial_delay=1,
                 )
                 repaired = self._clean_code(repaired)
-                if is_syntax_valid(repaired):
+                repaired_valid = is_syntax_valid(repaired)
+                if repaired_valid:
                     repaired = self._fix_data_path_in_code(repaired, data_path)
                     repaired = self._fix_to_csv_dialect_in_code(repaired)
-                    remaining = self._check_training_policy_compliance(
-                        code=repaired,
-                        execution_contract=execution_contract,
-                        ml_view=ml_view,
-                        ml_plan=ml_plan,
-                    )
-                    if not remaining:
-                        code = repaired
-                    else:
+                remaining = self._check_training_policy_compliance(
+                    code=repaired if repaired_valid else code,
+                    execution_contract=execution_contract,
+                    ml_view=ml_view,
+                    ml_plan=ml_plan,
+                )
+                if not remaining and repaired_valid:
+                    code = repaired
+                elif remaining:
+                    fallback_code = repaired if repaired_valid else (code if is_syntax_valid(code) else None)
+                    if fallback_code is None:
                         raise RuntimeError(
                             "ML training policy compliance failed after repair: "
                             + "; ".join(remaining)
                         )
+                    self.last_training_policy_warnings = {
+                        "issues": remaining,
+                        "context": context,
+                        "required_filter": required_filter,
+                        "checklist": checklist,
+                    }
+                    print("ML_TRAINING_POLICY_WARNING: " + json.dumps(self.last_training_policy_warnings))
+                    code = fallback_code
             return code
 
         except Exception as e:

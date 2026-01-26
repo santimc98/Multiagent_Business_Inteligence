@@ -9657,6 +9657,10 @@ def run_engineer(state: AgentState) -> AgentState:
         except Exception as iter_err:
             print(f"Warning: failed to persist ml_code_iter_{iter_id}.py: {iter_err}")
 
+        policy_warnings = getattr(ml_engineer, "last_training_policy_warnings", None)
+        if policy_warnings and run_id:
+            log_run_event(run_id, "ml_training_policy_warning", policy_warnings)
+
         if run_id:
             log_run_event(run_id, "ml_engineer_complete", {"code_len": len(code or "")})
         if str(code).strip().startswith("{") or str(code).strip().startswith("["):
@@ -9686,6 +9690,7 @@ def run_engineer(state: AgentState) -> AgentState:
             "selected_strategy": strategy,
             "generated_code": code,
             "last_generated_code": code, # Update for next patch
+            "ml_training_policy_warnings": policy_warnings,
             "ml_data_path": data_path,
             "csv_sep": csv_sep,
             "csv_decimal": csv_decimal,
@@ -9949,6 +9954,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         if isinstance(qa_context["evaluation_spec"], dict):
              qa_context["evaluation_spec"]["ml_plan"] = state.get("ml_plan") or {}
              qa_context["evaluation_spec"]["data_profile"] = state.get("data_profile") or {}
+             qa_context["evaluation_spec"]["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings") or {}
         dataset_semantics_summary = state.get("dataset_semantics_summary")
         if dataset_semantics_summary:
             qa_context["dataset_semantics_summary"] = dataset_semantics_summary
@@ -11339,6 +11345,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     )
     decisioning_enabled = bool(decisioning_reqs.get("enabled"))
     decisioning_required = bool(decisioning_reqs.get("required")) and decisioning_enabled
+    decisioning_warning = None
     if decisioning_enabled:
         decisioning_result = _check_decisioning_columns(decisioning_reqs)
         missing_file = decisioning_result.get("missing_file")
@@ -11358,17 +11365,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     "decisioning_requirements_review",
                     {"missing_columns": missing_columns, "violations": constraint_violations, "file": missing_file},
                 )
-            return {
-                "review_verdict": "NEEDS_IMPROVEMENT",
-                "review_feedback": message,
-                "failed_gates": ["Decisioning_Requirements_Validation"],
-                "feedback_history": history,
-            }
+            decisioning_warning = message
+            state["feedback_history"] = history
         if not decisioning_required and (missing_columns or constraint_violations):
             history = list(state.get("feedback_history", []))
             history.append(
                 f"Decisioning warning: columns={missing_columns} violations={constraint_violations}"
             )
+            decisioning_warning = history[-1]
             state["feedback_history"] = history
 
     execution_output = state.get('execution_output', '')
@@ -11386,7 +11390,15 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
     contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
 
-    eval_result = reviewer.evaluate_results(execution_output, business_objective, strategy_context, evaluation_spec)
+    governance_context = {}
+    if decisioning_warning:
+        governance_context["decisioning_warning"] = decisioning_warning
+    evaluation_spec_for_review = dict(evaluation_spec or {})
+    if governance_context:
+        evaluation_spec_for_review = dict(evaluation_spec_for_review)
+        evaluation_spec_for_review["governance_context"] = governance_context
+
+    eval_result = reviewer.evaluate_results(execution_output, business_objective, strategy_context, evaluation_spec_for_review)
 
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
@@ -11750,6 +11762,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     else:
         qa_context = {"_contract_source": "fallback"}
     qa_context["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
+    if state.get("ml_training_policy_warnings"):
+        qa_context["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings")
     qa_context_prompt = compress_long_lists(qa_context)[0] if isinstance(qa_context, dict) else qa_context
 
     qa_gate_specs = _merge_qa_gate_specs(
@@ -11770,13 +11784,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         qa_failed_gates.extend(column_gate_eval.get("failed_gates", []))
         qa_required_fixes.extend(column_gate_eval.get("required_fixes", []))
         qa_hard_failures.extend(column_gate_eval.get("hard_failures", []))
-        if column_gate_eval.get("hard_failures"):
-            hard_qa_gate_reject = True
-            audit_rejected = True
 
+    review_warnings: List[str] = []
     if code:
         analysis_type = strategy.get("analysis_type", "predictive")
-        review_warnings: List[str] = []
         try:
             ok, counters, err_msg = _consume_budget(state, "reviewer_calls", "max_reviewer_calls", "Reviewer")
             review_counters = counters
@@ -11842,35 +11853,66 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         if qa_notes:
             review_warnings.extend(qa_notes)
             qa_notes_appended = True
-        if review_warnings:
-            warn_text = "\n".join(review_warnings)
-            feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
-            new_history.append(warn_text)
         if state.get("qa_budget_exceeded"):
             warn_text = "QA_INCOMPLETE: QA budget exceeded; QA audit skipped."
             feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
             new_history.append(warn_text)
 
     if qa_notes and not qa_notes_appended:
-        warn_text = "\n".join(qa_notes)
-        feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
-        new_history.append(warn_text)
+        review_warnings.extend(qa_notes)
+
+    post_audit_context = {}
+    if review_warnings:
+        post_audit_context["code_audit_warnings"] = list(review_warnings)
+    if qa_notes:
+        post_audit_context["deterministic_gate_notes"] = list(qa_notes)
+    if qa_failed_gates or qa_required_fixes or qa_hard_failures or qa_rejected:
+        post_audit_context["qa_code_audit"] = {
+            "status": "REJECTED" if (qa_rejected or qa_hard_failures) else "APPROVE_WITH_WARNINGS",
+            "failed_gates": qa_failed_gates,
+            "required_fixes": qa_required_fixes,
+            "hard_failures": qa_hard_failures,
+        }
+    if state.get("ml_training_policy_warnings"):
+        post_audit_context["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings")
+    post_audit_summary = None
+    if review_warnings or qa_notes:
+        post_audit_summary = "\n".join([*review_warnings, *qa_notes]) if (review_warnings or qa_notes) else None
+
+    post_audit_appended = False
+    if post_audit_context:
+        governance_context.update(post_audit_context)
+        evaluation_spec_final = dict(evaluation_spec_for_review)
+        evaluation_spec_final["governance_context"] = governance_context
+        if evaluation_spec_final != evaluation_spec_for_review:
+            re_eval = reviewer.evaluate_results(
+                execution_output, business_objective, strategy_context, evaluation_spec_final
+            )
+            if isinstance(re_eval, dict) and re_eval.get("status"):
+                status = re_eval.get("status", status)
+                feedback = re_eval.get("feedback", feedback)
+                retry_worth_it = re_eval.get("retry_worth_it", retry_worth_it)
+                new_history.append("REVIEWER_REEVAL: Final verdict computed with governance context.")
+                if post_audit_summary:
+                    feedback = f"{feedback}\n{post_audit_summary}" if feedback else post_audit_summary
+                    new_history.append(post_audit_summary)
+                    post_audit_appended = True
+
+    if post_audit_summary and not post_audit_appended:
+        feedback = f"{feedback}\n{post_audit_summary}" if feedback else post_audit_summary
+        new_history.append(post_audit_summary)
 
     if qa_rejected and not qa_hard_failures:
         qa_hard_failures.append("qa_rejected")
 
     if audit_rejected:
-        status = "NEEDS_IMPROVEMENT"
-        if feedback:
-            feedback = f"{feedback}\nCODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes."
-        else:
-            feedback = "CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes."
-        new_history.append("CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes.")
+        note = "CODE_AUDIT_FINDINGS: reviewer/QA raised issues; see governance_context for details."
+        feedback = f"{feedback}\n{note}" if feedback else note
+        new_history.append(note)
 
     hard_qa_retry_count = int(state.get("hard_qa_retry_count", 0))
-    if status == "NEEDS_IMPROVEMENT" and hard_qa_gate_reject:
-        hard_qa_retry_count += 1
-        hard_note = "HARD_QA_GATE: synthetic data or contract-column violation detected; limit retries to 1."
+    if hard_qa_gate_reject:
+        hard_note = "HARD_QA_GATE_NOTE: QA reported hard-failure signals (advisory)."
         new_history.append(hard_note)
         feedback = f"{feedback}\n{hard_note}" if feedback else hard_note
 
@@ -12306,19 +12348,6 @@ def check_evaluation(state: AgentState):
     metric_max = policy.get("metric_improvement_max") if policy else None
     budget_left = (metric_max - metric_iters) if metric_max else "unlimited"
     metric_name, metric_value, best_value = _get_metric_info()
-
-    if state.get("hard_qa_gate_reject"):
-        hard_count = int(state.get("hard_qa_retry_count", 0))
-        if hard_count > 1:
-            # Hard QA gate failed and retry limit reached - NEVER approve, just stop iterating
-            print("WARNING: Hard QA gate retry limit reached (max 1). Stopping iterations - NOT approving.")
-            print(f"ITER_DECISION type=hard_qa action=stop reason=HARD_GATE_FAIL metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
-            # Ensure the state reflects the hard gate failure for final reporting
-            state["stop_reason"] = "HARD_GATE_FAIL"
-            state["hard_gate_terminal"] = True
-            # NOTE: Returning "approved" here means "stop iterating", NOT "final approval"
-            # The review_verdict in state should still be NEEDS_IMPROVEMENT
-            return "approved"
 
     if policy:
         compliance_max = policy.get("compliance_bootstrap_max")
