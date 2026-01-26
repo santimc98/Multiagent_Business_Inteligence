@@ -6535,6 +6535,7 @@ def run_steward(state: AgentState) -> AgentState:
     dataset_semantics_summary = ""
     column_sets = {}
     column_sets_summary = ""
+    header_cols = []
     try:
         dialect_payload = {"encoding": encoding, "sep": sep, "decimal": decimal}
         header_cols = read_header(csv_path, dialect_payload)
@@ -6640,6 +6641,15 @@ def run_steward(state: AgentState) -> AgentState:
             print(f"Warning: failed to persist dataset semantics artifacts: {sem_write_err}")
     except Exception as sem_err:
         print(f"Warning: dataset semantics extraction failed: {sem_err}")
+        if header_cols and not column_sets and len(header_cols) > 200:
+            try:
+                from src.utils.column_sets import build_column_sets
+                column_sets = build_column_sets(header_cols)
+                column_sets_summary = summarize_column_sets(column_sets) if column_sets else ""
+                os.makedirs("data", exist_ok=True)
+                dump_json("data/column_sets.json", column_sets)
+            except Exception as cs_err:
+                print(f"Warning: failed to build column_sets fallback after semantics error: {cs_err}")
     if isinstance(state, dict):
         state["dataset_semantics"] = dataset_semantics
         state["dataset_training_mask"] = dataset_training_mask
@@ -8582,7 +8592,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
             contract = state.get("execution_contract", {}) or {}
             required_cols = _resolve_required_input_columns(contract, selected)
             contract_all_cols = _resolve_contract_columns(contract)
-            contract_derived_cols = _resolve_contract_columns_for_cleaning(contract, sources={"derived", "output"})
+            try:
+                from src.utils.contract_v41 import get_derived_column_names
+                contract_derived_cols = get_derived_column_names(contract)
+            except Exception:
+                contract_derived_cols = []
             cleaned_columns_set = set(df.columns.str.lower())
 
             print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")
@@ -8944,7 +8958,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         "data_engineer_failed": True,
                         "budget_counters": counters,
                     }
-            # Guard: derived columns should not be constant if present
+            # Guard: derived columns should not be constant if present (context-only; do not block runs)
             derived_issues = []
             derived_evidence = {}
             if contract_derived_cols:
@@ -8995,33 +9009,21 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             }
                         derived_evidence[derived_name] = dep_stats
             if derived_issues:
-                if not state.get("de_derived_guard_retry_done"):
-                    new_state = dict(state)
-                    new_state["de_derived_guard_retry_done"] = True
-                    override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                    try:
-                        override += (
-                            "\n\nDERIVED_COLUMN_GUARD: "
-                            + "; ".join(derived_issues)
-                            + ". Ensure derived columns use normalized column mapping "
-                            "to access source columns and do not default all rows."
+                warning_payload = "DERIVED_COLUMN_GUARD: " + "; ".join(derived_issues)
+                try:
+                    if derived_evidence:
+                        warning_payload += "\nDERIVED_SOURCE_EVIDENCE:\n" + json.dumps(
+                            derived_evidence,
+                            ensure_ascii=True,
                         )
-                        if derived_evidence:
-                            override += "\nDERIVED_SOURCE_EVIDENCE:\n" + json.dumps(
-                                derived_evidence,
-                                ensure_ascii=True,
-                            )
-                    except Exception:
-                        pass
-                    new_state["data_engineer_audit_override"] = override
-                    print("Derived column guard: retrying Data Engineer with mapping guidance.")
-                    return run_data_engineer(new_state)
-                else:
-                    return {
-                        "cleaning_code": code,
-                        "cleaned_data_preview": "Error: Derived Columns Constant",
-                        "error_message": "CRITICAL: Derived columns present but constant; verify mapping and derivation.",
-                    }
+                except Exception:
+                    pass
+                warnings = state.get("data_engineer_guard_warnings")
+                if not isinstance(warnings, list):
+                    warnings = []
+                warnings.append(warning_payload)
+                state["data_engineer_guard_warnings"] = warnings
+                print("Derived column guard warning recorded for reviewer context.")
 
             # Create Synthetic Columns if needed
             for synth in mapping_result['synthetic']:
