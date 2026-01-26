@@ -121,7 +121,16 @@ class ResultsAdvisorAgent:
         if not metrics_summary and isinstance(metrics_payload, dict):
             nested = metrics_payload.get("metrics")
             metrics_summary = self._extract_metrics_summary(nested, objective_type)
+        primary_metric_name = self._resolve_primary_metric_name(
+            context,
+            metrics_payload,
+            metrics_summary,
+            objective_type,
+        )
         deployment_info = self._compute_deployment_recommendation(metrics_payload, predictions_summary)
+        if primary_metric_name:
+            deployment_info = dict(deployment_info)
+            deployment_info["primary_metric"] = primary_metric_name
         risks = []
         recommendations = []
         summary_lines: List[str] = []
@@ -203,7 +212,7 @@ class ResultsAdvisorAgent:
             "summary_lines": summary_lines,
             "deployment_recommendation": deployment_info.get("deployment_recommendation"),
             "confidence": deployment_info.get("confidence"),
-            "primary_metric": deployment_info.get("primary_metric"),
+            "primary_metric": deployment_info.get("primary_metric") or primary_metric_name,
             "iteration_recommendation": iteration_recommendation,
         }
         self.last_response = insights
@@ -413,6 +422,54 @@ class ResultsAdvisorAgent:
                 return str(key), value
         return None, None
 
+    def _resolve_primary_metric_name(
+        self,
+        context: Dict[str, Any],
+        metrics_payload: Dict[str, Any],
+        metrics_summary: List[Dict[str, Any]],
+        objective_type: str,
+    ) -> str | None:
+        if not isinstance(context, dict):
+            return None
+        snapshot = context.get("primary_metric_snapshot") or {}
+        if isinstance(snapshot, dict):
+            name = snapshot.get("primary_metric_name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        evaluation_spec = context.get("evaluation_spec")
+        if isinstance(evaluation_spec, dict):
+            validation = evaluation_spec.get("validation_requirements")
+            if isinstance(validation, dict):
+                primary = validation.get("primary_metric")
+                if isinstance(primary, str) and primary.strip():
+                    return primary.strip()
+            primary = evaluation_spec.get("primary_metric")
+            if isinstance(primary, str) and primary.strip():
+                return primary.strip()
+            qa_gates = evaluation_spec.get("qa_gates")
+            if isinstance(qa_gates, list):
+                for gate in qa_gates:
+                    if not isinstance(gate, dict):
+                        continue
+                    params = gate.get("params")
+                    if isinstance(params, dict):
+                        metric = params.get("metric")
+                        if isinstance(metric, str) and metric.strip():
+                            return metric.strip()
+        if isinstance(metrics_summary, list) and metrics_summary:
+            first = metrics_summary[0]
+            if isinstance(first, dict):
+                metric = first.get("metric")
+                if isinstance(metric, str) and metric.strip():
+                    return metric.strip()
+        model_perf = metrics_payload.get("model_performance") if isinstance(metrics_payload.get("model_performance"), dict) else {}
+        priority_tokens = self._objective_metric_priority(objective_type)
+        for token in priority_tokens:
+            for key in model_perf.keys():
+                if token in str(key).lower():
+                    return str(key)
+        return None
+
     def _extract_row_count(self, metrics: Dict[str, Any], predictions_summary: Dict[str, Any]) -> Optional[int]:
         row_count = None
         if isinstance(predictions_summary, dict):
@@ -533,6 +590,15 @@ class ResultsAdvisorAgent:
                     "action": "STOP",
                     "reason": "Data adequacy indicates signal ceiling reached.",
                     "next_changes": [],
+                }
+            status = data_adequacy.get("status")
+            if review_verdict in {"APPROVED", "APPROVE_WITH_WARNINGS"} and status not in {"data_limited", "insufficient_signal", "unknown"}:
+                next_changes = self._suggest_next_changes(review_feedback) if review_feedback else []
+                return {
+                    "action": "STOP",
+                    "reason": "Review approved; iterate only if explicit improvements are requested.",
+                    "next_changes": next_changes,
+                    "review_verdict": review_verdict,
                 }
         if isinstance(metric_history, list) and self._detect_plateau(metric_history, window, epsilon):
             return {

@@ -502,6 +502,15 @@ class MLEngineerAgent:
         training_rows_policy = plan.get("training_rows_policy")
         split_column = plan.get("split_column")
         train_filter = plan.get("train_filter") if isinstance(plan.get("train_filter"), dict) else None
+
+        canonical_cols = contract.get("canonical_columns")
+        if not isinstance(canonical_cols, list):
+            canonical_cols = view.get("canonical_columns")
+        if not isinstance(canonical_cols, list):
+            canonical_cols = []
+
+        dataset_semantics = contract.get("dataset_semantics") if isinstance(contract.get("dataset_semantics"), dict) else {}
+        partition_notes = dataset_semantics.get("data_partitioning_notes") if isinstance(dataset_semantics.get("data_partitioning_notes"), list) else []
         if not isinstance(split_column, str) or not split_column.strip():
             split_column = None
         if split_column is None:
@@ -515,6 +524,37 @@ class MLEngineerAgent:
                     if isinstance(col, str) and col.strip():
                         split_column = col.strip()
                         break
+        if split_column is None and "__split" in canonical_cols:
+            split_column = "__split"
+
+        if not isinstance(training_rows_policy, str) or not training_rows_policy.strip():
+            notes_text = " ".join(str(note) for note in partition_notes).lower()
+            if split_column and ("split" in notes_text or "train/test" in notes_text or "train test" in notes_text):
+                training_rows_policy = "use_split_column"
+            elif isinstance(training_rows_rule, str):
+                rule_lower = training_rows_rule.lower()
+                if any(token in rule_lower for token in ("not missing", "not null", "notna", "non-null")):
+                    training_rows_policy = "only_rows_with_label"
+            if not training_rows_policy:
+                training_rows_policy = "use_all_rows"
+
+        if not isinstance(train_filter, dict):
+            train_filter = None
+        if train_filter is None:
+            if training_rows_policy == "use_split_column" and split_column:
+                train_filter = {
+                    "type": "split_equals",
+                    "column": split_column,
+                    "value": "train",
+                    "rule": None,
+                }
+            elif training_rows_policy == "only_rows_with_label" and target_column:
+                train_filter = {
+                    "type": "label_not_null",
+                    "column": target_column,
+                    "value": None,
+                    "rule": None,
+                }
 
         return {
             "target_column": target_column,
@@ -1076,15 +1116,15 @@ $strategy_json
 *** UNIVERSAL CONSTRAINTS (apply always) ***
 1. If outcome_analysis shows any outcome column with null_frac > 0, you CANNOT use "use_all_rows" for training_rows_policy.
    Reason: You cannot compute loss/metric on rows without labels.
-2. If strategy.analysis_type == "classification", metric_policy.primary_metric MUST be a classification metric (roc_auc, accuracy, f1, precision, recall, log_loss).
-3. If strategy.analysis_type == "regression", metric_policy.primary_metric MUST be a regression metric (rmse, mae, r2, mse, mape).
-4. If leakage_flags exist in data_profile, leakage_policy.action should be "exclude_flagged_columns" unless contract explicitly allows them.
-5. METRIC SOURCE PRIORITY: Use contract.validation_requirements.primary_metric if set. Otherwise use evaluation_spec.primary_metric. Otherwise infer from analysis_type.
+2. METRIC SOURCE PRIORITY: Use contract.validation_requirements.primary_metric if set. Otherwise use evaluation_spec.primary_metric.
+   If qa_gates specify a metric, use that exact metric name. Do NOT invent or normalize metric names.
+3. If leakage_flags exist in data_profile, leakage_policy.action should be "exclude_flagged_columns" unless contract explicitly allows them.
+4. If no primary metric is specified anywhere, infer a minimal metric from analysis_type and state this explicitly in notes.
 
 *** INSTRUCTIONS ***
 1. Analyze 'outcome_analysis' to check for partial labels. If null_frac > 0 for any outcome, set training_rows_policy to "only_rows_with_label".
 2. Check 'split_candidates'. If a split column exists AND has values like 'train'/'test', consider "use_split_column". If you choose NOT to use it, explain why in evidence_used.split_evaluation.
-3. Check contract for primary_metric (validation_requirements.primary_metric or evaluation_spec.primary_metric). Use that exact metric.
+3. Check contract for primary_metric (validation_requirements.primary_metric or evaluation_spec primary metric / qa_gates metric). Use that exact metric name.
 4. DO NOT invent rules. Base every decision on 'evidence' found in the data_profile.
 5. CRITICAL: Populate 'evidence_used' with STRUCTURED facts you used for decisions. This enables QA to verify coherence.
 6. If you choose "only_rows_with_label", set train_filter.type="label_not_null" and train_filter.column=target.
@@ -1181,6 +1221,7 @@ $strategy_json
                 self.last_response = response
             parsed = self._parse_json_response(response)
             ml_plan = self._normalize_ml_plan(parsed, source="llm")
+            ml_plan = self._apply_contract_metric_override(ml_plan, contract)
 
             # Check if we got meaningful data
             if ml_plan.get("training_rows_policy") != "unspecified":
@@ -1194,6 +1235,7 @@ $strategy_json
                 self.last_response = response
             parsed = self._parse_json_response(response)
             ml_plan = self._normalize_ml_plan(parsed, source="llm_retry")
+            ml_plan = self._apply_contract_metric_override(ml_plan, contract)
             ml_plan = self._derive_train_filter(ml_plan, profile, contract)
 
             return ml_plan
@@ -1204,6 +1246,63 @@ $strategy_json
             result = self._derive_train_filter(result, profile, contract)
             result["notes"] = [f"LLM call failed: {e}"]
             return result
+
+    def _apply_contract_metric_override(
+        self,
+        ml_plan: Dict[str, Any],
+        contract: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not isinstance(ml_plan, dict):
+            return ml_plan
+        contract_metric = self._resolve_contract_primary_metric(contract)
+        if not contract_metric:
+            return ml_plan
+        metric_policy = ml_plan.get("metric_policy")
+        if not isinstance(metric_policy, dict):
+            metric_policy = {}
+            ml_plan["metric_policy"] = metric_policy
+        current = str(metric_policy.get("primary_metric") or "").strip()
+        if not current or current.lower() == "unspecified" or current != contract_metric:
+            metric_policy["primary_metric"] = contract_metric
+            notes = ml_plan.get("notes")
+            if not isinstance(notes, list):
+                notes = []
+            notes.append(f"Primary metric aligned to contract: {contract_metric}")
+            ml_plan["notes"] = notes
+        evidence = ml_plan.get("evidence_used")
+        if isinstance(evidence, dict):
+            evidence["contract_primary_metric"] = contract_metric
+        return ml_plan
+
+    def _resolve_contract_primary_metric(self, contract: Dict[str, Any] | None) -> str | None:
+        if not isinstance(contract, dict):
+            return None
+        validation = contract.get("validation_requirements")
+        if isinstance(validation, dict):
+            primary = validation.get("primary_metric")
+            if isinstance(primary, str) and primary.strip():
+                return primary.strip()
+        evaluation_spec = contract.get("evaluation_spec")
+        if isinstance(evaluation_spec, dict):
+            validation = evaluation_spec.get("validation_requirements")
+            if isinstance(validation, dict):
+                primary = validation.get("primary_metric")
+                if isinstance(primary, str) and primary.strip():
+                    return primary.strip()
+            primary = evaluation_spec.get("primary_metric")
+            if isinstance(primary, str) and primary.strip():
+                return primary.strip()
+            qa_gates = evaluation_spec.get("qa_gates")
+            if isinstance(qa_gates, list):
+                for gate in qa_gates:
+                    if not isinstance(gate, dict):
+                        continue
+                    params = gate.get("params")
+                    if isinstance(params, dict):
+                        metric = params.get("metric")
+                        if isinstance(metric, str) and metric.strip():
+                            return metric.strip()
+        return None
 
     def _parse_json_response(self, text: str) -> Any:
         try:
@@ -1944,6 +2043,8 @@ $strategy_json
         - Use signal_summary to choose model complexity (avoid overfitting).
         - Probability columns (e.g., Probability/prob/score) are audit-only; NEVER use for segmentation or modeling.
           For audit stats, use dropna on the joined sample; do not impute with zeros.
+        - REQUIRED: include a high-cardinality guard with an explicit nunique check, e.g.
+          if df[col].nunique() > threshold: apply top-K grouping or hashing. This must be in code.
 
         Step 2.5) Segmentation sanity (required if segmentation is used):
         - Compute and log: n_rows, n_segments, min/median segment_size.
@@ -1988,6 +2089,7 @@ $strategy_json
         - required artifacts,
         - derived targets/columns behavior.
         - Print a "MAPPING SUMMARY" block with canonical columns, selected features, and any derived outputs used.
+          MUST include the literal text "MAPPING SUMMARY" in stdout.
         - Only enforce segmentation/weights/pricing logic IF deliverables require those outputs or decision_columns exist.
         (Example: if a required deliverable includes "data/weights.json" or decision_columns are present -> run the corresponding logic; else skip.)
         - If price sensitivity curves or optimal pricing guide are required, they must NOT be empty.

@@ -12075,6 +12075,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "review_verdict": normalized_review_status,
             "metrics": metrics_report,
             "metric_history": metric_history,
+            "primary_metric_snapshot": primary_metric_snapshot,
+            "evaluation_spec": evaluation_spec if isinstance(evaluation_spec, dict) else None,
             "data_adequacy_report": data_adequacy_report,
             "iteration_policy": (contract or {}).get("iteration_policy", {}) if isinstance(contract, dict) else {},
             "strategy_spec": strategy_spec,
