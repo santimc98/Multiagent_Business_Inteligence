@@ -493,8 +493,19 @@ class MLEngineerAgent:
 
         training_rows_policy = plan.get("training_rows_policy")
         split_column = plan.get("split_column")
-        if not isinstance(split_column, str):
+        if not isinstance(split_column, str) or not split_column.strip():
             split_column = None
+        if split_column is None:
+            evidence = plan.get("evidence_used") if isinstance(plan.get("evidence_used"), dict) else {}
+            split_candidates = evidence.get("split_candidates")
+            if isinstance(split_candidates, list):
+                for cand in split_candidates:
+                    if not isinstance(cand, dict):
+                        continue
+                    col = cand.get("column")
+                    if isinstance(col, str) and col.strip():
+                        split_column = col.strip()
+                        break
 
         return {
             "target_column": target_column,
