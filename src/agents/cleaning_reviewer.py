@@ -493,7 +493,19 @@ def _merge_cleaning_gates(view: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], s
     universal_gates = _normalize_cleaning_gates(_FALLBACK_CLEANING_GATES)
     warnings: List[str] = []
     if contract_gates:
-        merged = _dedupe_gates(contract_gates)
+        contract_names = {
+            _normalize_gate_name(gate.get("name"))
+            for gate in contract_gates
+            if isinstance(gate, dict)
+        }
+        merged = _dedupe_gates(
+            contract_gates
+            + [
+                gate
+                for gate in universal_gates
+                if _normalize_gate_name(gate.get("name")) not in contract_names
+            ]
+        )
         source = "cleaning_view"
     else:
         merged = universal_gates

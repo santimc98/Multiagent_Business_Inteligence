@@ -605,9 +605,19 @@ def _build_default_cleaning_gates() -> List[Dict[str, Any]]:
 
 def _apply_cleaning_gate_policy(raw_gates: Any) -> List[Dict[str, Any]]:
     gates = _normalize_cleaning_gates(raw_gates)
+    default_gates = _build_default_cleaning_gates()
     if not gates:
-        gates = _build_default_cleaning_gates()
-    return gates
+        return default_gates
+    existing = {_normalize_gate_name(gate.get("name")) for gate in gates if isinstance(gate, dict)}
+    merged = list(gates)
+    for gate in default_gates:
+        if not isinstance(gate, dict):
+            continue
+        name = _normalize_gate_name(gate.get("name"))
+        if name and name not in existing:
+            merged.append(gate)
+            existing.add(name)
+    return merged
 
 
 _DEFAULT_MISSING_CATEGORY_VALUE = "__MISSING__"
