@@ -10770,6 +10770,10 @@ def execute_code(state: AgentState) -> AgentState:
         use_heavy, heavy_reason = _should_use_heavy_runner(state, data_profile, ml_plan)
         if use_heavy:
             contract = state.get("execution_contract", {}) or {}
+            dialect = _resolve_artifact_gate_dialect(state, contract)
+            csv_sep = dialect["sep"]
+            csv_decimal = dialect["decimal"]
+            csv_encoding = dialect["encoding"]
             eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
             required_outputs = _resolve_required_outputs(contract, state)
             expected_outputs = _resolve_expected_output_paths(contract, state)
