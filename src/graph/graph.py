@@ -65,6 +65,8 @@ from src.utils.cleaning_guards import (
 )
 from src.utils.integrity_audit import run_integrity_audit
 from src.utils.output_contract import check_required_outputs, get_csv_dialect
+from src.utils.cloudrun_launcher import launch_heavy_runner_job, CloudRunLaunchError
+from src.utils.column_sets import expand_column_sets
 from src.utils.sandbox_deps import (
     BASE_ALLOWLIST,
     EXTENDED_ALLOWLIST,
@@ -6882,6 +6884,262 @@ def _extract_decisioning_required_names(contract_like: Dict[str, Any]) -> List[s
     return list(dict.fromkeys(names))
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_heavy_runner_config() -> Dict[str, Any] | None:
+    if not _env_flag("HEAVY_RUNNER_ENABLED", False):
+        return None
+    job = os.getenv("HEAVY_RUNNER_JOB")
+    region = os.getenv("HEAVY_RUNNER_REGION")
+    bucket = os.getenv("HEAVY_RUNNER_BUCKET")
+    if not job or not region or not bucket:
+        return None
+    return {
+        "job": job,
+        "region": region,
+        "bucket": bucket,
+        "project": os.getenv("HEAVY_RUNNER_PROJECT"),
+        "input_prefix": os.getenv("HEAVY_RUNNER_INPUT_PREFIX", "inputs"),
+        "output_prefix": os.getenv("HEAVY_RUNNER_OUTPUT_PREFIX", "outputs"),
+        "dataset_prefix": os.getenv("HEAVY_RUNNER_DATASET_PREFIX", "datasets"),
+    }
+
+
+def _infer_problem_type_for_heavy(
+    contract: Dict[str, Any],
+    evaluation_spec: Dict[str, Any],
+    data_profile: Dict[str, Any],
+    target_col: str,
+) -> str:
+    metrics: List[str] = []
+    validation = contract.get("validation_requirements") if isinstance(contract, dict) else {}
+    if isinstance(validation, dict):
+        primary = validation.get("primary_metric")
+        if primary:
+            metrics.append(str(primary))
+        metrics.extend([str(m) for m in (validation.get("metrics_to_report") or []) if m])
+    if isinstance(evaluation_spec, dict):
+        metrics.extend([str(m) for m in (evaluation_spec.get("metrics_to_report") or []) if m])
+        if evaluation_spec.get("primary_metric"):
+            metrics.append(str(evaluation_spec.get("primary_metric")))
+    metrics_norm = {str(m).lower() for m in metrics}
+    cls_metrics = {
+        "accuracy",
+        "roc_auc",
+        "auc",
+        "f1",
+        "precision",
+        "recall",
+        "balanced_accuracy",
+        "log_loss",
+    }
+    reg_metrics = {"rmse", "mse", "mae", "r2", "rmsle", "mape"}
+    if metrics_norm & cls_metrics:
+        return "classification"
+    if metrics_norm & reg_metrics:
+        return "regression"
+    target_stats = (data_profile or {}).get("numeric_summary", {}).get(target_col) if target_col else None
+    if isinstance(target_stats, dict):
+        n_unique = target_stats.get("n_unique") or target_stats.get("unique")
+        try:
+            n_unique_val = int(n_unique)
+            if n_unique_val <= 20:
+                return "classification"
+        except Exception:
+            pass
+    return "regression"
+
+
+def _resolve_heavy_feature_columns(
+    column_inventory: List[str],
+    column_sets: Dict[str, Any],
+    roles: Dict[str, List[str]],
+    target_col: str,
+) -> List[str]:
+    features: List[str] = []
+    if column_sets and column_inventory:
+        expanded = expand_column_sets(column_inventory, column_sets)
+        if isinstance(expanded, dict):
+            features = [str(c) for c in (expanded.get("expanded_feature_columns") or []) if c]
+    if not features and roles:
+        features = [str(c) for c in (roles.get("pre_decision") or []) if c]
+    if not features:
+        features = [str(c) for c in column_inventory if c]
+    filtered = [c for c in features if c and c != target_col and c != "__split"]
+    return list(dict.fromkeys(filtered))
+
+
+def _should_use_heavy_runner(
+    state: Dict[str, Any],
+    data_profile: Dict[str, Any],
+    ml_plan: Dict[str, Any],
+) -> tuple[bool, str]:
+    if _env_flag("HEAVY_RUNNER_FORCE", False):
+        return True, "forced"
+    hints = state.get("dataset_scale_hints") or {}
+    file_mb = float(hints.get("file_mb") or 0.0)
+    est_rows = int(hints.get("est_rows") or 0)
+    n_cols = int(hints.get("cols") or hints.get("n_cols") or 0)
+    if not n_cols:
+        column_inventory = state.get("column_inventory") or []
+        if isinstance(column_inventory, list):
+            n_cols = len(column_inventory)
+    numeric_summary = (data_profile or {}).get("numeric_summary")
+    numeric_ratio = None
+    if isinstance(numeric_summary, dict) and n_cols:
+        numeric_ratio = len(numeric_summary) / max(n_cols, 1)
+    cv_policy = (ml_plan or {}).get("cv_policy") if isinstance(ml_plan, dict) else {}
+    folds = cv_policy.get("n_splits") if isinstance(cv_policy, dict) else None
+    try:
+        folds_val = int(folds) if folds is not None else 0
+    except Exception:
+        folds_val = 0
+    heavy = (
+        file_mb >= 50
+        or est_rows >= 50_000
+        or n_cols >= 500
+    )
+    if numeric_ratio is not None and numeric_ratio < 0.7:
+        return False, "non_numeric_ratio"
+    if heavy and folds_val >= 4:
+        return True, "size_and_cv"
+    if heavy:
+        return True, "size_only"
+    return False, "below_threshold"
+
+
+def _finalize_heavy_execution(
+    state: Dict[str, Any],
+    output: str,
+    exec_start_ts: float,
+    contract: Dict[str, Any],
+    eval_spec: Dict[str, Any],
+    csv_sep: str,
+    csv_decimal: str,
+    csv_encoding: str,
+    counters: Dict[str, int],
+    run_id: Optional[str],
+    attempt_id: int,
+    visuals_missing: bool,
+) -> Dict[str, Any]:
+    required_outputs = _resolve_required_outputs(contract, state)
+    deliverables = _resolve_contract_deliverables(contract)
+    output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
+
+    artifact_issues = _artifact_alignment_gate(
+        cleaned_path="data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv",
+        scored_path="data/scored_rows.csv",
+        contract=contract,
+        evaluation_spec=eval_spec,
+        csv_sep=csv_sep,
+        csv_decimal=csv_decimal,
+        csv_encoding=csv_encoding,
+    )
+    if artifact_issues:
+        issue_text = "; ".join(artifact_issues)
+        output = f"{output}\nEXECUTION ERROR: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
+
+    stale_outputs = _find_stale_outputs(required_outputs, exec_start_ts)
+    if stale_outputs:
+        output = f"{output}\nEXECUTION ERROR: STALE_OUTPUTS: {stale_outputs}"
+
+    content_issues, content_diagnostics = _validate_artifact_content(state)
+    if content_issues:
+        issue_text = ", ".join(content_issues)
+        output = f"{output}\nEXECUTION ERROR: ARTIFACT_CONTENT_INVALID: {issue_text}"
+
+    error_in_output = (
+        "Traceback (most recent call last)" in output
+        or "EXECUTION ERROR" in output
+    )
+    sandbox_failed = False
+
+    outputs_valid = not bool(artifact_issues or stale_outputs or content_issues or error_in_output)
+    if run_id:
+        update_sandbox_attempt(
+            run_id,
+            "ml_engineer",
+            attempt_id,
+            artifacts_valid=outputs_valid,
+            artifact_issues=artifact_issues,
+            stale_outputs=stale_outputs,
+            content_issues=content_issues,
+        )
+
+    oc_report = check_required_outputs(output_contract)
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/output_contract_report.json", oc_report)
+    except Exception as oc_err:
+        print(f"Warning: failed to persist output_contract_report.json: {oc_err}")
+
+    artifact_paths: List[str] = []
+    if isinstance(oc_report, dict):
+        artifact_paths.extend(oc_report.get("present", []))
+    for extra_path in [
+        "data/strategy_spec.json",
+        "data/plan.json",
+        "data/evaluation_spec.json",
+        "data/plot_insights.json",
+    ]:
+        if os.path.exists(extra_path):
+            artifact_paths.append(extra_path)
+
+    deduped = []
+    seen = set()
+    for item in artifact_paths:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    artifact_paths = deduped
+
+    artifact_index = _build_artifact_index(artifact_paths, deliverables if isinstance(deliverables, list) else None)
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/produced_artifact_index.json", artifact_index)
+    except Exception as idx_err:
+        print(f"Warning: failed to persist produced_artifact_index.json: {idx_err}")
+
+    attempt_score = _score_attempt(outputs_valid, oc_report, content_issues, artifact_paths)
+    attempt_valid = bool(outputs_valid and not oc_report.get("missing") and not content_issues)
+
+    result = {
+        "execution_output": output,
+        "plots_local": [],
+        "fallback_plots": [],
+        "has_partial_visuals": visuals_missing,
+        "execution_error": error_in_output,
+        "execution_attempt": state.get("execution_attempt", 0) + 1,
+        "last_runtime_error_tail": output[-4000:] if error_in_output else None,
+        "ml_skipped_reason": state.get("ml_skipped_reason"),
+        "output_contract_report": oc_report,
+        "artifact_index": artifact_index,
+        "produced_artifact_index": artifact_index,
+        "artifact_paths": artifact_paths,
+        "artifact_content_issues": content_issues,
+        "artifact_content_diagnostics": content_diagnostics,
+        "visuals_missing": visuals_missing,
+        "last_attempt_score": attempt_score,
+        "last_attempt_valid": attempt_valid,
+        "sandbox_failed": sandbox_failed,
+        "sandbox_retry_count": 0,
+        "ml_call_refund_pending": False,
+        "execution_call_refund_pending": False,
+        "budget_counters": counters,
+    }
+    if not error_in_output:
+        result["runtime_fix_count"] = 0
+        result["last_successful_execution_output"] = output
+        result["last_successful_plots"] = []
+        result["last_successful_output_contract_report"] = oc_report
+    return result
+
+
 def _filter_scored_rows_required_columns(
     artifact_requirements: Dict[str, Any],
     decisioning_names: List[str],
@@ -10502,6 +10760,164 @@ def execute_code(state: AgentState) -> AgentState:
     code = state['generated_code']
     attempt_id = int(state.get("execution_attempt", 0)) + 1
     visuals_missing = False
+
+    # Optional heavy runner path (Cloud Run Job) for large workloads
+    heavy_cfg = _get_heavy_runner_config()
+    if heavy_cfg:
+        ml_plan = state.get("ml_plan") or {}
+        data_profile = state.get("data_profile") or {}
+        use_heavy, heavy_reason = _should_use_heavy_runner(state, data_profile, ml_plan)
+        if use_heavy:
+            contract = state.get("execution_contract", {}) or {}
+            eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
+            required_outputs = _resolve_required_outputs(contract, state)
+            expected_outputs = _resolve_expected_output_paths(contract, state)
+            _purge_execution_outputs(required_outputs, expected_outputs)
+            column_inventory = state.get("column_inventory")
+            if not isinstance(column_inventory, list) or not column_inventory:
+                inv = _load_json_safe("data/column_inventory.json")
+                if isinstance(inv, dict):
+                    column_inventory = inv.get("columns") or inv.get("column_inventory")
+            if not isinstance(column_inventory, list):
+                column_inventory = []
+            column_sets = state.get("column_sets")
+            if not isinstance(column_sets, dict) or not column_sets:
+                column_sets = _load_json_safe("data/column_sets.json") or {}
+            roles = get_column_roles(contract_min or contract) if isinstance(contract, dict) else {}
+            target_cols = get_outcome_columns(contract_min or contract) or roles.get("outcome") or []
+            if not target_cols:
+                target_cols = list(state.get("target_columns") or [])
+            target_col = target_cols[0] if target_cols else None
+            if not target_col:
+                return {"error_message": "HEAVY_RUNNER: target column missing", "execution_output": "HEAVY_RUNNER_ERROR: target column missing", "budget_counters": counters}
+
+            feature_cols = _resolve_heavy_feature_columns(column_inventory, column_sets, roles, target_col)
+            problem_type = _infer_problem_type_for_heavy(contract, eval_spec or {}, data_profile or {}, target_col)
+            dataset_scale = state.get("dataset_scale_hints") or {}
+            float32_default = (dataset_scale.get("scale") in {"medium", "large"})
+            safe_mode_default = (dataset_scale.get("scale") in {"medium", "large"})
+            float32 = _env_flag("HEAVY_RUNNER_FLOAT32", default=float32_default)
+            safe_mode = _env_flag("HEAVY_RUNNER_SAFE_MODE", default=safe_mode_default)
+
+            model_type_env = os.getenv("HEAVY_RUNNER_MODEL_TYPE")
+            model_type = model_type_env or ("random_forest_classifier" if problem_type == "classification" else "random_forest_regressor")
+            model_params = {}
+            params_env = os.getenv("HEAVY_RUNNER_MODEL_PARAMS")
+            if params_env:
+                try:
+                    model_params = json.loads(params_env)
+                except Exception:
+                    model_params = {}
+
+            cv_policy = ml_plan.get("cv_policy") if isinstance(ml_plan, dict) else {}
+            cv_folds = None
+            if isinstance(cv_policy, dict):
+                cv_folds = cv_policy.get("n_splits")
+            if cv_folds is None:
+                validation = contract.get("validation_requirements") if isinstance(contract, dict) else {}
+                if isinstance(validation, dict):
+                    params = validation.get("params") or {}
+                    if isinstance(params, dict):
+                        cv_folds = params.get("k")
+            cv_cfg = {}
+            if cv_folds:
+                cv_cfg = {
+                    "folds": cv_folds,
+                    "shuffle": True,
+                    "random_state": 42,
+                }
+
+            decisioning_names = _extract_decisioning_required_names(contract_min or contract)
+
+            request = {
+                "run_id": run_id,
+                "dataset_uri": None,
+                "output_uri": None,
+                "read": {"sep": csv_sep, "decimal": csv_decimal, "encoding": csv_encoding},
+                "target_col": target_col,
+                "feature_cols": feature_cols or None,
+                "problem_type": problem_type,
+                "float32": float32,
+                "safe_mode": safe_mode,
+                "model": {"type": model_type, "params": model_params},
+                "cv": cv_cfg,
+                "decisioning_required_names": decisioning_names,
+            }
+
+            local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
+            if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
+                local_csv = "data/cleaned_data.csv"
+            if not os.path.exists(local_csv):
+                return {"error_message": "HEAVY_RUNNER: cleaned_data.csv missing", "execution_output": "HEAVY_RUNNER_ERROR: cleaned_data.csv missing", "budget_counters": counters}
+
+            download_map = {
+                "metrics.json": "data/metrics.json",
+                "scored_rows.csv": "data/scored_rows.csv",
+                "alignment_check.json": "data/alignment_check.json",
+                "model.joblib": os.path.join("artifacts", "heavy_model.joblib"),
+                "error.json": os.path.join("artifacts", "heavy_error.json"),
+            }
+            if run_id:
+                log_run_event(run_id, "heavy_runner_start", {"reason": heavy_reason})
+            try:
+                heavy_result = launch_heavy_runner_job(
+                    run_id=run_id or "unknown",
+                    request=request,
+                    dataset_path=local_csv,
+                    bucket=heavy_cfg["bucket"],
+                    job=heavy_cfg["job"],
+                    region=heavy_cfg["region"],
+                    project=heavy_cfg.get("project"),
+                    input_prefix=heavy_cfg.get("input_prefix", "inputs"),
+                    output_prefix=heavy_cfg.get("output_prefix", "outputs"),
+                    dataset_prefix=heavy_cfg.get("dataset_prefix", "datasets"),
+                    download_map=download_map,
+                )
+            except CloudRunLaunchError as exc:
+                output = f"HEAVY_RUNNER_ERROR: {exc}"
+                return _finalize_heavy_execution(
+                    state=state,
+                    output=output,
+                    exec_start_ts=exec_start_ts,
+                    contract=contract,
+                    eval_spec=eval_spec or {},
+                    csv_sep=csv_sep,
+                    csv_decimal=csv_decimal,
+                    csv_encoding=csv_encoding,
+                    counters=counters,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    visuals_missing=False,
+                )
+
+            if run_id:
+                log_run_event(run_id, "heavy_runner_complete", {"status": heavy_result.get("status")})
+
+            output = f"HEAVY_RUNNER: status={heavy_result.get('status')} reason={heavy_reason}"
+            if heavy_result.get("error"):
+                output += f"\nHEAVY_RUNNER_ERROR: {heavy_result.get('error')}"
+
+            visual_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
+            visual_cfg = visual_reqs.get("visual_requirements") if isinstance(visual_reqs.get("visual_requirements"), dict) else {}
+            visual_items = visual_cfg.get("items") if isinstance(visual_cfg.get("items"), list) else []
+            visual_required = bool(visual_cfg.get("required")) and bool(visual_items)
+            visuals_missing = bool(visual_required)
+            state["ml_skipped_reason"] = "HEAVY_RUNNER"
+
+            return _finalize_heavy_execution(
+                state=state,
+                output=output,
+                exec_start_ts=exec_start_ts,
+                contract=contract,
+                eval_spec=eval_spec or {},
+                csv_sep=csv_sep,
+                csv_decimal=csv_decimal,
+                csv_encoding=csv_encoding,
+                counters=counters,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                visuals_missing=visuals_missing,
+            )
 
     # Prevent stale metrics from previous iterations
     try:
