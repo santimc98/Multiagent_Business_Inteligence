@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 
 # Tokens that indicate a column might be a split/fold indicator
 SPLIT_CANDIDATE_TOKENS = {"split", "set", "fold", "train", "test", "partition", "is_train", "is_test"}
+TARGET_TOKEN_HINTS = {"label", "target", "outcome", "response", "class", "y"}
+ID_TOKEN_HINTS = {"id", "uuid", "guid", "key", "account", "customer", "user", "session", "device", "row", "index", "record"}
 
 
 def convert_dataset_profile_to_data_profile(
@@ -311,6 +313,11 @@ def compact_data_profile_for_llm(
     # 7.6 Sampling metadata (helps interpret profile fidelity)
     compact["sampling"] = profile.get("sampling", {})
 
+    # 7.7 Target candidates (contextual evidence, not rules)
+    target_candidates = _build_target_candidates(profile)
+    if target_candidates:
+        compact["target_candidates"] = target_candidates
+
     # 8. Column DTypes - Simplify
     dtypes = profile.get("dtypes", {})
     if len(dtypes) > max_cols:
@@ -325,3 +332,92 @@ def compact_data_profile_for_llm(
         compact["dtypes"] = dtypes
 
     return compact
+
+
+def _build_target_candidates(profile: Dict[str, Any], max_candidates: int = 8) -> List[Dict[str, Any]]:
+    basic_stats = profile.get("basic_stats", {}) if isinstance(profile.get("basic_stats"), dict) else {}
+    columns = basic_stats.get("columns") or []
+    if not isinstance(columns, list) or not columns:
+        return []
+
+    n_rows = int(basic_stats.get("n_rows") or 0)
+    missingness = profile.get("missingness", {}) if isinstance(profile.get("missingness"), dict) else {}
+    cardinality = profile.get("cardinality", {}) if isinstance(profile.get("cardinality"), dict) else {}
+    dtypes = profile.get("dtypes", {}) if isinstance(profile.get("dtypes"), dict) else {}
+    high_card = set()
+    high_card_cols = profile.get("high_cardinality_columns")
+    if isinstance(high_card_cols, list):
+        for item in high_card_cols:
+            if isinstance(item, dict) and item.get("column"):
+                high_card.add(str(item.get("column")))
+
+    candidates: List[Dict[str, Any]] = []
+
+    for col in columns:
+        name = str(col)
+        name_lower = name.lower()
+        tokens = {tok for tok in name_lower.replace("-", "_").split("_") if tok}
+        score = 0.0
+        evidence: List[str] = []
+
+        if name_lower in TARGET_TOKEN_HINTS:
+            score += 3.0
+            evidence.append("name_exact_target_token")
+        if tokens & TARGET_TOKEN_HINTS:
+            score += 1.5
+            evidence.append("name_contains_target_token")
+        if "label" in name_lower or "target" in name_lower:
+            score += 1.0
+            evidence.append("name_contains_label_target")
+
+        id_like = False
+        if tokens & ID_TOKEN_HINTS or name_lower in ID_TOKEN_HINTS:
+            id_like = True
+            score -= 2.0
+            evidence.append("name_id_like")
+
+        card_info = cardinality.get(name, {}) if isinstance(cardinality, dict) else {}
+        n_unique = card_info.get("unique")
+        if isinstance(n_unique, int):
+            if n_unique <= 20:
+                score += 1.0
+                evidence.append("low_cardinality")
+            elif n_rows and n_unique < max(20, int(0.5 * n_rows)):
+                score += 0.5
+                evidence.append("medium_cardinality")
+            elif n_rows and n_unique >= int(0.9 * n_rows):
+                score -= 1.0
+                evidence.append("near_unique")
+
+        null_frac = missingness.get(name)
+        if isinstance(null_frac, (int, float)):
+            if 0 < null_frac < 0.9:
+                score += 0.5
+                evidence.append("partial_missingness")
+
+        if name in high_card:
+            score -= 0.5
+            evidence.append("high_cardinality")
+
+        if score <= 0 and not evidence:
+            continue
+
+        unique_ratio = None
+        if isinstance(n_unique, int) and n_rows:
+            unique_ratio = round(n_unique / n_rows, 4)
+
+        candidates.append(
+            {
+                "column": name,
+                "score": round(score, 2),
+                "null_frac": round(float(null_frac), 4) if isinstance(null_frac, (int, float)) else None,
+                "n_unique": n_unique if isinstance(n_unique, int) else None,
+                "unique_ratio": unique_ratio,
+                "dtype_hint": dtypes.get(name),
+                "evidence": evidence,
+                "id_like_name": id_like,
+            }
+        )
+
+    candidates.sort(key=lambda x: (x.get("score") or 0), reverse=True)
+    return candidates[:max_candidates]
