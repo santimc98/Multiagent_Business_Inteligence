@@ -6979,6 +6979,8 @@ def _should_use_heavy_runner(
     data_profile: Dict[str, Any],
     ml_plan: Dict[str, Any],
 ) -> tuple[bool, str]:
+    if state.get("heavy_runner_unavailable"):
+        return False, "unavailable"
     if _env_flag("HEAVY_RUNNER_FORCE", False):
         return True, "forced"
     hints = state.get("dataset_scale_hints") or {}
@@ -10768,6 +10770,24 @@ def execute_code(state: AgentState) -> AgentState:
         ml_plan = state.get("ml_plan") or {}
         data_profile = state.get("data_profile") or {}
         use_heavy, heavy_reason = _should_use_heavy_runner(state, data_profile, ml_plan)
+        if run_id:
+            hints = state.get("dataset_scale_hints") or {}
+            cv_policy = ml_plan.get("cv_policy") if isinstance(ml_plan, dict) else {}
+            log_run_event(
+                run_id,
+                "execution_backend_selection",
+                {
+                    "backend": "heavy_runner" if use_heavy else "e2b",
+                    "reason": heavy_reason,
+                    "dataset_scale": {
+                        "scale": hints.get("scale"),
+                        "file_mb": hints.get("file_mb"),
+                        "est_rows": hints.get("est_rows"),
+                        "cols": hints.get("cols") or hints.get("n_cols"),
+                    },
+                    "cv_folds": cv_policy.get("n_splits") if isinstance(cv_policy, dict) else None,
+                },
+            )
         if use_heavy:
             contract = state.get("execution_contract", {}) or {}
             dialect = _resolve_artifact_gate_dialect(state, contract)
@@ -10863,6 +10883,24 @@ def execute_code(state: AgentState) -> AgentState:
                 "error.json": os.path.join("artifacts", "heavy_error.json"),
             }
             if run_id:
+                log_run_event(
+                    run_id,
+                    "heavy_runner_request",
+                    {
+                        "gcloud_bin": os.getenv("HEAVY_RUNNER_GCLOUD_BIN") or "PATH",
+                        "gsutil_bin": os.getenv("HEAVY_RUNNER_GSUTIL_BIN") or "PATH",
+                        "target_col": target_col,
+                        "feature_count": len(feature_cols or []),
+                        "problem_type": problem_type,
+                        "cv_folds": cv_folds,
+                        "float32": float32,
+                        "safe_mode": safe_mode,
+                        "model_type": model_type,
+                        "model_params_keys": list(model_params.keys()) if isinstance(model_params, dict) else [],
+                        "download_keys": list(download_map.keys()),
+                    },
+                )
+            if run_id:
                 log_run_event(run_id, "heavy_runner_start", {"reason": heavy_reason})
             try:
                 heavy_result = launch_heavy_runner_job(
@@ -10879,7 +10917,56 @@ def execute_code(state: AgentState) -> AgentState:
                     download_map=download_map,
                 )
             except CloudRunLaunchError as exc:
-                output = f"HEAVY_RUNNER_ERROR: {exc}"
+                if run_id:
+                    log_run_event(run_id, "heavy_runner_failed", {"error": str(exc)})
+                if "Required CLI not found" in str(exc):
+                    if run_id:
+                        log_run_event(run_id, "heavy_runner_unavailable", {"error": str(exc)})
+                    state["heavy_runner_unavailable"] = True
+                    print(f"HEAVY_RUNNER_UNAVAILABLE: {exc} -- falling back to E2B.")
+                else:
+                    output = f"HEAVY_RUNNER_ERROR: {exc}"
+                    return _finalize_heavy_execution(
+                        state=state,
+                        output=output,
+                        exec_start_ts=exec_start_ts,
+                        contract=contract,
+                        eval_spec=eval_spec or {},
+                        csv_sep=csv_sep,
+                        csv_decimal=csv_decimal,
+                        csv_encoding=csv_encoding,
+                        counters=counters,
+                        run_id=run_id,
+                        attempt_id=attempt_id,
+                        visuals_missing=False,
+                    )
+
+            if not state.get("heavy_runner_unavailable"):
+                if run_id:
+                    log_run_event(
+                        run_id,
+                        "heavy_runner_complete",
+                        {
+                            "status": heavy_result.get("status"),
+                            "output_uri": heavy_result.get("output_uri"),
+                            "dataset_uri": heavy_result.get("dataset_uri"),
+                            "downloaded": list((heavy_result.get("downloaded") or {}).keys()),
+                            "error_present": bool(heavy_result.get("error")),
+                            "gcloud_flag": heavy_result.get("gcloud_flag"),
+                        },
+                    )
+
+                output = f"HEAVY_RUNNER: status={heavy_result.get('status')} reason={heavy_reason}"
+                if heavy_result.get("error"):
+                    output += f"\nHEAVY_RUNNER_ERROR: {heavy_result.get('error')}"
+
+                visual_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
+                visual_cfg = visual_reqs.get("visual_requirements") if isinstance(visual_reqs.get("visual_requirements"), dict) else {}
+                visual_items = visual_cfg.get("items") if isinstance(visual_cfg.get("items"), list) else []
+                visual_required = bool(visual_cfg.get("required")) and bool(visual_items)
+                visuals_missing = bool(visual_required)
+                state["ml_skipped_reason"] = "HEAVY_RUNNER"
+
                 return _finalize_heavy_execution(
                     state=state,
                     output=output,
@@ -10892,37 +10979,8 @@ def execute_code(state: AgentState) -> AgentState:
                     counters=counters,
                     run_id=run_id,
                     attempt_id=attempt_id,
-                    visuals_missing=False,
+                    visuals_missing=visuals_missing,
                 )
-
-            if run_id:
-                log_run_event(run_id, "heavy_runner_complete", {"status": heavy_result.get("status")})
-
-            output = f"HEAVY_RUNNER: status={heavy_result.get('status')} reason={heavy_reason}"
-            if heavy_result.get("error"):
-                output += f"\nHEAVY_RUNNER_ERROR: {heavy_result.get('error')}"
-
-            visual_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
-            visual_cfg = visual_reqs.get("visual_requirements") if isinstance(visual_reqs.get("visual_requirements"), dict) else {}
-            visual_items = visual_cfg.get("items") if isinstance(visual_cfg.get("items"), list) else []
-            visual_required = bool(visual_cfg.get("required")) and bool(visual_items)
-            visuals_missing = bool(visual_required)
-            state["ml_skipped_reason"] = "HEAVY_RUNNER"
-
-            return _finalize_heavy_execution(
-                state=state,
-                output=output,
-                exec_start_ts=exec_start_ts,
-                contract=contract,
-                eval_spec=eval_spec or {},
-                csv_sep=csv_sep,
-                csv_decimal=csv_decimal,
-                csv_encoding=csv_encoding,
-                counters=counters,
-                run_id=run_id,
-                attempt_id=attempt_id,
-                visuals_missing=visuals_missing,
-            )
 
     # Prevent stale metrics from previous iterations
     try:
