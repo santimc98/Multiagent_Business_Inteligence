@@ -89,6 +89,92 @@ def ensure_data_profile_artifact(
             except Exception:
                 pass
 
+    def _augment_outcome_missingness_from_cleaned(data_profile: Dict[str, Any]) -> bool:
+        if not isinstance(data_profile, dict):
+            return False
+        cleaned_path = _abs_in_work(work_dir_abs, "data/cleaned_data.csv")
+        if not os.path.exists(cleaned_path):
+            return False
+        try:
+            import pandas as pd
+            from src.utils.missing import is_effectively_missing_series
+            from src.utils.contract_v41 import get_outcome_columns
+        except Exception:
+            return False
+
+        outcome_cols = []
+        try:
+            outcome_cols = get_outcome_columns(contract or {})
+        except Exception:
+            outcome_cols = []
+        if not outcome_cols:
+            return False
+
+        try:
+            header = pd.read_csv(cleaned_path, nrows=0)
+            present_cols = [c for c in outcome_cols if c in header.columns]
+        except Exception:
+            present_cols = []
+        if not present_cols:
+            return False
+
+        total_rows = 0
+        missing_counts = {col: 0 for col in present_cols}
+        unique_values = {col: set() for col in present_cols}
+        max_uniques = 2000
+        chunksize = 100000
+        try:
+            for chunk in pd.read_csv(cleaned_path, usecols=present_cols, dtype=str, chunksize=chunksize):
+                total_rows += len(chunk)
+                for col in present_cols:
+                    series = chunk[col]
+                    miss_mask = is_effectively_missing_series(series)
+                    missing_counts[col] += int(miss_mask.sum())
+                    if len(unique_values[col]) < max_uniques:
+                        vals = series[~miss_mask].dropna().unique().tolist()
+                        for val in vals:
+                            if len(unique_values[col]) >= max_uniques:
+                                break
+                            unique_values[col].add(str(val))
+        except Exception:
+            return False
+
+        if total_rows <= 0:
+            return False
+
+        outcome_analysis = data_profile.get("outcome_analysis")
+        if not isinstance(outcome_analysis, dict):
+            outcome_analysis = {}
+
+        for col in present_cols:
+            missing = int(missing_counts.get(col, 0))
+            non_null = int(total_rows - missing)
+            null_frac = round((missing / total_rows) if total_rows > 0 else 0.0, 6)
+            entry = outcome_analysis.get(col, {}) if isinstance(outcome_analysis.get(col), dict) else {}
+            n_unique = len(unique_values[col])
+            inferred_type = entry.get("inferred_type")
+            if not inferred_type:
+                inferred_type = "classification" if n_unique <= 20 else "regression"
+            entry.update(
+                {
+                    "present": True,
+                    "non_null_count": non_null,
+                    "total_count": total_rows,
+                    "null_frac": null_frac,
+                    "n_unique": n_unique,
+                    "inferred_type": inferred_type,
+                }
+            )
+            outcome_analysis[col] = entry
+
+        data_profile["outcome_analysis"] = outcome_analysis
+        data_profile["outcome_missingness_source"] = "cleaned_data"
+        basic_stats = data_profile.get("basic_stats")
+        if isinstance(basic_stats, dict) and total_rows:
+            basic_stats["n_rows"] = int(total_rows)
+            data_profile["basic_stats"] = basic_stats
+        return True
+
     try:
         from src.utils.data_profile_compact import convert_dataset_profile_to_data_profile
         from src.agents.steward import write_data_profile
@@ -163,6 +249,15 @@ def ensure_data_profile_artifact(
             }
             profile_source = "minimal_fallback"
             print(f"DATA_PROFILE_PREFLIGHT: Created minimal fallback (no dataset_profile.json)")
+
+        # Optional augmentation: compute outcome missingness from full cleaned data (if available)
+        try:
+            if data_profile:
+                updated = _augment_outcome_missingness_from_cleaned(data_profile)
+                if updated:
+                    profile_source = f"{profile_source}|outcome_missingness_cleaned"
+        except Exception:
+            pass
 
         # Write the profile
         if data_profile:

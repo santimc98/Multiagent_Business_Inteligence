@@ -195,6 +195,8 @@ class DataEngineerAgent:
         - Print a CLEANING_VALIDATION section that reports dtype and null_frac for each required column (no advanced metrics).
         - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
         - If a derived column has derived_owner='ml_engineer', do NOT create placeholders; leave it absent and document in the manifest.
+        - OUTCOME/TARGET COLUMNS MAY HAVE MISSING VALUES. Do NOT fail or impute when outcome values are NaN.
+          Only raise an error if NON-NULL outcome values cannot be parsed. Preserve missingness and record null_frac in the manifest.
         - Manifest audit counts: include n_cols_in, n_cols_out, kept_by_selectors_count, dropped_forbidden_count, dropped_constant_count.
 
         *** GATE CHECKLIST (CONTRACT-DRIVEN) ***
