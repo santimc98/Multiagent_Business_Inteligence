@@ -80,6 +80,7 @@ def _write_file_output(local_path: str, output_uri: str, filename: str) -> None:
         return
     os.makedirs(output_uri, exist_ok=True)
     dest = os.path.join(output_uri, filename)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
     os.replace(local_path, dest)
 
 
@@ -129,6 +130,33 @@ def _run_script(script_path: str, work_dir: str) -> Tuple[int, str, str]:
         text=True,
     )
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def _collect_output_files(work_dir: str) -> list[str]:
+    roots = [
+        "data",
+        os.path.join("static", "plots"),
+        "report",
+        "artifacts",
+    ]
+    skip = {
+        os.path.join("data", "cleaned_data.csv"),
+        os.path.join("data", "cleaned_full.csv"),
+    }
+    collected = []
+    for root in roots:
+        base = os.path.join(work_dir, root)
+        if not os.path.exists(base):
+            continue
+        for dirpath, _, filenames in os.walk(base):
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                rel = os.path.relpath(path, work_dir)
+                rel_norm = rel.replace("\\", "/")
+                if rel_norm in skip:
+                    continue
+                collected.append(rel_norm)
+    return sorted(set(collected))
 
 
 def _read_dataset(dataset_uri: str, read_cfg: Dict[str, Any]) -> pd.DataFrame:
@@ -258,21 +286,17 @@ def main() -> int:
                 if stderr:
                     log_file.write("\n[stderr]\n")
                     log_file.write(stderr)
-            _write_file_output(log_path, output_uri, "execution_log.txt")
+            _write_file_output(log_path, output_uri, "artifacts/execution_log.txt")
             if exit_code != 0:
                 raise RuntimeError(
                     f"ML script failed with exit code {exit_code}. See execution_log.txt for details."
                 )
-            expected_outputs = payload.get("expected_outputs") or [
-                "data/metrics.json",
-                "data/scored_rows.csv",
-                "data/alignment_check.json",
-            ]
+            collected_outputs = _collect_output_files(work_dir)
             uploaded = []
-            for rel_path in expected_outputs:
+            for rel_path in collected_outputs:
                 local_path = os.path.join(work_dir, rel_path)
                 if os.path.exists(local_path):
-                    _write_file_output(local_path, output_uri, os.path.basename(rel_path))
+                    _write_file_output(local_path, output_uri, rel_path)
                     uploaded.append(rel_path)
             status_payload = {
                 "ok": True,
