@@ -1,6 +1,26 @@
+# --- Core & Data ---
 numpy
 pandas
-scikit-learn==1.4.2
-joblib
+scipy
+openpyxl
+
+# --- Google Cloud ---
 google-cloud-storage
+
+# --- Machine Learning (Classic & Boosting) ---
+scikit-learn==1.4.2
+xgboost
+lightgbm
+catboost
+category_encoders
+imbalanced-learn
+statsmodels
+joblib
+
+# --- Explainability (XAI) ---
+shap
+
+# --- Visualization ---
 matplotlib
+seaborn
+plotly
