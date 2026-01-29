@@ -7055,11 +7055,31 @@ def _finalize_heavy_execution(
         issue_text = ", ".join(content_issues)
         output = f"{output}\nEXECUTION ERROR: ARTIFACT_CONTENT_INVALID: {issue_text}"
 
+    # Read heavy runner execution log to extract actual Traceback
+    heavy_log_path = os.path.join("artifacts", "heavy_execution_log.txt")
+    heavy_log_traceback = ""
+    if os.path.exists(heavy_log_path):
+        try:
+            with open(heavy_log_path, "r", encoding="utf-8", errors="replace") as f_log:
+                heavy_log_content = f_log.read()
+            # Extract Traceback from log if present
+            if "Traceback (most recent call last)" in heavy_log_content:
+                # Find the last Traceback in the log
+                tb_idx = heavy_log_content.rfind("Traceback (most recent call last)")
+                if tb_idx >= 0:
+                    heavy_log_traceback = heavy_log_content[tb_idx:][-4000:]
+                    output = f"{output}\n{heavy_log_traceback}"
+        except Exception:
+            pass
+
+    # Check for errors in output - include HEAVY_RUNNER_ERROR detection
+    heavy_runner_error = "HEAVY_RUNNER_ERROR" in output
     error_in_output = (
         "Traceback (most recent call last)" in output
         or "EXECUTION ERROR" in output
+        or heavy_runner_error
     )
-    sandbox_failed = False
+    sandbox_failed = heavy_runner_error  # Mark as sandbox failure for proper retry handling
 
     outputs_valid = not bool(artifact_issues or stale_outputs or content_issues or error_in_output)
     if run_id:
@@ -11052,6 +11072,11 @@ def execute_code(state: AgentState) -> AgentState:
                     )
 
                 output = f"HEAVY_RUNNER: status={heavy_result.get('status')} reason={heavy_reason}"
+                if heavy_result.get("job_failed"):
+                    output += f"\nHEAVY_RUNNER_ERROR: Job execution failed"
+                    job_err = heavy_result.get("job_error")
+                    if job_err:
+                        output += f"\nJOB_ERROR_DETAIL: {str(job_err)[:2000]}"
                 if heavy_result.get("error"):
                     output += f"\nHEAVY_RUNNER_ERROR: {heavy_result.get('error')}"
 
@@ -12027,7 +12052,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             state["feedback_history"] = history
 
     execution_output = state.get('execution_output', '')
-    if "Traceback" in execution_output or "EXECUTION ERROR" in execution_output:
+    if "Traceback" in execution_output or "EXECUTION ERROR" in execution_output or "HEAVY_RUNNER_ERROR" in execution_output:
          print("Reviewer: Critical Execution Error detected. Requesting fix.")
          return {
              "review_verdict": "NEEDS_IMPROVEMENT",
@@ -12846,6 +12871,7 @@ def check_execution_status(state: AgentState):
     has_error = (
         "Traceback (most recent call last)" in output
         or "EXECUTION ERROR" in output
+        or "HEAVY_RUNNER_ERROR" in output
         or "Sandbox Execution Failed" in output
         or "peer closed connection" in output
         or "incomplete chunked read" in output

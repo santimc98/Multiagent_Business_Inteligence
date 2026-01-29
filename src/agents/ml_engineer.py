@@ -799,37 +799,6 @@ class MLEngineerAgent:
         except Exception:
             return code
 
-    def _fix_sklearn_api_errors(self, code: str) -> str:
-        """
-        Fix common sklearn API errors that LLMs make.
-
-        Known issues:
-        1. CalibratedClassifierCV does not accept random_state parameter
-        2. Other sklearn API misuses can be added here
-        """
-        import re
-
-        fixes_applied = []
-
-        # Fix 1: CalibratedClassifierCV with random_state
-        # CalibratedClassifierCV(estimator, method='sigmoid', cv=3, random_state=42)
-        # should become:
-        # CalibratedClassifierCV(estimator, method='sigmoid', cv=3)
-        pattern = r'(CalibratedClassifierCV\s*\([^)]*),\s*random_state\s*=\s*\d+(\s*\))'
-        if re.search(pattern, code):
-            code = re.sub(pattern, r'\1\2', code)
-            fixes_applied.append("CalibratedClassifierCV_random_state")
-
-        # Also handle case where random_state is not last parameter
-        pattern2 = r'(CalibratedClassifierCV\s*\([^)]*)\s*random_state\s*=\s*\d+\s*,([^)]*\))'
-        if re.search(pattern2, code):
-            code = re.sub(pattern2, r'\1\2', code)
-            fixes_applied.append("CalibratedClassifierCV_random_state_mid")
-
-        if fixes_applied:
-            print(f"SKLEARN_API_FIX: Applied fixes: {fixes_applied}")
-
-        return code
 
     def _call_name(self, call_node: ast.Call) -> str:
         try:
@@ -2563,7 +2532,6 @@ $strategy_json
             # Post-processing: Inject correct data_path if LLM used wrong path
             code = self._fix_data_path_in_code(code, data_path)
             code = self._fix_to_csv_dialect_in_code(code)
-            code = self._fix_sklearn_api_errors(code)
             reasons = self._detect_forbidden_input_fallback(code, data_path)
             if reasons:
                 guard_system = (
@@ -2596,7 +2564,6 @@ $strategy_json
                         continue
                     repaired = self._fix_data_path_in_code(repaired, data_path)
                     repaired = self._fix_to_csv_dialect_in_code(repaired)
-                    repaired = self._fix_sklearn_api_errors(repaired)
                     reasons = self._detect_forbidden_input_fallback(repaired, data_path)
                     if not reasons:
                         code = repaired
@@ -2663,7 +2630,6 @@ $strategy_json
                 if repaired_valid:
                     repaired = self._fix_data_path_in_code(repaired, data_path)
                     repaired = self._fix_to_csv_dialect_in_code(repaired)
-                    repaired = self._fix_sklearn_api_errors(repaired)
                 remaining = self._check_training_policy_compliance(
                     code=repaired if repaired_valid else code,
                     execution_contract=execution_contract,

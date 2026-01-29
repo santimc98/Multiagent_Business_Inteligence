@@ -226,14 +226,27 @@ def launch_heavy_runner_job(
     _upload_json_to_gcs(request, input_uri, gsutil_bin)
 
     env_vars = f"INPUT_URI={input_uri},OUTPUT_URI={output_uri}"
-    stdout, stderr, flag_used = _run_gcloud_job_execute(
-        gcloud_bin=gcloud_bin,
-        job=job,
-        region=region,
-        env_vars=env_vars,
-        project=project,
-        wait=wait,
-    )
+
+    # Execute job - capture failure but still attempt downloads
+    job_failed = False
+    job_error_msg = ""
+    stdout = ""
+    stderr = ""
+    flag_used = ""
+    try:
+        stdout, stderr, flag_used = _run_gcloud_job_execute(
+            gcloud_bin=gcloud_bin,
+            job=job,
+            region=region,
+            env_vars=env_vars,
+            project=project,
+            wait=wait,
+        )
+    except CloudRunLaunchError as exc:
+        # Job execution failed, but outputs may still exist in GCS
+        # Attempt to download them for error analysis
+        job_failed = True
+        job_error_msg = str(exc)
 
     downloaded: Dict[str, str] = {}
     if download_map:
@@ -262,8 +275,20 @@ def launch_heavy_runner_job(
             if artifact not in downloaded:
                 missing_artifacts.append(artifact)
 
-    # Build diagnostic info if artifacts are missing
+    # Build diagnostic info if job failed or artifacts are missing
     gcs_listing: list[str] = []
+
+    # If job failed, include that in error_payload
+    if job_failed and not error_payload:
+        gcs_listing = _gsutil_ls(output_uri, gsutil_bin)
+        error_payload = {
+            "error": "job_execution_failed",
+            "job_error": job_error_msg,
+            "downloaded": list(downloaded.keys()),
+            "gcs_listing": gcs_listing,
+            "message": f"Cloud Run Job execution failed: {job_error_msg[:500]}",
+        }
+
     if missing_artifacts and not error_payload:
         gcs_listing = _gsutil_ls(output_uri, gsutil_bin)
         error_payload = {
@@ -274,8 +299,11 @@ def launch_heavy_runner_job(
             "message": f"Heavy runner job completed but required artifacts missing: {missing_artifacts}",
         }
 
+    # Determine overall status
+    has_error = bool(error_payload) or job_failed
+
     return {
-        "status": "error" if error_payload else "success",
+        "status": "error" if has_error else "success",
         "input_uri": input_uri,
         "output_uri": output_uri,
         "dataset_uri": dataset_uri,
@@ -284,6 +312,8 @@ def launch_heavy_runner_job(
         "gcs_listing": gcs_listing,
         "job_stdout": stdout,
         "job_stderr": stderr,
+        "job_failed": job_failed,
+        "job_error": job_error_msg if job_failed else None,
         "gcloud_flag": flag_used,
         "gcloud_bin": gcloud_bin,
         "gsutil_bin": gsutil_bin,
