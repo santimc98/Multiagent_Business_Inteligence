@@ -2,7 +2,9 @@
 numpy
 pandas
 scipy
+pyarrow
 openpyxl
+duckdb
 
 # --- Google Cloud ---
 google-cloud-storage
@@ -17,6 +19,9 @@ imbalanced-learn
 statsmodels
 joblib
 
+# --- Hyperparameter Tuning ---
+optuna
+
 # --- Explainability (XAI) ---
 shap
 
@@ -24,3 +29,9 @@ shap
 matplotlib
 seaborn
 plotly
+
+# --- Utilities ---
+python-dateutil
+pytz
+tqdm
+pyyaml

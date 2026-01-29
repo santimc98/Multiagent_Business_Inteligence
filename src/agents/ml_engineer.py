@@ -2008,9 +2008,16 @@ $strategy_json
         - Data audit context: $data_audit_context
 
         DEPENDENCIES
-        - Use only: numpy, pandas, scipy, sklearn, statsmodels, matplotlib, seaborn, pyarrow, openpyxl, duckdb, sqlalchemy, dateutil, pytz, tqdm, yaml.
-        - Extended deps (rapidfuzz, plotly, pydantic, pandera, networkx) ONLY if listed in execution_contract.required_dependencies.
-        - Do not import any other deps.
+        - Core ML: numpy, pandas, scipy, sklearn, statsmodels, joblib
+        - Gradient Boosting: xgboost, lightgbm, catboost (use for large datasets or when sklearn underperforms)
+        - Preprocessing: category_encoders, imbalanced-learn (for class imbalance: SMOTE, ADASYN, etc.)
+        - Hyperparameter Tuning: optuna (for efficient Bayesian optimization, better than GridSearchCV for large search spaces)
+        - Explainability: shap (for feature importance and model explanations)
+        - Visualization: matplotlib, seaborn, plotly
+        - Data I/O: pyarrow, openpyxl, duckdb, sqlalchemy
+        - Utilities: dateutil, pytz, tqdm, yaml
+        - Extended deps (rapidfuzz, pydantic, pandera, networkx) ONLY if listed in execution_contract.required_dependencies.
+        - Do not import deep learning frameworks (tensorflow, keras, torch) unless explicitly required by contract.
 
         CAUSAL REASONING FOR OPTIMIZATION
         - Consultation: check column_roles in contract. Variables marked 'decision' or 'post-decision' CANNOT be features.
@@ -2085,10 +2092,13 @@ $strategy_json
 
         Step 5) Models (contract-first):
         - If the contract/plan specifies model family or a single model, follow that exactly.
-        - If not specified, you MAY include:
-          * A baseline (simple, interpretable).
-          * A stronger model (more expressive) appropriate for dataset size and task.
-        - Prefer stable sklearn models unless the contract explicitly requires others.
+        - If not specified, choose based on dataset characteristics:
+          * Small datasets (<10k rows): sklearn models (LogisticRegression, RandomForest, GradientBoosting)
+          * Medium datasets (10k-100k rows): Consider xgboost or lightgbm for better performance
+          * Large datasets (>100k rows): Prefer lightgbm (faster) or catboost (handles categoricals natively)
+          * High-cardinality categoricals: catboost handles them well without encoding
+          * Class imbalance: Use imbalanced-learn (SMOTE, ADASYN) or model's built-in class_weight
+        - For calibrated probabilities: sklearn's CalibratedClassifierCV (note: does NOT accept random_state)
         - Any predict_proba call must pass a 2D array (e.g., X.reshape(1, -1) or [[x]] for a single row).
 
         MODEL SELECTION & METRICS CONSISTENCY:
