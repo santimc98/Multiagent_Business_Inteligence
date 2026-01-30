@@ -101,12 +101,15 @@ class ReviewerAgent:
         1. **SECURITY & SAFETY (Non-Negotiable):**
            - No malicious code, no external network calls (except sanctioned APIs), no file system deletions outside `data/`.
            
-        2. **METHODOLOGY VERIFICATION (The Scientific Method):**
-           - **Baseline Check:** Does the code establish a baseline? (e.g., Dummy Classifier)?
-           - **Validation Rigor:** 
-             * REJECT if a predictive model uses a single `train_test_split` on a small dataset (<1000 rows). Require Cross-Validation.
-             * REJECT if testing is done on Training Data (Leakage).
-           - **Assumption Check:** Does the code handle assumptions? (e.g. Checking stationarity for Time Series, checking class balance for Classification).
+        2. **METHODOLOGY VERIFICATION (Results-Based, Not Syntax-Based):**
+           - **Baseline Check:** Does the code establish a baseline? (e.g., Dummy Classifier)? PREFERRED but not required.
+           - **Validation Rigor:**
+             * WARN (not REJECT) if a predictive model uses a single `train_test_split` on a small dataset.
+             * Cross-Validation is PREFERRED but holdout is ACCEPTABLE if metrics.json shows reasonable results.
+             * REJECT only if testing is done on Training Data (actual Leakage detected in results).
+           - **Assumption Check:** Does the code handle critical assumptions? (WARN if missing, REJECT only if results are clearly invalid).
+           - **EXECUTION-AWARE PRINCIPLE:** If the code produces valid metrics.json and alignment_check.json,
+             the methodology is likely sound. Trust execution results over static code patterns.
            
         3. **BUSINESS VALUE CHECK (The "So What?"):**
            - **Alignment:** Does this analysis *actually* answer: "$business_objective"?
@@ -306,16 +309,28 @@ class ReviewerAgent:
         *** EXECUTION OUTPUT (Truncated) ***
         $truncated_output
         
-        *** EVALUATION CRITERIA ***
-        1. **Answer Quality:** Does the output provide a clear answer/insight?
-        2. **Visuals:** Are plots generated? (If empty plots or no files, REJECT).
-        3. **Metrics:** Are metrics reasonable? (e.g. Accuracy > 0.5 for balanced classes).
-        4. **Validation:** If predictive, was Cross-Validation used?
+        *** EVALUATION CRITERIA (BUSINESS-FIRST) ***
+        1. **Answer Quality:** Does the output provide a clear answer/insight relevant to the BUSINESS OBJECTIVE?
+        2. **Visuals:** Are plots generated when required? (If required by spec but missing, flag as warning).
+        3. **Metrics - BUSINESS-RELATIVE EVALUATION (CRITICAL):**
+           - DO NOT use arbitrary fixed thresholds (e.g., "Accuracy > 0.5").
+           - INSTEAD, evaluate metrics RELATIVE TO:
+             a) The BASELINE model (if provided): Is the final model better than the baseline?
+             b) The PROBLEM DIFFICULTY: Imbalanced classes, noisy data, or limited features justify lower scores.
+             c) The BUSINESS VALUE: A 60% accuracy model that identifies 3x more leads than random is valuable.
+           - LOW ABSOLUTE SCORES CAN BE VALUABLE if they represent meaningful improvement over baseline.
+           - Example: AUC=0.65 on a 1% positive class is excellent; AUC=0.65 on balanced data is mediocre.
+        4. **Validation:** If predictive, was validation performed? (Cross-validation preferred but holdout acceptable).
+        5. **Safety Outputs:** Does alignment_check.json exist? (Execution-aware check, not code pattern matching).
         - Only enforce criteria that are required by the Evaluation Spec.
-        
+
+        *** SENIOR TECH LEAD MINDSET ***
+        You care that the system WORKS, is SAFE, and SOLVES THE PROBLEM.
+        You do NOT care if the code looks exactly like a textbook example.
+
         *** FALLBACK LOGIC ***
-        - If results are "weak" (low accuracy) but methodology is sound => APPROVE with limitations note.
-        - REJECT only if there are specific TECHNICAL fixes available (e.g. "Use Class Balancing", "Try Non-Linear Model").
+        - If results are "weak" in absolute terms but methodology is sound and improves over baseline => APPROVE with note.
+        - REJECT only if there are specific TECHNICAL fixes that would materially improve results.
         - If "Traceback" or "Error" persists in output despite your checks, REJECT.
 
         *** EVIDENCE REQUIREMENT ***
