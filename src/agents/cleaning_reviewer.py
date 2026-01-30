@@ -40,11 +40,14 @@ _FALLBACK_CLEANING_GATES = [
         },
     },
     {
+        # LLM-DELEGATED: This gate uses contextual reasoning, not deterministic rules.
+        # The LLM evaluates cleaning_code + data_profile to determine if rescaling occurred.
         "name": "no_semantic_rescale",
         "severity": "HARD",
         "params": {
             "allow_percent_like_only": True,
             "percent_like_name_regex": _DEFAULT_PERCENT_REGEX,
+            "llm_delegated": True,  # Marker for LLM-based evaluation
         },
     },
     {
@@ -331,6 +334,14 @@ def _review_cleaning_impl(
     if raw_csv_path:
         raw_sample = _read_csv_sample(raw_csv_path, dialect_raw, None, dtype=str, nrows=200)
 
+    # Load dataset_profile for LLM contextual reasoning (no_semantic_rescale, etc.)
+    dataset_profile = view.get("dataset_profile")
+    if not isinstance(dataset_profile, dict):
+        dataset_profile = _load_json("data/dataset_profile.json")
+
+    # Extract cleaning code from view for LLM intent verification
+    cleaning_code = view.get("cleaning_code")
+
     facts = _build_facts(
         cleaned_header=cleaned_header,
         required_columns=required_columns,
@@ -338,15 +349,8 @@ def _review_cleaning_impl(
         sample_str=sample_str,
         sample_infer=sample_infer,
         raw_sample=raw_sample,
+        dataset_profile=dataset_profile,
     )
-
-    # Load dataset_profile for dynamic rescaling checks (avoids hardcoded assumptions)
-    dataset_profile = view.get("dataset_profile")
-    if not isinstance(dataset_profile, dict):
-        dataset_profile = _load_json("data/dataset_profile.json")
-
-    # Extract cleaning code from view for intent verification in rescale checks
-    cleaning_code = view.get("cleaning_code")
 
     deterministic = _evaluate_gates_deterministic(
         gates=gates,
@@ -385,6 +389,8 @@ def _review_cleaning_impl(
         deterministic_gate_results=deterministic["gate_results"],
         contract_source_used=contract_source_used,
         context_pack=context_pack,
+        cleaning_code=cleaning_code,
+        dataset_profile=dataset_profile,
     )
     if provider == "gemini":
         print(f"DEBUG: Cleaning Reviewer calling Gemini ({model_name})...")
@@ -812,6 +818,7 @@ def _build_facts(
     sample_str: Optional[pd.DataFrame],
     sample_infer: Optional[pd.DataFrame],
     raw_sample: Optional[pd.DataFrame],
+    dataset_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     facts: Dict[str, Any] = {}
     facts["cleaned_header"] = cleaned_header[:200]
@@ -834,6 +841,23 @@ def _build_facts(
     facts["column_stats_sample"] = _build_column_stats(sample_str, sample_infer, max_cols=40)
     facts["cleaned_sample_rows"] = _sample_rows(sample_str, max_rows=5)
     facts["raw_sample_rows"] = _sample_rows(raw_sample, max_rows=5)
+
+    # Include numeric ranges from data profile for LLM context (no_semantic_rescale reasoning)
+    if isinstance(dataset_profile, dict):
+        numeric_summary = dataset_profile.get("numeric_summary", {})
+        if numeric_summary:
+            # Extract min/max ranges for key columns
+            numeric_ranges = {}
+            for col, stats in list(numeric_summary.items())[:50]:  # Limit to 50 columns
+                if isinstance(stats, dict):
+                    numeric_ranges[col] = {
+                        "min": stats.get("min"),
+                        "max": stats.get("max"),
+                        "mean": stats.get("mean"),
+                    }
+            if numeric_ranges:
+                facts["source_data_numeric_ranges"] = numeric_ranges
+
     return facts
 
 
@@ -920,16 +944,13 @@ def _evaluate_gates_deterministic(
                 column_roles,
             )
         elif gate_key == "no_semantic_rescale":
-            issues = _check_no_semantic_rescale(
-                manifest,
-                params,
-                cleaned_header,
-                column_roles,
-                raw_sample,
-                sample_infer if sample_infer is not None else sample_str,
-                dataset_profile=dataset_profile,
-                cleaning_code=cleaning_code,
-            )
+            # DELEGATED TO LLM: Semantic rescale detection requires contextual reasoning
+            # about code + data profile, not brittle threshold-based heuristics.
+            # The LLM will evaluate this gate using the cleaning_code and dataset_profile.
+            issues = []
+            evidence["llm_delegated"] = True
+            evidence["reason"] = "Semantic rescale detection requires LLM contextual reasoning"
+            evaluated = False  # Mark as not deterministically evaluated
         elif gate_key == "no_synthetic_data":
             issues = _check_no_synthetic_data(manifest, cleaning_code=cleaning_code)
         elif gate_key == "row_count_sanity":
@@ -1064,23 +1085,46 @@ def _build_llm_prompt(
     deterministic_gate_results: List[Dict[str, Any]],
     contract_source_used: str,
     context_pack: Optional[str] = None,
+    cleaning_code: Optional[str] = None,
+    dataset_profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     system_prompt = (
-        "You are a Senior Data Cleaning Reviewer.\n"
-        "Evaluate ONLY the gates listed in cleaning_gates.\n"
-        "Use the provided evidence and samples; do not invent data.\n"
-        "If a HARD gate fails, status must be REJECTED.\n"
-        "If only SOFT gates fail, status must be APPROVE_WITH_WARNINGS.\n"
-        "If no gates fail, status must be APPROVED.\n"
-        "When evidence is insufficient, mark the gate as not failed and add a warning.\n"
+        "You are a Senior Data Scientist reviewing data cleaning output.\n"
+        "Your role is to evaluate cleaning quality using CONTEXTUAL REASONING, not rigid rules.\n\n"
+        "EVALUATION APPROACH:\n"
+        "1. Review the CONTEXT TRIPLET provided:\n"
+        "   - Contract/View: What gates and constraints were requested?\n"
+        "   - Data Profile: What are the actual numeric ranges and distributions in the source data?\n"
+        "   - Cleaning Code: What transformations did the Data Engineer actually execute?\n\n"
+        "2. For each gate, reason about whether the cleaning OUTPUT violates the gate's INTENT.\n\n"
+        "GATE-SPECIFIC INSTRUCTIONS:\n\n"
+        "*** no_semantic_rescale ***\n"
+        "This gate checks if numeric columns were inappropriately rescaled (e.g., /255, /100, MinMaxScaler).\n"
+        "DO NOT use arbitrary thresholds like 'if max < 1.5, it was rescaled'.\n"
+        "INSTEAD, follow this reasoning process:\n"
+        "  1. Check the DATA PROFILE: What were the original min/max ranges for numeric columns?\n"
+        "  2. Check the CLEANING CODE: Are there explicit rescaling operations like:\n"
+        "     - Division: df['col'] = df['col'] / 255, df['col'] / 100\n"
+        "     - Scalers: MinMaxScaler, StandardScaler\n"
+        "     - Multiplication: df['col'] * 0.01, df['col'] * 0.00392\n"
+        "  3. ONLY flag rescaling if you find EXPLICIT EVIDENCE of transformation in the code.\n"
+        "  4. If data has low values (0-1 range) but NO rescaling code exists, the data was ALREADY normalized in the source. This is NOT a violation.\n"
+        "  5. Columns with 'percent', 'pct', '%', 'ratio', 'probability' in the name are ALLOWED to be rescaled.\n\n"
+        "*** no_synthetic_data ***\n"
+        "Check if the cleaning code generates fake/synthetic data (Faker, make_classification, np.random for data generation).\n"
+        "Using np.random for imputation or noise is different from generating entire synthetic datasets.\n\n"
+        "GENERAL RULES:\n"
+        "- If a HARD gate fails, status must be REJECTED.\n"
+        "- If only SOFT gates fail, status must be APPROVE_WITH_WARNINGS.\n"
+        "- If no gates fail, status must be APPROVED.\n"
+        "- When evidence is insufficient, mark the gate as PASSED and add a warning.\n"
+        "- DO NOT reject based on data ranges alone; you MUST find code evidence of violations.\n\n"
         "EVIDENCE REQUIREMENT:\n"
-        "- Any REJECT or warning must cite evidence in gate_results.evidence.\n"
-        "- Format: EVIDENCE: <artifact_path>#<key> -> <short snippet>\n"
-        "- If you cannot find evidence, do NOT reject; downgrade and note NO_EVIDENCE_FOUND.\n"
-        "SELF-CHECK BEFORE REJECT:\n"
-        "- If you cannot cite at least one concrete evidence item, you must not reject.\n"
-        "Return JSON only with the specified schema.\n"
-        "\n"
+        "- Any REJECT must cite SPECIFIC evidence from cleaning_code or data_profile.\n"
+        "- Format: EVIDENCE: <source>#<detail> -> <snippet>\n"
+        "- Example: EVIDENCE: cleaning_code#line42 -> df['pixel'] = df['pixel'] / 255\n"
+        "- If you cannot find code evidence, do NOT reject; mark as PASSED with a note.\n\n"
+        "Return JSON only with the specified schema.\n\n"
         "Required JSON schema:\n"
         "{\n"
         '  "status": "APPROVED" | "APPROVE_WITH_WARNINGS" | "REJECTED",\n'
@@ -1096,7 +1140,7 @@ def _build_llm_prompt(
         '       "severity": "HARD|SOFT",\n'
         '       "passed": true|false,\n'
         '       "issues": ["issue", ...],\n'
-        '       "evidence": "short evidence string"\n'
+        '       "evidence": "specific code line or data evidence"\n'
         "     }\n"
         "  ],\n"
         '  "contract_source_used": "cleaning_view|fallback|merged"\n'
@@ -1114,6 +1158,30 @@ def _build_llm_prompt(
     }
     if context_pack:
         payload["context_pack"] = context_pack
+
+    # CONTEXT TRIPLET for LLM reasoning
+    # 1. Cleaning Code - what did the engineer actually execute?
+    if cleaning_code:
+        # Truncate if too long but preserve key parts
+        max_code_len = 6000
+        if len(cleaning_code) > max_code_len:
+            payload["cleaning_code"] = cleaning_code[:max_code_len] + "\n... [TRUNCATED]"
+        else:
+            payload["cleaning_code"] = cleaning_code
+
+    # 2. Data Profile - what are the actual data characteristics?
+    if dataset_profile and isinstance(dataset_profile, dict):
+        # Extract relevant summary for LLM
+        profile_summary = {}
+        if "numeric_summary" in dataset_profile:
+            profile_summary["numeric_ranges"] = dataset_profile["numeric_summary"]
+        if "column_types" in dataset_profile:
+            profile_summary["column_types"] = dataset_profile["column_types"]
+        if "basic_stats" in dataset_profile:
+            profile_summary["basic_stats"] = dataset_profile["basic_stats"]
+        if profile_summary:
+            payload["data_profile"] = profile_summary
+
     return system_prompt, payload
 
 
@@ -1396,6 +1464,16 @@ def _check_id_integrity(
     return issues
 
 
+# =============================================================================
+# DEPRECATED: Deterministic rescale detection functions
+# These functions are NO LONGER USED for gate evaluation.
+# The no_semantic_rescale gate is now DELEGATED TO THE LLM for contextual reasoning.
+#
+# Rationale: Threshold-based heuristics (e.g., "if max < 1.5, assume rescaled")
+# cause false positives on datasets with naturally low values (sparse pixel data,
+# pre-normalized features, etc.). The LLM can reason about code + data context.
+# =============================================================================
+
 def _check_no_semantic_rescale(
     manifest: Dict[str, Any],
     params: Dict[str, Any],
@@ -1407,71 +1485,13 @@ def _check_no_semantic_rescale(
     cleaning_code: Optional[str] = None,
 ) -> List[str]:
     """
-    Check for semantic rescaling in cleaned data.
+    DEPRECATED: This function is no longer used for gate evaluation.
+    The no_semantic_rescale gate is delegated to the LLM for contextual reasoning.
 
-    Uses code context (if provided) to verify INTENT rather than guessing from
-    data samples. This prevents false positives on columns with naturally low
-    values (e.g., pixel data that was already normalized in the source).
-
-    Args:
-        cleaning_code: Optional DE Python code for intent verification. When provided,
-                      rescale operations are detected from actual code (/255, /100, etc.)
-                      rather than inferring from data sample ranges alone.
+    Kept for backwards compatibility but returns empty list.
     """
-    allow_percent_only = bool(params.get("allow_percent_like_only", True))
-    regex = params.get("percent_like_name_regex") or _DEFAULT_PERCENT_REGEX
-    try:
-        percent_pattern = re.compile(regex)
-    except re.error:
-        percent_pattern = re.compile(_DEFAULT_PERCENT_REGEX)
-
-    percent_like = {col for col in cleaned_header if percent_pattern.search(col)}
-    percent_like.update(_columns_with_role_tokens(column_roles, {"percent", "percentage", "ratio", "probability"}))
-
-    conversions = manifest.get("conversions") if isinstance(manifest, dict) else {}
-    if not isinstance(conversions, dict):
-        conversions = {}
-    conversions_meta = manifest.get("conversions_meta") if isinstance(manifest, dict) else {}
-    if not isinstance(conversions_meta, dict):
-        conversions_meta = {}
-
-    rescaled_cols: List[str] = []
-    for col, conv in conversions.items():
-        if not isinstance(col, str):
-            continue
-        if isinstance(conv, str) and "normalized_0_1" in conv:
-            rescaled_cols.append(col)
-    for col, meta in conversions_meta.items():
-        if not isinstance(col, str) or not isinstance(meta, dict):
-            continue
-        if meta.get("normalized") or meta.get("scale_factor") or meta.get("scaled_by"):
-            rescaled_cols.append(col)
-
-    # IMPROVED: Use provided cleaning_code if available, else fall back to file scan
-    if cleaning_code:
-        rescaled_cols.extend(_scan_code_for_rescale_ops_from_code(cleaning_code))
-    else:
-        rescaled_cols.extend(_scan_code_for_rescale_ops())
-    rescaled_cols = [col for col in rescaled_cols if col]
-    if not rescaled_cols:
-        return _check_semantic_rescale_from_raw(
-            raw_sample,
-            cleaned_sample,
-            cleaned_header,
-            percent_like,
-            allow_percent_only,
-            dataset_profile=dataset_profile,
-            cleaning_code=cleaning_code,
-        )
-
-    issues: List[str] = []
-    for col in rescaled_cols:
-        if col == "__MINMAX__":
-            issues.append("MinMaxScaler detected in cleaning script")
-            continue
-        if allow_percent_only and col not in percent_like:
-            issues.append(f"{col} appears rescaled but is not percent-like")
-    return issues
+    # Delegated to LLM - return no deterministic issues
+    return []
 
 
 def _check_semantic_rescale_from_raw(
@@ -1484,170 +1504,35 @@ def _check_semantic_rescale_from_raw(
     cleaning_code: Optional[str] = None,
 ) -> List[str]:
     """
-    Check for semantic rescaling by comparing raw vs cleaned samples.
+    DEPRECATED: This function is no longer used for gate evaluation.
+    The no_semantic_rescale gate is delegated to the LLM for contextual reasoning.
 
-    DYNAMIC BEHAVIOR: Uses CODE CONTEXT (if available) to verify actual rescaling
-    operations rather than guessing from data ranges. This prevents false positives
-    when data has naturally low values (e.g., pixel data already normalized).
-
-    The check follows this priority:
-    1. If cleaning_code is provided, verify actual /255, /100, etc. operations exist
-    2. If data profile shows column was already normalized, skip flagging
-    3. Only flag if raw_max >= 80, cleaned_max <= 1.5, AND code shows rescaling
-
-    Args:
-        raw_sample: Sample of raw data
-        cleaned_sample: Sample of cleaned data
-        cleaned_header: Column names in cleaned data
-        percent_like: Columns that match percent regex (allowed to rescale)
-        allow_percent_only: Whether to enforce percent-only rescaling
-        dataset_profile: Optional data profile with numeric_summary for context
-        cleaning_code: Optional DE Python code for intent verification
-
-    Returns:
-        List of issues found (informative, not hard failures)
+    Kept for backwards compatibility but returns empty list.
     """
-    if raw_sample is None or raw_sample.empty or cleaned_sample is None or cleaned_sample.empty:
-        return []
-
-    # IMPROVED: Scan code for actual rescale operations to verify intent
-    code_rescaled_cols: set[str] = set()
-    if cleaning_code:
-        code_rescaled_cols = set(_scan_code_for_rescale_ops_from_code(cleaning_code))
-
-    # Extract numeric_summary from profile for context
-    numeric_summary = {}
-    if isinstance(dataset_profile, dict):
-        numeric_summary = dataset_profile.get("numeric_summary", {})
-
-    issues: List[str] = []
-    for col in cleaned_header:
-        if col not in raw_sample.columns or col in percent_like:
-            continue
-        if col not in cleaned_sample.columns:
-            continue
-        raw_vals = pd.to_numeric(raw_sample[col], errors="coerce")
-        cleaned_vals = pd.to_numeric(cleaned_sample[col], errors="coerce")
-        if raw_vals.dropna().empty or cleaned_vals.dropna().empty:
-            continue
-
-        raw_max = float(raw_vals.max())
-        cleaned_max = float(cleaned_vals.max())
-        raw_min = float(raw_vals.min())
-
-        # Check profile for original column range (from full dataset, not just sample)
-        profile_stats = numeric_summary.get(col, {})
-        profile_max = profile_stats.get("max")
-        profile_min = profile_stats.get("min")
-
-        # DYNAMIC CHECK: Use profile if available, otherwise use sample
-        original_max = float(profile_max) if profile_max is not None else raw_max
-        original_min = float(profile_min) if profile_min is not None else raw_min
-
-        # Determine if data was ALREADY normalized in the original dataset
-        already_normalized = original_min >= -1.01 and original_max <= 1.01
-
-        # CODE-VERIFIED RESCALING: Only flag if we have evidence from code context
-        # This prevents false positives on columns with naturally low values (e.g., pre-normalized data)
-        col_in_code_rescale = col in code_rescaled_cols or "__MINMAX__" in code_rescaled_cols
-
-        # IMPROVED LOGIC: Flag rescaling only if:
-        # 1. Code context confirms rescaling operation on this column, OR
-        # 2. No code context AND data ranges suggest rescaling (fallback heuristic)
-        if code_rescaled_cols:
-            # We have code context - only flag if code shows rescaling for this column
-            if col_in_code_rescale and allow_percent_only and col not in percent_like:
-                issues.append(f"{col} appears rescaled in code but is not percent-like")
-        else:
-            # Fallback: No code context, use data range heuristics with profile check
-            if not already_normalized and original_max >= 80 and cleaned_max <= 1.5 and allow_percent_only:
-                # This looks like actual rescaling from 0-100/0-255 to 0-1
-                issues.append(f"{col} appears scaled from 0-{int(original_max)} to 0-1 but is not percent-like (verify code)")
-            elif already_normalized and original_max <= 1.01 and cleaned_max <= 1.5:
-                # Data was already normalized - this is fine, no issue
-                pass
-
-    return issues
+    # Delegated to LLM - return no deterministic issues
+    return []
 
 
 def _scan_code_for_rescale_ops() -> List[str]:
-    path = os.path.join("artifacts", "data_engineer_last.py")
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            code = handle.read()
-    except Exception:
-        return []
-    stripped = extract_code_block(code)
-    text = stripped if stripped.strip() else code
-    matches: List[str] = []
-    patterns = [
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*/\s*100",
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*\*\s*0\.01",
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\.div\(\s*100",
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\.mul\(\s*100",
-    ]
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            col = match.group("col")
-            if col:
-                matches.append(col)
-    if "MinMaxScaler" in text:
-        matches.append("__MINMAX__")
-    return matches
+    """
+    DEPRECATED: This function is no longer used for gate evaluation.
+    The no_semantic_rescale gate is delegated to the LLM for contextual reasoning.
+
+    Kept for backwards compatibility but returns empty list.
+    """
+    # Delegated to LLM - return no deterministic issues
+    return []
 
 
 def _scan_code_for_rescale_ops_from_code(code: str) -> List[str]:
     """
-    Scan provided code string for rescaling operations.
+    DEPRECATED: This function is no longer used for gate evaluation.
+    The no_semantic_rescale gate is delegated to the LLM for contextual reasoning.
 
-    This function extracts column names that are being rescaled by detecting
-    patterns like /255, /100, *0.01, MinMaxScaler, etc.
-
-    Args:
-        code: Python code string to scan
-
-    Returns:
-        List of column names that have rescaling operations applied
+    Kept for backwards compatibility but returns empty list.
     """
-    if not code or not isinstance(code, str):
-        return []
-    stripped = extract_code_block(code)
-    text = stripped if stripped.strip() else code
-    matches: List[str] = []
-
-    # Patterns for common rescaling operations
-    patterns = [
-        # Division by 255 (pixel normalization)
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*/\s*255",
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\.div\(\s*255",
-        # Division by 100 (percentage normalization)
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*/\s*100",
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\.div\(\s*100",
-        # Multiplication by 0.01 or 0.00392 (1/255)
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*\*\s*0\.01",
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*\*\s*0\.00392",
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\.mul\(\s*0\.01",
-        # Division by any large number (generic normalization)
-        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*/\s*[0-9]{3,}",
-    ]
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            col = match.group("col")
-            if col:
-                matches.append(col)
-
-    # Check for MinMaxScaler usage
-    if "MinMaxScaler" in text:
-        matches.append("__MINMAX__")
-
-    # Check for StandardScaler usage
-    if "StandardScaler" in text:
-        matches.append("__STANDARDSCALER__")
-
-    return list(set(matches))  # Deduplicate
+    # Delegated to LLM - return no deterministic issues
+    return []
 
 
 def _check_no_synthetic_data(manifest: Dict[str, Any], cleaning_code: Optional[str] = None) -> List[str]:
