@@ -1,5 +1,6 @@
 import google.generativeai as genai
 import pandas as pd
+import numpy as np
 import os
 import csv
 import re
@@ -12,6 +13,198 @@ from dotenv import load_dotenv
 
 load_dotenv()
 from src.utils.pii_scrubber import PIIScrubber
+
+
+# =============================================================================
+# SMART SAMPLING CONFIGURATION
+# =============================================================================
+# Instead of reading only the first N rows (biased for time-sorted data),
+# we use a composite sampling strategy: Head + Tail + Random Middle
+# This captures temporal/distributional range for better profiling.
+
+_MIN_SAMPLE_SIZE = 3000      # Minimum total sample
+_MAX_SAMPLE_SIZE = 15000     # Safety cap to protect memory
+_HEAD_RATIO = 0.4            # 40% from head
+_TAIL_RATIO = 0.4            # 40% from tail
+_RANDOM_RATIO = 0.2          # 20% from random middle (if file supports it)
+_FILE_SIZE_THRESHOLD_MB = 10 # Only sample if file > this size
+
+
+def _compute_sample_sizes(file_size_mb: float, total_rows_estimate: int = None) -> Dict[str, int]:
+    """
+    Compute context-aware sample sizes based on file size.
+
+    Returns dict with 'head', 'tail', 'random', 'total' sample sizes.
+    """
+    # Scale sample size with file size, but cap it
+    if file_size_mb <= _FILE_SIZE_THRESHOLD_MB:
+        # Small file - no sampling needed
+        return {"head": 0, "tail": 0, "random": 0, "total": 0, "strategy": "full_read"}
+
+    # Base sample size scales with file size (logarithmic scaling)
+    # e.g., 10MB -> 5000, 100MB -> 8000, 1GB -> 12000
+    import math
+    base_sample = int(5000 + 2000 * math.log10(max(1, file_size_mb / 10)))
+    total_sample = min(max(base_sample, _MIN_SAMPLE_SIZE), _MAX_SAMPLE_SIZE)
+
+    head_size = int(total_sample * _HEAD_RATIO)
+    tail_size = int(total_sample * _TAIL_RATIO)
+    random_size = total_sample - head_size - tail_size  # Remainder for random
+
+    return {
+        "head": head_size,
+        "tail": tail_size,
+        "random": random_size,
+        "total": total_sample,
+        "strategy": "composite_head_tail_random"
+    }
+
+
+def _read_csv_composite_sample(
+    data_path: str,
+    sep: str,
+    decimal: str,
+    encoding: str,
+    file_size_mb: float,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Read CSV using composite sampling strategy (Head + Tail + Random).
+
+    This captures both the beginning and end of the data, which is crucial
+    for time-sorted or grouped datasets where the first N rows may only
+    represent a small slice of the distribution.
+
+    Returns:
+        Tuple of (DataFrame, sampling_metadata)
+    """
+    sample_config = _compute_sample_sizes(file_size_mb)
+
+    if sample_config["strategy"] == "full_read":
+        # Small file - read everything
+        df = pd.read_csv(data_path, sep=sep, decimal=decimal, encoding=encoding)
+        return df, {
+            "was_sampled": False,
+            "strategy": "full_read",
+            "total_rows_read": len(df),
+        }
+
+    head_size = sample_config["head"]
+    tail_size = sample_config["tail"]
+    random_size = sample_config["random"]
+    total_target = sample_config["total"]
+
+    print(f"Steward: Composite sampling - Head={head_size}, Tail={tail_size}, Random={random_size} (File: {file_size_mb:.2f}MB)")
+
+    # Step 1: Read HEAD rows
+    df_head = pd.read_csv(
+        data_path, sep=sep, decimal=decimal, encoding=encoding,
+        nrows=head_size, dtype=str, low_memory=False
+    )
+
+    # Step 2: Count total rows (efficient - just count lines)
+    total_rows = _count_csv_rows(data_path, encoding)
+
+    # Step 3: Read TAIL rows (skip to end)
+    df_tail = pd.DataFrame()
+    if total_rows > head_size + tail_size:
+        skip_rows = max(0, total_rows - tail_size)
+        # Skip header + rows to get to tail
+        try:
+            df_tail = pd.read_csv(
+                data_path, sep=sep, decimal=decimal, encoding=encoding,
+                skiprows=range(1, skip_rows + 1),  # +1 to skip header row index
+                dtype=str, low_memory=False
+            )
+        except Exception as e:
+            print(f"Steward: Tail sampling failed ({e}), using head only")
+            df_tail = pd.DataFrame()
+    elif total_rows > head_size:
+        # File is small enough that head overlaps with tail
+        # Read everything after head
+        try:
+            df_tail = pd.read_csv(
+                data_path, sep=sep, decimal=decimal, encoding=encoding,
+                skiprows=range(1, head_size + 1),
+                dtype=str, low_memory=False
+            )
+        except Exception:
+            df_tail = pd.DataFrame()
+
+    # Step 4: Random middle sample (probabilistic skip if file is large)
+    df_random = pd.DataFrame()
+    if random_size > 0 and total_rows > head_size + tail_size + random_size:
+        try:
+            # Calculate rows to sample from middle section
+            middle_start = head_size
+            middle_end = total_rows - tail_size
+            middle_size = middle_end - middle_start
+
+            if middle_size > random_size:
+                # Probabilistic sampling from middle
+                # Sample random row indices from middle section
+                np.random.seed(42)  # Reproducible
+                random_indices = sorted(np.random.choice(
+                    range(middle_start, middle_end),
+                    size=min(random_size, middle_size),
+                    replace=False
+                ))
+
+                # Read only those rows (skip all others)
+                # This is more efficient than reading all and sampling
+                skip_set = set(range(1, total_rows + 1)) - set(idx + 1 for idx in random_indices)
+                df_random = pd.read_csv(
+                    data_path, sep=sep, decimal=decimal, encoding=encoding,
+                    skiprows=list(skip_set)[:total_rows],  # Limit skip list
+                    dtype=str, low_memory=False, nrows=random_size
+                )
+        except Exception as e:
+            print(f"Steward: Random middle sampling failed ({e}), using head+tail only")
+            df_random = pd.DataFrame()
+
+    # Step 5: Combine samples
+    dfs_to_concat = [df_head]
+    if not df_tail.empty:
+        dfs_to_concat.append(df_tail)
+    if not df_random.empty:
+        dfs_to_concat.append(df_random)
+
+    df_combined = pd.concat(dfs_to_concat, ignore_index=True)
+
+    # Step 6: Remove duplicates (in case tail overlaps with head)
+    df_combined = df_combined.drop_duplicates()
+
+    # Step 7: Shuffle for unbiased example rows
+    df_combined = df_combined.sample(frac=1, random_state=42).reset_index(drop=True)
+
+    actual_strategy = "head_tail_random" if not df_random.empty else "head_tail"
+
+    sampling_metadata = {
+        "was_sampled": True,
+        "strategy": actual_strategy,
+        "head_rows": len(df_head),
+        "tail_rows": len(df_tail) if not df_tail.empty else 0,
+        "random_rows": len(df_random) if not df_random.empty else 0,
+        "total_rows_read": len(df_combined),
+        "total_rows_in_file": total_rows,
+        "shuffled": True,
+    }
+
+    print(f"Steward: Composite sample created - {len(df_combined)} rows from {total_rows} total (shuffled)")
+
+    return df_combined, sampling_metadata
+
+
+def _count_csv_rows(file_path: str, encoding: str) -> int:
+    """Efficiently count rows in CSV file without loading into memory."""
+    try:
+        with open(file_path, 'r', encoding=encoding) as f:
+            # Count lines, subtract 1 for header
+            row_count = sum(1 for _ in f) - 1
+            return max(0, row_count)
+    except Exception:
+        # Fallback: estimate from file size (rough: ~100 bytes per row)
+        file_size = os.path.getsize(file_path)
+        return max(1000, file_size // 100)
 
 class StewardAgent:
     def __init__(self, api_key: str = None):
@@ -59,27 +252,30 @@ class StewardAgent:
         print(f"Steward Detected: Sep='{sep}', Decimal='{decimal}', Encoding='{detected_encoding}'")
 
         try:
-            # 3. Load Data with Fallbacks & Sampling
+            # 3. Load Data with COMPOSITE SAMPLING (Head + Tail + Random)
+            # This captures temporal/distributional range for better profiling
             file_size = os.path.getsize(data_path)
             file_size_mb = file_size / (1024 * 1024)
-            SAMPLE_SIZE = 5000
-            
-            # Primary Load Attempt
+
+            # Primary Load Attempt with Smart Composite Sampling
+            sampling_metadata = {}
             try:
-                if file_size_mb > 10:
-                    print(f"Steward: Sampling {SAMPLE_SIZE} rows (File size: {file_size_mb:.2f}MB)")
-                    df = pd.read_csv(data_path, sep=sep, decimal=decimal, encoding=detected_encoding, nrows=SAMPLE_SIZE)
-                    was_sampled = True
-                else:
-                    df = pd.read_csv(data_path, sep=sep, decimal=decimal, encoding=detected_encoding)
-                    was_sampled = False
+                df, sampling_metadata = _read_csv_composite_sample(
+                    data_path=data_path,
+                    sep=sep,
+                    decimal=decimal,
+                    encoding=detected_encoding,
+                    file_size_mb=file_size_mb,
+                )
+                was_sampled = sampling_metadata.get("was_sampled", False)
             except Exception as e:
-                print(f"Steward: Primary load failed ({e}). Attempting fallback engine...")
+                print(f"Steward: Composite sampling failed ({e}). Attempting fallback engine...")
                 # Fallback: Python engine is slower but more robust
-                df = pd.read_csv(data_path, sep=sep if sep else None, decimal=decimal, 
+                df = pd.read_csv(data_path, sep=sep if sep else None, decimal=decimal,
                                encoding=detected_encoding, engine='python', on_bad_lines='skip')
-                was_sampled = False # Can't guarantee sampling in fallback generic mode easily without nrows, but usually fine
-            
+                was_sampled = False
+                sampling_metadata = {"was_sampled": False, "strategy": "fallback_full_read"}
+
             # 4. Preserve raw headers & Scrub
             df.columns = [str(c) for c in df.columns]
             pii_findings = detect_pii_findings(df)
@@ -96,44 +292,65 @@ class StewardAgent:
                 encoding=detected_encoding,
                 file_size_bytes=file_size,
                 was_sampled=was_sampled,
-                sample_size=SAMPLE_SIZE if was_sampled else shape[0] if len(df) > 0 else 0,
+                sample_size=sampling_metadata.get("total_rows_read", shape[0]),
                 pii_findings=pii_findings,
+                sampling_metadata=sampling_metadata,  # Pass full sampling info
             )
             try:
                 write_dataset_profile(dataset_profile)
             except Exception:
                 pass
-            
-            # 6. Construct Prompt
+
+            # 6. Construct Prompt with TRANSPARENT sampling info
+            sampling_strategy = sampling_metadata.get("strategy", "unknown")
+            total_in_file = sampling_metadata.get("total_rows_in_file", "unknown")
+            head_rows = sampling_metadata.get("head_rows", 0)
+            tail_rows = sampling_metadata.get("tail_rows", 0)
+            random_rows = sampling_metadata.get("random_rows", 0)
+
+            if was_sampled:
+                sampling_description = (
+                    f"SAMPLING: Composite sample (Head={head_rows} + Tail={tail_rows} + Random={random_rows}) "
+                    f"from {total_in_file} total rows. Sample is SHUFFLED for unbiased distribution."
+                )
+            else:
+                sampling_description = "SAMPLING: Full dataset loaded (no sampling required)."
+
             metadata_str = f"""
-            Rows: {shape[0]} (Estimated/Sampled: {was_sampled}), Columns: {shape[1]}
+            Rows in Sample: {shape[0]}, Columns: {shape[1]}
             Filesize: {file_size_mb:.2f} MB
-            
+            {sampling_description}
+
             KEY COLUMNS (Top 50 Importance):
             {profile['column_details']}
-            
+
             AMBIGUITY REPORT:
             {profile['ambiguities']}
-            
+
             COLUMN GLOSSARY (Heuristic Hints):
             {profile['glossary']}
-            
+
             {profile['alerts']}
-            
-            Example Rows (Random Sample):
+
+            Example Rows (from shuffled composite sample):
             {profile['examples']}
             """
-            
+
             from src.utils.prompting import render_prompt
-            
+
             SYSTEM_PROMPT_TEMPLATE = """
             You are the Senior Data Steward.
-            
+
             MISSION: Support the Business Objective: "$business_objective"
-            
+
             INPUT DATA PROFILE:
             $metadata_str
-            
+
+            IMPORTANT SAMPLING NOTE:
+            The profile is based on a COMPOSITE SAMPLE (Head + Tail portions of the data) to capture
+            temporal/distributional range. This means you're seeing data from BOTH the beginning AND
+            end of the file, which is crucial for time-sorted or grouped datasets.
+
             INSTRUCTIONS:
             1. Start strictly with "DATA SUMMARY:".
             2. Infer the Business Domain (e.g., Retail, CRM, Manufacturing) based on column names.
@@ -141,7 +358,7 @@ class StewardAgent:
             4. Highlight Data Quality Blockers and Ambiguities (e.g., numeric-looking strings with commas, percent signs, mixed types).
             5. Mention which columns seem to be Identifiers vs Dates vs Numerical Features, and why they matter to the objective.
             6. Explicitly call out any columns whose meaning is unclear or overloaded.
-            7. IF "Sampled: True" is in the profile, YOU MUST EXPLICITLY STATE: "Note: Analysis based on a sample of the first 5000 rows."
+            7. IF sampling was used, acknowledge it but note that the sample covers both START and END of the data for better representativeness.
             8. Be concise. NO markdown tables. Plain text only.
             """
             
@@ -629,6 +846,7 @@ def build_dataset_profile(
     was_sampled: bool,
     sample_size: int,
     pii_findings: Dict[str, Any] | None = None,
+    sampling_metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     def _safe_numeric_summary(series: pd.Series) -> Dict[str, Any]:
         summary: Dict[str, Any] = {}
@@ -749,6 +967,13 @@ def build_dataset_profile(
             "was_sampled": bool(was_sampled),
             "sample_size": int(sample_size),
             "file_size_bytes": int(file_size_bytes),
+            # Include detailed sampling metadata for transparency
+            "strategy": (sampling_metadata or {}).get("strategy", "unknown"),
+            "head_rows": (sampling_metadata or {}).get("head_rows", 0),
+            "tail_rows": (sampling_metadata or {}).get("tail_rows", 0),
+            "random_rows": (sampling_metadata or {}).get("random_rows", 0),
+            "total_rows_in_file": (sampling_metadata or {}).get("total_rows_in_file"),
+            "shuffled": (sampling_metadata or {}).get("shuffled", False),
         },
         "dialect": {
             "sep": dialect_info.get("sep"),
