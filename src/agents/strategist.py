@@ -107,40 +107,46 @@ class StrategistAgent:
            This is a DESCRIPTIVE objective because the goal is pattern discovery, not prediction.
            Success metric: Segment interpretability and separation quality (silhouette score)."
 
-        *** STEP 3: DESIGN STRATEGY WITH TEAM CAPABILITIES IN MIND ***
-        You are designing a plan for AI engineers (Data Engineer, ML Engineer) with specific strengths and limitations.
-        Consider dataset size and complexity when proposing strategies.
-        
-        ML Engineer Capabilities:
-        ✅ Strong: Supervised learning (Linear/Logistic Regression, Random Forest, Gradient Boosting), 
-            clustering (KMeans, DBSCAN), segmentation analysis, baseline comparisons, 
-            simple pipelines, visualization, cross-validation
-        ⚠️ Limited: Complex causal inference (small n), advanced time series (requires n>=1000), 
-            deep learning, automatic feature engineering beyond standard transforms
-        ❌ Cannot: Generate synthetic data, access external APIs, train models requiring >5000 samples
-        
-        Data Engineer Capabilities:
-        ✅ Strong: Data cleaning, type inference, missing value handling, outlier detection,
-            basic transformations, duplicate removal, format standardization
-        ⚠️ Limited: Complex feature engineering, advanced imputation strategies
-        ❌ Cannot: External data joins, API calls, database writes
-        
-        Dataset Scale Guidance (UNIVERSAL):
-        - Use dataset_scale_hints or the data summary to infer small/medium/large.
-        - Small or limited scale: favor simple, interpretable approaches; penalize complexity.
-        - Medium or large scale: allow more complex methods if justified, but prefer robust baselines.
-        
-        Strategy Complexity Rules:
-        1. Small or limited datasets: Prefer simple, interpretable models over complex methods.
-        2. If proposing COMPLEX techniques (elasticity modeling, causal inference, multi-stage optimization):
-           → Include FALLBACK to a simpler approach if data limits apply.
-        3. Always consider: Can this be implemented with available data and engineer capabilities?
-        
-        Implementation Feasibility Check:
-        Before finalizing strategy, ask yourself:
-        - Does this require data we don't have (time series with n=300)?
-        - Does this need capabilities engineers lack (deep learning, causal DAGs)?
-        - Is there a simpler approach that delivers 80% of the value with 20% of the risk?
+        *** STEP 3: CONTEXT-AWARE STRATEGY DESIGN ***
+        You are a Chief Data Strategist designing executable plans. Your decisions must be driven by DATA CONTEXT,
+        not arbitrary thresholds or pre-defined capability lists.
+
+        FIRST PRINCIPLES FEASIBILITY (Replace Hardcoded Rules):
+        Instead of checking against fixed row limits, reason through:
+
+        1. **STATISTICAL POWER**: Does the data have enough observations per feature to support the proposed method?
+           - Linear models: Generally robust even with moderate n/p ratios
+           - Tree ensembles: Can handle high dimensionality but need enough leaf samples
+           - Complex methods: Evaluate variance-bias tradeoff dynamically
+
+        2. **SIGNAL-TO-NOISE**: Given the data profile (missing rates, cardinality, variance), what methods are appropriate?
+           - High noise → favor regularization, ensembles
+           - Clean signal → simpler methods may suffice
+           - Sparse features → consider appropriate encoding strategies
+
+        3. **COMPUTE-VALUE TRADEOFF**: Is the added complexity justified by expected lift?
+           - Simple baseline + small improvement = ship the simple version
+           - Complex method + large improvement = worth the investment
+           - Always define: "What is the marginal value of 5% more accuracy?"
+
+        4. **FAILURE MODE ANALYSIS**: What happens if the method underperforms?
+           - Define graceful degradation: complex → medium → simple fallback chain
+           - Identify early-stopping criteria (e.g., validation loss plateau)
+           - Specify recovery actions
+
+        DYNAMIC CAPABILITY ASSESSMENT:
+        Rather than fixed "can/cannot" lists, evaluate each technique against:
+        - Data volume and quality (from dataset summary)
+        - Feature complexity (cardinality, types, relationships)
+        - Business constraints (latency, interpretability, auditability)
+        - Available validation strategy (enough data for holdout? time-based split needed?)
+
+        STRATEGY CALIBRATION PROTOCOL:
+        For ANY proposed technique, explicitly state:
+        - WHY this technique fits the data profile (not generic "it's good for classification")
+        - WHAT could cause it to fail (data-specific risks)
+        - FALLBACK if primary approach underperforms (always have Plan B)
+        - EXPECTED LIFT over naive baseline (quantify the value proposition)
 
         
         *** DATA SCIENCE FIRST PRINCIPLES (UNIVERSAL REASONING) ***
@@ -154,7 +160,31 @@ class StrategistAgent:
         3. **TARGET CLARITY:**
            - What exactly are we solving for? (e.g. Price Optimization -> Target = "Success Probability" given Price).
            
-        *** STEP 4: EVALUATE APPROPRIATE METRICS ***
+        *** STEP 4: DYNAMIC VALIDATION STRATEGY ***
+        Choose validation strategy based on DATA STRUCTURE, not defaults:
+
+        1. **TEMPORAL DATA**: If data has time ordering (dates, sequences):
+           - Use time-based split (train on past, validate on future)
+           - NEVER use random shuffle - it causes data leakage
+           - Consider walk-forward validation for robust estimates
+
+        2. **GROUPED DATA**: If observations belong to groups (customers, stores):
+           - Use group-aware splits (all of customer X in train OR test, not both)
+           - Prevents overfitting to specific entities
+
+        3. **IMBALANCED DATA**: If target class is rare (<10%):
+           - Use stratified sampling to preserve class ratios
+           - Consider precision-recall metrics over accuracy
+
+        4. **SMALL DATA**: If n < 1000 or n/features < 10:
+           - Use k-fold cross-validation (k=5 or k=10) for variance reduction
+           - Consider bootstrap for confidence intervals
+
+        5. **LARGE DATA**: If n > 50000:
+           - Simple holdout (70/15/15) is often sufficient
+           - Consider computational cost of cross-validation
+
+        *** STEP 5: EVALUATE APPROPRIATE METRICS ***
         Based on your objective_type, reason through what metrics best measure success.
         DO NOT use pre-defined metric lists. Instead, think:
         - What does the business care about? (revenue, accuracy, interpretability, coverage)
@@ -178,17 +208,27 @@ class StrategistAgent:
             "objective_reasoning": "2-3 sentences explaining WHY this objective_type fits the business goal",
             "success_metric": "Primary business metric (not generic ML metric)",
             "recommended_evaluation_metrics": ["list", "of", "metrics", "to", "track"],
-            "validation_strategy": "cross_validation | time_split | holdout | bootstrap (with reasoning)",
+            "validation_strategy": "Strategy name with data-driven rationale (e.g., 'time_split: data has temporal ordering')",
+            "validation_rationale": "2-3 sentences explaining WHY this validation fits the data structure",
             "analysis_type": "Brief label (e.g. 'Price Optimization', 'Churn Prediction')",
             "hypothesis": "What you expect to find or achieve",
             "required_columns": ["exact", "column", "names", "from", "summary"],
             "techniques": ["list", "of", "data science techniques"],
-            "estimated_difficulty": "Low | Medium | High",
+            "feasibility_analysis": {
+              "statistical_power": "Assessment of n/p ratio and sample adequacy",
+              "signal_quality": "Assessment of data quality for proposed method",
+              "compute_value_tradeoff": "Is complexity justified by expected lift?"
+            },
+            "fallback_chain": ["Primary technique", "Fallback if primary fails", "Simple baseline"],
+            "expected_lift": "Quantified estimate: 'X% improvement over naive baseline because Y'",
+            "estimated_difficulty": "Low | Medium | High (with data-driven justification)",
             "reasoning": "Why this strategy is optimal for the data and objective"
           }
         - "required_columns": Use EXACT column names from the dataset summary.
         - "objective_reasoning" is MANDATORY and must connect business goal → objective_type.
-        - "reasoning" must include: why this fits the objective, what could fail, and a fallback if data limits apply.
+        - "feasibility_analysis" is MANDATORY - no technique without data-driven justification.
+        - "fallback_chain" is MANDATORY - every strategy needs a Plan B.
+        - "reasoning" must include: why this fits the objective, what could fail, and recovery plan.
         """
         
         system_prompt = render_prompt(
@@ -318,14 +358,40 @@ class StrategistAgent:
                 metrics = ["summary_statistics"]
 
         validation_strategy = primary.get("validation_strategy", "cross_validation")
+        validation_rationale = primary.get("validation_rationale", "Default cross-validation for general applicability.")
+
+        # Extract new context-aware fields from LLM output
+        feasibility_analysis = primary.get("feasibility_analysis", {})
+        if not feasibility_analysis:
+            # Provide sensible defaults if LLM didn't generate
+            feasibility_analysis = {
+                "statistical_power": "Not assessed - using default assumptions",
+                "signal_quality": "Not assessed - using default assumptions",
+                "compute_value_tradeoff": "Not assessed - using default assumptions",
+            }
+
+        fallback_chain = primary.get("fallback_chain", [])
+        if not fallback_chain:
+            # Provide default fallback chain based on objective_type
+            if objective_type == "predictive":
+                fallback_chain = ["Proposed model", "Logistic/Linear Regression baseline", "Majority class/mean predictor"]
+            elif objective_type == "prescriptive":
+                fallback_chain = ["Optimization model", "Rule-based heuristic", "Current business practice"]
+            else:
+                fallback_chain = ["Primary analysis", "Simplified analysis", "Descriptive statistics only"]
+
+        expected_lift = primary.get("expected_lift", "Not quantified - baseline comparison recommended")
 
         evaluation_plan = {
             "objective_type": objective_type,
             "metrics": metrics,
             "validation": {
                 "strategy": validation_strategy,
-                "notes": "Adjust validation to data volume and temporal ordering.",
+                "rationale": validation_rationale,
             },
+            "feasibility": feasibility_analysis,
+            "fallback_chain": fallback_chain,
+            "expected_lift": expected_lift,
         }
 
         # Keep simple leakage heuristics (universal)
