@@ -8377,6 +8377,28 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 sandbox.files.write(f"{run_root}/data/execution_contract.json", f)
                         except Exception as contract_err:
                             print(f"Warning: failed to upload execution_contract.json: {contract_err}")
+                    # 2.6 Upload context artifacts used by DE logic (best-effort)
+                    context_artifacts = [
+                        "data/column_inventory.json",
+                        "data/column_sets.json",
+                        "data/contract_min.json",
+                        "data/dataset_semantics.json",
+                        "data/dataset_training_mask.json",
+                        "data/execution_contract.json",
+                    ]
+                    for local_path in context_artifacts:
+                        if not os.path.exists(local_path):
+                            continue
+                        remote_path = (
+                            f"{run_root}/{local_path}"
+                            if local_path.startswith("data/")
+                            else f"{run_root}/data/{os.path.basename(local_path)}"
+                        )
+                        try:
+                            with open(local_path, "rb") as f:
+                                sandbox.files.write(remote_path, f)
+                        except Exception as ctx_err:
+                            print(f"Warning: failed to upload {local_path}: {ctx_err}")
 
                     # 3. Execute Cleaning (P2.1: Patch placeholders + minimal backward compat)
                     code = patch_placeholders(code, data_rel=CANONICAL_RAW_REL)

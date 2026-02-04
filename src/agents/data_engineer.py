@@ -113,6 +113,14 @@ class DataEngineerAgent:
         de_runbook = contract.get("data_engineer_runbook") or {}
         de_runbook_json = json.dumps(compress_long_lists(de_runbook)[0], indent=2)
 
+        # [SAFETY] Truncate data_audit if massive to prevent context overflow
+        # The audit concatenates many sources; preserve head (structure) and tail (recent instructions).
+        if data_audit and len(data_audit) > 100000:
+            print(f"DEBUG: Truncating massive data_audit ({len(data_audit)} chars) to 100k.")
+            head_len = 50000
+            tail_len = 50000
+            data_audit = data_audit[:head_len] + "\n...[AUDIT TRUNCATED FOR CONTEXT SAFETY]...\n" + data_audit[-tail_len:]
+
         # SYSTEM TEMPLATE with PYTHON SYNTAX GOTCHAS (Fix CAUSA RAÍZ 3)
         SYSTEM_TEMPLATE = """
         You are a Senior Data Engineer. Produce a robust cleaning SCRIPT for downstream ML.
