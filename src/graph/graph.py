@@ -7055,6 +7055,29 @@ def _finalize_heavy_execution(
         issue_text = ", ".join(content_issues)
         output = f"{output}\nEXECUTION ERROR: ARTIFACT_CONTENT_INVALID: {issue_text}"
 
+    heavy_error_kind = state.get("heavy_runner_error_kind")
+    heavy_error_context = state.get("heavy_runner_error_context")
+    heavy_error_path = os.path.join("artifacts", "heavy_error.json")
+    if os.path.exists(heavy_error_path):
+        try:
+            with open(heavy_error_path, "r", encoding="utf-8") as f_err:
+                heavy_error_payload = json.load(f_err)
+            error_summary = heavy_error_payload.get("error") if isinstance(heavy_error_payload, dict) else ""
+            error_stack = heavy_error_payload.get("stacktrace") if isinstance(heavy_error_payload, dict) else ""
+            parts = []
+            if error_summary:
+                parts.append(str(error_summary))
+            if error_stack:
+                parts.append(str(error_stack)[-2000:])
+            if parts:
+                output = f"{output}\nHEAVY_RUNNER_ERROR_CONTEXT:\n" + "\n".join(parts)
+                if not heavy_error_kind:
+                    heavy_error_kind = "code"
+        except Exception:
+            pass
+    if heavy_error_context and "HEAVY_RUNNER_ERROR_CONTEXT" not in output:
+        output = f"{output}\nHEAVY_RUNNER_ERROR_CONTEXT:\n{str(heavy_error_context)[:2000]}"
+
     # Read heavy runner execution log to extract actual Traceback
     heavy_log_path = os.path.join("artifacts", "heavy_execution_log.txt")
     heavy_log_traceback = ""
@@ -7079,7 +7102,12 @@ def _finalize_heavy_execution(
         or "EXECUTION ERROR" in output
         or heavy_runner_error
     )
-    sandbox_failed = heavy_runner_error  # Mark as sandbox failure for proper retry handling
+    if heavy_error_kind == "code":
+        sandbox_failed = False
+    elif heavy_error_kind == "infra":
+        sandbox_failed = True
+    else:
+        sandbox_failed = heavy_runner_error  # Mark as sandbox failure for proper retry handling
 
     outputs_valid = not bool(artifact_issues or stale_outputs or content_issues or error_in_output)
     if run_id:
@@ -11135,14 +11163,36 @@ def execute_code(state: AgentState) -> AgentState:
                         },
                     )
 
+                heavy_error_kind = None
+                heavy_error_context = None
+                if heavy_result.get("error"):
+                    heavy_error_kind = "code"
+                    heavy_error_context = heavy_result.get("error")
+                elif heavy_result.get("job_failed"):
+                    heavy_error_kind = "infra"
+                    heavy_error_context = heavy_result.get("job_error")
+                state["heavy_runner_error_kind"] = heavy_error_kind
+                state["heavy_runner_error_context"] = heavy_error_context
+
                 output = f"HEAVY_RUNNER: status={heavy_result.get('status')} reason={heavy_reason}"
                 if heavy_result.get("job_failed"):
                     output += f"\nHEAVY_RUNNER_ERROR: Job execution failed"
                     job_err = heavy_result.get("job_error")
                     if job_err:
                         output += f"\nJOB_ERROR_DETAIL: {str(job_err)[:2000]}"
+                    output += "\nHEAVY_RUNNER_INFRA_ERROR"
                 if heavy_result.get("error"):
-                    output += f"\nHEAVY_RUNNER_ERROR: {heavy_result.get('error')}"
+                    err_payload = heavy_result.get("error")
+                    err_text = ""
+                    if isinstance(err_payload, dict):
+                        err_summary = err_payload.get("error") or ""
+                        err_stack = err_payload.get("stacktrace") or ""
+                        err_text = "\n".join([item for item in [err_summary, err_stack] if item])
+                    else:
+                        err_text = str(err_payload)
+                    if err_text:
+                        output += f"\nHEAVY_RUNNER_ERROR: {err_text[:4000]}"
+                    output += "\nHEAVY_RUNNER_CODE_ERROR"
 
                 visual_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
                 visual_cfg = visual_reqs.get("visual_requirements") if isinstance(visual_reqs.get("visual_requirements"), dict) else {}
