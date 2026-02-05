@@ -13,7 +13,7 @@ import fnmatch
 import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import TypedDict, Dict, Any, List, Literal, Optional
+from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple
 from langgraph.graph import StateGraph, END
 from e2b_code_interpreter import Sandbox as CodeSandbox
 try:
@@ -1364,6 +1364,38 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
     # Fallback to strategy if contract has no canonical_columns
     return strategy.get("required_columns", []) if strategy else []
 
+def _load_constant_columns_from_profile(profile_path: str = "data/data_profile.json") -> List[str]:
+    profile = _load_json_safe(profile_path)
+    if not isinstance(profile, dict):
+        return []
+    constant_cols = profile.get("constant_columns")
+    if not isinstance(constant_cols, list):
+        return []
+    return [col for col in constant_cols if isinstance(col, str) and col.strip()]
+
+def _filter_missing_required_constants(
+    missing_cols: List[str],
+    contract: Dict[str, Any],
+    constant_cols: List[str],
+) -> Tuple[List[str], List[str]]:
+    if not missing_cols or not constant_cols:
+        return missing_cols, []
+    constant_norm = {_norm_name(col) for col in constant_cols if col}
+    protected = set()
+    for col in contract.get("outcome_columns", []) or []:
+        protected.add(_norm_name(col))
+    for col in contract.get("decision_columns", []) or []:
+        protected.add(_norm_name(col))
+    filtered: List[str] = []
+    ignored: List[str] = []
+    for col in missing_cols:
+        normed = _norm_name(col)
+        if normed in constant_norm and normed not in protected:
+            ignored.append(col)
+        else:
+            filtered.append(col)
+    return filtered, ignored
+
 def _resolve_contract_deliverables(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     V4.1 compatible deliverables resolver.
@@ -1407,8 +1439,6 @@ def _resolve_allowed_columns_for_gate(
 ) -> List[str]:
     allowed: List[str] = []
     csv_path = state.get("ml_data_path") or "data/cleaned_data.csv"
-    if not os.path.exists(csv_path) and os.path.exists("data/cleaned_full.csv"):
-        csv_path = "data/cleaned_full.csv"
     if os.path.exists(csv_path):
         try:
             import pandas as pd
@@ -9136,6 +9166,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 contract_derived_cols = get_derived_column_names(contract)
             except Exception:
                 contract_derived_cols = []
+            constant_cols = _load_constant_columns_from_profile()
             cleaned_columns_set = set(df.columns.str.lower())
 
             print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")
@@ -9147,6 +9178,22 @@ def run_data_engineer(state: AgentState) -> AgentState:
             if mapping_result['missing']:
                 missing_cols = mapping_result['missing']
                 missing_input = [m for m in missing_cols]
+                missing_input, ignored_constants = _filter_missing_required_constants(
+                    missing_input,
+                    contract,
+                    constant_cols,
+                )
+                if ignored_constants:
+                    info_msg = (
+                        "IGNORED_MISSING_CONSTANT_COLUMNS: "
+                        f"{ignored_constants[:10]} (total={len(ignored_constants)})"
+                    )
+                    warnings = state.get("data_engineer_guard_warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                    warnings.append(info_msg)
+                    state["data_engineer_guard_warnings"] = warnings
+                    state["data_engineer_constant_columns_ignored"] = ignored_constants
                 if missing_input:
                     alias_conflicts = [req for req, meta in mapping_result.get("summary", {}).items() if meta.get("method") == "alias_conflict"]
                     manifest_raw = normalize_manifest(load_json(local_manifest_path))
@@ -9839,6 +9886,12 @@ def run_engineer(state: AgentState) -> AgentState:
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
     if isinstance(de_view, dict) and de_view.get("output_path"):
         data_path = str(de_view.get("output_path"))
+    if os.path.basename(data_path).lower() == "cleaned_full.csv":
+        data_audit_context = _merge_de_audit_override(
+            data_audit_context,
+            "NOTICE: cleaned_full.csv is not a valid ML input; using cleaned_data.csv instead.",
+        )
+        data_path = "data/cleaned_data.csv"
     feedback_history = state.get('feedback_history', [])
     leakage_summary = state.get("leakage_audit_summary", "")
     data_audit_context = state.get('data_summary', '')
@@ -9891,17 +9944,33 @@ def run_engineer(state: AgentState) -> AgentState:
                     print(f"ML dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
             except Exception:
                 pass
-    if not os.path.exists(data_path) and os.path.exists("data/cleaned_full.csv"):
-        data_path = "data/cleaned_full.csv"
+    if not os.path.exists(data_path):
+        data_audit_context = _merge_de_audit_override(
+            data_audit_context,
+            f"WARNING: cleaned_data.csv missing at '{data_path}'. ML execution cannot proceed without cleaned_data.csv.",
+        )
     required_input_cols = _resolve_required_input_columns(execution_contract, strategy)
-    header_cols = _read_csv_header(data_path, csv_encoding, csv_sep)
-    if data_path == "data/cleaned_data.csv" and required_input_cols:
+    header_cols = _read_csv_header(data_path, csv_encoding, csv_sep) if os.path.exists(data_path) else []
+    if required_input_cols and header_cols:
         header_norm = {_norm_name(c) for c in header_cols}
         missing_required = [c for c in required_input_cols if _norm_name(c) not in header_norm]
-        if missing_required and os.path.exists("data/cleaned_full.csv"):
-            data_path = "data/cleaned_full.csv"
-            header_cols = _read_csv_header(data_path, csv_encoding, csv_sep)
-            note = f"ML_DATA_PATH_FALLBACK: using cleaned_full.csv due to missing required columns {missing_required[:5]}"
+        constant_cols = _load_constant_columns_from_profile()
+        missing_required, ignored_constants = _filter_missing_required_constants(
+            missing_required,
+            execution_contract or {},
+            constant_cols,
+        )
+        if ignored_constants:
+            note = (
+                "ML_REQUIRED_COLUMNS_IGNORED_CONSTANTS: "
+                f"{ignored_constants[:10]} (total={len(ignored_constants)})"
+            )
+            data_audit_context = _merge_de_audit_override(data_audit_context, note)
+        if missing_required:
+            note = (
+                "ML_REQUIRED_COLUMNS_MISSING: "
+                f"{missing_required[:10]} (total={len(missing_required)})"
+            )
             data_audit_context = _merge_de_audit_override(data_audit_context, note)
     # V4.1: Removed legacy feature_availability and availability_summary
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
@@ -10768,6 +10837,13 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     base_cols = contract_min.get("relevant_columns")
     if not base_cols:
          base_cols = get_canonical_columns(contract) or []
+
+    constant_cols = _load_constant_columns_from_profile()
+    constant_norm = {_norm_name(col) for col in constant_cols if col} if constant_cols else set()
+    if constant_norm and base_cols:
+        filtered_base = [col for col in base_cols if _norm_name(col) not in constant_norm]
+        if filtered_base:
+            base_cols = filtered_base
     
     key_columns = list(base_cols)[:30]
     
@@ -10776,6 +10852,10 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     if isinstance(strategy_req, list) and strategy_req:
         canonical = get_canonical_columns(contract) or []
         intersect = [c for c in strategy_req if c in canonical]
+        if constant_norm and intersect:
+            intersect_filtered = [c for c in intersect if _norm_name(c) not in constant_norm]
+            if intersect_filtered:
+                intersect = intersect_filtered
         if intersect:
             key_columns = list(intersect)[:30]
             
@@ -10797,7 +10877,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     if not has_read_csv:
         issues.append("DATA_LOAD_MISSING")
     else:
-        allowed_paths = ("data/cleaned_data.csv", "data/cleaned_full.csv", "data.csv")
+        allowed_paths = ("data/cleaned_data.csv", "data.csv")
         path_hits = [p for p in read_csv_info.get("paths", []) if any(a in p for a in allowed_paths)]
         if not path_hits and "data_path" not in (code or "").lower():
             issues.append("DATA_PATH_NOT_USED")
