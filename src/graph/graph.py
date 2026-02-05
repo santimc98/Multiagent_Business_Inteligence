@@ -7345,6 +7345,49 @@ def _update_column_inventory_required_columns(
         pass
 
 
+def _sync_required_columns_artifacts(
+    *,
+    required_cols: List[str],
+    contract: Dict[str, Any] | None,
+    state: Dict[str, Any],
+) -> None:
+    if not required_cols:
+        return
+    try:
+        dump_json("data/required_columns.json", required_cols)
+        state["required_columns_path"] = "data/required_columns.json"
+    except Exception as req_err:
+        print(f"Warning: failed to persist required_columns.json: {req_err}")
+    try:
+        from src.utils.column_sets import build_column_sets, summarize_column_sets
+
+        role_map: Dict[str, str] = {}
+        if isinstance(contract, dict):
+            for col in contract.get("outcome_columns", []) or []:
+                if col:
+                    role_map[str(col)] = "target_candidate"
+            roles = get_column_roles(contract)
+            if isinstance(roles, dict):
+                for col in roles.get("identifiers", []) or []:
+                    if col:
+                        role_map[str(col)] = "id_like"
+        dataset_semantics = state.get("dataset_semantics")
+        if isinstance(dataset_semantics, dict):
+            split_candidates = dataset_semantics.get("split_candidates") or []
+            if isinstance(split_candidates, list):
+                for col in split_candidates:
+                    if col:
+                        role_map[str(col)] = "split_candidate"
+
+        column_sets = build_column_sets(required_cols, roles=role_map)
+        if isinstance(column_sets, dict):
+            dump_json("data/column_sets.json", column_sets)
+            state["column_sets"] = column_sets
+            state["column_sets_summary"] = summarize_column_sets(column_sets) or state.get("column_sets_summary")
+    except Exception as cs_err:
+        print(f"Warning: failed to rebuild column_sets from required_columns: {cs_err}")
+
+
 def run_execution_planner(state: AgentState) -> AgentState:
     print("--- [2.7] Execution Planner: Building Contract ---")
     abort_state = _abort_if_requested(state, "execution_planner")
@@ -7639,6 +7682,20 @@ def run_execution_planner(state: AgentState) -> AgentState:
             csv_path=csv_path,
             state=state if isinstance(state, dict) else {},
         )
+        required_cols_synced, _ = _extract_required_columns_from_contract(
+            contract if isinstance(contract, dict) else {},
+            contract_min if isinstance(contract_min, dict) else {},
+        )
+        _sync_required_columns_artifacts(
+            required_cols=required_cols_synced,
+            contract=contract if isinstance(contract, dict) else {},
+            state=state if isinstance(state, dict) else {},
+        )
+        # refresh contract_min column_sets_summary after sync
+        if isinstance(contract_min, dict):
+            refreshed_summary = (state.get("column_sets_summary") if isinstance(state, dict) else None)
+            if refreshed_summary:
+                contract_min["column_sets_summary"] = refreshed_summary
     except Exception as inv_err:
         print(f"Warning: column_inventory required_columns sync failed: {inv_err}")
     if run_id:
@@ -8510,6 +8567,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     context_artifacts = [
                         "data/column_inventory.json",
                         "data/column_sets.json",
+                        "data/required_columns.json",
                         "data/contract_min.json",
                         "data/dataset_semantics.json",
                         "data/dataset_training_mask.json",

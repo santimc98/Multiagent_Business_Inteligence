@@ -680,6 +680,7 @@ def build_de_view(
         "required_columns": required_columns,
         "optional_passthrough_columns": passthrough_columns,
         "output_path": output_path or "data/cleaned_data.csv",
+        "required_columns_path": "data/required_columns.json",
         "constraints": {
             "scope": "cleaning_only",
             "hard_constraints": [

@@ -162,6 +162,7 @@ class DataEngineerAgent:
         - If a column exists in raw data but is NOT in required_columns, DISCARD it (do not include in output).
         - Constant columns (single unique value) have been PRE-EXCLUDED from required_columns by the contract.
         - Do NOT second-guess the required_columns list; it represents the FINAL schema after cleaning.
+        - The authoritative list is stored in data/required_columns.json (array). Use it directly; do NOT infer by counting constants.
         - If a required column is missing from the input, raise an error (no fabrication).
         - Optional passthrough columns: include ONLY if present in input AND listed in optional_passthrough.
 
@@ -169,6 +170,7 @@ class DataEngineerAgent:
         - Preserve partition/split columns if they exist or are detected in the Dataset Semantics Summary.
         - If you create a partition column (split/fold/bucket), document it in the manifest and do not drop it.
         - For wide datasets, avoid enumerating all columns in code comments or logic. If data/column_sets.json exists, use src.utils.column_sets.expand_column_sets to manage column lists; fall back gracefully if the file is missing.
+        - Note: data/column_sets.json is aligned to required_columns; prefer it for large schemas.
         - Do NOT drop columns just because they are missing from a truncated list; use selectors + explicit columns from column_sets.json when available.
         - If column_sets.json is present, preserve all columns matched by its selectors plus explicit_columns unless the contract explicitly forbids them.
         - Never assume canonical_columns is the full inventory on wide datasets. Use data/column_inventory.json + data/column_sets.json as source of truth when present.
