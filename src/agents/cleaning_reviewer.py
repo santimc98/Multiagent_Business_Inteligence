@@ -297,7 +297,7 @@ def _review_cleaning_impl(
     gates, contract_source_used, warnings = _merge_cleaning_gates(view)
     gate_names = [gate["name"] for gate in gates]
 
-    required_columns = _list_str(view.get("required_columns"))
+    required_columns = _resolve_required_columns_for_review(view)
     column_roles = _coerce_roles(view.get("column_roles"))
 
     manifest = _load_json(cleaning_manifest_path)
@@ -798,6 +798,23 @@ def _list_str(value: Any) -> List[str]:
         return [str(item) for item in value if item]
     if isinstance(value, str) and value.strip():
         return [value.strip()]
+    return []
+
+
+def _resolve_required_columns_for_review(view: Dict[str, Any]) -> List[str]:
+    required = view.get("required_columns")
+    if isinstance(required, list):
+        return _list_str(required)
+    # If required_columns got compacted (count/head/tail), load from file.
+    path = view.get("required_columns_path") or "data/required_columns.json"
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, list) and payload:
+                return _list_str(payload)
+        except Exception:
+            pass
     return []
 
 

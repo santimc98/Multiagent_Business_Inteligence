@@ -1356,12 +1356,21 @@ def build_de_objective(contract: Dict[str, Any]) -> str:
 
 
 def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str, Any]) -> List[str]:
-    """V4.1: Use canonical_columns only. No legacy data_requirements fallback."""
+    """V4.1: Prefer explicit required_columns; avoid canonical_columns unless required set is missing."""
+    if contract and isinstance(contract, dict):
+        artifact_reqs = contract.get("artifact_requirements") or {}
+        clean_cfg = artifact_reqs.get("clean_dataset") or {}
+        required = clean_cfg.get("required_columns")
+        if isinstance(required, list) and required:
+            return required
+    file_required = _load_json_safe("data/required_columns.json")
+    if isinstance(file_required, list) and file_required:
+        return file_required
     if contract and isinstance(contract, dict):
         canonical = get_canonical_columns(contract)
         if canonical:
             return canonical
-    # Fallback to strategy if contract has no canonical_columns
+    # Fallback to strategy if contract has no usable columns
     return strategy.get("required_columns", []) if strategy else []
 
 def _load_constant_columns_from_profile(profile_path: str = "data/data_profile.json") -> List[str]:
@@ -9226,6 +9235,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 contract_derived_cols = []
             constant_cols = _load_constant_columns_from_profile()
             cleaned_columns_set = set(df.columns.str.lower())
+            host_mapping_enabled = False  # context-only: do not modify DE output
 
             print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")
             print(f"Required: {required_cols}")
@@ -9261,14 +9271,13 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         csv_path,
                         input_dialect
                     )
-                    if issues and not state.get("de_destructive_retry_done"):
+                    if issues:
                         patch = format_patch_instructions(issues)
-                        new_state = dict(state)
-                        new_state["de_destructive_retry_done"] = True
-                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, patch)
-                        print("⚠️ DESTRUCTIVE_CONVERSION_GUARD: retrying Data Engineer once with patch instructions.")
-                        return run_data_engineer(new_state)
+                        warnings = state.get("data_engineer_guard_warnings")
+                        if not isinstance(warnings, list):
+                            warnings = []
+                        warnings.append("DESTRUCTIVE_CONVERSION_GUARD:\n" + patch)
+                        state["data_engineer_guard_warnings"] = warnings
                     conflict_msg = f" Alias conflicts: {alias_conflicts}" if alias_conflicts else ""
                     warning_msg = f"MISSING_REQUIRED_COLUMNS_AFTER_MAPPING: {missing_input}.{conflict_msg}"
                     warnings = state.get("data_engineer_guard_warnings")
@@ -9280,26 +9289,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     state["data_engineer_alias_conflicts"] = alias_conflicts
                     print("Missing required columns after mapping: recorded warning for reviewer context.")
 
-            # Apply Renaming to Canonical Names
-            df_mapped = df.rename(columns=mapping_result['rename_mapping'])
+            # Do not apply deterministic renaming to DE output; mapping is context-only.
+            df_mapped = df.copy()
 
-            # Best-effort rename for derived/output columns already present
-            if contract_all_cols:
-                existing_norm = {}
-                for col in df_mapped.columns:
-                    normed = _norm_name(col)
-                    if normed and normed not in existing_norm:
-                        existing_norm[normed] = col
-                derived_rename = {}
-                for req_name in contract_all_cols:
-                    if req_name in df_mapped.columns:
-                        continue
-                    req_norm = _norm_name(req_name)
-                    match = existing_norm.get(req_norm)
-                    if match and match not in derived_rename:
-                        derived_rename[match] = req_name
-                if derived_rename:
-                    df_mapped = df_mapped.rename(columns=derived_rename)
+            # Skip deterministic renames for derived columns (context-only).
 
             # --- ID/SCALE GUARDS (Deterministic) ---
             id_issues = []
@@ -9418,17 +9411,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             f"raw_max={issue.get('raw_max')} raw_high_ratio={issue.get('raw_high_ratio')}"
                         )
                 if payload_lines:
-                    new_state = dict(state)
-                    if id_issues:
-                        new_state["de_id_guard_retry_done"] = True
-                    if scale_issues:
-                        new_state["de_scale_guard_retry_done"] = True
-                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(
-                        base_override, "\n".join(payload_lines)
-                    )
-                    print("ID/SCALE guard: retrying Data Engineer with evidence.")
-                    return run_data_engineer(new_state)
+                    warnings = state.get("data_engineer_guard_warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                    warnings.append("ID/SCALE_GUARD:\n" + "\n".join(payload_lines))
+                    state["data_engineer_guard_warnings"] = warnings
+                    print("ID/SCALE guard: recorded warning for reviewer context.")
 
             empty_required = _find_empty_required_columns(df_mapped, required_cols)
             if empty_required:
@@ -9444,20 +9432,22 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         required_issues.append(item)
                 if optional_issues and not required_issues:
                     warn_cols = [item.get("column") for item in optional_issues if item.get("column")]
+                    warnings = state.get("data_engineer_guard_warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                    warnings.append(f"OPTIONAL_COLUMNS_EMPTY: {warn_cols}")
+                    state["data_engineer_guard_warnings"] = warnings
                     print(f"Warning: optional columns empty after cleaning: {warn_cols}")
                 else:
                     required_cols_only = [item.get("column") for item in required_issues if item.get("column")]
                     raw_map = _build_required_raw_map(required_cols_only, norm_map)
                     raw_stats = _sample_raw_null_stats(csv_path, input_dialect, list(raw_map.values()))
                     parse_lines = []
-                    has_raw_values = False
                     for item in required_issues:
                         col = item.get("column")
                         raw_col = raw_map.get(col) if col else None
                         stats = raw_stats.get(raw_col, {}) if raw_col else {}
                         non_null_frac = stats.get("non_null_frac")
-                        if isinstance(non_null_frac, (int, float)) and non_null_frac > 0.01:
-                            has_raw_values = True
                         parse_lines.append(
                             f"- {col}: null_frac={item.get('null_frac'):.2%}, non_null_count={item.get('non_null_count')}, "
                             f"raw_col={raw_col}, raw_non_null_frac={non_null_frac}"
@@ -9474,18 +9464,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 payload = f"{payload}\n\n{hints}"
                     except Exception:
                         pass
-                    if has_raw_values and not state.get("de_empty_required_retry_done"):
-                        new_state = dict(state)
-                        new_state["de_empty_required_retry_done"] = True
-                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-                        print("Empty required columns guard: retrying Data Engineer with evidence.")
-                        return run_data_engineer(new_state)
-                    return {
-                        "cleaning_code": code,
-                        "cleaned_data_preview": "Error: Empty Required Columns",
-                        "error_message": "CRITICAL: Required input columns are empty after cleaning.\n" + payload,
-                    }
+                    warnings = state.get("data_engineer_guard_warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                    warnings.append(payload)
+                    state["data_engineer_guard_warnings"] = warnings
+                    print("Empty required columns guard: recorded warning for reviewer context.")
 
             # --- CLEANING REVIEWER (contract-driven) ---
             if cleaning_reviewer:
@@ -9520,6 +9504,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             cleaning_view_copy["input_dialect"] = input_dialect
                         if cleaning_code_for_normal_review:
                             cleaning_view_copy["cleaning_code"] = cleaning_code_for_normal_review
+                        if os.path.exists("data/required_columns.json"):
+                            cleaning_view_copy["required_columns_path"] = "data/required_columns.json"
                         cleaning_view_copy = compress_long_lists(cleaning_view_copy)[0]
                         review_result = cleaning_reviewer.review_cleaning(
                             cleaning_view_copy,
@@ -9543,6 +9529,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "cleaning_manifest_path": local_manifest_path,
                             "raw_csv_path": csv_path,
                         }
+                        if os.path.exists("data/required_columns.json"):
+                            review_context["required_columns_path"] = "data/required_columns.json"
                         if output_dialect:
                             review_context["output_dialect"] = output_dialect
                         if isinstance(input_dialect, dict):
@@ -9718,17 +9706,18 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 except Exception:
                     pass
 
-            try:
-                os.makedirs("data", exist_ok=True)
-                df_mapped.to_csv(
-                    "data/cleaned_full.csv",
-                    index=False,
-                    sep=csv_sep,
-                    decimal=csv_decimal,
-                    encoding=csv_encoding
-                )
-            except Exception as full_save_err:
-                print(f"Warning: failed to save cleaned_full.csv: {full_save_err}")
+            if host_mapping_enabled:
+                try:
+                    os.makedirs("data", exist_ok=True)
+                    df_mapped.to_csv(
+                        "data/cleaned_full.csv",
+                        index=False,
+                        sep=csv_sep,
+                        decimal=csv_decimal,
+                        encoding=csv_encoding
+                    )
+                except Exception as full_save_err:
+                    print(f"Warning: failed to save cleaned_full.csv: {full_save_err}")
 
             try:
                 audit = run_unsupervised_numeric_relation_audit(df_mapped)
@@ -9749,26 +9738,28 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 print(f"Warning: leakage audit failed: {audit_err}")
                 leakage_audit_summary = "Leakage audit failed; proceed with caution."
 
-            # Filter to only required columns (Strict output)
-            # Ensure we strictly have what we asked for, aligned by name
-            final_cols = [c for c in required_cols if c in df_mapped.columns]
-            if contract_derived_cols:
-                for col in contract_derived_cols:
-                    if col in df_mapped.columns and col not in final_cols:
-                        final_cols.append(col)
-            if not final_cols:
-                final_cols = df_mapped.columns.tolist()
-            df_final = df_mapped[final_cols]
-
-            # Save Mapped Data back to disk
-            df_final.to_csv(
-                local_cleaned_path,
-                index=False,
-                sep=csv_sep,
-                decimal=csv_decimal,
-                encoding=csv_encoding
-            )
-            print("Mapped data saved to 'data/cleaned_data.csv'")
+            # Do not rewrite cleaned_data.csv; keep DE output as the source of truth.
+            if host_mapping_enabled:
+                # Filter to only required columns (Strict output)
+                final_cols = [c for c in required_cols if c in df_mapped.columns]
+                if contract_derived_cols:
+                    for col in contract_derived_cols:
+                        if col in df_mapped.columns and col not in final_cols:
+                            final_cols.append(col)
+                if not final_cols:
+                    final_cols = df_mapped.columns.tolist()
+                df_final = df_mapped[final_cols]
+                df_final.to_csv(
+                    local_cleaned_path,
+                    index=False,
+                    sep=csv_sep,
+                    decimal=csv_decimal,
+                    encoding=csv_encoding
+                )
+                print("Mapped data saved to 'data/cleaned_data.csv'")
+            else:
+                df_final = df_mapped
+                print("Host mapping disabled; using DE cleaned_data.csv as-is.")
 
             # Save Summary
             with open("data/column_mapping_summary.json", "w") as f:
