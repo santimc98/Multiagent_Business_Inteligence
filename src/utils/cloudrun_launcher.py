@@ -260,6 +260,19 @@ def launch_heavy_runner_job(
             _gsutil_cp(remote_path, local_path, gsutil_bin)
             downloaded[filename] = local_path
 
+    # Always attempt to pull plots if present
+    plot_listing = _gsutil_ls(output_uri + "static/plots/*", gsutil_bin)
+    for uri in plot_listing:
+        if not uri or uri.endswith("/"):
+            continue
+        rel_path = uri.replace(output_uri, "")
+        if not rel_path or rel_path in downloaded:
+            continue
+        local_path = rel_path
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        _gsutil_cp(uri, local_path, gsutil_bin)
+        downloaded[rel_path] = local_path
+
     error_payload: Optional[Dict[str, Any]] = None
     error_uri = output_uri + "error.json"
     if _gsutil_exists(error_uri, gsutil_bin):

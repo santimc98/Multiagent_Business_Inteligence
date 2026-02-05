@@ -167,6 +167,15 @@ def _truncate_cell(text: str, max_len: int) -> str:
         return cleaned[:max_len]
     return cleaned[: max(0, max_len - len(suffix))] + suffix
 
+def _compact_header(columns: List[str], head: int = 10, tail: int = 6) -> str:
+    if not columns:
+        return ""
+    cols = [str(c) for c in columns if c]
+    if len(cols) <= head + tail:
+        return ", ".join(cols)
+    middle_count = len(cols) - head - tail
+    return ", ".join(cols[:head] + [f"[+{middle_count} more]"] + cols[-tail:])
+
 def render_table_text(headers: List[str], rows: List[List[str]], max_rows: int = 8, max_cell_len: int = 28) -> str:
     """
     Render a professional ASCII table suitable for PDF monospaced fonts.
@@ -729,6 +738,12 @@ class BusinessTranslatorAgent:
             data_adequacy_report,
             metrics_payload,
         )
+        if isinstance(run_summary, dict):
+            outcome = str(run_summary.get("run_outcome") or "").upper()
+            if outcome in {"GO", "NO_GO", "GO_WITH_LIMITATIONS"}:
+                executive_decision_label = outcome
+            elif outcome in {"APPROVE_WITH_WARNINGS", "APPROVED"}:
+                executive_decision_label = "GO_WITH_LIMITATIONS"
 
         def _summarize_integrity():
             issues = integrity_audit.get("issues", []) if isinstance(integrity_audit, dict) else []
@@ -1052,6 +1067,22 @@ class BusinessTranslatorAgent:
             scored_rows_list = _rows_from_sample(scored_rows, scored_cols, max_rows=5)
             scored_sample_table_text = render_table_text(scored_cols, scored_rows_list, max_rows=5)
 
+        artifact_headers_table_text = "No data available."
+        header_rows = []
+        if isinstance(cleaned_rows, dict) and isinstance(cleaned_rows.get("columns"), list):
+            cols = cleaned_rows.get("columns") or []
+            header_rows.append(["data/cleaned_data.csv", str(len(cols)), _compact_header(cols)])
+        if isinstance(scored_rows, dict) and isinstance(scored_rows.get("columns"), list):
+            cols = scored_rows.get("columns") or []
+            header_rows.append(["data/scored_rows.csv", str(len(cols)), _compact_header(cols)])
+        if header_rows:
+            artifact_headers_table_text = render_table_text(
+                ["artifact", "columns", "header_preview"],
+                header_rows,
+                max_rows=4,
+                max_cell_len=80,
+            )
+
         metrics_table_text = _metrics_table(metrics_payload, max_items=10)
         recommendations_table_text = _recommendations_table(recommendations_preview, max_rows=3)
         evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths) if evidence_paths else "No data available."
@@ -1129,6 +1160,7 @@ class BusinessTranslatorAgent:
         - Recommendations Preview: $recommendations_preview_context
         - Cleaned Data Sample Table (text): $cleaned_sample_table_text
         - Scored Rows Sample Table (text): $scored_sample_table_text
+        - Artifact Headers Table (text): $artifact_headers_table_text
         - Metrics Table (text): $metrics_table_text
         - Recommendations Table (text): $recommendations_table_text
         - Evidence Paths (max 8): $evidence_paths_text
@@ -1142,6 +1174,7 @@ class BusinessTranslatorAgent:
         GUIDANCE:
         - Use Insights as the primary evidence source; only reference other artifacts if they add clear value.
         - Include 2-4 short "tablas de muestra" using the provided text tables. Label them explicitly as samples and keep 3-5 rows maximum. Do NOT use markdown tables or pipes; use the text tables as-is.
+        - Include a short "Data schema snapshot" section that uses the Artifact Headers Table (text) exactly as provided.
         - If reporting_policy.demonstrative_examples_enabled is true AND run_outcome is in reporting_policy.demonstrative_examples_when_outcome_in,
           you MUST include a section titled "Ejemplos ilustrativos (no aptos para producción)".
           Use recommendations_preview.items (max 3-5) and include strong disclaimers plus support (n, observed_support if available).
@@ -1316,6 +1349,7 @@ class BusinessTranslatorAgent:
             recommendations_preview_context=json.dumps(recommendations_preview, ensure_ascii=False),
             cleaned_sample_table_text=cleaned_sample_table_text,
             scored_sample_table_text=scored_sample_table_text,
+            artifact_headers_table_text=artifact_headers_table_text,
             metrics_table_text=metrics_table_text,
             recommendations_table_text=recommendations_table_text,
             evidence_paths_text=evidence_paths_text,

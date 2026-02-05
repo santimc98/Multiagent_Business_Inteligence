@@ -7068,6 +7068,7 @@ def _finalize_heavy_execution(
     attempt_id: int,
     visuals_missing: bool,
 ) -> Dict[str, Any]:
+    import glob
     required_outputs = _resolve_required_outputs(contract, state)
     deliverables = _resolve_contract_deliverables(contract)
     output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
@@ -7170,6 +7171,9 @@ def _finalize_heavy_execution(
     artifact_paths: List[str] = []
     if isinstance(oc_report, dict):
         artifact_paths.extend(oc_report.get("present", []))
+    plots_local = glob.glob("static/plots/*.png")
+    if plots_local:
+        artifact_paths.extend(plots_local)
     for extra_path in [
         "data/strategy_spec.json",
         "data/plan.json",
@@ -7199,9 +7203,9 @@ def _finalize_heavy_execution(
 
     result = {
         "execution_output": output,
-        "plots_local": [],
+        "plots_local": plots_local,
         "fallback_plots": [],
-        "has_partial_visuals": visuals_missing,
+        "has_partial_visuals": bool(plots_local) and bool(error_in_output or sandbox_failed or visuals_missing),
         "execution_error": error_in_output,
         "execution_attempt": state.get("execution_attempt", 0) + 1,
         "last_runtime_error_tail": output[-4000:] if error_in_output else None,
