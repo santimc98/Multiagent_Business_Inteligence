@@ -7254,6 +7254,67 @@ def _filter_scored_rows_required_columns(
     return updated_artifacts
 
 
+def _extract_required_columns_from_contract(
+    contract: Dict[str, Any] | None,
+    contract_min: Dict[str, Any] | None,
+) -> tuple[List[str], str]:
+    sources = [("contract_min", contract_min), ("contract", contract)]
+    for source_name, cfg in sources:
+        if not isinstance(cfg, dict):
+            continue
+        artifact_reqs = cfg.get("artifact_requirements")
+        if not isinstance(artifact_reqs, dict):
+            continue
+        clean_cfg = artifact_reqs.get("clean_dataset")
+        if isinstance(clean_cfg, dict):
+            required = clean_cfg.get("required_columns")
+            if isinstance(required, list) and required:
+                return [str(c) for c in required if c], source_name
+        schema_binding = artifact_reqs.get("schema_binding")
+        if isinstance(schema_binding, dict):
+            required = schema_binding.get("required_columns")
+            if isinstance(required, list) and required:
+                return [str(c) for c in required if c], source_name
+    return [], ""
+
+
+def _update_column_inventory_required_columns(
+    *,
+    column_inventory: List[str],
+    contract: Dict[str, Any] | None,
+    contract_min: Dict[str, Any] | None,
+    csv_path: str | None,
+    state: Dict[str, Any],
+) -> None:
+    required_cols, source = _extract_required_columns_from_contract(contract, contract_min)
+    if not required_cols:
+        return
+    inv_path = "data/column_inventory.json"
+    inv_payload = _load_json_safe(inv_path)
+    if not isinstance(inv_payload, dict):
+        inv_payload = {}
+    if not isinstance(inv_payload.get("columns"), list):
+        inv_payload["columns"] = list(column_inventory or [])
+    if "n_columns" not in inv_payload:
+        inv_payload["n_columns"] = len(inv_payload.get("columns") or [])
+    if csv_path and "source_csv" not in inv_payload:
+        inv_payload["source_csv"] = csv_path
+    inv_payload["required_columns"] = required_cols
+    inv_payload["required_columns_source"] = source
+    try:
+        dump_json(inv_path, inv_payload)
+    except Exception as inv_err:
+        print(f"Warning: failed to persist column_inventory.json required_columns: {inv_err}")
+    try:
+        column_state = state.get("column_inventory")
+        if isinstance(column_state, dict):
+            column_state["required_columns"] = required_cols
+            column_state["required_columns_source"] = source
+            state["column_inventory"] = column_state
+    except Exception:
+        pass
+
+
 def run_execution_planner(state: AgentState) -> AgentState:
     print("--- [2.7] Execution Planner: Building Contract ---")
     abort_state = _abort_if_requested(state, "execution_planner")
@@ -7540,6 +7601,16 @@ def run_execution_planner(state: AgentState) -> AgentState:
             dump_json(_abs_in_work(work_dir_abs, "data/contract_min.json"), contract_min)
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
+    try:
+        _update_column_inventory_required_columns(
+            column_inventory=column_inventory,
+            contract=contract if isinstance(contract, dict) else {},
+            contract_min=contract_min if isinstance(contract_min, dict) else {},
+            csv_path=csv_path,
+            state=state if isinstance(state, dict) else {},
+        )
+    except Exception as inv_err:
+        print(f"Warning: column_inventory required_columns sync failed: {inv_err}")
     if run_id:
         copy_run_contracts(
             run_id,
