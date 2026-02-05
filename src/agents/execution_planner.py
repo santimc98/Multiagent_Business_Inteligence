@@ -24,6 +24,7 @@ from src.utils.contract_v41 import (
     assert_only_allowed_v41_keys,
     LEGACY_KEYS,
     CONTRACT_VERSION_V41,
+    normalize_contract_version,
 )
 from src.utils.run_bundle import get_run_dir
 from src.utils.feature_selectors import infer_feature_selectors, compact_column_representation
@@ -5771,6 +5772,27 @@ class ExecutionPlannerAgent:
             self.last_contract_min = contract_min
             return _finalize_and_persist(contract, contract_min, where="execution_planner:no_client")
 
+        target_candidates: List[Dict[str, Any]] = []
+        resolved_target = None
+        if isinstance(data_profile, dict):
+            try:
+                from src.utils.data_profile_compact import compact_data_profile_for_llm
+                compact = compact_data_profile_for_llm(data_profile, contract=None)
+                target_candidates = compact.get("target_candidates") if isinstance(compact, dict) else []
+            except Exception:
+                target_candidates = []
+        if isinstance(target_candidates, list) and target_candidates:
+            for item in target_candidates:
+                if not isinstance(item, dict):
+                    continue
+                col = item.get("column") or item.get("name") or item.get("candidate")
+                if not col:
+                    continue
+                resolved = _resolve_exact_header(col) or col
+                if resolved:
+                    resolved_target = resolved
+                    break
+
         strategy_json = json.dumps(strategy, indent=2)
         column_inventory_count = len(column_inventory or [])
         column_inventory_sample = (column_inventory or [])[:25]
@@ -5793,6 +5815,9 @@ relevant_sources:
 omitted_columns_policy:
 {omitted_columns_policy}
 
+contract_version_required:
+{json.dumps(CONTRACT_VERSION_V41)}
+
 column_inventory_count:
 {column_inventory_count}
 
@@ -5807,6 +5832,21 @@ column_inventory:
 
 data_profile_summary:
 {data_summary_str}
+
+target_candidates:
+{json.dumps(target_candidates, indent=2)}
+
+resolved_target:
+{json.dumps(resolved_target)}
+
+column_inventory_path:
+{json.dumps("data/column_inventory.json")}
+
+column_sets_path:
+{json.dumps("data/column_sets.json")}
+
+required_columns_path:
+{json.dumps("data/required_columns.json")}
 
 output_dialect:
 {json.dumps(output_dialect or "unknown")}
@@ -5846,10 +5886,19 @@ domain_expert_critique:
             "Return ONLY valid JSON with EXACT keys: "
             + json.dumps(repair_keys)
             + ". Do not include any other keys or commentary.\n"
+            + f"contract_version MUST be {json.dumps(CONTRACT_VERSION_V41)}.\n"
             + "Use RELEVANT_COLUMNS as focus_columns only; do NOT truncate canonical_columns.\n"
+            + "RELEVANT_COLUMNS must NOT be used to build canonical_columns; use full column inventory or feature selectors.\n"
             + "RELEVANT_COLUMNS: "
             + json.dumps(relevant_columns)
             + "\n"
+            + "TARGET_CANDIDATES: "
+            + json.dumps(target_candidates)
+            + "\n"
+            + "RESOLVED_TARGET: "
+            + json.dumps(resolved_target)
+            + "\n"
+            + "If RESOLVED_TARGET is provided, outcome_columns MUST include it.\n"
             + "STRATEGY_TITLE: "
             + json.dumps(strategy.get("title", "") if isinstance(strategy, dict) else "")
             + "\n"
@@ -5926,6 +5975,12 @@ domain_expert_critique:
                 print(f"WARNING: Planner parse failed on attempt {attempt_index}.")
                 continue
 
+            version = normalize_contract_version(parsed.get("contract_version"))
+            if version != CONTRACT_VERSION_V41:
+                parse_error = ValueError("contract_version_mismatch")
+                print(f"WARNING: Planner contract_version mismatch on attempt {attempt_index}.")
+                continue
+
             contract = parsed
             llm_success = True
             break
@@ -5934,6 +5989,32 @@ domain_expert_critique:
             contract = _fallback("JSON Parse Error after retries")
 
         contract = ensure_v41_schema(contract)
+        if resolved_target:
+            explicit_outcomes = contract.get("outcome_columns")
+            has_outcomes = False
+            if isinstance(explicit_outcomes, list):
+                has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
+            elif isinstance(explicit_outcomes, str):
+                has_outcomes = explicit_outcomes.strip().lower() != "unknown"
+            if not has_outcomes:
+                contract["outcome_columns"] = [resolved_target]
+        elif isinstance(target_candidates, list) and target_candidates:
+            explicit_outcomes = contract.get("outcome_columns")
+            has_outcomes = False
+            if isinstance(explicit_outcomes, list):
+                has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
+            elif isinstance(explicit_outcomes, str):
+                has_outcomes = explicit_outcomes.strip().lower() != "unknown"
+            if not has_outcomes:
+                inferred = []
+                for item in target_candidates:
+                    if isinstance(item, dict):
+                        col = item.get("column") or item.get("name") or item.get("candidate")
+                        if col:
+                            inferred.append(col)
+                            break
+                if inferred:
+                    contract["outcome_columns"] = inferred
         contract["qa_gates"] = _apply_qa_gate_policy(
             contract.get("qa_gates"),
             strategy,
