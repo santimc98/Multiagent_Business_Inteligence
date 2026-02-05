@@ -45,6 +45,15 @@ def log(message: str) -> None:
     print(f"[{ts}] [heavy_runner] {message}", flush=True)
 
 
+def _ensure_text(value: Optional[Any]) -> str:
+    """Coerce bytes/None to safe text for logging."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _parse_gs_uri(uri: str) -> Tuple[str, str]:
     """Parse gs:// URI into bucket and blob path."""
     if not uri.startswith("gs://"):
@@ -310,6 +319,8 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     exec_start = time.perf_counter()
     exit_code, stdout, stderr = _run_script(script_path, work_dir)
     exec_time = time.perf_counter() - exec_start
+    stdout = _ensure_text(stdout)
+    stderr = _ensure_text(stderr)
 
     log(f"Execution completed in {exec_time:.2f}s with exit_code={exit_code}")
 
