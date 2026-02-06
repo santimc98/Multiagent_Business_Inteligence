@@ -54,3 +54,17 @@ def test_synthetic_margin():
     assert res["summary"]["Net_Margin"]["synthetic"] is True
     assert res["summary"]["Net_Margin"]["score"] == 0.0
     assert "Net_Margin" in res["synthetic"]
+
+def test_mapping_strict_mode_disables_fuzzy_and_synthetic():
+    req = ["Revenue", "Net_Margin"]
+    actual = ["Revenues"]
+    res = build_mapping(
+        req,
+        actual,
+        allow_synthetic_margin=False,
+        enable_fuzzy=False,
+    )
+    assert res["summary"]["Revenue"]["method"] == "missing"
+    assert res["summary"]["Net_Margin"]["method"] == "missing"
+    assert "Revenue" in res["missing"]
+    assert "Net_Margin" in res["missing"]

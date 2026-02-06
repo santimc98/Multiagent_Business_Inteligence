@@ -24,7 +24,10 @@ def normalize_colname(name: str) -> str:
 def build_mapping(
     required_cols: List[str], 
     actual_cols: List[str], 
-    allow_synthetic_margin: bool = True
+    allow_synthetic_margin: bool = True,
+    *,
+    enable_fuzzy: bool = True,
+    fuzzy_cutoff: float = 0.86,
 ) -> Dict[str, Any]:
     """
     Builds a robust mapping from Required Columns -> Actual Columns.
@@ -32,7 +35,7 @@ def build_mapping(
     Protocol:
     1. Exact Match (Case-Insensitive)
     2. Exact Match (Normalized)
-    3. Fuzzy Match (Difflib, cutoff ~0.8)
+    3. Fuzzy Match (Difflib) when enabled
     4. Aliasing Check (One actual col cannot map to multiple required cols)
     5. Synthetic Logic (Margin/Profit defaults to 0.0 if missing)
     
@@ -72,9 +75,9 @@ def build_mapping(
             score = 1.0
             
         # 3. Fuzzy Match
-        else:
+        elif enable_fuzzy:
             # Match against normalized keys
-            candidates = difflib.get_close_matches(req_norm, actual_map_norm.keys(), n=1, cutoff=0.86)
+            candidates = difflib.get_close_matches(req_norm, actual_map_norm.keys(), n=1, cutoff=fuzzy_cutoff)
             if candidates:
                 match_norm = candidates[0]
                 match = actual_map_norm[match_norm]

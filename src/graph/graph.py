@@ -1321,6 +1321,24 @@ def _build_required_raw_map(
             mapping[col] = raw
     return mapping
 
+def _load_required_columns_artifact(path: str = "data/required_columns.json") -> List[str]:
+    """
+    Load required input columns from runtime artifact.
+    Supports:
+    - list[str] payload
+    - dict payload with `required_columns` or `columns`
+    """
+    payload = _load_json_any(path)
+    if isinstance(payload, list):
+        return [str(col) for col in payload if col]
+    if isinstance(payload, dict):
+        candidates = payload.get("required_columns")
+        if not isinstance(candidates, list):
+            candidates = payload.get("columns")
+        if isinstance(candidates, list):
+            return [str(col) for col in candidates if col]
+    return []
+
 def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     V4.1: Canonical columns ARE inputs. Returns contract as-is.
@@ -1328,7 +1346,17 @@ def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(contract, dict):
         return {}
-    return dict(contract)
+    filtered = dict(contract)
+    required_cols = _load_required_columns_artifact()
+    if required_cols:
+        artifact_reqs = filtered.get("artifact_requirements")
+        artifact_reqs = dict(artifact_reqs) if isinstance(artifact_reqs, dict) else {}
+        clean_cfg = artifact_reqs.get("clean_dataset")
+        clean_cfg = dict(clean_cfg) if isinstance(clean_cfg, dict) else {}
+        clean_cfg["required_columns"] = required_cols
+        artifact_reqs["clean_dataset"] = clean_cfg
+        filtered["artifact_requirements"] = artifact_reqs
+    return filtered
 
 
 def _filter_contract_for_data_engineer(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -1357,15 +1385,15 @@ def build_de_objective(contract: Dict[str, Any]) -> str:
 
 def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str, Any]) -> List[str]:
     """V4.1: Prefer explicit required_columns; avoid canonical_columns unless required set is missing."""
+    file_required = _load_required_columns_artifact("data/required_columns.json")
+    if file_required:
+        return file_required
     if contract and isinstance(contract, dict):
         artifact_reqs = contract.get("artifact_requirements") or {}
         clean_cfg = artifact_reqs.get("clean_dataset") or {}
         required = clean_cfg.get("required_columns")
         if isinstance(required, list) and required:
             return required
-    file_required = _load_json_safe("data/required_columns.json")
-    if isinstance(file_required, list) and file_required:
-        return file_required
     if contract and isinstance(contract, dict):
         canonical = get_canonical_columns(contract)
         if canonical:
@@ -9244,7 +9272,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
             print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")
             print(f"Required: {required_cols}")
 
-            mapping_result = build_mapping(required_cols, df.columns.tolist())
+            mapping_result = build_mapping(
+                required_cols,
+                df.columns.tolist(),
+                allow_synthetic_margin=False,
+                enable_fuzzy=False,
+            )
 
             # Check for Missing Critical Columns (input only)
             if mapping_result['missing']:
@@ -9710,18 +9743,17 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 except Exception:
                     pass
 
-            if host_mapping_enabled:
-                try:
-                    os.makedirs("data", exist_ok=True)
-                    df_mapped.to_csv(
-                        "data/cleaned_full.csv",
-                        index=False,
-                        sep=csv_sep,
-                        decimal=csv_decimal,
-                        encoding=csv_encoding
-                    )
-                except Exception as full_save_err:
-                    print(f"Warning: failed to save cleaned_full.csv: {full_save_err}")
+            try:
+                os.makedirs("data", exist_ok=True)
+                df_mapped.to_csv(
+                    "data/cleaned_full.csv",
+                    index=False,
+                    sep=csv_sep,
+                    decimal=csv_decimal,
+                    encoding=csv_encoding
+                )
+            except Exception as full_save_err:
+                print(f"Warning: failed to save cleaned_full.csv: {full_save_err}")
 
             try:
                 audit = run_unsupervised_numeric_relation_audit(df_mapped)
