@@ -37,6 +37,7 @@ from src.agents.data_engineer import DataEngineerAgent
 from src.agents.cleaning_reviewer import CleaningReviewerAgent
 from src.agents.reviewer import ReviewerAgent
 from src.agents.qa_reviewer import QAReviewerAgent, collect_static_qa_facts, run_static_qa_checks # New QA Gate
+from src.agents.review_board import ReviewBoardAgent
 from src.agents.execution_planner import (
     ExecutionPlannerAgent,
     build_execution_plan,
@@ -5965,6 +5966,46 @@ def _normalize_review_feedback(feedback: str | None, status: str) -> str:
         text = re.sub(r"\brejection\b", "flag", text, flags=re.IGNORECASE)
     return text
 
+
+def _normalize_board_status(status: Any) -> str:
+    if not status:
+        return "APPROVE_WITH_WARNINGS"
+    upper = str(status).strip().upper()
+    if upper in {"APPROVED", "APPROVE_WITH_WARNINGS", "NEEDS_IMPROVEMENT", "REJECTED"}:
+        return upper
+    if upper in {"PASS", "OK", "SUCCESS"}:
+        return "APPROVED"
+    if upper in {"WARN", "WARNING"}:
+        return "APPROVE_WITH_WARNINGS"
+    if upper in {"FAIL", "FAILED", "REJECT"}:
+        return "REJECTED"
+    if any(tok in upper for tok in ["REJECT", "FAIL", "ERROR", "CRASH"]):
+        return "REJECTED"
+    return "APPROVE_WITH_WARNINGS"
+
+
+def _board_status_to_pipeline(status: Any) -> str:
+    normalized = _normalize_board_status(status)
+    if normalized in {"NEEDS_IMPROVEMENT", "REJECTED"}:
+        return "NEEDS_IMPROVEMENT"
+    if normalized == "APPROVED":
+        return "APPROVED"
+    return "APPROVE_WITH_WARNINGS"
+
+
+def _has_runtime_failure_marker(output: str | None) -> bool:
+    text = str(output or "")
+    checks = [
+        "Traceback (most recent call last)",
+        "EXECUTION ERROR",
+        "HEAVY_RUNNER_ERROR",
+        "Sandbox Execution Failed",
+        "peer closed connection",
+        "incomplete chunked read",
+        "Response 404",
+    ]
+    return any(token in text for token in checks)
+
 def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
     if not output:
         return None
@@ -6459,6 +6500,8 @@ class AgentState(TypedDict):
     run_budget: Dict[str, Any]
     budget_counters: Dict[str, int]
     qa_budget_exceeded: bool
+    ml_review_stack: Dict[str, Any]
+    review_board_verdict: Dict[str, Any]
 
 from src.agents.domain_expert import DomainExpertAgent
 
@@ -6472,6 +6515,7 @@ ml_engineer = MLEngineerAgent()
 translator = BusinessTranslatorAgent()
 reviewer = ReviewerAgent()
 qa_reviewer = QAReviewerAgent()
+review_board = ReviewBoardAgent()
 execution_planner = ExecutionPlannerAgent()
 failure_explainer = FailureExplainerAgent()
 results_advisor = ResultsAdvisorAgent()
@@ -12454,13 +12498,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             state["feedback_history"] = history
 
     execution_output = state.get('execution_output', '')
-    if "Traceback" in execution_output or "EXECUTION ERROR" in execution_output or "HEAVY_RUNNER_ERROR" in execution_output:
-         print("Reviewer: Critical Execution Error detected. Requesting fix.")
-         return {
-             "review_verdict": "NEEDS_IMPROVEMENT",
-             "review_feedback": f"Execution failed with traceback: {execution_output[-500:]}",
-             "feedback_history": state.get("feedback_history", []) # Maintain history
-         }
+    runtime_failure_detected = _has_runtime_failure_marker(execution_output) or bool(state.get("sandbox_failed"))
+    runtime_terminal = bool(state.get("runtime_fix_terminal"))
 
     strategy = state.get('selected_strategy', {}) or {}
     strategy_context = f"Strategy: {strategy.get('title')}\nType: {strategy.get('analysis_type')}\nRules: {strategy.get('reasoning')}"
@@ -12476,14 +12515,27 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         evaluation_spec_for_review = dict(evaluation_spec_for_review)
         evaluation_spec_for_review["governance_context"] = governance_context
 
-    eval_result = reviewer.evaluate_results(execution_output, business_objective, strategy_context, evaluation_spec_for_review)
+    if runtime_failure_detected:
+        print("Reviewer: Runtime failure markers detected. Applying deterministic failure packet.")
+        tail = execution_output[-1200:] if execution_output else "No execution output captured."
+        eval_result = {
+            "status": "NEEDS_IMPROVEMENT",
+            "feedback": f"Runtime failure detected in execution output.\nError Snippet: {tail}",
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Fix runtime failure and regenerate required artifacts."],
+            "retry_worth_it": not runtime_terminal,
+        }
+    else:
+        eval_result = reviewer.evaluate_results(
+            execution_output, business_objective, strategy_context, evaluation_spec_for_review
+        )
 
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
     retry_worth_it = eval_result.get("retry_worth_it") if isinstance(eval_result, dict) else None
 
     new_history = list(state.get('feedback_history', []))
-    has_deterministic_error = "Traceback" in execution_output or "EXECUTION ERROR" in execution_output
+    has_deterministic_error = runtime_failure_detected
     downgraded = False
     if status == "NEEDS_IMPROVEMENT":
         if has_deterministic_error:
@@ -12864,6 +12916,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         qa_hard_failures.extend(column_gate_eval.get("hard_failures", []))
 
     review_warnings: List[str] = []
+    review_result: Dict[str, Any] = {}
+    qa_result: Dict[str, Any] = {}
     if code:
         analysis_type = strategy.get("analysis_type", "predictive")
         try:
@@ -12898,7 +12952,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         try:
             ok, counters, err_msg = _consume_budget(state, "qa_calls", "max_qa_calls", "QA Reviewer")
             review_counters = counters
-            qa_result = None
             if ok:
                 qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context_prompt)
                 if qa_result and qa_result.get("status") != "APPROVED":
@@ -13045,6 +13098,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         print(f"Advice: {feedback}")
 
     iteration_type = _classify_iteration_type(status, audit_rejected, oc_report, feedback)
+    if runtime_failure_detected and status == "NEEDS_IMPROVEMENT":
+        iteration_type = "compliance"
 
     # METRIC ITERATION DISABLED: Force downgrade to APPROVE_WITH_WARNINGS for metric-only issues.
     # This stops the metric retry loop while preserving compliance/runtime retries.
@@ -13114,6 +13169,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         result_state["hard_failures"] = merged_hard_failures
     if qa_summary:
         result_state["qa_last_result"] = qa_summary
+    if review_result:
+        result_state["reviewer_last_result"] = {
+            "status": review_result.get("status"),
+            "feedback": review_result.get("feedback"),
+            "failed_gates": review_result.get("failed_gates", []),
+            "required_fixes": review_result.get("required_fixes", []),
+            "hard_failures": review_result.get("hard_failures", []),
+        }
     if retry_worth_it is not None:
         result_state["review_retry_worth_it"] = bool(retry_worth_it)
     if state.get("qa_budget_exceeded"):
@@ -13131,6 +13194,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     # The condition (status=="NEEDS_IMPROVEMENT" and iteration_type=="metric") can never
     # be true because we force downgrade to APPROVE_WITH_WARNINGS above.
 
+    results_insights: Dict[str, Any] = {}
     try:
         strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
         objective_type = objective_type or (strategy_spec or {}).get("objective_type")
@@ -13163,6 +13227,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         }
         insights = results_advisor.generate_insights(insights_context)
         if insights:
+            if isinstance(insights, dict):
+                results_insights = dict(insights)
             run_id = state.get("run_id")
             if run_id:
                 log_agent_snapshot(
@@ -13186,6 +13252,75 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 print(f"Warning: failed to persist insights.json: {ins_err}")
     except Exception as ins_err:
         print(f"Warning: results advisor insights failed: {ins_err}")
+
+    runtime_packet = {
+        "status": "FAILED_RUNTIME" if runtime_failure_detected else "OK",
+        "runtime_fix_terminal": runtime_terminal,
+        "runtime_fix_count": int(state.get("runtime_fix_count", 0) or 0),
+        "sandbox_failed": bool(state.get("sandbox_failed")),
+    }
+    eval_packet = {
+        "status": str(eval_result.get("status") or status),
+        "feedback": str(eval_result.get("feedback") or ""),
+        "failed_gates": [str(g) for g in (eval_result.get("failed_gates") or []) if g],
+        "required_fixes": [str(fx) for fx in (eval_result.get("required_fixes") or []) if fx],
+        "retry_worth_it": bool(retry_worth_it) if retry_worth_it is not None else None,
+    }
+    reviewer_packet = {
+        "status": str(review_result.get("status") or "SKIPPED"),
+        "feedback": str(review_result.get("feedback") or ""),
+        "failed_gates": [str(g) for g in (review_result.get("failed_gates") or []) if g],
+        "required_fixes": [str(fx) for fx in (review_result.get("required_fixes") or []) if fx],
+        "hard_failures": [str(h) for h in (review_result.get("hard_failures") or []) if h],
+    }
+    qa_packet = qa_summary or {
+        "status": str(qa_result.get("status") or "SKIPPED"),
+        "feedback": str(qa_result.get("feedback") or ""),
+        "failed_gates": [str(g) for g in (qa_result.get("failed_gates") or []) if g],
+        "required_fixes": [str(fx) for fx in (qa_result.get("required_fixes") or []) if fx],
+        "hard_failures": [str(h) for h in (qa_result.get("hard_failures") or []) if h],
+    }
+    results_packet: Dict[str, Any] = {
+        "status": "APPROVED" if status == "APPROVED" else "APPROVE_WITH_WARNINGS",
+        "insights_available": bool(results_insights),
+        "summary_lines": results_insights.get("summary_lines", []) if isinstance(results_insights, dict) else [],
+        "risks": results_insights.get("risks", []) if isinstance(results_insights, dict) else [],
+        "recommendations": results_insights.get("recommendations", []) if isinstance(results_insights, dict) else [],
+        "iteration_recommendation": (
+            results_insights.get("iteration_recommendation", {}) if isinstance(results_insights, dict) else {}
+        ),
+    }
+    if status == "NEEDS_IMPROVEMENT":
+        results_packet["status"] = "NEEDS_IMPROVEMENT"
+    elif status == "APPROVE_WITH_WARNINGS":
+        results_packet["status"] = "APPROVE_WITH_WARNINGS"
+    review_stack = {
+        "runtime": runtime_packet,
+        "result_evaluator": eval_packet,
+        "reviewer": reviewer_packet,
+        "qa_reviewer": qa_packet,
+        "results_advisor": results_packet,
+        "final_pre_board": {
+            "status": status,
+            "feedback": feedback,
+            "failed_gates": failed_gates,
+            "required_fixes": required_fixes,
+            "hard_failures": merged_hard_failures,
+        },
+    }
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/ml_review_stack.json", review_stack)
+        existing_index = _load_json_any("data/produced_artifact_index.json")
+        normalized_existing = existing_index if isinstance(existing_index, list) else []
+        additions = _build_artifact_index(["data/ml_review_stack.json"], None)
+        merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+        dump_json("data/produced_artifact_index.json", merged_index)
+        result_state["artifact_index"] = merged_index
+        result_state["produced_artifact_index"] = merged_index
+    except Exception as stack_err:
+        print(f"Warning: failed to persist ml_review_stack.json: {stack_err}")
+    result_state["ml_review_stack"] = review_stack
 
     # Iteration memory (delta + objective + weights) for patch-mode guidance
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
@@ -13246,6 +13381,152 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if run_id:
         log_run_event(run_id, "result_evaluator_complete", {"status": status})
     return result_state
+
+
+def run_review_board(state: AgentState) -> AgentState:
+    print("--- [5.6] Review Board: Consolidating reviewer outputs ---")
+    abort_state = _abort_if_requested(state, "review_board")
+    if abort_state:
+        return abort_state
+    run_id = state.get("run_id")
+    if run_id:
+        log_run_event(run_id, "review_board_start", {})
+
+    review_stack = state.get("ml_review_stack")
+    if not isinstance(review_stack, dict) or not review_stack:
+        review_stack = _load_json_safe("data/ml_review_stack.json") or {}
+    if not isinstance(review_stack, dict):
+        review_stack = {}
+    if not review_stack:
+        review_stack = {
+            "runtime": {
+                "status": "FAILED_RUNTIME" if _has_runtime_failure_marker(state.get("execution_output")) else "OK",
+                "runtime_fix_terminal": bool(state.get("runtime_fix_terminal")),
+                "runtime_fix_count": int(state.get("runtime_fix_count", 0) or 0),
+            },
+            "result_evaluator": {
+                "status": state.get("review_verdict"),
+                "feedback": state.get("review_feedback"),
+                "failed_gates": (state.get("last_gate_context") or {}).get("failed_gates", []),
+                "required_fixes": (state.get("last_gate_context") or {}).get("required_fixes", []),
+            },
+            "reviewer": state.get("reviewer_last_result") or {},
+            "qa_reviewer": state.get("qa_last_result") or {},
+            "results_advisor": {
+                "status": "APPROVE_WITH_WARNINGS",
+                "insights_available": bool(_load_json_safe("data/insights.json")),
+            },
+        }
+
+    board_context = dict(review_stack)
+    board_context["runtime"] = board_context.get("runtime") if isinstance(board_context.get("runtime"), dict) else {}
+    runtime_block = dict(board_context.get("runtime") or {})
+    runtime_block.setdefault("runtime_fix_terminal", bool(state.get("runtime_fix_terminal")))
+    runtime_block.setdefault("runtime_fix_count", int(state.get("runtime_fix_count", 0) or 0))
+    board_context["runtime"] = runtime_block
+    board_context["review_verdict_before_board"] = state.get("review_verdict")
+    board_context["review_feedback_before_board"] = state.get("review_feedback")
+
+    verdict = review_board.adjudicate(board_context)
+    if not isinstance(verdict, dict):
+        verdict = {}
+    board_status = _normalize_board_status(verdict.get("status"))
+    final_status = _board_status_to_pipeline(board_status)
+    board_summary = str(verdict.get("summary") or "").strip()
+    failed_areas = [str(x) for x in (verdict.get("failed_areas") or []) if x]
+    required_actions = [str(x) for x in (verdict.get("required_actions") or []) if x]
+    evidence = verdict.get("evidence") if isinstance(verdict.get("evidence"), list) else []
+    confidence = str(verdict.get("confidence") or "medium").lower()
+
+    current_feedback = str(state.get("review_feedback") or "")
+    if board_summary:
+        if current_feedback:
+            current_feedback = f"{current_feedback}\nREVIEW_BOARD: {board_summary}"
+        else:
+            current_feedback = f"REVIEW_BOARD: {board_summary}"
+
+    history = list(state.get("feedback_history", []) or [])
+    if board_summary:
+        history.append(f"REVIEW_BOARD[{board_status}]: {board_summary}")
+    elif required_actions:
+        history.append(f"REVIEW_BOARD[{board_status}]: required_actions={required_actions}")
+
+    gate_context = dict(state.get("last_gate_context") or {})
+    current_failed = [str(g) for g in (gate_context.get("failed_gates") or []) if g]
+    current_required = [str(g) for g in (gate_context.get("required_fixes") or []) if g]
+    for area in failed_areas:
+        if area not in current_failed:
+            current_failed.append(area)
+    for action in required_actions:
+        if action not in current_required:
+            current_required.append(action)
+    if current_failed:
+        gate_context["failed_gates"] = current_failed
+    if current_required:
+        gate_context["required_fixes"] = current_required
+    gate_context["review_board"] = {
+        "status": board_status,
+        "summary": board_summary,
+        "failed_areas": failed_areas,
+        "required_actions": required_actions,
+        "confidence": confidence,
+    }
+
+    board_payload = {
+        "status": board_status,
+        "final_review_verdict": final_status,
+        "summary": board_summary,
+        "failed_areas": failed_areas,
+        "required_actions": required_actions,
+        "confidence": confidence,
+        "evidence": evidence,
+        "runtime_fix_terminal": bool(state.get("runtime_fix_terminal")),
+        "review_verdict_before_board": state.get("review_verdict"),
+    }
+    merged_index = None
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/review_board_verdict.json", board_payload)
+        existing_index = _load_json_any("data/produced_artifact_index.json")
+        normalized_existing = existing_index if isinstance(existing_index, list) else []
+        additions = _build_artifact_index(["data/review_board_verdict.json"], None)
+        merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+        dump_json("data/produced_artifact_index.json", merged_index)
+    except Exception as board_err:
+        print(f"Warning: failed to persist review_board_verdict.json: {board_err}")
+
+    if run_id:
+        try:
+            log_agent_snapshot(
+                run_id,
+                "review_board",
+                prompt=getattr(review_board, "last_prompt", None),
+                response=getattr(review_board, "last_response", None) or verdict,
+                context=board_context,
+                verdicts=board_payload,
+            )
+        except Exception:
+            pass
+        log_run_event(
+            run_id,
+            "review_board_complete",
+            {"status": board_status, "final_review_verdict": final_status},
+        )
+
+    result = {
+        "review_board_verdict": board_payload,
+        "review_verdict": final_status,
+        "review_feedback": current_feedback,
+        "feedback_history": history,
+        "last_gate_context": gate_context,
+    }
+    if final_status in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+        result["last_successful_review_verdict"] = final_status
+        result["last_successful_gate_context"] = gate_context
+    if merged_index:
+        result["artifact_index"] = merged_index
+        result["produced_artifact_index"] = merged_index
+    return result
 
 
 def _detect_target_nan_error(output: str) -> bool:
@@ -13422,6 +13703,15 @@ def check_evaluation(state: AgentState):
         metric_value = snapshot.get("primary_metric_value", "N/A")
         best_value = snapshot.get("baseline_value", "N/A")
         return metric_name, metric_value, best_value
+
+    if state.get("runtime_fix_terminal"):
+        metric_name, metric_value, best_value = _get_metric_info()
+        print(
+            f"ITER_DECISION type=runtime action=stop reason=TERMINAL_RUNTIME_FAILURE "
+            f"metric={metric_name}:{metric_value} best={best_value} budget_left=0"
+        )
+        state["stop_reason"] = "TERMINAL_RUNTIME_FAILURE"
+        return "approved"
 
     policy = _get_iteration_policy(state)
     last_iter_type = state.get("last_iteration_type")
@@ -14010,6 +14300,7 @@ workflow.add_node("qa_reviewer", run_qa_reviewer) # QA Node
 workflow.add_node("final_runtime_fix", finalize_runtime_failure)
 workflow.add_node("execute_code", execute_code)
 workflow.add_node("evaluate_results", run_result_evaluator) # New Node
+workflow.add_node("review_board", run_review_board)
 workflow.add_node("retry_handler", retry_handler)
 workflow.add_node("retry_sandbox", retry_sandbox_execution)
 workflow.add_node("prepare_runtime_fix", prepare_runtime_fix) # New Node
@@ -14065,12 +14356,14 @@ workflow.add_conditional_edges(
 )
 
 workflow.add_edge("prepare_runtime_fix", "engineer")
-workflow.add_edge("final_runtime_fix", "translator")
+workflow.add_edge("final_runtime_fix", "evaluate_results")
 workflow.add_edge("retry_sandbox", "execute_code")
 
-# Conditional Edge for Result Evaluation
+workflow.add_edge("evaluate_results", "review_board")
+
+# Conditional Edge for Review Board Decision
 workflow.add_conditional_edges(
-    "evaluate_results",
+    "review_board",
     check_evaluation,
     {
         "retry": "retry_handler",
