@@ -173,6 +173,9 @@ class DataEngineerAgent:
         - NEVER use: df.assign(1stYearAmount=...) - This causes SyntaxError!
         - ALWAYS use: df.assign(**{'1stYearAmount': ...}) or df['1stYearAmount'] = ...
         - np.where returns a NumPy array. If you need pandas .str operations, keep a Series (use Series.where/mask or wrap back into a Series before .str).
+        - UNIVERSAL DTYPE RULE: before any `.str` operation, explicitly cast the working Series to string dtype.
+          After operations like `.replace(..., np.nan)`, dtype may no longer be string in pandas 2.x.
+          Therefore use `series = series.astype(str)` or `series = series.astype('string')` immediately before `.str.*`.
         - DO NOT rescale numeric columns in cleaning. Only parse formats (e.g., remove thousand separators).
           CRITICAL: Check NUMERIC_RANGES_SUMMARY in DATA AUDIT to understand actual data scales:
           * If columns show [0, 1] range → data is ALREADY normalized, do NOT assume it needs 0-255 conversion

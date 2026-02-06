@@ -201,10 +201,37 @@ def run_python_file_with_optional_timeout(
     except (ValueError, TypeError):
         supports_timeout = False
 
-    if supports_timeout and timeout_s is not None:
-        proc = sandbox.commands.run(cmd, timeout=timeout_s)
-    else:
-        proc = sandbox.commands.run(cmd)
+    try:
+        if supports_timeout and timeout_s is not None:
+            proc = sandbox.commands.run(cmd, timeout=timeout_s)
+        else:
+            proc = sandbox.commands.run(cmd)
+    except Exception as e:
+        # E2B may raise CommandExitException for non-zero exit codes.
+        # Normalize it to _ExecutionResult so callers can use the regular
+        # runtime-error recovery path instead of jumping to outer exception flow.
+        msg = _normalize_text(e)
+        exc_name = type(e).__name__
+        is_command_exit = exc_name == "CommandExitException" or "command exited with code" in msg.lower()
+        if not is_command_exit:
+            raise
+
+        exit_code = getattr(e, "exit_code", None)
+        if exit_code is None:
+            m = re.search(r"code\s+(\d+)", msg.lower())
+            if m:
+                try:
+                    exit_code = int(m.group(1))
+                except Exception:
+                    exit_code = None
+
+        stdout = _normalize_text(getattr(e, "stdout", ""))
+        stderr = _normalize_text(getattr(e, "stderr", ""))
+        if not stderr:
+            stderr = msg
+        if exit_code is None:
+            exit_code = 1
+        return _ExecutionResult(stdout, stderr, exit_code)
 
     stdout = _normalize_text(getattr(proc, "stdout", ""))
     stderr = _normalize_text(getattr(proc, "stderr", ""))

@@ -9887,6 +9887,26 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
                     print("OOM guard: retrying Data Engineer with chunked processing guidance.")
                     return run_data_engineer(new_state)
+                if not _flag_active_for_run(state, "de_runtime_retry_done", run_id):
+                    new_state = dict(state)
+                    new_state["de_runtime_retry_done"] = True
+                    if run_id:
+                        new_state["de_runtime_retry_done_run_id"] = run_id
+                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                    payload = (
+                        "RUNTIME_ERROR_CONTEXT:\n"
+                        + err_msg[-3000:]
+                        + "\n\nUNIVERSAL_PANDAS_DTYPE_GUARD:\n"
+                        + "- Before using .str accessor, enforce string dtype on the working Series "
+                        + "(astype(str) or astype('string')).\n"
+                        + "- After replace(..., np.nan), do not assume the dtype is still string; re-cast before .str.*.\n"
+                        + "- Apply this rule universally for any CSV/objective (no hardcoded columns)."
+                    )
+                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                    print("Runtime exception guard: retrying Data Engineer with exception context.")
+                    if run_id:
+                        log_run_event(run_id, "data_engineer_runtime_retry", {"attempt": attempt_id, "source": "exception"})
+                    return run_data_engineer(new_state)
                 if sb_attempt == 0 and is_transient_sandbox_error(e):
                     print(f"SANDBOX_RETRY step=data_engineer attempt={sb_attempt+1} err={e}")
                     continue
