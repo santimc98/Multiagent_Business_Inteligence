@@ -25,6 +25,22 @@ def test_get_required_outputs_ignores_concepts() -> None:
     assert "Priority ranking" not in outputs
 
 
+def test_get_required_outputs_includes_visualization_required_plots() -> None:
+    contract = {
+        "required_outputs": ["data/metrics.json"],
+        "visualization_requirements": {
+            "required": True,
+            "required_plots": [{"name": "reliability_curve"}],
+            "outputs_dir": "static/plots",
+        },
+    }
+
+    outputs = get_required_outputs(contract)
+
+    assert "data/metrics.json" in outputs
+    assert "static/plots/reliability_curve.png" in outputs
+
+
 def test_output_contract_ignores_concepts(tmp_path) -> None:
     metrics_path = tmp_path / "data" / "metrics.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)

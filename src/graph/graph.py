@@ -1725,6 +1725,19 @@ def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | 
                     conceptual_like.append(path)
         return file_like, conceptual_like
 
+    resolved: List[str] = []
+    seen: set[str] = set()
+
+    def _add_output(path: str) -> None:
+        if not path:
+            return
+        normalized = _normalize_output_path(str(path))
+        key = normalized.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        resolved.append(normalized)
+
     # Priority 1: evaluation_spec.required_outputs
     eval_spec = contract.get("evaluation_spec")
     if isinstance(eval_spec, dict):
@@ -1732,42 +1745,35 @@ def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | 
         if isinstance(eval_outputs, list) and eval_outputs:
             file_like, conceptual_like = _split_outputs(eval_outputs)
             conceptual_outputs.extend(conceptual_like)
-            if file_like:
-                _merge_conceptual_outputs(state, contract, conceptual_outputs)
-                return file_like
+            for path in file_like:
+                _add_output(path)
 
     # Priority 2: contract.required_outputs
     req_outputs = contract.get("required_outputs")
     if isinstance(req_outputs, list) and req_outputs:
         file_like, conceptual_like = _split_outputs(req_outputs)
         conceptual_outputs.extend(conceptual_like)
-        if file_like:
-            _merge_conceptual_outputs(state, contract, conceptual_outputs)
-            return file_like
+        for path in file_like:
+            _add_output(path)
 
-    # Priority 3: artifact_requirements.required_files
-    artifact_reqs = contract.get("artifact_requirements")
-    if isinstance(artifact_reqs, dict):
-        req_files = artifact_reqs.get("required_files")
-        if isinstance(req_files, list) and req_files:
-            resolved: List[str] = []
-            for entry in req_files:
-                if not entry:
-                    continue
-                if isinstance(entry, dict):
-                    path = entry.get("path") or entry.get("output") or entry.get("artifact")
-                else:
-                    path = entry
-                path = str(path) if path else ""
-                if not path:
-                    continue
-                if _looks_like_filesystem_path(path):
-                    resolved.append(_normalize_output_path(path))
-                else:
-                    conceptual_outputs.append(path)
-            if resolved:
-                _merge_conceptual_outputs(state, contract, conceptual_outputs)
-                return resolved
+    # Priority 3: V4.1 accessor union (required_files, required_plots, visual required items)
+    try:
+        accessor_outputs = get_required_outputs(contract)
+    except Exception:
+        accessor_outputs = []
+    if isinstance(accessor_outputs, list):
+        for entry in accessor_outputs:
+            if not entry:
+                continue
+            text = str(entry)
+            if _looks_like_filesystem_path(text):
+                _add_output(text)
+            else:
+                conceptual_outputs.append(text)
+
+    if resolved:
+        _merge_conceptual_outputs(state, contract, conceptual_outputs)
+        return resolved
 
     # Fallback: minimal required outputs for a valid ML run
     _merge_conceptual_outputs(state, contract, conceptual_outputs)
@@ -2560,6 +2566,12 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "REQUIRED_OUTPUTS_MISSING": [
             "Write all required outputs to the exact contract paths before exiting.",
         ],
+        "contract_required_artifacts_missing": [
+            "Generate every contract-required artifact and write each file to the exact contract path.",
+        ],
+        "contract_artifact_schema_mismatch": [
+            "Regenerate scored_rows.csv to satisfy contract schema requirements (required columns and fail-severity any-of groups).",
+        ],
         "REQUIRED_COLUMNS_NOT_USED": [
             "Use the required business columns from the contract (e.g., Size, Debtors, Sector) in mapping/processing.",
         ],
@@ -2683,6 +2695,65 @@ def _build_fix_instructions(required_fixes: List[str]) -> str:
     for fix in required_fixes:
         lines.append(f"- {fix}")
     return "\n".join(lines)
+
+
+def _extract_contract_artifact_issues(oc_report: Dict[str, Any] | None) -> Dict[str, List[str]]:
+    """
+    Extract actionable contract artifact issues from output_contract_report.
+
+    Returns:
+      {
+        "missing_paths": [...],
+        "schema_issues": [...],
+      }
+    """
+    missing_paths: List[str] = []
+    schema_issues: List[str] = []
+    if not isinstance(oc_report, dict):
+        return {"missing_paths": missing_paths, "schema_issues": schema_issues}
+
+    def _add_missing(path_like: Any) -> None:
+        text = str(path_like or "").strip().replace("\\", "/")
+        while text.startswith("./"):
+            text = text[2:]
+        if not text:
+            return
+        if text not in missing_paths:
+            missing_paths.append(text)
+
+    for path in oc_report.get("missing", []) or []:
+        _add_missing(path)
+
+    artifact_report = oc_report.get("artifact_requirements_report")
+    if isinstance(artifact_report, dict):
+        files_report = artifact_report.get("files_report")
+        if isinstance(files_report, dict):
+            for path in files_report.get("missing", []) or []:
+                _add_missing(path)
+
+        scored_rows_report = artifact_report.get("scored_rows_report")
+        if isinstance(scored_rows_report, dict):
+            missing_columns = [str(col) for col in (scored_rows_report.get("missing_columns") or []) if col]
+            if missing_columns:
+                schema_issues.append(
+                    "scored_rows.csv missing required columns: " + ", ".join(missing_columns)
+                )
+            fail_groups: List[str] = []
+            for group in scored_rows_report.get("missing_any_of_groups_with_severity", []) or []:
+                if not isinstance(group, dict):
+                    continue
+                if str(group.get("severity") or "").lower() != "fail":
+                    continue
+                values = group.get("group") if isinstance(group.get("group"), list) else []
+                normalized = [str(v) for v in values if v]
+                if normalized:
+                    fail_groups.append("[" + ", ".join(normalized) + "]")
+            if fail_groups:
+                schema_issues.append(
+                    "scored_rows.csv missing required any-of groups: " + "; ".join(fail_groups)
+                )
+
+    return {"missing_paths": missing_paths, "schema_issues": schema_issues}
 
 def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
     contract = state.get("execution_contract") or {}
@@ -12752,12 +12823,32 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     contract = state.get("execution_contract", {}) or {}
     oc_report = _persist_output_contract_report(state, reason="result_evaluator")
     oc_overall_status = str(oc_report.get("overall_status") or "").lower() if isinstance(oc_report, dict) else ""
+    contract_output_failed_gates: List[str] = []
+    contract_output_required_fixes: List[str] = []
     if oc_overall_status == "error" or (isinstance(oc_report, dict) and oc_report.get("missing")):
         status = "NEEDS_IMPROVEMENT"
         miss_text = json.dumps(oc_report, indent=2)
         feedback_missing = f"Output contract compliance error: {miss_text}"
         feedback = f"{feedback}\n{feedback_missing}" if feedback else feedback_missing
         new_history.append(f"OUTPUT_CONTRACT_ERROR: {miss_text}")
+        contract_issues = _extract_contract_artifact_issues(oc_report)
+        missing_paths = contract_issues.get("missing_paths", [])
+        schema_issues = contract_issues.get("schema_issues", [])
+        if missing_paths:
+            if "contract_required_artifacts_missing" not in contract_output_failed_gates:
+                contract_output_failed_gates.append("contract_required_artifacts_missing")
+            for path in missing_paths:
+                contract_output_required_fixes.append(f"Generate required artifact at path: {path}")
+        if schema_issues:
+            if "contract_artifact_schema_mismatch" not in contract_output_failed_gates:
+                contract_output_failed_gates.append("contract_artifact_schema_mismatch")
+            for issue in schema_issues:
+                contract_output_required_fixes.append(f"Fix artifact schema issue: {issue}")
+        if not contract_output_required_fixes:
+            contract_output_required_fixes.append(
+                "Regenerate all contract-required artifacts and ensure output contract compliance."
+            )
+        retry_worth_it = True
 
     alignment_failed_gates: List[str] = []
     alignment_check = _load_json_safe("data/alignment_check.json")
@@ -13132,9 +13223,17 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         for gate in qa_failed_gates:
             if gate not in failed_gates:
                 failed_gates.append(gate)
+    if contract_output_failed_gates:
+        for gate in contract_output_failed_gates:
+            if gate not in failed_gates:
+                failed_gates.append(gate)
     required_fixes = _expand_required_fixes(failed_gates, failed_gates)
     if qa_required_fixes:
         for fix in qa_required_fixes:
+            if fix not in required_fixes:
+                required_fixes.append(fix)
+    if contract_output_required_fixes:
+        for fix in contract_output_required_fixes:
             if fix not in required_fixes:
                 required_fixes.append(fix)
     if alignment_failed_gates:
@@ -13145,6 +13244,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     required_fixes = _expand_required_fixes(required_fixes, failed_gates)
     if case_report.get("status") == "FAIL":
         gate_source = "case_alignment_gate"
+    elif contract_output_failed_gates:
+        gate_source = "output_contract"
     elif alignment_failed_gates:
         gate_source = "alignment_check"
     else:

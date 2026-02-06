@@ -227,13 +227,25 @@ def is_candidate_identifier_column(col_name: str) -> bool:
 
 
 def _resolve_required_outputs(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[str]:
-    outputs = contract_min.get("required_outputs")
-    if isinstance(outputs, list) and outputs:
-        return [str(p) for p in outputs if p]
-    outputs = get_required_outputs(contract_full)
-    if outputs:
-        return [str(p) for p in outputs if p]
-    return []
+    merged: List[str] = []
+    seen: set[str] = set()
+
+    def _add(values: Any) -> None:
+        if not isinstance(values, list):
+            return
+        for item in values:
+            if not item:
+                continue
+            text = str(item)
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(text)
+
+    _add(contract_min.get("required_outputs"))
+    _add(get_required_outputs(contract_full))
+    return merged
 
 
 def _resolve_required_columns(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[str]:
@@ -621,6 +633,66 @@ def _cap_plot_spec(plot_spec: Dict[str, Any] | None, max_caption_chars: int = 40
     return capped
 
 
+def _slugify_plot_token(value: Any, fallback: str) -> str:
+    token = re.sub(r"[^0-9a-zA-Z]+", "_", str(value or "")).strip("_").lower()
+    return token or fallback
+
+
+def _normalize_plot_output_path(raw_path: Any, outputs_dir: str, fallback_id: str) -> str:
+    base_dir = str(outputs_dir or "static/plots").replace("\\", "/").rstrip("/")
+    if not base_dir:
+        base_dir = "static/plots"
+    candidate = str(raw_path or "").strip().replace("\\", "/")
+    if not candidate:
+        candidate = f"{_slugify_plot_token(fallback_id, 'plot')}.png"
+    if not os.path.splitext(candidate)[1]:
+        candidate = f"{candidate}.png"
+    if not os.path.isabs(candidate) and "/" not in candidate:
+        candidate = f"{base_dir}/{candidate}"
+    return candidate
+
+
+def _derive_visual_items_from_plot_spec(plot_spec: Dict[str, Any] | None, outputs_dir: str) -> List[Dict[str, Any]]:
+    if not isinstance(plot_spec, dict):
+        return []
+    plots = plot_spec.get("plots")
+    if not isinstance(plots, list):
+        return []
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for idx, raw in enumerate(plots, start=1):
+        if not isinstance(raw, dict):
+            continue
+        plot_id = raw.get("plot_id") or raw.get("id") or raw.get("name") or raw.get("title") or f"plot_{idx}"
+        safe_id = _slugify_plot_token(plot_id, f"plot_{idx}")
+        raw_path = (
+            raw.get("path")
+            or raw.get("output_path")
+            or raw.get("output")
+            or raw.get("artifact")
+            or raw.get("file")
+            or raw.get("filename")
+            or raw.get("expected_filename")
+            or safe_id
+        )
+        path = _normalize_plot_output_path(raw_path, outputs_dir, safe_id)
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(
+            {
+                "id": safe_id,
+                "purpose": str(raw.get("goal") or raw.get("title") or raw.get("caption_template") or "").strip(),
+                "type": str(raw.get("type") or raw.get("plot_type") or "other"),
+                "expected_filename": os.path.basename(path),
+                "path": path,
+                "required": True,
+            }
+        )
+    return items
+
+
 def _trim_value(
     obj: Any,
     max_str_len: int,
@@ -948,11 +1020,12 @@ def build_ml_view(
     visual_reqs = (
         artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
     )
+    visual_items = visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else []
     visual_payload = {
         "enabled": bool(visual_reqs.get("enabled")),
         "required": bool(visual_reqs.get("required")),
         "outputs_dir": visual_reqs.get("outputs_dir") or "static/plots",
-        "items": visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else [],
+        "items": visual_items,
         "notes": visual_reqs.get("notes") or "",
     }
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
@@ -966,6 +1039,11 @@ def build_ml_view(
     plot_spec = _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
     if plot_spec is not None:
         visual_payload["enabled"] = bool(plot_spec.get("enabled", True))
+        if not visual_items:
+            visual_payload["items"] = _derive_visual_items_from_plot_spec(
+                plot_spec,
+                str(visual_payload.get("outputs_dir") or "static/plots"),
+            )
         view["plot_spec"] = plot_spec
     view["visual_requirements"] = visual_payload
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
@@ -1091,15 +1169,21 @@ def build_translator_view(
     visual_reqs = (
         artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
     )
+    visual_items = visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else []
     visual_payload = {
         "enabled": bool(visual_reqs.get("enabled")),
         "required": bool(visual_reqs.get("required")),
         "outputs_dir": visual_reqs.get("outputs_dir") or "static/plots",
-        "items": visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else [],
+        "items": visual_items,
         "notes": visual_reqs.get("notes") or "",
     }
     if plot_spec is not None:
         visual_payload["enabled"] = bool(plot_spec.get("enabled", True))
+        if not visual_items:
+            visual_payload["items"] = _derive_visual_items_from_plot_spec(
+                plot_spec,
+                str(visual_payload.get("outputs_dir") or "static/plots"),
+            )
     view["visual_requirements"] = visual_payload
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
     return trim_to_budget(view, 16000)

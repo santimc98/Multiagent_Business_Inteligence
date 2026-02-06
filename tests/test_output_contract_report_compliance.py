@@ -243,6 +243,34 @@ class TestBuildOutputContractReport:
         assert report["overall_status"] == "error"
         assert "scored_rows" in str(report["missing"])
 
+    def test_overall_status_error_missing_required_visual_plot(self, tmp_path):
+        """Missing required plot declared in visualization_requirements -> overall_status=error."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "metrics.json").write_text("{}")
+
+        contract = {
+            "required_outputs": ["data/metrics.json"],
+            "artifact_requirements": {
+                "required_files": [{"path": "data/metrics.json"}],
+            },
+            "visualization_requirements": {
+                "required": True,
+                "required_plots": [{"name": "confidence_distribution"}],
+                "outputs_dir": "static/plots",
+            },
+        }
+
+        original_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            report = build_output_contract_report(contract, work_dir=".")
+        finally:
+            os.chdir(original_cwd)
+
+        assert report["overall_status"] == "error"
+        assert "static/plots/confidence_distribution.png" in report["missing"]
+
     def test_overall_status_error_missing_column(self, tmp_path):
         """Missing required column -> overall_status=error."""
         data_dir = tmp_path / "data"

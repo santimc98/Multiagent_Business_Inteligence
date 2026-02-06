@@ -197,3 +197,44 @@ def test_result_evaluator_qa_rejected_blocks_metric_downgrade(tmp_path, monkeypa
 
     state.update(result)
     assert graph_mod.check_evaluation(state) == "retry"
+
+
+def test_result_evaluator_missing_contract_artifact_forces_retry(tmp_path, monkeypatch):
+    """
+    Missing contract-required artifacts must force NEEDS_IMPROVEMENT and retry context.
+    """
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump({"metric": 0.9}, f)
+
+    state = {
+        "execution_output": "OK",
+        "selected_strategy": {},
+        "business_objective": "",
+        "execution_contract": {
+            "required_outputs": ["data/metrics.json", "static/plots/confidence_distribution.png"],
+            "artifact_requirements": {
+                "required_files": [{"path": "data/metrics.json"}],
+            },
+            "spec_extraction": {"case_taxonomy": []},
+        },
+        "evaluation_spec": {},
+        "iteration_count": 0,
+        "feedback_history": [],
+    }
+
+    monkeypatch.setattr(graph_mod, "reviewer", _StubReviewerApproved())
+    result = graph_mod.run_result_evaluator(state)
+
+    assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
+    gate_ctx = result.get("last_gate_context", {})
+    assert "contract_required_artifacts_missing" in (gate_ctx.get("failed_gates") or [])
+    assert any(
+        "static/plots/confidence_distribution.png" in fix
+        for fix in (gate_ctx.get("required_fixes") or [])
+    )
+    assert result.get("review_retry_worth_it") is True
+
+    state.update(result)
+    assert graph_mod.check_evaluation(state) == "retry"

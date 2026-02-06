@@ -724,10 +724,13 @@ def get_leakage_execution_plan(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     """
-    Return list of required output files from artifact_requirements and required_outputs.
+    Return list of required output files from contract outputs and artifact requirements.
     
     Combines:
       - artifact_requirements.required_files
+      - artifact_requirements.required_plots
+      - artifact_requirements.visual_requirements.items (when required)
+      - visualization_requirements.required_plots
       - required_outputs (top-level)
     
     Normalizes paths:
@@ -738,6 +741,7 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
         Unique list of required output paths (normalized).
     """
     import os
+    import re
     
     def _normalize_path(path: str) -> str:
         """Normalize output path for consistency."""
@@ -751,42 +755,117 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
         if basename in known_files and not path.startswith("data/"):
             return f"data/{basename}"
         return path
+
+    def _slug(value: Any, fallback: str) -> str:
+        token = re.sub(r"[^0-9a-zA-Z]+", "_", str(value or "")).strip("_").lower()
+        return token or fallback
+
+    def _extract_candidate(item: Any) -> str:
+        if not item:
+            return ""
+        if isinstance(item, dict):
+            for key in (
+                "path",
+                "output_path",
+                "output",
+                "artifact",
+                "file",
+                "filename",
+                "expected_filename",
+            ):
+                value = item.get(key)
+                if value:
+                    return str(value)
+            for key in ("plot_id", "id", "name", "title"):
+                value = item.get(key)
+                if value:
+                    return str(value)
+            return ""
+        return str(item)
+
+    def _normalize_plot_path(candidate: Any, outputs_dir: str, fallback: str) -> str:
+        base_dir = str(outputs_dir or "static/plots").replace("\\", "/").rstrip("/")
+        if not base_dir:
+            base_dir = "static/plots"
+        raw = str(candidate or "").strip().replace("\\", "/")
+        if not raw:
+            raw = fallback
+        if "/" not in raw and not os.path.isabs(raw):
+            raw = _slug(raw, fallback)
+        if not os.path.splitext(raw)[1]:
+            raw = f"{raw}.png"
+        if not os.path.isabs(raw) and "/" not in raw:
+            raw = f"{base_dir}/{raw}"
+        return raw
     
     if not isinstance(contract, dict):
         return []
     
     outputs = []
 
-    def _extract_path(item: Any) -> str:
-        if not item:
-            return ""
-        if isinstance(item, dict):
-            path = item.get("path") or item.get("output") or item.get("artifact")
-            return str(path) if path else ""
-        return str(item)
+    def _append_if_path(path: Any) -> None:
+        text = str(path or "").strip()
+        if text and is_probably_path(text):
+            outputs.append(text)
     
     # From artifact_requirements
     artifacts = get_artifact_requirements(contract)
+    visual_cfg = artifacts.get("visual_requirements") if isinstance(artifacts.get("visual_requirements"), dict) else {}
+    visual_outputs_dir = (
+        visual_cfg.get("outputs_dir")
+        or artifacts.get("visual_outputs_dir")
+        or artifacts.get("outputs_dir")
+        or "static/plots"
+    )
     required_files = artifacts.get("required_files")
     if isinstance(required_files, list):
         for entry in required_files:
-            path = _extract_path(entry)
-            if path and is_probably_path(path):
-                outputs.append(path)
+            _append_if_path(_extract_candidate(entry))
     required_plots = artifacts.get("required_plots")
     if isinstance(required_plots, list):
-        for entry in required_plots:
-            path = _extract_path(entry)
-            if path and is_probably_path(path):
-                outputs.append(path)
+        for idx, entry in enumerate(required_plots, start=1):
+            candidate = _extract_candidate(entry)
+            normalized = _normalize_plot_path(candidate, str(visual_outputs_dir), f"required_plot_{idx}")
+            _append_if_path(normalized)
+
+    # From artifact_requirements.visual_requirements (only required items)
+    if isinstance(visual_cfg, dict):
+        visual_enabled = bool(visual_cfg.get("enabled", True))
+        visual_required = bool(visual_cfg.get("required"))
+        visual_items = visual_cfg.get("items") if isinstance(visual_cfg.get("items"), list) else []
+        if visual_enabled and visual_items:
+            for idx, entry in enumerate(visual_items, start=1):
+                if not isinstance(entry, dict):
+                    continue
+                item_required = entry.get("required")
+                if not visual_required and item_required is not True:
+                    continue
+                candidate = _extract_candidate(entry)
+                normalized = _normalize_plot_path(candidate, str(visual_outputs_dir), f"visual_item_{idx}")
+                _append_if_path(normalized)
+
+    # From top-level visualization_requirements.required_plots
+    visualization_requirements = (
+        contract.get("visualization_requirements") if isinstance(contract.get("visualization_requirements"), dict) else {}
+    )
+    if isinstance(visualization_requirements, dict):
+        top_visual_required = bool(visualization_requirements.get("required")) or bool(visual_cfg.get("required"))
+        if not top_visual_required:
+            top_required_plots = []
+        else:
+            top_required_plots = visualization_requirements.get("required_plots")
+        top_outputs_dir = visualization_requirements.get("outputs_dir") or visual_outputs_dir
+        if isinstance(top_required_plots, list):
+            for idx, entry in enumerate(top_required_plots, start=1):
+                candidate = _extract_candidate(entry)
+                normalized = _normalize_plot_path(candidate, str(top_outputs_dir), f"viz_required_plot_{idx}")
+                _append_if_path(normalized)
     
     # From top-level required_outputs
     top_level = contract.get("required_outputs")
     if isinstance(top_level, list):
         for entry in top_level:
-            path = _extract_path(entry)
-            if path and is_probably_path(path):
-                outputs.append(path)
+            _append_if_path(_extract_candidate(entry))
     
     # Normalize and deduplicate
     seen = set()

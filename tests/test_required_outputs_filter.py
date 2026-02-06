@@ -22,3 +22,18 @@ def test_resolve_required_outputs_filters_conceptual():
     reporting = state.get("reporting_requirements", {})
     conceptual = reporting.get("conceptual_outputs", [])
     assert "Priority Rank" in conceptual
+
+
+def test_resolve_required_outputs_includes_visualization_required_plots():
+    contract = {
+        "required_outputs": ["data/metrics.json"],
+        "visualization_requirements": {
+            "required": True,
+            "required_plots": [{"name": "confidence_distribution"}],
+            "outputs_dir": "static/plots",
+        },
+    }
+    outputs = _resolve_required_outputs(contract, {})
+
+    assert "data/metrics.json" in outputs
+    assert "static/plots/confidence_distribution.png" in outputs
