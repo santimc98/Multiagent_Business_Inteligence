@@ -177,6 +177,7 @@ def launch_heavy_runner_job(
     support_files: Optional[list[Dict[str, str]]] = None,
     data_path: str = "data/cleaned_data.csv",
     required_artifacts: Optional[list[str]] = None,
+    attempt_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     gcloud_bin = _resolve_cli_override("gcloud", "HEAVY_RUNNER_GCLOUD_BIN")
     gsutil_bin = _resolve_cli_override("gsutil", "HEAVY_RUNNER_GSUTIL_BIN")
@@ -186,18 +187,27 @@ def launch_heavy_runner_job(
     input_prefix = _normalize_prefix(input_prefix)
     output_prefix = _normalize_prefix(output_prefix)
     dataset_prefix = _normalize_prefix(dataset_prefix)
+    run_scope = str(run_id or "unknown").strip().strip("/")
+    attempt_num = 0
+    try:
+        if attempt_id is not None:
+            attempt_num = max(0, int(attempt_id))
+    except Exception:
+        attempt_num = 0
+    if attempt_num > 0:
+        run_scope = f"{run_scope}/attempt_{attempt_num}"
 
     dataset_uri = request.get("dataset_uri")
     if not dataset_uri or not str(dataset_uri).startswith("gs://"):
         if not dataset_path or not os.path.exists(dataset_path):
             raise CloudRunLaunchError("dataset_path missing or does not exist for heavy runner upload")
         dataset_name = os.path.basename(dataset_path)
-        dataset_uri = f"gs://{bucket}/{dataset_prefix}/{run_id}/{dataset_name}"
+        dataset_uri = f"gs://{bucket}/{dataset_prefix}/{run_scope}/{dataset_name}"
         _gsutil_cp(dataset_path, dataset_uri, gsutil_bin)
     request["dataset_uri"] = dataset_uri
 
     if code_text is not None:
-        code_uri = f"gs://{bucket}/{input_prefix}/{run_id}/ml_script.py"
+        code_uri = f"gs://{bucket}/{input_prefix}/{run_scope}/ml_script.py"
         _upload_text_to_gcs(code_text, code_uri, gsutil_bin)
         request["code_uri"] = code_uri
         request["data_path"] = data_path
@@ -214,14 +224,17 @@ def launch_heavy_runner_job(
                 if not os.path.exists(local_path):
                     continue
                 rel_path = str(rel_path).lstrip("/").replace("\\", "/")
-                support_uri = f"gs://{bucket}/{input_prefix}/{run_id}/support/{rel_path}"
+                support_uri = f"gs://{bucket}/{input_prefix}/{run_scope}/support/{rel_path}"
                 _gsutil_cp(local_path, support_uri, gsutil_bin)
                 uploaded_support.append({"uri": support_uri, "path": rel_path})
         if uploaded_support:
             request["support_files"] = uploaded_support
 
-    input_uri = f"gs://{bucket}/{input_prefix}/{run_id}.json"
-    output_uri = f"gs://{bucket}/{output_prefix}/{run_id}/"
+    if attempt_num > 0:
+        input_uri = f"gs://{bucket}/{input_prefix}/{run_scope}/request.json"
+    else:
+        input_uri = f"gs://{bucket}/{input_prefix}/{run_id}.json"
+    output_uri = f"gs://{bucket}/{output_prefix}/{run_scope}/"
     request["output_uri"] = output_uri
     _upload_json_to_gcs(request, input_uri, gsutil_bin)
 
@@ -273,13 +286,30 @@ def launch_heavy_runner_job(
         _gsutil_cp(uri, local_path, gsutil_bin)
         downloaded[rel_path] = local_path
 
+    status_payload: Optional[Dict[str, Any]] = None
+    status_uri = output_uri + "status.json"
+    if _gsutil_exists(status_uri, gsutil_bin):
+        raw_status = ""
+        try:
+            raw_status = _gsutil_cat(status_uri, gsutil_bin)
+            status_payload = json.loads(raw_status)
+        except Exception:
+            status_payload = {"ok": False, "error": "Failed to parse status.json"}
+            if raw_status:
+                status_payload["raw"] = raw_status
+    status_ok = bool(isinstance(status_payload, dict) and status_payload.get("ok"))
+
     error_payload: Optional[Dict[str, Any]] = None
     error_uri = output_uri + "error.json"
     if _gsutil_exists(error_uri, gsutil_bin):
+        raw_error = ""
         try:
-            error_payload = json.loads(_gsutil_cat(error_uri, gsutil_bin))
+            raw_error = _gsutil_cat(error_uri, gsutil_bin)
+            error_payload = json.loads(raw_error)
         except Exception:
-            error_payload = {"error": "Failed to parse error.json", "raw": _gsutil_cat(error_uri, gsutil_bin)}
+            error_payload = {"error": "Failed to parse error.json"}
+            if raw_error:
+                error_payload["raw"] = raw_error
 
     # Check for missing required artifacts
     missing_artifacts: list[str] = []
@@ -312,6 +342,24 @@ def launch_heavy_runner_job(
             "message": f"Heavy runner job completed but required artifacts missing: {missing_artifacts}",
         }
 
+    raw_job_failed = job_failed
+    raw_job_error = job_error_msg
+    raw_error_payload = error_payload
+    status_arbitration: Dict[str, Any] | None = None
+
+    # Arbitration: if required outputs are present and status.json says ok,
+    # prefer the success contract even if stale error markers exist.
+    if status_ok and not missing_artifacts and (job_failed or error_payload):
+        status_arbitration = {
+            "applied": True,
+            "reason": "status_ok_with_required_artifacts",
+            "ignored_error_payload": bool(error_payload),
+            "ignored_job_failure": bool(job_failed),
+        }
+        job_failed = False
+        job_error_msg = ""
+        error_payload = None
+
     # Determine overall status
     has_error = bool(error_payload) or job_failed
 
@@ -327,8 +375,15 @@ def launch_heavy_runner_job(
         "job_stderr": stderr,
         "job_failed": job_failed,
         "job_error": job_error_msg if job_failed else None,
+        "job_failed_raw": raw_job_failed,
+        "job_error_raw": raw_job_error,
         "gcloud_flag": flag_used,
         "gcloud_bin": gcloud_bin,
         "gsutil_bin": gsutil_bin,
         "error": error_payload,
+        "error_raw": raw_error_payload,
+        "status_payload": status_payload,
+        "status_ok": status_ok,
+        "status_arbitration": status_arbitration,
+        "attempt_id": attempt_num if attempt_num > 0 else None,
     }

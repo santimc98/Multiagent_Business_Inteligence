@@ -1755,6 +1755,10 @@ def _purge_execution_outputs(required_outputs: List[str], keep_outputs: List[str
         "data/alignment_check.json",
         "data/output_contract_report.json",
         "analysis/leakage_report.json",
+        "artifacts/heavy_error.json",
+        "artifacts/heavy_status.json",
+        "artifacts/heavy_execution_log.txt",
+        "artifacts/heavy_model.joblib",
     ]:
         if extra in protected:
             continue
@@ -11333,6 +11337,7 @@ def execute_code(state: AgentState) -> AgentState:
                         "model_params_keys": list(model_params.keys()) if isinstance(model_params, dict) else [],
                         "download_keys": list(download_map.keys()),
                         "support_files": [item.get("path") for item in support_files],
+                        "attempt_id": attempt_id,
                     },
                 )
             if run_id:
@@ -11356,6 +11361,7 @@ def execute_code(state: AgentState) -> AgentState:
                     support_files=support_files,
                     data_path="data/cleaned_data.csv",
                     required_artifacts=required_artifacts,
+                    attempt_id=attempt_id,
                 )
             except CloudRunLaunchError as exc:
                 if run_id:
@@ -11395,6 +11401,10 @@ def execute_code(state: AgentState) -> AgentState:
                             "missing_artifacts": heavy_result.get("missing_artifacts") or [],
                             "gcs_listing": heavy_result.get("gcs_listing") or [],
                             "error_present": bool(heavy_result.get("error")),
+                            "error_raw_present": bool(heavy_result.get("error_raw")),
+                            "status_ok": bool(heavy_result.get("status_ok")),
+                            "status_arbitration": heavy_result.get("status_arbitration"),
+                            "job_failed_raw": bool(heavy_result.get("job_failed_raw")),
                             "gcloud_flag": heavy_result.get("gcloud_flag"),
                         },
                     )
