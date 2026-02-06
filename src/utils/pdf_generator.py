@@ -134,6 +134,17 @@ def convert_report_to_pdf(
                 table.data th, table.data td {{ border: 1px solid #ddd; padding: 6px; text-align: left; }}
                 table.data th {{ background-color: #f2f2f2; font-weight: bold; }}
 
+                /* Executive HTML tables injected by translator */
+                table.exec-table {{ width: 100%; border-collapse: collapse; margin: 12px 0 16px 0; font-size: 9.5pt; }}
+                table.exec-table th, table.exec-table td {{ border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; vertical-align: top; }}
+                table.exec-table th {{ background-color: #e2e8f0; color: #0f172a; font-weight: bold; }}
+                table.exec-table tr:nth-child(even) td {{ background-color: #f8fafc; }}
+                .status-badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 8pt; font-weight: bold; }}
+                .status-ok {{ background: #dcfce7; color: #166534; }}
+                .status-warn {{ background: #fef3c7; color: #92400e; }}
+                .status-error {{ background: #fee2e2; color: #991b1b; }}
+                .status-neutral {{ background: #e2e8f0; color: #334155; }}
+
                 .footer {{ position: fixed; bottom: 0; width: 100%; text-align: center; font-size: 9pt; color: #aaa; }}
             </style>
         </head>

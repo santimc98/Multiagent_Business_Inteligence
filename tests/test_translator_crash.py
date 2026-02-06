@@ -1,13 +1,16 @@
 
+import os
 import pytest
 from src.agents.business_translator import BusinessTranslatorAgent
 from unittest.mock import MagicMock, patch
 
-def test_translator_report_generation_crash():
+def test_translator_report_generation_crash(tmp_path, monkeypatch):
     """
     Test that calls generate_report to verify no NameError occurs.
     Mocking the LLM call to avoid API usage.
     """
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
     agent = BusinessTranslatorAgent(api_key="dummy_key")
     
     # Mock the client

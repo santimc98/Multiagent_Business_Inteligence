@@ -14260,7 +14260,12 @@ def run_translator(state: AgentState) -> AgentState:
             f_exec.write(report or "")
         existing_index = _load_json_any("data/produced_artifact_index.json")
         normalized_existing = existing_index if isinstance(existing_index, list) else []
-        additions = _build_artifact_index(["data/executive_summary.md"], None)
+        report_artifacts = ["data/executive_summary.md"]
+        if os.path.exists("data/report_artifact_manifest.json"):
+            report_artifacts.append("data/report_artifact_manifest.json")
+        if os.path.exists("data/report_visual_tables.json"):
+            report_artifacts.append("data/report_visual_tables.json")
+        additions = _build_artifact_index(report_artifacts, None)
         merged_index = _merge_artifact_index_entries(normalized_existing, additions)
         dump_json("data/produced_artifact_index.json", merged_index)
         report_state["artifact_index"] = merged_index

@@ -204,6 +204,8 @@ def clean_workspace_outputs() -> None:
         os.path.join("data", "contract_min.json"),
         os.path.join("data", "execution_contract.json"),
         os.path.join("data", "executive_summary.md"),
+        os.path.join("data", "report_artifact_manifest.json"),
+        os.path.join("data", "report_visual_tables.json"),
     ]:
         try:
             if os.path.exists(path):

@@ -1,5 +1,7 @@
 import os
 import re
+import html
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -176,6 +178,386 @@ def _compact_header(columns: List[str], head: int = 10, tail: int = 6) -> str:
         return ", ".join(cols)
     middle_count = len(cols) - head - tail
     return ", ".join(cols[:head] + [f"[+{middle_count} more]"] + cols[-tail:])
+
+
+def _looks_like_path(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    if lower.startswith(("data/", "static/", "reports/", "artifacts/", "report/")):
+        return True
+    if "/" in text or "\\" in text:
+        return True
+    _, ext = os.path.splitext(lower)
+    return ext in {
+        ".csv",
+        ".json",
+        ".md",
+        ".txt",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".pdf",
+        ".parquet",
+        ".xlsx",
+        ".xls",
+        ".joblib",
+        ".pkl",
+        ".pickle",
+    }
+
+
+def _normalize_path(path: Any) -> str:
+    text = str(path or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _human_size(num_bytes: Optional[int]) -> str:
+    if not isinstance(num_bytes, int) or num_bytes < 0:
+        return "-"
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024.0:.1f} KB"
+    return f"{num_bytes / (1024.0 * 1024.0):.2f} MB"
+
+
+def _count_csv_rows(path: str) -> Optional[int]:
+    encodings = ("utf-8", "utf-8-sig", "latin-1")
+    for enc in encodings:
+        try:
+            with open(path, "r", encoding=enc, errors="ignore") as handle:
+                line_count = sum(1 for _ in handle)
+            return max(line_count - 1, 0)
+        except Exception:
+            continue
+    return None
+
+
+def _profile_artifact(path: str) -> Dict[str, Any]:
+    profile: Dict[str, Any] = {"row_count": None, "column_count": None}
+    if not path or not os.path.exists(path):
+        return profile
+    lower = path.lower()
+    try:
+        if lower.endswith(".csv"):
+            sample = _safe_load_csv(path, max_rows=50) or {}
+            cols = sample.get("columns") if isinstance(sample.get("columns"), list) else []
+            if cols:
+                profile["column_count"] = len(cols)
+            row_count = _count_csv_rows(path)
+            if row_count is None and isinstance(sample.get("row_count_sampled"), int):
+                row_count = int(sample.get("row_count_sampled"))
+            profile["row_count"] = row_count
+        elif lower.endswith(".json"):
+            payload = _safe_load_json(path)
+            if isinstance(payload, list):
+                profile["row_count"] = len(payload)
+                if payload and isinstance(payload[0], dict):
+                    profile["column_count"] = len(payload[0].keys())
+            elif isinstance(payload, dict):
+                profile["row_count"] = len(payload.keys())
+                profile["column_count"] = len(payload.keys())
+    except Exception:
+        pass
+    return profile
+
+
+def render_table_html(
+    headers: List[str],
+    rows: List[List[Any]],
+    max_rows: int = 10,
+    table_class: str = "exec-table",
+    raw_html_columns: Optional[List[int]] = None,
+) -> str:
+    if not headers or not rows:
+        return "<p><em>No data available.</em></p>"
+
+    raw_cols = set(raw_html_columns or [])
+    safe_rows = [row for row in rows[:max_rows] if isinstance(row, list)]
+    if not safe_rows:
+        return "<p><em>No data available.</em></p>"
+
+    lines: List[str] = [f'<table class="{html.escape(table_class)}">', "<thead><tr>"]
+    for header in headers:
+        lines.append(f"<th>{html.escape(str(header))}</th>")
+    lines.append("</tr></thead><tbody>")
+    for row in safe_rows:
+        lines.append("<tr>")
+        for idx, cell in enumerate(row):
+            if idx in raw_cols:
+                lines.append(f"<td>{str(cell)}</td>")
+            else:
+                lines.append(f"<td>{html.escape(str(cell))}</td>")
+        lines.append("</tr>")
+    lines.append("</tbody></table>")
+    if len(rows) > max_rows:
+        lines.append(f"<p><em>Showing {max_rows} of {len(rows)} rows.</em></p>")
+    return "".join(lines)
+
+
+def _status_badge(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    label = normalized.upper() if normalized else "UNKNOWN"
+    css_class = {
+        "ok": "status-ok",
+        "present_optional": "status-ok",
+        "missing_required": "status-error",
+        "missing_optional": "status-warn",
+        "warning": "status-warn",
+        "error": "status-error",
+    }.get(normalized, "status-neutral")
+    return f'<span class="status-badge {css_class}">{html.escape(label)}</span>'
+
+
+def _build_report_artifact_manifest(
+    artifact_index: List[Dict[str, Any]],
+    required_outputs: List[str],
+    output_contract_report: Dict[str, Any],
+    review_verdict: Optional[str],
+    gate_context: Dict[str, Any],
+    run_summary: Dict[str, Any],
+    run_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    artifact_index = artifact_index if isinstance(artifact_index, list) else []
+    output_contract_report = output_contract_report if isinstance(output_contract_report, dict) else {}
+
+    required_set: set[str] = set()
+    for path in required_outputs or []:
+        if _looks_like_path(path):
+            required_set.add(_normalize_path(path))
+
+    for path in output_contract_report.get("missing", []) or []:
+        if _looks_like_path(path):
+            required_set.add(_normalize_path(path))
+
+    missing_set: set[str] = set(_normalize_path(p) for p in (output_contract_report.get("missing", []) or []) if _looks_like_path(p))
+
+    artifact_report = output_contract_report.get("artifact_requirements_report")
+    if isinstance(artifact_report, dict):
+        files_report = artifact_report.get("files_report")
+        if isinstance(files_report, dict):
+            for path in files_report.get("missing", []) or []:
+                if _looks_like_path(path):
+                    normalized = _normalize_path(path)
+                    required_set.add(normalized)
+                    missing_set.add(normalized)
+
+    path_to_type: Dict[str, str] = {}
+    candidate_paths: List[str] = []
+    seen_paths: set[str] = set()
+
+    def _add_candidate(path_value: Any, artifact_type: str = "") -> None:
+        if not _looks_like_path(path_value):
+            return
+        normalized = _normalize_path(path_value)
+        if not normalized or normalized in seen_paths:
+            if normalized and artifact_type and not path_to_type.get(normalized):
+                path_to_type[normalized] = str(artifact_type)
+            return
+        seen_paths.add(normalized)
+        candidate_paths.append(normalized)
+        if artifact_type:
+            path_to_type[normalized] = str(artifact_type)
+
+    for item in artifact_index:
+        if not isinstance(item, dict):
+            continue
+        _add_candidate(item.get("path"), item.get("artifact_type") or "")
+    for path in required_set:
+        _add_candidate(path, path_to_type.get(path, "required_output"))
+    for path in output_contract_report.get("present", []) or []:
+        _add_candidate(path, "present_output")
+    for path in output_contract_report.get("missing", []) or []:
+        _add_candidate(path, "required_output")
+
+    items: List[Dict[str, Any]] = []
+    for path in sorted(candidate_paths):
+        present = os.path.exists(path)
+        required = path in required_set
+        if path in missing_set:
+            status = "missing_required"
+        elif required and present:
+            status = "ok"
+        elif required and not present:
+            status = "missing_required"
+        elif present:
+            status = "present_optional"
+        else:
+            status = "missing_optional"
+        stat_size = None
+        stat_mtime = None
+        if present:
+            try:
+                stat = os.stat(path)
+                stat_size = int(stat.st_size)
+                stat_mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+            except Exception:
+                pass
+        profile = _profile_artifact(path)
+        items.append(
+            {
+                "path": path,
+                "artifact_type": path_to_type.get(path) or "artifact",
+                "required": bool(required),
+                "present": bool(present),
+                "status": status,
+                "size_bytes": stat_size,
+                "updated_at_utc": stat_mtime,
+                "row_count": profile.get("row_count"),
+                "column_count": profile.get("column_count"),
+            }
+        )
+
+    required_total = sum(1 for item in items if item.get("required"))
+    required_missing = sum(1 for item in items if item.get("required") and not item.get("present"))
+    summary = {
+        "required_total": required_total,
+        "required_present": required_total - required_missing,
+        "required_missing": required_missing,
+        "optional_present": sum(1 for item in items if not item.get("required") and item.get("present")),
+        "optional_missing": sum(1 for item in items if not item.get("required") and not item.get("present")),
+    }
+
+    manifest = {
+        "generated_at_utc": datetime.now(tz=timezone.utc).isoformat(),
+        "run_id": run_id,
+        "summary": summary,
+        "items": items,
+        "governance_snapshot": {
+            "review_verdict": review_verdict,
+            "run_outcome": run_summary.get("run_outcome") if isinstance(run_summary, dict) else None,
+            "failed_gates": gate_context.get("failed_gates", []) if isinstance(gate_context, dict) else [],
+            "required_fixes": gate_context.get("required_fixes", []) if isinstance(gate_context, dict) else [],
+            "output_contract_status": output_contract_report.get("overall_status"),
+        },
+    }
+    return manifest
+
+
+def _build_artifact_inventory_table_html(manifest: Dict[str, Any], max_rows: int = 14) -> str:
+    items = manifest.get("items", []) if isinstance(manifest, dict) else []
+    rows: List[List[Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            [
+                item.get("path") or "",
+                item.get("artifact_type") or "artifact",
+                "yes" if item.get("required") else "no",
+                _status_badge(item.get("status") or ""),
+                item.get("row_count") if item.get("row_count") is not None else "-",
+                item.get("column_count") if item.get("column_count") is not None else "-",
+                _human_size(item.get("size_bytes")),
+            ]
+        )
+    return render_table_html(
+        ["Artifact", "Type", "Required", "Status", "Rows", "Cols", "Size"],
+        rows,
+        max_rows=max_rows,
+        table_class="exec-table artifact-inventory",
+        raw_html_columns=[3],
+    )
+
+
+def _build_artifact_compliance_table_html(
+    manifest: Dict[str, Any],
+    output_contract_report: Dict[str, Any],
+    review_verdict: Optional[str],
+    gate_context: Dict[str, Any],
+) -> str:
+    summary = manifest.get("summary", {}) if isinstance(manifest, dict) else {}
+    overall_status = str(output_contract_report.get("overall_status") or "unknown").lower()
+    failed_gates = gate_context.get("failed_gates", []) if isinstance(gate_context, dict) else []
+    if not isinstance(failed_gates, list):
+        failed_gates = []
+    rows: List[List[Any]] = [
+        ["Output Contract Status", _status_badge(overall_status)],
+        ["Review Verdict", html.escape(str(review_verdict or "UNKNOWN"))],
+        ["Required Artifacts", str(summary.get("required_total", 0))],
+        ["Required Missing", str(summary.get("required_missing", 0))],
+        ["Failed Gates", html.escape(", ".join([str(g) for g in failed_gates[:6]]) or "none")],
+    ]
+    missing = output_contract_report.get("missing", []) if isinstance(output_contract_report, dict) else []
+    if isinstance(missing, list) and missing:
+        rows.append(["Missing Paths", "<br/>".join(html.escape(_normalize_path(path)) for path in missing[:8])])
+    return render_table_html(
+        ["Check", "Value"],
+        rows,
+        max_rows=10,
+        table_class="exec-table artifact-compliance",
+        raw_html_columns=[1],
+    )
+
+
+def _build_kpi_snapshot_table_html(
+    metrics_payload: Dict[str, Any],
+    data_adequacy_report: Dict[str, Any],
+    decisioning_columns: List[str],
+    executive_decision_label: str,
+    max_metric_rows: int = 8,
+) -> str:
+    rows: List[List[Any]] = []
+    rows.append(["Executive Decision", executive_decision_label or "UNKNOWN"])
+    if isinstance(data_adequacy_report, dict):
+        rows.append(["Data Adequacy Status", str(data_adequacy_report.get("status") or "unknown")])
+    if decisioning_columns:
+        rows.append(["Decisioning Columns", ", ".join([str(col) for col in decisioning_columns[:6]])])
+    flat = _flatten_metrics(metrics_payload if isinstance(metrics_payload, dict) else {})
+    metric_count = 0
+    for key, value in flat:
+        if metric_count >= max_metric_rows:
+            break
+        if _is_number(value):
+            rows.append([f"metric:{key}", f"{float(value):.6g}"])
+            metric_count += 1
+    return render_table_html(
+        ["KPI / Signal", "Value"],
+        rows,
+        max_rows=14,
+        table_class="exec-table kpi-snapshot",
+    )
+
+
+def _load_run_timeline_tail(run_id: Optional[str], max_events: int = 12) -> List[Dict[str, Any]]:
+    candidates: List[str] = []
+    if run_id:
+        candidates.append(os.path.join("runs", str(run_id), "events.jsonl"))
+    candidates.append("events.jsonl")
+
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            rows: List[Dict[str, Any]] = []
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    payload = json.loads(line)
+                    if isinstance(payload, dict):
+                        rows.append(payload)
+            if not rows:
+                continue
+            tail = rows[-max_events:]
+            normalized: List[Dict[str, Any]] = []
+            for item in tail:
+                normalized.append(
+                    {
+                        "ts": item.get("timestamp") or item.get("ts"),
+                        "event": item.get("event") or item.get("type") or item.get("name"),
+                        "status": item.get("status"),
+                    }
+                )
+            return normalized
+        except Exception:
+            continue
+    return []
 
 def render_table_text(headers: List[str], rows: List[List[str]], max_rows: int = 8, max_cell_len: int = 28) -> str:
     """
@@ -711,6 +1093,7 @@ class BusinessTranslatorAgent:
             "plot_reference_mode": plot_reference_mode,
         }
         visuals_context_json = json.dumps(visuals_context_data, ensure_ascii=False)
+        run_id = state.get("run_id")
         contract = _safe_load_json("data/execution_contract.json") or {}
         decisioning_context = translator_view.get("decisioning_requirements") or contract.get("decisioning_requirements") or {}
         if not isinstance(decisioning_context, dict):
@@ -759,6 +1142,23 @@ class BusinessTranslatorAgent:
                 executive_decision_label = outcome
             elif outcome in {"APPROVE_WITH_WARNINGS", "APPROVED"}:
                 executive_decision_label = "GO_WITH_LIMITATIONS"
+
+        required_outputs: List[str] = []
+        if isinstance(contract.get("required_outputs"), list):
+            required_outputs.extend([_normalize_path(path) for path in contract.get("required_outputs") if _looks_like_path(path)])
+        artifact_requirements = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
+        if isinstance(artifact_requirements, dict):
+            required_files = artifact_requirements.get("required_files")
+            if isinstance(required_files, list):
+                for item in required_files:
+                    if isinstance(item, dict):
+                        path = item.get("path") or item.get("output") or item.get("artifact")
+                    else:
+                        path = item
+                    if _looks_like_path(path):
+                        required_outputs.append(_normalize_path(path))
+        # Keep insertion order
+        required_outputs = [p for idx, p in enumerate(required_outputs) if p and p not in required_outputs[:idx]]
 
         def _summarize_integrity():
             issues = integrity_audit.get("issues", []) if isinstance(integrity_audit, dict) else []
@@ -1070,6 +1470,47 @@ class BusinessTranslatorAgent:
             "missing_required_slots": missing_required_slots,
         }
 
+        manifest = _build_report_artifact_manifest(
+            artifact_index=artifact_index,
+            required_outputs=required_outputs,
+            output_contract_report=output_contract_report,
+            review_verdict=review_verdict or compliance,
+            gate_context=gate_context if isinstance(gate_context, dict) else {},
+            run_summary=run_summary if isinstance(run_summary, dict) else {},
+            run_id=str(run_id) if run_id else None,
+        )
+        artifact_inventory_table_html = _build_artifact_inventory_table_html(manifest)
+        artifact_compliance_table_html = _build_artifact_compliance_table_html(
+            manifest,
+            output_contract_report,
+            review_verdict or compliance,
+            gate_context if isinstance(gate_context, dict) else {},
+        )
+        kpi_snapshot_table_html = _build_kpi_snapshot_table_html(
+            metrics_payload if isinstance(metrics_payload, dict) else {},
+            data_adequacy_report if isinstance(data_adequacy_report, dict) else {},
+            decisioning_columns,
+            executive_decision_label,
+        )
+        run_timeline_context = _load_run_timeline_tail(str(run_id) if run_id else None, max_events=12)
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/report_artifact_manifest.json", "w", encoding="utf-8") as f_manifest:
+                json.dump(manifest, f_manifest, indent=2, ensure_ascii=False)
+            with open("data/report_visual_tables.json", "w", encoding="utf-8") as f_tables:
+                json.dump(
+                    {
+                        "artifact_inventory_table_html": artifact_inventory_table_html,
+                        "artifact_compliance_table_html": artifact_compliance_table_html,
+                        "kpi_snapshot_table_html": kpi_snapshot_table_html,
+                    },
+                    f_tables,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+        except Exception:
+            pass
+
         cleaned_sample_table_text = "No data available."
         if isinstance(cleaned_rows, dict) and cleaned_rows.get("rows"):
             cleaned_cols = _select_informative_columns(cleaned_rows, max_cols=8, min_cols=5)
@@ -1121,8 +1562,10 @@ class BusinessTranslatorAgent:
            GENERATE THE ENTIRE REPORT IN THIS LANGUAGE. Do not mix languages.
         2. **NO MARKDOWN TABLES:** The PDF generator breaks on markdown table syntax.
            DO NOT use pipe-based tables (| col | col |).
-           INSTEAD, use the professional ASCII grid tables provided in the context (they use + and - characters).
-           These render beautifully in monospaced PDF fonts.
+           Use either:
+           - HTML tables (preferred for visual executive reporting), or
+           - ASCII grid tables provided in context.
+           Do not mix pipe tables with HTML tables.
         3. **NO ELLIPSIS:** Never output the literal sequence "..." anywhere in the report.
         4. **NO TRUNCATED SENTENCES:** Do not leave sentences hanging; rewrite as complete, concise sentences.
 
@@ -1172,6 +1615,11 @@ class BusinessTranslatorAgent:
         - Scored Rows Snapshot: $scored_rows_context
         - Plot Insights (data-driven): $plot_insights_json
         - Artifacts Available: $artifacts_context
+        - Artifact Manifest (json): $artifact_manifest_context
+        - Artifact Inventory Table (HTML): $artifact_inventory_table_html
+        - Artifact Compliance Table (HTML): $artifact_compliance_table_html
+        - KPI Snapshot Table (HTML): $kpi_snapshot_table_html
+        - Run Timeline (tail): $run_timeline_context
         - Recommendations Preview: $recommendations_preview_context
         - Cleaned Data Sample Table (text): $cleaned_sample_table_text
         - Scored Rows Sample Table (text): $scored_sample_table_text
@@ -1188,8 +1636,10 @@ class BusinessTranslatorAgent:
 
         GUIDANCE:
         - Use Insights as the primary evidence source; only reference other artifacts if they add clear value.
-        - Include 2-4 short "tablas de muestra" using the provided text tables. Label them explicitly as samples and keep 3-5 rows maximum. Do NOT use markdown tables or pipes; use the text tables as-is.
-        - Include a short "Data schema snapshot" section that uses the Artifact Headers Table (text) exactly as provided.
+        - Prefer HTML tables for executive readability when summarizing artifacts, compliance, and KPIs.
+        - You may embed the provided HTML snippets directly (Artifact Inventory Table, Artifact Compliance Table, KPI Snapshot Table) and then comment on the implications.
+        - Keep sample tables concise (3-8 rows) and label them as snapshots.
+        - Include a short "Data schema snapshot" section using Artifact Headers Table (text) or the inventory/compliance HTML tables if clearer.
         - If reporting_policy.demonstrative_examples_enabled is true AND run_outcome is in reporting_policy.demonstrative_examples_when_outcome_in,
           you MUST include a section titled "Ejemplos ilustrativos (no aptos para producción)".
           Use recommendations_preview.items (max 3-5) and include strong disclaimers plus support (n, observed_support if available).
@@ -1240,11 +1690,12 @@ class BusinessTranslatorAgent:
         6. Close with 2-4 "Next actions" that would unblock the pipeline (data / pipeline / validation).
 
         IF SUCCESS (Only if NO Error):
-        OUTPUT FORMAT (MANDATORY):
-        - You MUST generate ONLY the top-level sections listed in reporting_policy.sections, in that exact order.
-        - Each section MUST be a level-2 heading: "## <Section Title>".
-        - You MAY use short subheadings or bullet lists inside a section, but do NOT add new top-level sections.
-        - Exception: you WILL add the final mandatory top-level section "## Evidencia usada" at the end (see later instruction).
+        OUTPUT FORMAT (FLEXIBLE, EXECUTIVE-FIRST):
+        - Treat reporting_policy.sections as a recommended outline, not a rigid template.
+        - You may merge/reorder/add sections if that improves clarity for executives and remains evidence-based.
+        - Use level-2 headings for major sections.
+        - Keep a coherent narrative arc: decision -> evidence -> risks -> actions.
+        - You MUST still include the final section "## Evidencia usada" at the end (see later instruction).
 
         SECTION TITLE GUIDELINES:
         - decision -> Executive Decision
@@ -1361,6 +1812,11 @@ class BusinessTranslatorAgent:
             scored_rows_context=json.dumps(scored_rows_context, ensure_ascii=False),
             plot_insights_json=json.dumps(plot_insights, ensure_ascii=False),
             artifacts_context=json.dumps(artifacts_context, ensure_ascii=False),
+            artifact_manifest_context=json.dumps(manifest, ensure_ascii=False),
+            artifact_inventory_table_html=artifact_inventory_table_html,
+            artifact_compliance_table_html=artifact_compliance_table_html,
+            kpi_snapshot_table_html=kpi_snapshot_table_html,
+            run_timeline_context=json.dumps(run_timeline_context, ensure_ascii=False),
             recommendations_preview_context=json.dumps(recommendations_preview, ensure_ascii=False),
             cleaned_sample_table_text=cleaned_sample_table_text,
             scored_sample_table_text=scored_sample_table_text,
