@@ -78,4 +78,7 @@ def test_run_result_evaluator_runtime_failure_builds_review_stack(tmp_path, monk
     assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
     assert "ml_review_stack" in result
     assert result["ml_review_stack"]["runtime"]["status"] == "FAILED_RUNTIME"
+    assert result["ml_review_stack"]["result_evaluator"]["status"] == result["ml_review_stack"]["final_pre_board"]["status"]
+    assert result["ml_review_stack"]["result_evaluator"]["raw_status"] == "NEEDS_IMPROVEMENT"
+    assert isinstance(result["ml_review_stack"].get("deterministic_facts"), dict)
     assert os.path.exists("data/ml_review_stack.json")

@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import re
 import json
+import copy
 import hashlib
 import csv
 import math
@@ -401,6 +402,218 @@ def _refresh_run_facts_pack(state: Dict[str, Any]) -> None:
             shutil.copy2(src_path, dest_path)
     except Exception as err:
         print(f"Warning: failed to copy run_facts_pack.json into bundle: {err}")
+
+
+def _freeze_payload(payload: Any) -> Any:
+    try:
+        return copy.deepcopy(payload)
+    except Exception:
+        return payload
+
+
+def _resolve_contract_pair_from_state(state: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    snapshot = state.get("execution_contract_snapshot")
+    if isinstance(snapshot, dict):
+        full_snap = snapshot.get("execution_contract")
+        min_snap = snapshot.get("execution_contract_min")
+        if isinstance(full_snap, dict) and full_snap:
+            return (
+                _freeze_payload(full_snap) if isinstance(full_snap, dict) else {},
+                _freeze_payload(min_snap) if isinstance(min_snap, dict) else {},
+            )
+    contract_full = state.get("execution_contract")
+    if not isinstance(contract_full, dict) or not contract_full:
+        contract_full = _load_json_safe("data/execution_contract.json") or {}
+    contract_min = state.get("execution_contract_min") or state.get("contract_min")
+    if not isinstance(contract_min, dict) or not contract_min:
+        contract_min = _load_json_safe("data/contract_min.json") or {}
+    if not isinstance(contract_full, dict):
+        contract_full = {}
+    if not isinstance(contract_min, dict):
+        contract_min = {}
+    return contract_full, contract_min
+
+
+def _persist_execution_contract_snapshot(
+    state: Dict[str, Any],
+    contract: Dict[str, Any],
+    contract_min: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    contract_payload = contract if isinstance(contract, dict) else {}
+    contract_min_payload = contract_min if isinstance(contract_min, dict) else {}
+    iteration_id = int(state.get("iteration_count", 0) or 0) + 1
+    run_id = state.get("run_id")
+    contract_sig = _hash_json(contract_payload)
+    contract_min_sig = _hash_json(contract_min_payload)
+    snapshot = {
+        "snapshot_schema_version": 1,
+        "run_id": run_id,
+        "iteration_id": iteration_id,
+        "captured_at_utc": datetime.utcnow().isoformat() + "Z",
+        "execution_contract_signature": contract_sig,
+        "execution_contract_min_signature": contract_min_sig,
+        "execution_contract": _freeze_payload(contract_payload),
+        "execution_contract_min": _freeze_payload(contract_min_payload),
+    }
+
+    os.makedirs(os.path.join("data", "contracts", "snapshots"), exist_ok=True)
+    snapshot_path = os.path.join(
+        "data",
+        "contracts",
+        "snapshots",
+        f"contract_snapshot_iter_{iteration_id}.json",
+    )
+    dump_json(snapshot_path, snapshot)
+    latest_path = os.path.join("data", "contract_snapshot_latest.json")
+    dump_json(latest_path, snapshot)
+
+    run_bundle_dir = state.get("run_bundle_dir")
+    if run_bundle_dir:
+        try:
+            dest_main = os.path.join(
+                run_bundle_dir,
+                "artifacts",
+                "data",
+                "contracts",
+                "snapshots",
+                os.path.basename(snapshot_path),
+            )
+            os.makedirs(os.path.dirname(dest_main), exist_ok=True)
+            shutil.copy2(os.path.abspath(snapshot_path), dest_main)
+            dest_latest = os.path.join(run_bundle_dir, "artifacts", "data", "contract_snapshot_latest.json")
+            os.makedirs(os.path.dirname(dest_latest), exist_ok=True)
+            shutil.copy2(os.path.abspath(latest_path), dest_latest)
+        except Exception as copy_err:
+            print(f"Warning: failed to copy contract snapshot into bundle: {copy_err}")
+
+    return {
+        "snapshot": snapshot,
+        "snapshot_path": snapshot_path,
+        "snapshot_latest_path": latest_path,
+        "execution_contract_signature": contract_sig,
+        "execution_contract_min_signature": contract_min_sig,
+        "execution_contract_source": "execution_planner_snapshot",
+    }
+
+
+def _summarize_alignment_requirements(alignment_check: Dict[str, Any]) -> Dict[str, Any]:
+    requirements = alignment_check.get("requirements")
+    failed: List[Dict[str, Any]] = []
+    warned: List[Dict[str, Any]] = []
+    if isinstance(requirements, list):
+        for item in requirements:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("id") or item.get("gate") or "requirement")
+            req_status = str(item.get("status") or "").upper()
+            entry = {
+                "name": name,
+                "status": req_status or "UNKNOWN",
+                "evidence": _truncate_text(str(item.get("evidence") or item.get("summary") or ""), max_len=260),
+            }
+            if req_status == "FAIL":
+                failed.append(entry)
+            elif req_status == "WARN":
+                warned.append(entry)
+    return {
+        "status": str(alignment_check.get("status") or "").upper() or "UNKNOWN",
+        "failure_mode": str(alignment_check.get("failure_mode") or ""),
+        "summary": _truncate_text(str(alignment_check.get("summary") or alignment_check.get("notes") or ""), max_len=320),
+        "failed_requirements": failed,
+        "warn_requirements": warned,
+    }
+
+
+def _extract_primary_metric_for_board(
+    state: Dict[str, Any],
+    metrics_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    snapshot = state.get("primary_metric_snapshot")
+    if isinstance(snapshot, dict) and snapshot:
+        return {
+            "name": snapshot.get("primary_metric_name"),
+            "value": snapshot.get("primary_metric_value"),
+            "baseline_value": snapshot.get("baseline_value"),
+            "source": "primary_metric_snapshot",
+        }
+    model_perf = metrics_report.get("model_performance") if isinstance(metrics_report.get("model_performance"), dict) else {}
+    for key in ("normalized_gini", "auc", "accuracy", "f1", "rmse", "mae", "r2"):
+        val = model_perf.get(key)
+        if isinstance(val, (int, float)):
+            return {"name": key, "value": float(val), "source": "metrics.model_performance"}
+    return {"name": None, "value": None, "source": "unavailable"}
+
+
+def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    metrics_report = _load_json_safe("data/metrics.json")
+    if not isinstance(metrics_report, dict):
+        metrics_report = {}
+    alignment_check = _load_json_safe("data/alignment_check.json")
+    if not isinstance(alignment_check, dict):
+        alignment_check = {}
+    oc_report = state.get("output_contract_report")
+    if not isinstance(oc_report, dict):
+        oc_report = _load_json_safe("data/output_contract_report.json")
+    if not isinstance(oc_report, dict):
+        oc_report = {}
+    artifact_issues = _extract_contract_artifact_issues(oc_report)
+    visual_reqs = (
+        contract.get("artifact_requirements", {}).get("visual_requirements")
+        if isinstance(contract.get("artifact_requirements"), dict)
+        else {}
+    )
+    if not isinstance(visual_reqs, dict):
+        visual_reqs = {}
+    model_perf = metrics_report.get("model_performance")
+    model_perf_compact: Dict[str, Any] = {}
+    if isinstance(model_perf, dict):
+        for key, value in model_perf.items():
+            if isinstance(value, (int, float, str, bool)) and len(model_perf_compact) < 15:
+                model_perf_compact[str(key)] = value
+
+    runtime_status = "FAILED_RUNTIME" if (
+        bool(state.get("sandbox_failed"))
+        or _has_runtime_failure_marker(state.get("execution_output"))
+    ) else "OK"
+    gate_context = state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+    return {
+        "contract": {
+            "source": state.get("execution_contract_source") or "execution_contract",
+            "signature": state.get("execution_contract_signature"),
+            "min_signature": state.get("execution_contract_min_signature"),
+            "version": contract.get("contract_version"),
+            "snapshot_path": state.get("execution_contract_snapshot_path"),
+        },
+        "runtime": {
+            "status": runtime_status,
+            "runtime_fix_terminal": bool(state.get("runtime_fix_terminal")),
+            "runtime_fix_count": int(state.get("runtime_fix_count", 0) or 0),
+            "sandbox_failed": bool(state.get("sandbox_failed")),
+        },
+        "metrics": {
+            "primary": _extract_primary_metric_for_board(state, metrics_report),
+            "model_performance": model_perf_compact,
+        },
+        "alignment": _summarize_alignment_requirements(alignment_check),
+        "output_contract": {
+            "overall_status": str(oc_report.get("overall_status") or "").lower() if isinstance(oc_report, dict) else "",
+            "missing_required_artifacts": artifact_issues.get("missing_paths", []),
+            "schema_issues": artifact_issues.get("schema_issues", []),
+        },
+        "visual_requirements": {
+            "enabled": bool(visual_reqs.get("enabled")),
+            "required": bool(visual_reqs.get("required")),
+            "expected_items": len(visual_reqs.get("items") or []) if isinstance(visual_reqs.get("items"), list) else 0,
+            "visuals_missing_signal": bool(state.get("visuals_missing")),
+        },
+        "pipeline": {
+            "review_verdict_before_board": state.get("review_verdict"),
+            "failed_gates": gate_context.get("failed_gates", []),
+            "required_fixes": gate_context.get("required_fixes", []),
+            "hard_failures": state.get("hard_failures", []),
+        },
+    }
 
 
 def _append_run_facts_block(text: str, state: Dict[str, Any]) -> str:
@@ -6621,6 +6834,11 @@ class AgentState(TypedDict):
     ml_skipped_reason: str
     execution_contract: Dict[str, Any]
     execution_contract_min: Dict[str, Any]
+    execution_contract_snapshot: Dict[str, Any]
+    execution_contract_snapshot_path: str
+    execution_contract_signature: str
+    execution_contract_min_signature: str
+    execution_contract_source: str
     contract_views: Dict[str, Any]
     contract_view_paths: Dict[str, str]
     de_view: Dict[str, Any]
@@ -6641,6 +6859,7 @@ class AgentState(TypedDict):
     budget_counters: Dict[str, int]
     qa_budget_exceeded: bool
     ml_review_stack: Dict[str, Any]
+    review_board_facts: Dict[str, Any]
     review_board_verdict: Dict[str, Any]
 
 from src.agents.domain_expert import DomainExpertAgent
@@ -7983,6 +8202,17 @@ def run_execution_planner(state: AgentState) -> AgentState:
         )
         _verify_run_bundle_contracts(run_id, contract, work_dir_abs)
 
+    contract_snapshot_payload: Dict[str, Any] = {}
+    try:
+        contract_snapshot_payload = _persist_execution_contract_snapshot(
+            state if isinstance(state, dict) else {},
+            contract if isinstance(contract, dict) else {},
+            contract_min if isinstance(contract_min, dict) else {},
+        )
+    except Exception as snapshot_err:
+        print(f"Warning: failed to persist contract snapshot: {snapshot_err}")
+        contract_snapshot_payload = {}
+
     # DATA_PROFILE PREFLIGHT: Create data_profile.json early so it's available
     # even if DE/ML abort. This is the first opportunity after contract is persisted.
     try:
@@ -8031,6 +8261,12 @@ def run_execution_planner(state: AgentState) -> AgentState:
         result["evaluation_spec"] = evaluation_spec
     if isinstance(contract_min, dict) and contract_min:
         result["execution_contract_min"] = contract_min
+    if isinstance(contract_snapshot_payload, dict) and contract_snapshot_payload:
+        result["execution_contract_snapshot"] = contract_snapshot_payload.get("snapshot")
+        result["execution_contract_snapshot_path"] = contract_snapshot_payload.get("snapshot_path")
+        result["execution_contract_signature"] = contract_snapshot_payload.get("execution_contract_signature")
+        result["execution_contract_min_signature"] = contract_snapshot_payload.get("execution_contract_min_signature")
+        result["execution_contract_source"] = contract_snapshot_payload.get("execution_contract_source")
     if view_payload:
         result.update(view_payload)
     if isinstance(policy, dict) and policy:
@@ -10230,11 +10466,10 @@ def run_engineer(state: AgentState) -> AgentState:
     csv_encoding = state.get('csv_encoding', 'utf-8') # Pass real encoding
     csv_sep = state.get('csv_sep', ',')
     csv_decimal = state.get('csv_decimal', '.')
-    execution_contract = state.get("execution_contract", {}) or _load_json_safe("data/execution_contract.json")
+    execution_contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     evaluation_spec = state.get("evaluation_spec") or (execution_contract or {}).get("evaluation_spec") or {}
     if isinstance(execution_contract, dict) and evaluation_spec and not execution_contract.get("evaluation_spec"):
         execution_contract["evaluation_spec"] = evaluation_spec
-    contract_min = _load_json_safe("data/contract_min.json")
     if not isinstance(contract_min, dict) or not contract_min:
         contract_min = _build_contract_min(execution_contract, evaluation_spec)
         try:
@@ -10898,9 +11133,8 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     current_history = list(state.get('feedback_history', []))
     try:
         # Run QA Audit
-        contract = state.get("execution_contract", {}) or {}
+        contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
         qa_view = state.get("qa_view") or (state.get("contract_views") or {}).get("qa_view")
-        contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
         if isinstance(qa_view, dict) and qa_view:
             qa_context = dict(qa_view)
             contract_source = "qa_view"
@@ -11708,7 +11942,7 @@ def execute_code(state: AgentState) -> AgentState:
         return {"error_message": failure_reason, "execution_output": failure_reason, "budget_counters": counters}
 
     # Dependency allowlist precheck
-    contract = state.get("execution_contract", {}) or {}
+    contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     artifact_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
     visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
     visual_outputs_dir = str(visual_reqs.get("outputs_dir") or "static/plots")
@@ -12585,7 +12819,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "result_evaluator_start", {})
-    contract = state.get("execution_contract", {}) or {}
+    contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     artifact_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
     visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
     visuals_missing = bool(state.get("visuals_missing"))
@@ -12646,9 +12880,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     strategy = state.get('selected_strategy', {}) or {}
     strategy_context = f"Strategy: {strategy.get('title')}\nType: {strategy.get('analysis_type')}\nRules: {strategy.get('reasoning')}"
     business_objective = state.get('business_objective', '')
-    evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
-    contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
-
+    evaluation_spec = state.get("evaluation_spec") or (contract or {}).get("evaluation_spec")
     governance_context = {}
     if decisioning_warning:
         governance_context["decisioning_warning"] = decisioning_warning
@@ -12695,7 +12927,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     print(f"ITER_EVAL status={status} retry_worth_it={retry_worth_it} downgraded={downgraded} reason={'no_traceback_retry_not_worth' if downgraded else 'none'}")
 
     # Case alignment QA gate (optional if required by contract/spec)
-    contract = state.get("execution_contract", {}) or {}
     skip_reason = _case_alignment_skip_reason(contract, evaluation_spec)
     case_alignment_required = _should_run_case_alignment(contract, evaluation_spec)
     case_report: Dict[str, Any] = {
@@ -12820,7 +13051,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         new_history.append(f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('failures')}")
 
     # Output contract validation (schema-aware)
-    contract = state.get("execution_contract", {}) or {}
     oc_report = _persist_output_contract_report(state, reason="result_evaluator")
     oc_overall_status = str(oc_report.get("overall_status") or "").lower() if isinstance(oc_report, dict) else ""
     contract_output_failed_gates: List[str] = []
@@ -12885,7 +13115,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 alignment_check["status"] = raw_status
                 alignment_check["summary"] = summary
                 alignment_check["failure_mode"] = failure_mode
-            contract_min = _load_json_safe("data/contract_min.json")
+            if not isinstance(contract_min, dict) or not contract_min:
+                contract_min = _load_json_safe("data/contract_min.json") or {}
             alignment_check, forbidden_violations = _apply_forbidden_feature_gate(
                 alignment_check,
                 contract,
@@ -13090,7 +13321,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 if not isinstance(reviewer_view, dict) or not reviewer_view:
                     reviewer_view = build_reviewer_view(
                         contract,
-                        _load_json_safe("data/contract_min.json") or {},
+                        contract_min if isinstance(contract_min, dict) else {},
                         state.get("artifact_index") or [],
                     )
                 if isinstance(reviewer_view, dict):
@@ -13431,8 +13662,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "runtime_fix_count": int(state.get("runtime_fix_count", 0) or 0),
         "sandbox_failed": bool(state.get("sandbox_failed")),
     }
+    raw_eval_status = str(eval_result.get("status") or "").upper()
     eval_packet = {
-        "status": str(eval_result.get("status") or status),
+        "status": status,
+        "raw_status": raw_eval_status or status,
+        "status_origin": "result_evaluator.final",
         "feedback": str(eval_result.get("feedback") or ""),
         "failed_gates": [str(g) for g in (eval_result.get("failed_gates") or []) if g],
         "required_fixes": [str(fx) for fx in (eval_result.get("required_fixes") or []) if fx],
@@ -13466,12 +13700,16 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         results_packet["status"] = "NEEDS_IMPROVEMENT"
     elif status == "APPROVE_WITH_WARNINGS":
         results_packet["status"] = "APPROVE_WITH_WARNINGS"
+    facts_state = dict(state or {})
+    facts_state.update(result_state)
+    review_board_facts = _build_review_board_facts(facts_state)
     review_stack = {
         "runtime": runtime_packet,
         "result_evaluator": eval_packet,
         "reviewer": reviewer_packet,
         "qa_reviewer": qa_packet,
         "results_advisor": results_packet,
+        "deterministic_facts": review_board_facts,
         "final_pre_board": {
             "status": status,
             "feedback": feedback,
@@ -13493,6 +13731,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     except Exception as stack_err:
         print(f"Warning: failed to persist ml_review_stack.json: {stack_err}")
     result_state["ml_review_stack"] = review_stack
+    result_state["review_board_facts"] = review_board_facts
 
     # Iteration memory (delta + objective + weights) for patch-mode guidance
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
@@ -13596,6 +13835,10 @@ def run_review_board(state: AgentState) -> AgentState:
     runtime_block.setdefault("runtime_fix_terminal", bool(state.get("runtime_fix_terminal")))
     runtime_block.setdefault("runtime_fix_count", int(state.get("runtime_fix_count", 0) or 0))
     board_context["runtime"] = runtime_block
+    deterministic_facts = board_context.get("deterministic_facts")
+    if not isinstance(deterministic_facts, dict) or not deterministic_facts:
+        deterministic_facts = _build_review_board_facts(state if isinstance(state, dict) else {})
+    board_context["deterministic_facts"] = deterministic_facts
     board_context["review_verdict_before_board"] = state.get("review_verdict")
     board_context["review_feedback_before_board"] = state.get("review_feedback")
 
@@ -13652,6 +13895,7 @@ def run_review_board(state: AgentState) -> AgentState:
         "required_actions": required_actions,
         "confidence": confidence,
         "evidence": evidence,
+        "deterministic_facts": deterministic_facts,
         "runtime_fix_terminal": bool(state.get("runtime_fix_terminal")),
         "review_verdict_before_board": state.get("review_verdict"),
     }
@@ -13687,6 +13931,7 @@ def run_review_board(state: AgentState) -> AgentState:
 
     result = {
         "review_board_verdict": board_payload,
+        "review_board_facts": deterministic_facts,
         "review_verdict": final_status,
         "review_feedback": current_feedback,
         "feedback_history": history,

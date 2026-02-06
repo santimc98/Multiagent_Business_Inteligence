@@ -25,6 +25,11 @@ def _unique_strings(items: List[Any]) -> List[str]:
 
 
 def _extract_contract(state: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = state.get("execution_contract_snapshot")
+    if isinstance(snapshot, dict):
+        snap_contract = snapshot.get("execution_contract")
+        if isinstance(snap_contract, dict) and snap_contract:
+            return snap_contract
     contract = (
         state.get("execution_contract")
         or state.get("execution_contract_min")
@@ -32,6 +37,16 @@ def _extract_contract(state: Dict[str, Any]) -> Dict[str, Any]:
         or {}
     )
     return contract if isinstance(contract, dict) else {}
+
+
+def _extract_contract_min(state: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = state.get("execution_contract_snapshot")
+    if isinstance(snapshot, dict):
+        snap_min = snapshot.get("execution_contract_min")
+        if isinstance(snap_min, dict) and snap_min:
+            return snap_min
+    contract_min = state.get("execution_contract_min") or state.get("contract_min") or {}
+    return contract_min if isinstance(contract_min, dict) else {}
 
 
 def _extract_objective_type(contract: Dict[str, Any], state: Dict[str, Any]) -> Optional[str]:
@@ -91,6 +106,7 @@ def build_run_facts_pack(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     state = state or {}
     contract = _extract_contract(state)
+    contract_min = _extract_contract_min(state)
     dialect = {
         "sep": state.get("csv_sep"),
         "decimal": state.get("csv_decimal"),
@@ -104,6 +120,10 @@ def build_run_facts_pack(state: Dict[str, Any]) -> Dict[str, Any]:
     run_facts = {
         "run_id": state.get("run_id"),
         "input_csv_path": state.get("csv_path"),
+        "contract_source": state.get("execution_contract_source") or "execution_contract",
+        "contract_signature": state.get("execution_contract_signature"),
+        "contract_min_signature": state.get("execution_contract_min_signature"),
+        "contract_version": contract.get("contract_version") or contract_min.get("contract_version"),
         "dialect": dialect,
         "dataset_scale_hints": dataset_scale_hints or None,
         "objective_type": _extract_objective_type(contract, state),

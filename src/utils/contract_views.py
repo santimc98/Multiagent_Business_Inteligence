@@ -633,6 +633,82 @@ def _cap_plot_spec(plot_spec: Dict[str, Any] | None, max_caption_chars: int = 40
     return capped
 
 
+def _json_equal(left: Any, right: Any) -> bool:
+    try:
+        return json.dumps(left, sort_keys=True, ensure_ascii=True) == json.dumps(
+            right,
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+    except Exception:
+        return left == right
+
+
+def _resolve_policy_plot_spec(contract_full: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any] | None:
+    policy = contract_full.get("reporting_policy")
+    if not isinstance(policy, dict) or not policy:
+        policy = contract_min.get("reporting_policy")
+    return _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
+
+
+def _resolve_visual_context(
+    contract_full: Dict[str, Any],
+    contract_min: Dict[str, Any],
+) -> Dict[str, Any]:
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    visual_reqs = (
+        artifact_reqs.get("visual_requirements")
+        if isinstance(artifact_reqs.get("visual_requirements"), dict)
+        else {}
+    )
+    visual_items = visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else []
+    visual_payload: Dict[str, Any] = {
+        "enabled": bool(visual_reqs.get("enabled")),
+        "required": bool(visual_reqs.get("required")),
+        "outputs_dir": visual_reqs.get("outputs_dir") or "static/plots",
+        "items": visual_items,
+        "notes": visual_reqs.get("notes") or "",
+    }
+    view_warnings: Dict[str, Any] = {}
+
+    # Single source of truth: artifact_requirements.visual_requirements.plot_spec.
+    # reporting_policy.plot_spec is kept only as backward-compatible fallback.
+    canonical_plot_spec = _cap_plot_spec(
+        visual_reqs.get("plot_spec") if isinstance(visual_reqs, dict) else None
+    )
+    policy_plot_spec = _resolve_policy_plot_spec(contract_full, contract_min)
+    used_fallback = False
+    if canonical_plot_spec is None and policy_plot_spec is not None:
+        canonical_plot_spec = policy_plot_spec
+        used_fallback = True
+    elif canonical_plot_spec is not None and policy_plot_spec is not None and not _json_equal(
+        canonical_plot_spec,
+        policy_plot_spec,
+    ):
+        view_warnings["plot_spec_conflict"] = "Using artifact_requirements.visual_requirements.plot_spec"
+
+    if canonical_plot_spec is not None:
+        visual_payload["enabled"] = bool(canonical_plot_spec.get("enabled", True))
+        if not visual_items:
+            visual_payload["items"] = _derive_visual_items_from_plot_spec(
+                canonical_plot_spec,
+                str(visual_payload.get("outputs_dir") or "static/plots"),
+            )
+
+    if used_fallback:
+        view_warnings["plot_spec_source"] = "fallback_reporting_policy"
+    elif canonical_plot_spec is not None:
+        view_warnings["plot_spec_source"] = "artifact_requirements.visual_requirements.plot_spec"
+
+    return {
+        "visual_payload": visual_payload,
+        "plot_spec": canonical_plot_spec,
+        "view_warnings": view_warnings,
+    }
+
+
 def _slugify_plot_token(value: Any, fallback: str) -> str:
     token = re.sub(r"[^0-9a-zA-Z]+", "_", str(value or "")).strip("_").lower()
     return token or fallback
@@ -1017,33 +1093,19 @@ def build_ml_view(
     }
     if artifact_payload:
         view["artifact_requirements"] = artifact_payload
-    visual_reqs = (
-        artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
-    )
-    visual_items = visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else []
-    visual_payload = {
-        "enabled": bool(visual_reqs.get("enabled")),
-        "required": bool(visual_reqs.get("required")),
-        "outputs_dir": visual_reqs.get("outputs_dir") or "static/plots",
-        "items": visual_items,
-        "notes": visual_reqs.get("notes") or "",
-    }
+    visual_ctx = _resolve_visual_context(contract_full, contract_min)
+    visual_payload = visual_ctx.get("visual_payload", {})
+    plot_spec = visual_ctx.get("plot_spec")
+    visual_warnings = visual_ctx.get("view_warnings") if isinstance(visual_ctx.get("view_warnings"), dict) else {}
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
-    if view_warnings:
-        view["view_warnings"] = view_warnings
+    merged_warnings = dict(view_warnings)
+    if visual_warnings:
+        merged_warnings.update(visual_warnings)
+    if merged_warnings:
+        view["view_warnings"] = merged_warnings
     if case_rules is not None:
         view["case_rules"] = case_rules
-    policy = contract_full.get("reporting_policy")
-    if not isinstance(policy, dict) or not policy:
-        policy = contract_min.get("reporting_policy")
-    plot_spec = _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
     if plot_spec is not None:
-        visual_payload["enabled"] = bool(plot_spec.get("enabled", True))
-        if not visual_items:
-            visual_payload["items"] = _derive_visual_items_from_plot_spec(
-                plot_spec,
-                str(visual_payload.get("outputs_dir") or "static/plots"),
-            )
         view["plot_spec"] = plot_spec
     view["visual_requirements"] = visual_payload
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
@@ -1160,30 +1222,14 @@ def build_translator_view(
         "limitations": limitations,
         "constraints": {"no_markdown_tables": True, "cite_sources": True},
     }
-    plot_spec = _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
+    visual_ctx = _resolve_visual_context(contract_full, contract_min)
+    plot_spec = visual_ctx.get("plot_spec")
+    visual_payload = visual_ctx.get("visual_payload", {})
     if plot_spec is not None:
         view["plot_spec"] = plot_spec
-    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
-        contract_full.get("artifact_requirements")
-    )
-    visual_reqs = (
-        artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
-    )
-    visual_items = visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else []
-    visual_payload = {
-        "enabled": bool(visual_reqs.get("enabled")),
-        "required": bool(visual_reqs.get("required")),
-        "outputs_dir": visual_reqs.get("outputs_dir") or "static/plots",
-        "items": visual_items,
-        "notes": visual_reqs.get("notes") or "",
-    }
-    if plot_spec is not None:
-        visual_payload["enabled"] = bool(plot_spec.get("enabled", True))
-        if not visual_items:
-            visual_payload["items"] = _derive_visual_items_from_plot_spec(
-                plot_spec,
-                str(visual_payload.get("outputs_dir") or "static/plots"),
-            )
+    visual_warnings = visual_ctx.get("view_warnings")
+    if isinstance(visual_warnings, dict) and visual_warnings:
+        view["view_warnings"] = visual_warnings
     view["visual_requirements"] = visual_payload
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
     return trim_to_budget(view, 16000)

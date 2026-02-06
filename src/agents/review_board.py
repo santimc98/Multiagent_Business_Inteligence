@@ -43,6 +43,9 @@ class ReviewBoardAgent:
             "- Reviewer (strategy/contract/code alignment)\n"
             "- QA Reviewer (universal + contract QA gates)\n"
             "- Results Advisor (quality and improvement potential)\n\n"
+            "If REVIEW_STACK_CONTEXT contains deterministic_facts, treat those facts as canonical for\n"
+            "numeric values, metric thresholds, and artifact completeness.\n"
+            "If reviewer text conflicts with deterministic_facts, explicitly flag it in failed_areas and required_actions.\n\n"
             "=== EVIDENCE RULE ===\n"
             f"{SENIOR_EVIDENCE_RULE}\n\n"
             "Decision policy:\n"
@@ -51,6 +54,9 @@ class ReviewBoardAgent:
             "3) If results are usable but with caveats, return APPROVE_WITH_WARNINGS.\n"
             "4) If all critical areas pass, return APPROVED.\n"
             "Do not invent evidence.\n\n"
+            "Evidence policy:\n"
+            "- Prefer deterministic_facts entries when available.\n"
+            "- Cite source keys from deterministic_facts or reviewer packets in every critical claim.\n\n"
             "Output format:\n"
             f"{output_format}"
         )
@@ -132,4 +138,3 @@ class ReviewBoardAgent:
         text = re.sub(r"```json", "", text)
         text = re.sub(r"```", "", text)
         return text.strip()
-

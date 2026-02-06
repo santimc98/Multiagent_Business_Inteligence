@@ -145,6 +145,53 @@ def test_ml_view_derives_visual_items_from_plot_spec_when_missing():
     assert items[0].get("path") == "static/plots/confidence_distribution.png"
 
 
+def test_ml_view_prefers_visual_requirements_plot_spec_over_reporting_policy():
+    contract_full = {
+        "canonical_columns": ["col_a"],
+        "column_roles": {"pre_decision": ["col_a"]},
+        "allowed_feature_sets": {
+            "model_features": ["col_a"],
+            "segmentation_features": ["col_a"],
+            "forbidden_features": [],
+        },
+        "reporting_policy": {
+            "plot_spec": {
+                "enabled": True,
+                "plots": [{"plot_id": "policy_plot"}],
+            }
+        },
+    }
+    contract_min = {
+        "canonical_columns": ["col_a"],
+        "column_roles": {"pre_decision": ["col_a"]},
+        "allowed_feature_sets": {
+            "model_features": ["col_a"],
+            "segmentation_features": ["col_a"],
+            "forbidden_features": [],
+        },
+        "artifact_requirements": {
+            "visual_requirements": {
+                "enabled": True,
+                "required": True,
+                "outputs_dir": "static/plots",
+                "items": [],
+                "plot_spec": {
+                    "enabled": True,
+                    "plots": [{"plot_id": "canonical_plot"}],
+                },
+            }
+        },
+    }
+
+    ml_view = build_ml_view(contract_full, contract_min, [])
+    plot_spec = ml_view.get("plot_spec") or {}
+    plots = plot_spec.get("plots") or []
+    assert plots
+    assert plots[0].get("plot_id") == "canonical_plot"
+    warnings = ml_view.get("view_warnings") or {}
+    assert warnings.get("plot_spec_source") == "artifact_requirements.visual_requirements.plot_spec"
+
+
 def test_ml_view_required_outputs_merge_contract_min_and_full():
     contract_full = {
         "artifact_requirements": {
