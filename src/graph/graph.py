@@ -6767,6 +6767,8 @@ class AgentState(TypedDict):
     weights_signature: str
     execution_output_stale: bool
     sandbox_failed: bool
+    e2b_memory_failure_detected: bool
+    backend_memory_estimate: Dict[str, Any]
     sandbox_retry_count: int
     max_sandbox_retries: int
     ml_call_refund_pending: bool
@@ -7450,6 +7452,247 @@ def _resolve_heavy_feature_columns(
     return list(dict.fromkeys(filtered))
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _dtype_bytes_estimate(dtype_name: str) -> float:
+    dtype = str(dtype_name or "").strip().lower()
+    if not dtype:
+        return 16.0
+    if "float16" in dtype:
+        return 2.0
+    if "float32" in dtype or "int32" in dtype or "uint32" in dtype:
+        return 4.0
+    if "float64" in dtype or "int64" in dtype or "uint64" in dtype:
+        return 8.0
+    if "int16" in dtype or "uint16" in dtype:
+        return 2.0
+    if "int8" in dtype or "uint8" in dtype or "bool" in dtype:
+        return 1.0
+    if "datetime" in dtype or "timedelta" in dtype:
+        return 8.0
+    if "category" in dtype:
+        return 8.0
+    if "string" in dtype or "object" in dtype:
+        # Conservative estimate for Python objects + pointers.
+        return 96.0
+    return 24.0
+
+
+def _estimate_dataframe_memory_gb(
+    data_profile: Dict[str, Any],
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    profile = data_profile if isinstance(data_profile, dict) else {}
+    hints = state.get("dataset_scale_hints") or {}
+    basic = profile.get("basic_stats") if isinstance(profile.get("basic_stats"), dict) else {}
+    dtypes = profile.get("dtypes") if isinstance(profile.get("dtypes"), dict) else {}
+
+    n_rows = _safe_int(basic.get("n_rows"), 0)
+    if n_rows <= 0:
+        n_rows = _safe_int(hints.get("est_rows"), 0)
+    n_cols = _safe_int(basic.get("n_cols"), 0)
+    if n_cols <= 0 and isinstance(dtypes, dict) and dtypes:
+        n_cols = len(dtypes)
+    if n_cols <= 0:
+        n_cols = _safe_int(hints.get("cols") or hints.get("n_cols"), 0)
+
+    if n_rows <= 0 and n_cols <= 0:
+        return {
+            "available": False,
+            "n_rows": 0,
+            "n_cols": 0,
+            "raw_df_gb": None,
+            "bytes_per_row": None,
+            "dtype_confidence": "none",
+        }
+
+    object_cols = 0
+    if isinstance(dtypes, dict) and dtypes:
+        bytes_per_row = 0.0
+        for _, dtype_name in dtypes.items():
+            dtype = str(dtype_name or "").lower()
+            if "object" in dtype or "string" in dtype:
+                object_cols += 1
+            bytes_per_row += _dtype_bytes_estimate(dtype_name)
+        if n_cols <= 0:
+            n_cols = len(dtypes)
+        dtype_confidence = "high"
+    else:
+        # Unknown dtypes: assume mixed schema with overhead.
+        bytes_per_row = max(n_cols, 1) * 20.0
+        dtype_confidence = "low"
+
+    # Index overhead + object overhead adjustment.
+    index_bytes = max(n_rows, 1) * 8.0
+    object_extra_bytes = max(n_rows, 1) * object_cols * 24.0
+    raw_bytes = (max(n_rows, 1) * bytes_per_row) + index_bytes + object_extra_bytes
+    raw_df_gb = raw_bytes / float(1024 ** 3)
+    return {
+        "available": True,
+        "n_rows": int(max(n_rows, 1)),
+        "n_cols": int(max(n_cols, 1)),
+        "object_cols": int(object_cols),
+        "bytes_per_row": float(bytes_per_row),
+        "raw_df_gb": float(raw_df_gb),
+        "dtype_confidence": dtype_confidence,
+    }
+
+
+def _estimate_e2b_peak_memory_gb(
+    state: Dict[str, Any],
+    data_profile: Dict[str, Any],
+    ml_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    df_est = _estimate_dataframe_memory_gb(data_profile, state)
+    if not df_est.get("available"):
+        return {
+            "available": False,
+            "estimated_peak_gb": None,
+            "confidence": "low",
+            "reason": "insufficient_profile",
+        }
+
+    raw_df_gb = _safe_float(df_est.get("raw_df_gb"), 0.0)
+    n_rows = _safe_int(df_est.get("n_rows"), 0)
+    n_cols = _safe_int(df_est.get("n_cols"), 0)
+    object_cols = _safe_int(df_est.get("object_cols"), 0)
+
+    cv_policy = (ml_plan or {}).get("cv_policy") if isinstance(ml_plan, dict) else {}
+    folds = _safe_int(cv_policy.get("n_splits"), 0) if isinstance(cv_policy, dict) else 0
+
+    # Conservative multipliers to protect E2B 8GB ceiling.
+    prep_mult = 2.0
+    if n_rows >= 1_000_000:
+        prep_mult += 0.2
+    if n_cols >= 250:
+        prep_mult += 0.2
+    if object_cols > 0:
+        prep_mult += min(0.4, 0.05 * object_cols)
+
+    cv_mult = 1.0 + min(0.45, max(0, folds - 1) * 0.09)
+
+    # Generic modeling overhead (materialized matrices, estimator memory, serializations).
+    modeling_overhead_gb = 0.65
+    if n_rows >= 1_000_000:
+        modeling_overhead_gb += 0.85
+    if n_cols >= 400:
+        modeling_overhead_gb += 0.5
+
+    estimated_peak_gb = (raw_df_gb * prep_mult * cv_mult) + modeling_overhead_gb
+    if estimated_peak_gb < raw_df_gb:
+        estimated_peak_gb = raw_df_gb + 0.5
+
+    confidence = "high" if df_est.get("dtype_confidence") == "high" else "medium"
+    return {
+        "available": True,
+        "estimated_peak_gb": float(estimated_peak_gb),
+        "confidence": confidence,
+        "folds": int(folds),
+        "prep_mult": float(prep_mult),
+        "cv_mult": float(cv_mult),
+        "modeling_overhead_gb": float(modeling_overhead_gb),
+        "raw_df_gb": float(raw_df_gb),
+        "n_rows": int(n_rows),
+        "n_cols": int(n_cols),
+        "object_cols": int(object_cols),
+    }
+
+
+def _build_backend_memory_decision(
+    state: Dict[str, Any],
+    data_profile: Dict[str, Any],
+    ml_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    estimate = _estimate_e2b_peak_memory_gb(state, data_profile, ml_plan)
+    e2b_limit_gb = _safe_float(os.getenv("E2B_MEMORY_LIMIT_GB"), 8.0)
+    safe_fraction = _safe_float(os.getenv("E2B_MEMORY_SAFE_FRACTION"), 0.72)
+    min_margin_gb = _safe_float(os.getenv("E2B_MEMORY_MIN_MARGIN_GB"), 1.5)
+    safe_budget_gb = min(e2b_limit_gb * safe_fraction, max(0.1, e2b_limit_gb - min_margin_gb))
+
+    hints = state.get("dataset_scale_hints") or {}
+    file_mb = _safe_float(hints.get("file_mb"), 0.0)
+    est_rows = _safe_int(hints.get("est_rows"), 0)
+    n_cols_hint = _safe_int(hints.get("cols") or hints.get("n_cols"), 0)
+    heavy_size_signal = bool(file_mb >= 200 or est_rows >= 1_000_000 or n_cols_hint >= 1000)
+
+    if state.get("e2b_memory_failure_detected"):
+        return {
+            "use_heavy": True,
+            "reason": "e2b_memory_failure_fallback",
+            "safe_budget_gb": safe_budget_gb,
+            "e2b_limit_gb": e2b_limit_gb,
+            "estimate": estimate,
+        }
+
+    if estimate.get("available"):
+        peak_gb = _safe_float(estimate.get("estimated_peak_gb"), 0.0)
+        if peak_gb <= safe_budget_gb:
+            return {
+                "use_heavy": False,
+                "reason": "e2b_memory_safe",
+                "safe_budget_gb": safe_budget_gb,
+                "e2b_limit_gb": e2b_limit_gb,
+                "estimate": estimate,
+            }
+        return {
+            "use_heavy": True,
+            "reason": "est_memory_exceeds_e2b_safe",
+            "safe_budget_gb": safe_budget_gb,
+            "e2b_limit_gb": e2b_limit_gb,
+            "estimate": estimate,
+        }
+
+    if heavy_size_signal:
+        return {
+            "use_heavy": True,
+            "reason": "memory_uncertain_guard",
+            "safe_budget_gb": safe_budget_gb,
+            "e2b_limit_gb": e2b_limit_gb,
+            "estimate": estimate,
+        }
+    return {
+        "use_heavy": False,
+        "reason": "e2b_default",
+        "safe_budget_gb": safe_budget_gb,
+        "e2b_limit_gb": e2b_limit_gb,
+        "estimate": estimate,
+    }
+
+
+def _is_memory_pressure_error(text: str) -> bool:
+    if not text:
+        return False
+    lower = str(text).lower()
+    patterns = [
+        "out of memory",
+        "memoryerror",
+        "cannot allocate memory",
+        "resource exhausted",
+        "oom",
+        "killed",
+        "exit code 137",
+        "sigkill",
+        "std::bad_alloc",
+    ]
+    return any(pat in lower for pat in patterns)
+
+
 def _should_use_heavy_runner(
     state: Dict[str, Any],
     data_profile: Dict[str, Any],
@@ -7459,36 +7702,9 @@ def _should_use_heavy_runner(
         return False, "unavailable"
     if _env_flag("HEAVY_RUNNER_FORCE", False):
         return True, "forced"
-    hints = state.get("dataset_scale_hints") or {}
-    file_mb = float(hints.get("file_mb") or 0.0)
-    est_rows = int(hints.get("est_rows") or 0)
-    n_cols = int(hints.get("cols") or hints.get("n_cols") or 0)
-    if not n_cols:
-        column_inventory = state.get("column_inventory") or []
-        if isinstance(column_inventory, list):
-            n_cols = len(column_inventory)
-    numeric_summary = (data_profile or {}).get("numeric_summary")
-    numeric_ratio = None
-    if isinstance(numeric_summary, dict) and n_cols:
-        numeric_ratio = len(numeric_summary) / max(n_cols, 1)
-    cv_policy = (ml_plan or {}).get("cv_policy") if isinstance(ml_plan, dict) else {}
-    folds = cv_policy.get("n_splits") if isinstance(cv_policy, dict) else None
-    try:
-        folds_val = int(folds) if folds is not None else 0
-    except Exception:
-        folds_val = 0
-    heavy = (
-        file_mb >= 50
-        or est_rows >= 50_000
-        or n_cols >= 500
-    )
-    if numeric_ratio is not None and numeric_ratio < 0.7:
-        return False, "non_numeric_ratio"
-    if heavy and folds_val >= 4:
-        return True, "size_and_cv"
-    if heavy:
-        return True, "size_only"
-    return False, "below_threshold"
+    memory_decision = _build_backend_memory_decision(state, data_profile, ml_plan)
+    state["backend_memory_estimate"] = memory_decision
+    return bool(memory_decision.get("use_heavy")), str(memory_decision.get("reason") or "unknown")
 
 
 def _finalize_heavy_execution(
@@ -11655,6 +11871,7 @@ def execute_code(state: AgentState) -> AgentState:
         if run_id:
             hints = state.get("dataset_scale_hints") or {}
             cv_policy = ml_plan.get("cv_policy") if isinstance(ml_plan, dict) else {}
+            backend_memory = state.get("backend_memory_estimate") if isinstance(state.get("backend_memory_estimate"), dict) else {}
             log_run_event(
                 run_id,
                 "execution_backend_selection",
@@ -11668,6 +11885,7 @@ def execute_code(state: AgentState) -> AgentState:
                         "cols": hints.get("cols") or hints.get("n_cols"),
                     },
                     "cv_folds": cv_policy.get("n_splits") if isinstance(cv_policy, dict) else None,
+                    "memory_decision": backend_memory,
                 },
             )
         if use_heavy:
@@ -12556,6 +12774,7 @@ def execute_code(state: AgentState) -> AgentState:
 
     runtime_tail = None
     ml_skipped_reason = state.get("ml_skipped_reason", None)
+    memory_pressure_detected = False
     if error_in_output:
         print("runtime error detected in output.")
         tail = output[-4000:] if isinstance(output, str) else str(output)[-4000:]
@@ -12563,6 +12782,20 @@ def execute_code(state: AgentState) -> AgentState:
         print(tail)
         print("-----------------------------------------------------------")
         runtime_tail = tail
+        memory_pressure_detected = _is_memory_pressure_error(tail)
+        if memory_pressure_detected:
+            note = (
+                "E2B_MEMORY_PRESSURE_DETECTED: promoting next execution to CloudRun to avoid 8GB limit breaches."
+            )
+            history = list(state.get("feedback_history", []))
+            history.append(note)
+            state["feedback_history"] = history
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "e2b_memory_pressure_detected",
+                    {"attempt_id": attempt_id, "tail_excerpt": tail[-800:]},
+                )
         if "DETERMINISTIC_TARGET_RELATION" in tail:
             ml_skipped_reason = "DETERMINISTIC_TARGET_RELATION"
 
@@ -12654,6 +12887,7 @@ def execute_code(state: AgentState) -> AgentState:
         "last_attempt_score": attempt_score,
         "last_attempt_valid": attempt_valid,
         "sandbox_failed": sandbox_failed,
+        "e2b_memory_failure_detected": bool(memory_pressure_detected),
         "sandbox_retry_count": 0 if not sandbox_failed else state.get("sandbox_retry_count", 0),
         "ml_call_refund_pending": False,
         "execution_call_refund_pending": False,
