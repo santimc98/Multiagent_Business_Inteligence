@@ -7433,6 +7433,62 @@ def _sync_required_columns_artifacts(
         print(f"Warning: failed to rebuild column_sets from required_columns: {cs_err}")
 
 
+def _resolve_explicit_columns_for_wide_dataset(state: Dict[str, Any] | None) -> List[str]:
+    if not isinstance(state, dict):
+        return []
+    column_sets = state.get("column_sets")
+    if not isinstance(column_sets, dict) or not column_sets:
+        column_sets = _load_json_safe("data/column_sets.json") or {}
+        if isinstance(column_sets, dict) and column_sets:
+            state["column_sets"] = column_sets
+            if not state.get("column_sets_summary"):
+                try:
+                    summary = summarize_column_sets(column_sets)
+                    if summary:
+                        state["column_sets_summary"] = summary
+                except Exception:
+                    pass
+    if not isinstance(column_sets, dict):
+        return []
+    return [str(col) for col in (column_sets.get("explicit_columns") or []) if col]
+
+
+def _apply_wide_dataset_contract_truth(
+    *,
+    state: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+    contract_min: Dict[str, Any] | None,
+    n_columns: int | None,
+) -> None:
+    if not n_columns or n_columns <= 200:
+        return
+    dataset_truth_ref = {
+        "column_inventory_path": "data/column_inventory.json",
+        "column_sets_path": "data/column_sets.json",
+        "n_columns": int(n_columns),
+    }
+    if isinstance(contract, dict):
+        contract["dataset_truth_ref"] = dataset_truth_ref
+    if not isinstance(contract_min, dict):
+        return
+    contract_min["dataset_truth_ref"] = dataset_truth_ref
+
+    canonical_existing = [str(col) for col in (contract_min.get("canonical_columns") or []) if col]
+    if not canonical_existing and isinstance(contract, dict):
+        canonical_existing = [str(col) for col in (contract.get("canonical_columns") or []) if col]
+        if canonical_existing:
+            contract_min["canonical_columns"] = canonical_existing
+
+    explicit_columns = _resolve_explicit_columns_for_wide_dataset(state)
+    if explicit_columns:
+        contract_min["available_columns"] = explicit_columns
+        return
+
+    # Never blank canonical columns in wide datasets; keep planner truth.
+    if canonical_existing and not (isinstance(contract_min.get("available_columns"), list) and contract_min.get("available_columns")):
+        contract_min["available_columns"] = list(canonical_existing)
+
+
 def run_execution_planner(state: AgentState) -> AgentState:
     print("--- [2.7] Execution Planner: Building Contract ---")
     abort_state = _abort_if_requested(state, "execution_planner")
@@ -7588,26 +7644,12 @@ def run_execution_planner(state: AgentState) -> AgentState:
         n_columns = column_inventory_state.get("n_columns")
     if n_columns is None:
         n_columns = len(column_inventory)
-    if n_columns and n_columns > 200:
-        dataset_truth_ref = {
-            "column_inventory_path": "data/column_inventory.json",
-            "column_sets_path": "data/column_sets.json",
-            "n_columns": int(n_columns),
-        }
-        if isinstance(contract, dict):
-            contract["dataset_truth_ref"] = dataset_truth_ref
-        if isinstance(contract_min, dict):
-            contract_min["dataset_truth_ref"] = dataset_truth_ref
-            explicit_columns = []
-            column_sets = state.get("column_sets") if isinstance(state, dict) else {}
-            if isinstance(column_sets, dict):
-                explicit_columns = [str(c) for c in (column_sets.get("explicit_columns") or []) if c]
-            if explicit_columns:
-                contract_min["canonical_columns"] = explicit_columns
-                contract_min["available_columns"] = explicit_columns
-            else:
-                contract_min["canonical_columns"] = []
-                contract_min["available_columns"] = []
+    _apply_wide_dataset_contract_truth(
+        state=state if isinstance(state, dict) else None,
+        contract=contract if isinstance(contract, dict) else None,
+        contract_min=contract_min if isinstance(contract_min, dict) else None,
+        n_columns=n_columns,
+    )
     column_sets_summary = state.get("column_sets_summary") if isinstance(state, dict) else None
     if column_sets_summary:
         if isinstance(contract, dict):

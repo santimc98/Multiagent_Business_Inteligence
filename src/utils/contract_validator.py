@@ -1574,6 +1574,8 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             if isinstance(features, list):
                 for feat in features:
+                    if _is_selector_set_alias(feat, selectors):
+                        continue
                     if feat not in all_known_columns and not _matches_any_selector(feat, selectors):
                         # Only warn if we have canonical_columns defined
                         if canonical_columns:
@@ -1671,6 +1673,21 @@ def _matches_any_selector(feature: str, selectors: List[Dict]) -> bool:
                 return True
 
     return False
+
+
+def _is_selector_set_alias(feature: str, selectors: List[Dict]) -> bool:
+    """
+    Accept compact set aliases (e.g., SET_1) when selector metadata exists.
+    This avoids false positives for wide datasets represented via grouped selectors.
+    """
+    if not feature or not selectors:
+        return False
+    if not isinstance(feature, str):
+        return False
+    token = feature.strip()
+    if not token:
+        return False
+    return bool(re.fullmatch(r"SET_\d+", token, flags=re.IGNORECASE))
 
 
 def validate_output_compliance(

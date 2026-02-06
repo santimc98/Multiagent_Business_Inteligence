@@ -131,6 +131,39 @@ class TestContractValidation:
             for issue in issues
         )
 
+    def test_validate_contract_accepts_set_alias_when_selectors_exist(self):
+        """SET_n aliases are valid when feature selectors are present."""
+        contract = {
+            "canonical_columns": ["label", "pixel0", "pixel1"],
+            "feature_selectors": [{"type": "regex", "pattern": "^pixel\\d+$"}],
+            "allowed_feature_sets": {
+                "model_features": ["SET_1"],
+            },
+        }
+
+        result = validate_contract(contract)
+
+        assert not any(
+            issue.get("rule") == "feature_set_consistency" and issue.get("item") == "SET_1"
+            for issue in result.get("issues", [])
+        )
+
+    def test_validate_contract_set_alias_without_selectors_warns(self):
+        """SET_n aliases without selector context should still warn."""
+        contract = {
+            "canonical_columns": ["label", "pixel0", "pixel1"],
+            "allowed_feature_sets": {
+                "model_features": ["SET_1"],
+            },
+        }
+
+        result = validate_contract(contract)
+
+        assert any(
+            issue.get("rule") == "feature_set_consistency" and issue.get("item") == "SET_1"
+            for issue in result.get("issues", [])
+        )
+
     def test_validate_contract_decision_columns_without_levers(self):
         """Test that decision_columns without action_space triggers warning."""
         contract = {
