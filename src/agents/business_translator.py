@@ -11,6 +11,7 @@ import json
 from typing import Dict, Any, Optional, List
 from src.utils.prompting import render_prompt
 from src.utils.senior_protocol import SENIOR_TRANSLATION_PROTOCOL, SENIOR_EVIDENCE_RULE
+from src.utils.text_encoding import sanitize_text, sanitize_text_payload
 from src.utils.csv_dialect import (
     load_output_dialect,
     sniff_csv_dialect,
@@ -476,6 +477,7 @@ def _derive_exec_decision(
 def _sanitize_report_text(text: str) -> str:
     if not text:
         return text
+    text = sanitize_text(text)
     while "..." in text:
         text = text.replace("...", ".")
     return text
@@ -538,27 +540,39 @@ def _normalize_evidence_sources(report: str) -> str:
         out.append(updated)
     return "\n".join(out)
 
-def _ensure_evidence_section(report: str, evidence_paths: List[str]) -> str:
-    if not report:
-        return report
-    if re.search(r"(?im)^\s*evidence\s*:?", report) and "{claim" in report.lower():
-        return _normalize_evidence_sources(report)
-    header_match = re.search(r"(?im)^\s*##\s+evidencia usada\s*$", report)
+
+def _canonical_evidence_section(evidence_paths: List[str]) -> str:
     items = _build_evidence_items(evidence_paths)
     evidence_lines = ["evidence:"]
     for item in items:
         claim = _sanitize_evidence_value(item.get("claim", ""))
         source = _sanitize_evidence_value(item.get("source", "missing")) or "missing"
         evidence_lines.append(f'{{claim: "{claim}", source: "{source}"}}')
-    path_lines = [f"- {_sanitize_evidence_value(path)}" for path in (evidence_paths or [])[:8]]
-    if not path_lines:
-        path_lines = ["- missing"]
-    evidence_block = "\n".join(evidence_lines + ["", "Artifacts:"] + path_lines)
+    dedup_paths: List[str] = []
+    for path in (evidence_paths or []):
+        clean = _sanitize_evidence_value(path)
+        if clean and clean not in dedup_paths:
+            dedup_paths.append(clean)
+        if len(dedup_paths) >= 8:
+            break
+    path_lines = [f"- {path}" for path in dedup_paths] or ["- missing"]
+    return "\n".join(evidence_lines + ["", "Artifacts:"] + path_lines)
+
+
+def _ensure_evidence_section(report: str, evidence_paths: List[str]) -> str:
+    if not report:
+        return report
+    report = sanitize_text(report)
+    evidence_block = _canonical_evidence_section(evidence_paths)
+
+    header_match = re.search(r"(?im)^\s*##\s+evidencia usada\s*$", report)
     if header_match:
-        prefix = report[: header_match.end()]
-        suffix = report[header_match.end():].lstrip("\n")
-        return _normalize_evidence_sources(f"{prefix}\n\n{evidence_block}\n\n{suffix}")
-    return _normalize_evidence_sources(report.rstrip() + "\n\n## Evidencia usada\n\n" + evidence_block + "\n")
+        prefix = report[:header_match.start()].rstrip()
+    else:
+        prefix = report.rstrip()
+
+    rebuilt = f"{prefix}\n\n## Evidencia usada\n\n{evidence_block}\n"
+    return _normalize_evidence_sources(rebuilt)
 
 def _extract_numeric_metrics(metrics: Dict[str, Any], max_items: int = 8):
     if not isinstance(metrics, dict):
@@ -648,6 +662,7 @@ class BusinessTranslatorAgent:
         if not isinstance(state, dict):
             state = {"execution_output": str(state), "business_objective": str(error_message or "")}
             error_message = None
+        state = sanitize_text_payload(state)
 
         # Sanitize Visuals Context
         has_partial_visuals = bool(has_partial_visuals)
@@ -1393,6 +1408,7 @@ class BusinessTranslatorAgent:
             content = (getattr(response, "text", "") or "").strip()
             content = _sanitize_report_text(content)
             content = _ensure_evidence_section(content, evidence_paths)
+            content = sanitize_text(content)
             self.last_response = content
             return content
         except Exception as e:

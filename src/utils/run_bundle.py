@@ -11,6 +11,7 @@ from src.utils.run_logger import register_run_log
 from src.utils.context_pack import compress_long_lists
 from src.utils.contract_v41 import get_required_outputs
 from src.utils.review_status import normalize_status as normalize_review_status
+from src.utils.text_encoding import sanitize_text, sanitize_text_payload
 
 RUNS_DIR = "runs"
 
@@ -44,14 +45,16 @@ def _ensure_dir(path: str) -> None:
 
 def _write_text(path: str, text: str) -> None:
     _ensure_dir(os.path.dirname(path))
+    clean_text = sanitize_text(str(text or ""))
     with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+        f.write(clean_text)
 
 
 def _write_json(path: str, payload: Any) -> None:
     _ensure_dir(os.path.dirname(path))
+    clean_payload = sanitize_text_payload(payload)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+        json.dump(clean_payload, f, indent=2, ensure_ascii=False)
 
 
 def _safe_load_json(path: str) -> Any:

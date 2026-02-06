@@ -183,6 +183,12 @@ from src.utils.dataset_size import (
     classify_dataset_scale,
     get_dataset_scale_hints,
 )
+from src.utils.text_encoding import (
+    sanitize_text,
+    sanitize_text_payload,
+    sanitize_text_payload_with_stats,
+    mojibake_score,
+)
 
 
 def _retry_sandbox_operations(sandbox_func, max_attempts: int = 2, run_id: Optional[str] = None, step: Optional[str] = None) -> Any:
@@ -303,6 +309,69 @@ def _truncate_text(text: str, max_len: int = 18000, head_len: int = 10000, tail_
     if safe_head + safe_tail < max_len:
         safe_head = max_len - safe_tail
     return text[:safe_head] + "\n...[TRUNCATED]...\n" + text[-safe_tail:]
+
+
+def _scan_encoding_file(path: str, max_sample: int = 5000) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"path": path, "exists": bool(path and os.path.exists(path))}
+    if not payload["exists"]:
+        payload["mojibake_score"] = None
+        payload["sample"] = ""
+        return payload
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except Exception as err:
+        payload["error"] = str(err)
+        payload["mojibake_score"] = None
+        payload["sample"] = ""
+        return payload
+    score = mojibake_score(text)
+    payload["mojibake_score"] = int(score)
+    payload["length"] = len(text)
+    payload["sample"] = text[:max_sample]
+    return payload
+
+
+def _persist_encoding_audit(state: Dict[str, Any], report_text: str | None = None) -> Dict[str, Any]:
+    run_id = state.get("run_id") if isinstance(state, dict) else None
+    run_dir = get_run_dir(run_id) if run_id else None
+    event_log = os.path.join(run_dir, "events.jsonl") if run_dir else ""
+    translator_response = os.path.join(run_dir, "agents", "translator", "response.txt") if run_dir else ""
+    report_path = "data/executive_summary.md"
+
+    report_before = str(report_text or "")
+    report_after = sanitize_text(report_before) if report_before else report_before
+    _, report_stats = sanitize_text_payload_with_stats({"report": report_before})
+    state_objective = str((state or {}).get("business_objective", "") or "")
+    objective_before = state_objective
+    objective_after = sanitize_text(objective_before) if objective_before else objective_before
+
+    files = [
+        _scan_encoding_file(event_log),
+        _scan_encoding_file(translator_response),
+        _scan_encoding_file(report_path),
+    ]
+    flagged_files = [
+        item.get("path")
+        for item in files
+        if isinstance(item, dict) and int(item.get("mojibake_score") or 0) > 0
+    ]
+    audit = {
+        "run_id": run_id,
+        "report_repaired": bool(report_after != report_before),
+        "objective_repaired": bool(objective_after != objective_before),
+        "report_mojibake_hits": int(report_stats.get("mojibake_hits", 0)),
+        "report_strings_changed": int(report_stats.get("strings_changed", 0)),
+        "files_checked": files,
+        "mojibake_detected": bool(flagged_files),
+        "flagged_files": flagged_files,
+    }
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/encoding_audit.json", audit)
+    except Exception as err:
+        print(f"Warning: failed to persist encoding_audit.json: {err}")
+    return audit
 
 
 def _refresh_run_facts_pack(state: Dict[str, Any]) -> None:
@@ -6540,6 +6609,8 @@ def run_steward(state: AgentState) -> AgentState:
         run_start_epoch = time.time()
     orig_cwd_pre = os.getcwd()
     csv_path = state.get("csv_path") if state else ""
+    if state and isinstance(state.get("business_objective"), str):
+        state["business_objective"] = sanitize_text(state.get("business_objective", ""))
     if csv_path:
         resolved_csv_path = _resolve_csv_path_with_base(orig_cwd_pre, csv_path)
         if resolved_csv_path != csv_path:
@@ -9082,7 +9153,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 "output_dialect": {"encoding": "utf-8", "sep": ",", "decimal": "."},
                                 "generated_by": "Host Fallback"
                             }
-                            with open(local_manifest_path, "w") as f_def:
+                            with open(local_manifest_path, "w", encoding="utf-8") as f_def:
                                 json.dump(default_manifest, f_def)
                         if os.path.exists(local_manifest_path):
                             downloaded_paths.append(local_manifest_path)
@@ -9888,7 +9959,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 print("Host mapping disabled; using DE cleaned_data.csv as-is.")
 
             # Save Summary
-            with open("data/column_mapping_summary.json", "w") as f:
+            with open("data/column_mapping_summary.json", "w", encoding="utf-8") as f:
                 json.dump(mapping_result, f, indent=2)
 
             preview = df_final.head(5).to_json(orient='split')
@@ -13820,6 +13891,7 @@ def run_translator(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "translator")
     if abort_state:
         return abort_state
+    state = sanitize_text_payload(state if isinstance(state, dict) else {})
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "translator_start", {})
@@ -14065,6 +14137,8 @@ def run_translator(state: AgentState) -> AgentState:
 
         Please check the logs for more details.
         """
+    report = sanitize_text(report or "")
+    report_state["final_report"] = report
     if run_id:
         log_agent_snapshot(
             run_id,
@@ -14092,6 +14166,30 @@ def run_translator(state: AgentState) -> AgentState:
         report_state["produced_artifact_index"] = merged_index
     except Exception as exec_err:
         print(f"Warning: failed to persist executive_summary.md: {exec_err}")
+
+    try:
+        encoding_audit = _persist_encoding_audit(state, report_text=report)
+        existing_index = _load_json_any("data/produced_artifact_index.json")
+        normalized_existing = existing_index if isinstance(existing_index, list) else []
+        additions = _build_artifact_index(["data/encoding_audit.json"], None)
+        merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+        dump_json("data/produced_artifact_index.json", merged_index)
+        report_state["artifact_index"] = merged_index
+        report_state["produced_artifact_index"] = merged_index
+        state["encoding_audit"] = encoding_audit
+        if run_id:
+            log_run_event(
+                run_id,
+                "encoding_guard",
+                {
+                    "mojibake_detected": bool(encoding_audit.get("mojibake_detected")),
+                    "flagged_files": encoding_audit.get("flagged_files", []),
+                    "report_repaired": bool(encoding_audit.get("report_repaired")),
+                    "objective_repaired": bool(encoding_audit.get("objective_repaired")),
+                },
+            )
+    except Exception as enc_err:
+        print(f"Warning: encoding audit failed: {enc_err}")
 
     try:
         pdf_payload = generate_pdf_artifact({**report_state, "final_report": report})

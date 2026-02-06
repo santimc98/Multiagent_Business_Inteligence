@@ -1106,7 +1106,7 @@ def run_static_qa_checks(
     has_valid_metrics = False
     if os.path.exists(metrics_path):
         try:
-            with open(metrics_path, "r") as f:
+            with open(metrics_path, "r", encoding="utf-8", errors="replace") as f:
                 metrics_content = json.load(f)
             # Valid if it has model_performance or any metric keys
             if isinstance(metrics_content, dict) and (
