@@ -914,6 +914,13 @@ def _apply_qa_gate_policy(
 _KPI_ALIASES = {
     "accuracy": ["accuracy", "acc", "balanced accuracy", "balanced_accuracy"],
     "auc": ["auc", "auroc", "roc auc", "roc_auc"],
+    "normalized_gini": [
+        "normalized gini",
+        "normalized_gini",
+        "normalized gini coefficient",
+        "kaggle normalized gini",
+    ],
+    "gini": ["gini", "gini coefficient", "gini_score"],
     "f1": ["f1", "f1-score", "f1_score"],
     "precision": ["precision", "prec"],
     "recall": ["recall", "sensitivity", "tpr"],
@@ -968,6 +975,193 @@ def _extract_kpi_from_text(text: str) -> str:
     return ""
 
 
+def _extract_json_object(text: str) -> Optional[str]:
+    if not text:
+        return None
+    start = None
+    depth = 0
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text):
+        if start is None:
+            if ch == "{":
+                start = i
+                depth = 1
+                in_str = False
+                escape = False
+            continue
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "\"":
+                in_str = False
+            continue
+        if ch == "\"":
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start:i + 1]
+    return None
+
+
+def _repair_common_json_damage(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    repaired = text.strip()
+    if not repaired:
+        return repaired
+
+    # Remove markdown fences and keep only first JSON object.
+    repaired = repaired.replace("```json", "").replace("```", "").strip()
+    extracted = _extract_json_object(repaired)
+    if extracted:
+        repaired = extracted
+
+    # Drop trailing commas before object/array close.
+    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+
+    # Fix split-string corruption where a naked text line follows a quoted value.
+    repaired_lines: List[str] = []
+    for raw_line in repaired.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        looks_like_json_line = stripped.startswith(("{", "}", "[", "]", "\"")) or ":" in stripped
+        if (
+            not looks_like_json_line
+            and repaired_lines
+            and repaired_lines[-1].rstrip().endswith('"')
+            and not repaired_lines[-1].rstrip().endswith('",')
+        ):
+            prev = repaired_lines.pop().rstrip()
+            if prev.endswith('"'):
+                prev = prev[:-1]
+            repaired_lines.append(f'{prev} {stripped.rstrip(",")}"')
+            continue
+        repaired_lines.append(line)
+    if repaired_lines:
+        repaired = "\n".join(repaired_lines)
+        repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+
+    return repaired
+
+
+def _infer_artifact_owner(path: str) -> str:
+    p = str(path or "").lower()
+    if not p:
+        return "ml_engineer"
+    if "cleaned_data" in p or "cleaning_manifest" in p:
+        return "data_engineer"
+    return "ml_engineer"
+
+
+def _build_contract_obligations(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(contract, dict):
+        return []
+    obligations: List[Dict[str, Any]] = []
+
+    artifact_reqs = contract.get("artifact_requirements")
+    if isinstance(artifact_reqs, dict):
+        required_files = artifact_reqs.get("required_files")
+        if isinstance(required_files, list):
+            for idx, entry in enumerate(required_files, start=1):
+                path = None
+                if isinstance(entry, dict):
+                    path = entry.get("path") or entry.get("output") or entry.get("artifact")
+                elif isinstance(entry, str):
+                    path = entry
+                if not path or not is_probably_path(str(path)):
+                    continue
+                owner = _infer_artifact_owner(str(path))
+                reviewer = "cleaning_reviewer" if owner == "data_engineer" else "qa_reviewer"
+                obligations.append(
+                    {
+                        "id": f"artifact_{idx}",
+                        "type": "artifact",
+                        "path": str(path),
+                        "owner": owner,
+                        "reviewer": reviewer,
+                        "required": True,
+                    }
+                )
+
+    cleaning_gates = contract.get("cleaning_gates")
+    if isinstance(cleaning_gates, list):
+        for gate in cleaning_gates:
+            if not isinstance(gate, dict):
+                continue
+            name = gate.get("name") or gate.get("id") or gate.get("gate")
+            if not name:
+                continue
+            obligations.append(
+                {
+                    "id": f"cleaning_gate::{name}",
+                    "type": "gate",
+                    "gate_name": str(name),
+                    "owner": "cleaning_reviewer",
+                    "required": True,
+                    "severity": str(gate.get("severity") or "HARD").upper(),
+                }
+            )
+
+    qa_gates = contract.get("qa_gates")
+    if isinstance(qa_gates, list):
+        for gate in qa_gates:
+            if not isinstance(gate, dict):
+                continue
+            name = gate.get("name") or gate.get("id") or gate.get("gate")
+            if not name:
+                continue
+            obligations.append(
+                {
+                    "id": f"qa_gate::{name}",
+                    "type": "gate",
+                    "gate_name": str(name),
+                    "owner": "qa_reviewer",
+                    "required": True,
+                    "severity": str(gate.get("severity") or "HARD").upper(),
+                }
+            )
+
+    seen_ids: set[str] = set()
+    unique: List[Dict[str, Any]] = []
+    for item in obligations:
+        oid = str(item.get("id") or "").strip()
+        if not oid or oid in seen_ids:
+            continue
+        seen_ids.add(oid)
+        unique.append(item)
+    return unique
+
+
+def _attach_contract_execution_blueprint(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+    evaluation_spec = contract.get("evaluation_spec")
+    if not isinstance(evaluation_spec, dict):
+        evaluation_spec = {}
+    obligations = _build_contract_obligations(contract)
+    if obligations:
+        evaluation_spec["contract_obligations"] = obligations
+    evaluation_spec["source_of_truth"] = "execution_contract"
+    evaluation_spec["agent_views"] = {
+        "data_engineer": "de_view_context",
+        "cleaning_reviewer": "cleaning_view_context",
+        "ml_engineer": "ml_view_context",
+        "qa_reviewer": "qa_view_context",
+        "review_board": "reviewer_view_context",
+        "results_advisor": "reviewer_view_context",
+    }
+    contract["evaluation_spec"] = evaluation_spec
+    return contract
+
+
 def _ensure_benchmark_kpi_gate(
     contract: Dict[str, Any],
     strategy: Dict[str, Any],
@@ -997,8 +1191,8 @@ def _ensure_benchmark_kpi_gate(
             params = gate.get("params")
             if not isinstance(params, dict):
                 params = {}
-            params.setdefault("metric", kpi)
-            params.setdefault("validation", "cross_validation_or_holdout")
+            params["metric"] = kpi
+            params["validation"] = "cross_validation_or_holdout"
             gate["type"] = gate.get("type") or "metric_report"
             gate["params"] = params
             gate.setdefault("severity", "warning")
@@ -1025,13 +1219,17 @@ def _ensure_benchmark_kpi_gate(
     validation = contract.get("validation_requirements")
     if not isinstance(validation, dict):
         validation = {}
-    validation.setdefault("primary_metric", kpi)
+    validation["primary_metric"] = kpi
     metrics_list = validation.get("metrics_to_report")
     if not isinstance(metrics_list, list):
         metrics_list = []
-    if kpi not in metrics_list:
-        metrics_list.append(kpi)
-    validation["metrics_to_report"] = metrics_list
+    metrics_norm = [str(m).strip().lower() for m in metrics_list if m]
+    if kpi.lower() not in metrics_norm:
+        metrics_list = [kpi] + [m for m in metrics_list if m]
+    else:
+        # Keep kpi first for deterministic downstream behavior.
+        metrics_list = [kpi] + [m for m in metrics_list if str(m).strip().lower() != kpi.lower()]
+    validation["metrics_to_report"] = list(dict.fromkeys(metrics_list))
     contract["validation_requirements"] = validation
     return contract
 
@@ -3202,31 +3400,50 @@ class ExecutionPlannerAgent:
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        self._generation_config = {
+            "temperature": 0.0,
+            "top_p": 0.9,
+            "top_k": 40,
+            "max_output_tokens": 8192,
+            "response_mime_type": "application/json",
+        }
+        self._safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
         if not self.api_key:
             self.client = None
         else:
             genai.configure(api_key=self.api_key)
-            generation_config = {
-                "temperature": 0.0,
-                "top_p": 0.9,
-                "top_k": 40,
-                "max_output_tokens": 8192,
-                "response_mime_type": "application/json",
-            }
-            safety_settings = {
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            }
             self.client = genai.GenerativeModel(
                 model_name="gemini-3-flash-preview",
-                generation_config=generation_config,
-                safety_settings=safety_settings,
+                generation_config=self._generation_config,
+                safety_settings=self._safety_settings,
             )
         self.model_name = "gemini-3-flash-preview"
+        chain_raw = os.getenv("EXECUTION_PLANNER_MODEL_CHAIN", "")
+        chain: List[str] = [self.model_name]
+        if isinstance(chain_raw, str) and chain_raw.strip():
+            for token in chain_raw.split(","):
+                model = token.strip()
+                if model and model not in chain:
+                    chain.append(model)
+        self.model_chain = chain
         self.last_prompt = None
         self.last_response = None
+
+    def _build_model_client(self, model_name: str) -> Any:
+        if not self.api_key:
+            return None
+        if model_name == self.model_name and self.client is not None:
+            return self.client
+        return genai.GenerativeModel(
+            model_name=model_name,
+            generation_config=self._generation_config,
+            safety_settings=self._safety_settings,
+        )
 
     def generate_contract(
         self,
@@ -5687,20 +5904,42 @@ class ExecutionPlannerAgent:
             if not raw_text:
                 return None, ValueError("Empty response text")
             cleaned = raw_text.replace("```json", "").replace("```", "").strip()
-            try:
-                return json.loads(cleaned), None
-            except json.JSONDecodeError as first_err:
-                start = cleaned.find("{")
-                end = cleaned.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    snippet = cleaned[start:end + 1]
-                    try:
-                        return json.loads(snippet), None
-                    except Exception as second_err:
-                        return None, second_err
-                return None, first_err
-            except Exception as err:
-                return None, err
+            candidates: List[str] = []
+            for candidate in (
+                cleaned,
+                _extract_json_object(cleaned),
+                _repair_common_json_damage(cleaned),
+            ):
+                if isinstance(candidate, str) and candidate.strip():
+                    text = candidate.strip()
+                    if text not in candidates:
+                        candidates.append(text)
+
+            last_err: Optional[Exception] = None
+            decoder = json.JSONDecoder()
+            for candidate in candidates:
+                try:
+                    return json.loads(candidate), None
+                except Exception as err:
+                    last_err = err
+                # Allow valid JSON object with trailing noise.
+                try:
+                    parsed, end_idx = decoder.raw_decode(candidate)
+                    trailing = candidate[end_idx:].strip()
+                    if isinstance(parsed, dict) and not trailing:
+                        return parsed, None
+                    if isinstance(parsed, dict) and trailing:
+                        return parsed, None
+                except Exception as err:
+                    last_err = err
+                # Last-resort: python-literal dicts (single quotes, True/False/None).
+                try:
+                    literal = ast.literal_eval(candidate)
+                    if isinstance(literal, dict):
+                        return literal, None
+                except Exception as err:
+                    last_err = err
+            return None, last_err or ValueError("Unable to parse planner JSON response")
 
         def _normalize_usage_metadata(raw_usage: Any) -> Optional[Dict[str, Any]]:
             if raw_usage is None:
@@ -5742,6 +5981,7 @@ class ExecutionPlannerAgent:
         if not self.client:
             contract = _fallback()
             contract = _attach_reporting_policy(contract)
+            contract = _attach_contract_execution_blueprint(contract)
             if isinstance(data_profile, dict):
                 try:
                     from src.utils.data_profile_compact import compact_data_profile_for_llm
@@ -5798,6 +6038,18 @@ class ExecutionPlannerAgent:
         column_inventory_sample = (column_inventory or [])[:25]
         inventory_truncated = column_inventory_count > 50
         column_inventory_payload = column_inventory_sample if inventory_truncated else (column_inventory or [])
+        data_summary_for_prompt = _compress_text_preserve_ends(
+            data_summary_str,
+            max_chars=12000,
+            head=8000,
+            tail=4000,
+        )
+        critique_for_prompt = _compress_text_preserve_ends(
+            domain_expert_critique or "",
+            max_chars=2000,
+            head=1300,
+            tail=700,
+        )
 
         user_input = f"""
 strategy:
@@ -5831,7 +6083,7 @@ column_inventory:
 {json.dumps(column_inventory_payload, indent=2)}
 
 data_profile_summary:
-{data_summary_str}
+{data_summary_for_prompt}
 
 target_candidates:
 {json.dumps(target_candidates, indent=2)}
@@ -5855,7 +6107,7 @@ env_constraints:
 {json.dumps(env_constraints or {"forbid_inplace_column_creation": True})}
 
 domain_expert_critique:
-{domain_expert_critique or "None"}
+{critique_for_prompt or "None"}
 """
 
         full_prompt = SENIOR_PLANNER_PROMPT + "\n\nINPUTS:\n" + user_input
@@ -5863,6 +6115,7 @@ domain_expert_critique:
             "contract_version",
             "strategy_title",
             "business_objective",
+            "output_dialect",
             "canonical_columns",
             "outcome_columns",
             "decision_columns",
@@ -5870,10 +6123,14 @@ domain_expert_critique:
             "allowed_feature_sets",
             "artifact_requirements",
             "required_outputs",
+            "validation_requirements",
             "qa_gates",
+            "cleaning_gates",
             "reviewer_gates",
             "data_engineer_runbook",
             "ml_engineer_runbook",
+            "decisioning_requirements",
+            "reporting_policy",
             "omitted_columns_policy",
         ]
         compressed_objective = _compress_text_preserve_ends(business_objective or "")
@@ -5887,10 +6144,14 @@ domain_expert_critique:
             + json.dumps(repair_keys)
             + ". Do not include any other keys or commentary.\n"
             + f"contract_version MUST be {json.dumps(CONTRACT_VERSION_V41)}.\n"
+            + "Return a single JSON object and close all strings, braces, and arrays.\n"
             + "Use RELEVANT_COLUMNS as focus_columns only; do NOT truncate canonical_columns.\n"
             + "RELEVANT_COLUMNS must NOT be used to build canonical_columns; use full column inventory or feature selectors.\n"
             + "RELEVANT_COLUMNS: "
             + json.dumps(relevant_columns)
+            + "\n"
+            + "OUTPUT_DIALECT: "
+            + json.dumps(output_dialect or {})
             + "\n"
             + "TARGET_CANDIDATES: "
             + json.dumps(target_candidates)
@@ -5919,11 +6180,20 @@ domain_expert_critique:
             ("prompt_attempt_1.txt", "response_attempt_1.txt", full_prompt),
             ("prompt_attempt_2_repair.txt", "response_attempt_2.txt", repair_prompt),
         ]
+        model_chain = [m for m in (self.model_chain or [self.model_name]) if m]
+        attempt_specs: List[Tuple[str, str, str, str]] = []
+        for prompt_name, response_name, prompt_text in attempt_prompts:
+            for model_idx, model_name in enumerate(model_chain, start=1):
+                if len(model_chain) > 1:
+                    response_name_model = response_name.replace(".txt", f"_m{model_idx}.txt")
+                else:
+                    response_name_model = response_name
+                attempt_specs.append((prompt_name, response_name_model, prompt_text, model_name))
 
         contract: Dict[str, Any] | None = None
         llm_success = False
 
-        for attempt_index, (prompt_name, response_name, prompt_text) in enumerate(attempt_prompts, start=1):
+        for attempt_index, (prompt_name, response_name, prompt_text, model_name) in enumerate(attempt_specs, start=1):
             self.last_prompt = prompt_text
             response_text = ""
             response = None
@@ -5932,9 +6202,13 @@ domain_expert_critique:
             usage_metadata = None
 
             try:
-                response = self.client.generate_content(prompt_text)
-                response_text = getattr(response, "text", "") or ""
-                self.last_response = response_text
+                model_client = self._build_model_client(model_name)
+                if model_client is None:
+                    parse_error = ValueError(f"Planner client unavailable for model {model_name}")
+                else:
+                    response = model_client.generate_content(prompt_text)
+                    response_text = getattr(response, "text", "") or ""
+                    self.last_response = response_text
             except Exception as err:
                 parse_error = err
 
@@ -5959,7 +6233,7 @@ domain_expert_critique:
 
             planner_diag.append(
                 {
-                    "model_name": self.model_name,
+                    "model_name": model_name,
                     "attempt_index": attempt_index,
                     "prompt_char_len": len(prompt_text or ""),
                     "response_char_len": len(response_text or ""),
@@ -5972,13 +6246,13 @@ domain_expert_critique:
             )
 
             if parsed is None or not isinstance(parsed, dict):
-                print(f"WARNING: Planner parse failed on attempt {attempt_index}.")
+                print(f"WARNING: Planner parse failed on attempt {attempt_index} (model={model_name}).")
                 continue
 
             version = normalize_contract_version(parsed.get("contract_version"))
             if version != CONTRACT_VERSION_V41:
                 parse_error = ValueError("contract_version_mismatch")
-                print(f"WARNING: Planner contract_version mismatch on attempt {attempt_index}.")
+                print(f"WARNING: Planner contract_version mismatch on attempt {attempt_index} (model={model_name}).")
                 continue
 
             contract = parsed
@@ -6097,6 +6371,7 @@ domain_expert_critique:
         )
 
         contract = _attach_reporting_policy(contract)
+        contract = _attach_contract_execution_blueprint(contract)
 
         def _sanitize_runbook_text(text: str) -> str:
             """Replace hardcoded dialect instructions with dynamic manifest reference."""

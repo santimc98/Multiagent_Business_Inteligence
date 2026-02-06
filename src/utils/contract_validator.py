@@ -30,6 +30,7 @@ CANONICAL_ROLES = {
     "outcome", "decision", "id", "feature", "timestamp", "group", "weight",
     "ignore", "forbidden", "target", "label", "identifier", "index",
     "segmentation", "audit_only", "protected", "sensitive",
+    "pre_decision", "post_decision_audit_only", "unknown", "identifiers", "time_columns",
 }
 
 # Role synonym mapping for normalization
@@ -80,6 +81,18 @@ def _normalize_metric_name(name: str) -> str:
     roc_auc_variants = {"rocauc", "roc_auc", "auc_roc", "auroc", "roc"}
     if s in roc_auc_variants or s == "roc_auc":
         return "roc_auc"
+
+    normalized_gini_variants = {
+        "normalized_gini",
+        "normalized_gini_coefficient",
+        "kaggle_normalized_gini",
+    }
+    if s in normalized_gini_variants:
+        return "normalized_gini"
+
+    gini_variants = {"gini", "gini_coefficient", "gini_score"}
+    if s in gini_variants:
+        return "gini"
     
     # RMSE log variants
     rmse_log_variants = {"rmsle", "rmse_log", "rmse_log1p", "rmsle_log1p", "log_rmse"}
@@ -675,6 +688,56 @@ def _extract_role_from_value(value: Any) -> Tuple[str, bool]:
     return "feature", False
 
 
+def _is_role_bucket_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
+    return normalized in {
+        "pre_decision",
+        "decision",
+        "outcome",
+        "post_decision_audit_only",
+        "audit_only",
+        "unknown",
+        "identifiers",
+        "time_columns",
+    }
+
+
+def _normalize_bucket_role_key(key: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
+    if normalized == "audit_only":
+        return "post_decision_audit_only"
+    return normalized
+
+
+def _extract_role_columns(role_map: Any, role_name: str) -> List[str]:
+    """Return columns for a role from either role->list or column->role formats."""
+    if not isinstance(role_map, dict):
+        return []
+    role_name = _normalize_role(role_name)
+    cols: List[str] = []
+
+    # Format A: role -> list[str]
+    if all(_is_role_bucket_key(k) for k in role_map.keys()):
+        for key, values in role_map.items():
+            bucket = _normalize_bucket_role_key(str(key))
+            if _normalize_role(bucket) != role_name:
+                continue
+            if isinstance(values, list):
+                cols.extend([str(v) for v in values if isinstance(v, str) and v.strip()])
+        return list(dict.fromkeys(cols))
+
+    # Format C: column -> role (string/dict)
+    for col, raw_role in role_map.items():
+        if not isinstance(col, str) or not col.strip():
+            continue
+        role_value, _ = _extract_role_from_value(raw_role)
+        if _normalize_role(role_value) == role_name:
+            cols.append(col.strip())
+    return list(dict.fromkeys(cols))
+
+
 # Supervised metric tokens - if primary_metric matches these, it's supervised learning
 SUPERVISED_METRIC_TOKENS = {
     # Classification
@@ -689,7 +752,7 @@ SUPERVISED_METRIC_TOKENS = {
 
 def lint_column_roles(
     contract: Dict[str, Any]
-) -> Tuple[Dict[str, str], List[Dict[str, Any]], List[str]]:
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
     """
     Lint and normalize column_roles to canonical dict format.
 
@@ -701,7 +764,7 @@ def lint_column_roles(
 
     Returns:
         (normalized_dict, issues, notes)
-        - normalized_dict: {column: canonical_role}
+        - normalized_dict: role->list (preferred V4.1) or {column: canonical_role}
         - issues: list of {rule, severity, message, item}
         - notes: repair notes for unknowns
     """
@@ -715,6 +778,33 @@ def lint_column_roles(
 
     # Already a dict - normalize roles
     if isinstance(raw, dict):
+        # Preferred V4.1 format: role -> list[str]
+        if raw and all(_is_role_bucket_key(k) for k in raw.keys()):
+            normalized_bucket: Dict[str, List[str]] = {}
+            for role_key, cols in raw.items():
+                bucket = _normalize_bucket_role_key(str(role_key))
+                if not isinstance(cols, list):
+                    issues.append({
+                        "rule": "contract_schema_lint.column_roles",
+                        "severity": "warning",
+                        "message": f"Role bucket '{role_key}' has non-list value; ignored",
+                        "item": role_key,
+                    })
+                    continue
+                cleaned_cols: List[str] = []
+                seen: set[str] = set()
+                for col in cols:
+                    if not isinstance(col, str) or not col.strip():
+                        continue
+                    col_clean = col.strip()
+                    col_norm = col_clean.lower()
+                    if col_norm in seen:
+                        continue
+                    seen.add(col_norm)
+                    cleaned_cols.append(col_clean)
+                normalized_bucket[bucket] = cleaned_cols
+            return normalized_bucket, issues, notes
+
         normalized: Dict[str, str] = {}
         for col, role_value in raw.items():
             if not isinstance(col, str) or not col.strip():
@@ -929,16 +1019,8 @@ def lint_allowed_feature_sets_coherence(
 
     # Get outcome and decision columns
     column_roles = contract.get("column_roles", {})
-    outcome_cols = set()
-    decision_cols = set()
-
-    if isinstance(column_roles, dict):
-        for col, role in column_roles.items():
-            role_norm = _normalize_role(role) if isinstance(role, str) else ""
-            if role_norm == "outcome":
-                outcome_cols.add(col)
-            elif role_norm == "decision":
-                decision_cols.add(col)
+    outcome_cols = set(_extract_role_columns(column_roles, "outcome"))
+    decision_cols = set(_extract_role_columns(column_roles, "decision"))
 
     # Also check explicit outcome_columns and decision_columns
     for col in contract.get("outcome_columns", []) or []:
@@ -1157,13 +1239,12 @@ def lint_outcome_presence_and_coherence(
     # Collect outcome candidates
     outcome_candidates: List[str] = []
 
-    # Source 1: column_roles with role == "outcome"
+    # Source 1: column_roles (supports both role->list and column->role)
     column_roles = contract.get("column_roles", {})
     if isinstance(column_roles, dict):
-        for col, role in column_roles.items():
-            if isinstance(role, str) and role.lower() == "outcome":
-                if col not in outcome_candidates:
-                    outcome_candidates.append(col)
+        for col in _extract_role_columns(column_roles, "outcome"):
+            if col not in outcome_candidates:
+                outcome_candidates.append(col)
 
     # Source 2: explicit outcome_columns
     explicit_outcomes = contract.get("outcome_columns", [])
@@ -1238,17 +1319,35 @@ def lint_outcome_presence_and_coherence(
         })
         notes.append(f"outcome_coherence: added {added_to_canonical} to canonical_columns")
 
-    # Ensure outcomes have role="outcome" in column_roles
+    # Ensure outcomes are represented in column_roles while preserving existing format.
     if isinstance(column_roles, dict):
-        for oc in outcome_candidates:
-            current_role = column_roles.get(oc)
-            if current_role != "outcome":
+        role_bucket_format = bool(column_roles) and all(_is_role_bucket_key(k) for k in column_roles.keys())
+        if role_bucket_format:
+            outcome_bucket = column_roles.get("outcome")
+            if not isinstance(outcome_bucket, list):
+                outcome_bucket = []
+            seen_outcomes = {str(c).strip().lower() for c in outcome_bucket if isinstance(c, str) and c.strip()}
+            for oc in outcome_candidates:
+                key = str(oc).strip().lower()
+                if key in seen_outcomes:
+                    continue
+                outcome_bucket.append(oc)
+                seen_outcomes.add(key)
+                notes.append(f"outcome_coherence: appended '{oc}' to column_roles.outcome")
+            column_roles["outcome"] = outcome_bucket
+            contract["column_roles"] = column_roles
+        else:
+            for oc in outcome_candidates:
+                current_role = column_roles.get(oc)
+                role_value, _ = _extract_role_from_value(current_role)
+                if _normalize_role(role_value) == "outcome":
+                    continue
                 column_roles[oc] = "outcome"
                 if current_role:
                     notes.append(f"outcome_coherence: changed column_roles['{oc}'] from '{current_role}' to 'outcome'")
                 else:
                     notes.append(f"outcome_coherence: set column_roles['{oc}'] = 'outcome'")
-        contract["column_roles"] = column_roles
+            contract["column_roles"] = column_roles
 
     # Ensure outcomes are in forbidden_for_modeling (to prevent leakage)
     allowed_sets = contract.get("allowed_feature_sets", {})
