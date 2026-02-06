@@ -475,8 +475,7 @@ def write_run_manifest(
                 "execution_contract": bool(work_contract) or os.path.exists(os.path.join(contracts_dir, "execution_contract.json")),
                 "evaluation_spec": bool(work_eval) or os.path.exists(os.path.join(contracts_dir, "evaluation_spec.json")),
                 "artifact_index": os.path.exists(os.path.join(contracts_dir, "artifact_index.json")),
-                "contract_min": os.path.exists(os.path.join(contracts_dir, "contract_min.json"))
-                or (bool(work_dir_abs) and os.path.exists(os.path.join(work_dir_abs, "data", "contract_min.json"))),
+                "contract_min": False,
             },
         }
     )

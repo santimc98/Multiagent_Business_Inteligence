@@ -1,5 +1,3 @@
-import json
-
 from src.agents.execution_planner import (
     ExecutionPlannerAgent,
     build_contract_min,
@@ -50,7 +48,7 @@ def test_select_relevant_columns_compact() -> None:
     assert contract_min["column_roles"].get("unknown") == []
 
 
-def test_execution_planner_invalid_json_fallback_contract_min() -> None:
+def test_execution_planner_invalid_json_fallback_uses_single_contract_source() -> None:
     agent = ExecutionPlannerAgent(api_key=None)
     agent.client = DummyClient(
         [
@@ -72,10 +70,7 @@ def test_execution_planner_invalid_json_fallback_contract_min() -> None:
     )
 
     assert isinstance(contract, dict)
-    assert isinstance(agent.last_contract_min, dict)
-    assert agent.last_contract_min["canonical_columns"]
-    assert agent.last_contract_min["artifact_requirements"]
-    assert json.dumps(agent.last_contract_min)
+    assert agent.last_contract_min is None
 
 
 def test_contract_min_inherits_roles_from_full() -> None:

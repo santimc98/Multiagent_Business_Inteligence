@@ -201,7 +201,6 @@ def clean_workspace_outputs() -> None:
         os.path.join("data", "data_adequacy_report.json"),
         os.path.join("data", "governance_report.json"),
         # Note: dataset_memory.json is intentionally NOT cleaned - it persists across runs
-        os.path.join("data", "contract_min.json"),
         os.path.join("data", "execution_contract.json"),
         os.path.join("data", "executive_summary.md"),
         os.path.join("data", "report_artifact_manifest.json"),

@@ -29,7 +29,7 @@ def test_run_facts_pack_prefers_contract_snapshot():
     facts = build_run_facts_pack(state)
     assert facts["contract_source"] == "execution_planner_snapshot"
     assert facts["contract_signature"] == "sig_full"
-    assert facts["contract_min_signature"] == "sig_min"
+    assert facts["contract_min_signature"] is None
     assert facts["contract_version"] == "4.2"
     assert facts["objective_type"] == "classification"
     assert facts["visual_requirements"]["enabled"] is True

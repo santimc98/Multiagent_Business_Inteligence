@@ -645,10 +645,9 @@ def _json_equal(left: Any, right: Any) -> bool:
 
 
 def _resolve_policy_plot_spec(contract_full: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any] | None:
-    policy = contract_full.get("reporting_policy")
-    if not isinstance(policy, dict) or not policy:
-        policy = contract_min.get("reporting_policy")
-    return _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
+    # Deprecated fallback kept for backward compatibility in callers.
+    # Plot source of truth is artifact_requirements.visual_requirements.plot_spec.
+    return None
 
 
 def _resolve_visual_context(
@@ -674,20 +673,9 @@ def _resolve_visual_context(
     view_warnings: Dict[str, Any] = {}
 
     # Single source of truth: artifact_requirements.visual_requirements.plot_spec.
-    # reporting_policy.plot_spec is kept only as backward-compatible fallback.
     canonical_plot_spec = _cap_plot_spec(
         visual_reqs.get("plot_spec") if isinstance(visual_reqs, dict) else None
     )
-    policy_plot_spec = _resolve_policy_plot_spec(contract_full, contract_min)
-    used_fallback = False
-    if canonical_plot_spec is None and policy_plot_spec is not None:
-        canonical_plot_spec = policy_plot_spec
-        used_fallback = True
-    elif canonical_plot_spec is not None and policy_plot_spec is not None and not _json_equal(
-        canonical_plot_spec,
-        policy_plot_spec,
-    ):
-        view_warnings["plot_spec_conflict"] = "Using artifact_requirements.visual_requirements.plot_spec"
 
     if canonical_plot_spec is not None:
         visual_payload["enabled"] = bool(canonical_plot_spec.get("enabled", True))
@@ -697,9 +685,7 @@ def _resolve_visual_context(
                 str(visual_payload.get("outputs_dir") or "static/plots"),
             )
 
-    if used_fallback:
-        view_warnings["plot_spec_source"] = "fallback_reporting_policy"
-    elif canonical_plot_spec is not None:
+    if canonical_plot_spec is not None:
         view_warnings["plot_spec_source"] = "artifact_requirements.visual_requirements.plot_spec"
 
     return {

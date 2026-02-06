@@ -20,6 +20,22 @@ class _StubBoardWarnings:
         }
 
 
+class _StubBoardNeedsImprovement:
+    def __init__(self):
+        self.last_prompt = None
+        self.last_response = None
+
+    def adjudicate(self, _context):
+        return {
+            "status": "NEEDS_IMPROVEMENT",
+            "summary": "Must retry with contract-compliant artifacts.",
+            "failed_areas": ["qa_gates"],
+            "required_actions": ["Retry ML iteration with fixes."],
+            "confidence": "high",
+            "evidence": [],
+        }
+
+
 class _RuntimePathReviewer:
     def evaluate_results(self, *_args, **_kwargs):
         raise AssertionError("evaluate_results must be skipped when runtime markers are present.")
@@ -82,3 +98,51 @@ def test_run_result_evaluator_runtime_failure_builds_review_stack(tmp_path, monk
     assert result["ml_review_stack"]["result_evaluator"]["raw_status"] == "NEEDS_IMPROVEMENT"
     assert isinstance(result["ml_review_stack"].get("deterministic_facts"), dict)
     assert os.path.exists("data/ml_review_stack.json")
+
+
+def test_run_review_board_increments_iteration_on_escalation_to_needs_improvement(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardNeedsImprovement())
+    state = {
+        "iteration_count": 0,
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "review_feedback": "Non-blocking warning.",
+        "feedback_history": [],
+        "last_gate_context": {"failed_gates": [], "required_fixes": []},
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False},
+            "result_evaluator": {"status": "APPROVE_WITH_WARNINGS"},
+            "reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "APPROVED"},
+            "results_advisor": {"status": "APPROVE_WITH_WARNINGS"},
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+    assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
+    assert result["iteration_count"] == 1
+
+
+def test_run_review_board_does_not_double_increment_when_already_needs_improvement(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardNeedsImprovement())
+    state = {
+        "iteration_count": 2,
+        "review_verdict": "NEEDS_IMPROVEMENT",
+        "review_feedback": "Already needs retry.",
+        "feedback_history": [],
+        "last_gate_context": {"failed_gates": ["qa_gates"], "required_fixes": ["Retry"]},
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False},
+            "result_evaluator": {"status": "NEEDS_IMPROVEMENT"},
+            "reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "APPROVED"},
+            "results_advisor": {"status": "APPROVE_WITH_WARNINGS"},
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+    assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
+    assert "iteration_count" not in result

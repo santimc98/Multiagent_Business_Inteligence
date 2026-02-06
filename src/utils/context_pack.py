@@ -176,7 +176,6 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
     Keeps output short and deterministic.
     """
     state = state if isinstance(state, dict) else {}
-    contract_min = state.get("execution_contract_min") or state.get("contract_min") or {}
     contract = state.get("execution_contract") or {}
 
     dataset_scale_hints = state.get("dataset_scale_hints") if isinstance(state.get("dataset_scale_hints"), dict) else {}
@@ -205,14 +204,10 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
     }
 
     required_outputs = []
-    if isinstance(contract_min, dict) and isinstance(contract_min.get("required_outputs"), list):
-        required_outputs = [str(item) for item in contract_min.get("required_outputs") if item]
-    elif isinstance(contract, dict) and isinstance(contract.get("required_outputs"), list):
+    if isinstance(contract, dict) and isinstance(contract.get("required_outputs"), list):
         required_outputs = [str(item) for item in contract.get("required_outputs") if item]
 
-    decisioning_columns = _extract_decisioning_columns(contract_min if isinstance(contract_min, dict) else contract)
-    if not decisioning_columns:
-        decisioning_columns = _extract_decisioning_columns(contract if isinstance(contract, dict) else {})
+    decisioning_columns = _extract_decisioning_columns(contract if isinstance(contract, dict) else {})
 
     column_sets = state.get("column_sets")
     if not isinstance(column_sets, dict) or not column_sets:

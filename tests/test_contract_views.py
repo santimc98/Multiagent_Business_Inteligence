@@ -72,7 +72,7 @@ def test_ml_view_includes_scored_rows_schema():
     assert scored_schema.get("required_any_of_groups")
 
 
-def test_ml_view_includes_plot_spec_from_policy():
+def test_ml_view_includes_plot_spec_from_visual_requirements():
     contract_full = {
         "canonical_columns": ["col_a"],
         "column_roles": {"pre_decision": ["col_a"]},
@@ -81,11 +81,17 @@ def test_ml_view_includes_plot_spec_from_policy():
             "segmentation_features": ["col_a"],
             "forbidden_features": [],
         },
-        "reporting_policy": {
-            "plot_spec": {
+        "artifact_requirements": {
+            "visual_requirements": {
                 "enabled": True,
-                "max_plots": 1,
-                "plots": [{"id": "plot_1", "caption_template": "Example"}],
+                "required": True,
+                "outputs_dir": "static/plots",
+                "items": [],
+                "plot_spec": {
+                    "enabled": True,
+                    "max_plots": 1,
+                    "plots": [{"id": "plot_1", "caption_template": "Example"}],
+                },
             }
         },
     }
@@ -112,30 +118,20 @@ def test_ml_view_derives_visual_items_from_plot_spec_when_missing():
             "segmentation_features": ["col_a"],
             "forbidden_features": [],
         },
-        "reporting_policy": {
-            "plot_spec": {
-                "enabled": True,
-                "plots": [{"plot_id": "confidence_distribution"}],
-            }
-        },
-    }
-    contract_min = {
-        "canonical_columns": ["col_a"],
-        "column_roles": {"pre_decision": ["col_a"]},
-        "allowed_feature_sets": {
-            "model_features": ["col_a"],
-            "segmentation_features": ["col_a"],
-            "forbidden_features": [],
-        },
         "artifact_requirements": {
             "visual_requirements": {
                 "enabled": True,
                 "required": True,
                 "outputs_dir": "static/plots",
                 "items": [],
+                "plot_spec": {
+                    "enabled": True,
+                    "plots": [{"plot_id": "confidence_distribution"}],
+                },
             }
         },
     }
+    contract_min = {}
 
     ml_view = build_ml_view(contract_full, contract_min, [])
     visual = ml_view.get("visual_requirements") or {}

@@ -43,7 +43,6 @@ from src.agents.execution_planner import (
     ExecutionPlannerAgent,
     build_execution_plan,
     build_dataset_profile,
-    build_reporting_policy,
     build_plot_spec,
 )
 from src.agents.failure_explainer import FailureExplainerAgent
@@ -100,7 +99,6 @@ from src.utils.contract_views import (
     build_translator_view,
     build_results_advisor_view,
     persist_views,
-    sanitize_contract_min_for_de,
 )
 from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
 from src.utils.cleaning_executor import execute_cleaning_plan
@@ -415,23 +413,17 @@ def _resolve_contract_pair_from_state(state: Dict[str, Any]) -> Tuple[Dict[str, 
     snapshot = state.get("execution_contract_snapshot")
     if isinstance(snapshot, dict):
         full_snap = snapshot.get("execution_contract")
-        min_snap = snapshot.get("execution_contract_min")
         if isinstance(full_snap, dict) and full_snap:
             return (
                 _freeze_payload(full_snap) if isinstance(full_snap, dict) else {},
-                _freeze_payload(min_snap) if isinstance(min_snap, dict) else {},
+                {},
             )
     contract_full = state.get("execution_contract")
     if not isinstance(contract_full, dict) or not contract_full:
         contract_full = _load_json_safe("data/execution_contract.json") or {}
-    contract_min = state.get("execution_contract_min") or state.get("contract_min")
-    if not isinstance(contract_min, dict) or not contract_min:
-        contract_min = _load_json_safe("data/contract_min.json") or {}
     if not isinstance(contract_full, dict):
         contract_full = {}
-    if not isinstance(contract_min, dict):
-        contract_min = {}
-    return contract_full, contract_min
+    return contract_full, {}
 
 
 def _persist_execution_contract_snapshot(
@@ -440,20 +432,18 @@ def _persist_execution_contract_snapshot(
     contract_min: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
     contract_payload = contract if isinstance(contract, dict) else {}
-    contract_min_payload = contract_min if isinstance(contract_min, dict) else {}
     iteration_id = int(state.get("iteration_count", 0) or 0) + 1
     run_id = state.get("run_id")
     contract_sig = _hash_json(contract_payload)
-    contract_min_sig = _hash_json(contract_min_payload)
     snapshot = {
         "snapshot_schema_version": 1,
         "run_id": run_id,
         "iteration_id": iteration_id,
         "captured_at_utc": datetime.utcnow().isoformat() + "Z",
         "execution_contract_signature": contract_sig,
-        "execution_contract_min_signature": contract_min_sig,
+        "execution_contract_min_signature": None,
         "execution_contract": _freeze_payload(contract_payload),
-        "execution_contract_min": _freeze_payload(contract_min_payload),
+        "execution_contract_min": {},
     }
 
     os.makedirs(os.path.join("data", "contracts", "snapshots"), exist_ok=True)
@@ -491,7 +481,7 @@ def _persist_execution_contract_snapshot(
         "snapshot_path": snapshot_path,
         "snapshot_latest_path": latest_path,
         "execution_contract_signature": contract_sig,
-        "execution_contract_min_signature": contract_min_sig,
+        "execution_contract_min_signature": None,
         "execution_contract_source": "execution_planner_snapshot",
     }
 
@@ -2399,19 +2389,16 @@ def _build_contract_views(
     artifact_index = state.get("artifact_index") or []
     if not artifact_index:
         required_outputs = []
-        if isinstance(contract_min, dict):
-            required_outputs = contract_min.get("required_outputs") or []
-        if not required_outputs:
-            required_outputs = _resolve_required_outputs(contract, state)
+        required_outputs = _resolve_required_outputs(contract, state)
         deliverables = _resolve_contract_deliverables(contract)
         artifact_index = _build_artifact_index(required_outputs, deliverables)
-    de_view = build_de_view(contract, contract_min or {}, artifact_index)
-    ml_view = build_ml_view(contract, contract_min or {}, artifact_index)
-    cleaning_view = build_cleaning_view(contract, contract_min or {}, artifact_index)
-    qa_view = build_qa_view(contract, contract_min or {}, artifact_index)
-    reviewer_view = build_reviewer_view(contract, contract_min or {}, artifact_index)
-    translator_view = build_translator_view(contract, contract_min or {}, artifact_index)
-    results_advisor_view = build_results_advisor_view(contract, contract_min or {}, artifact_index)
+    de_view = build_de_view(contract, {}, artifact_index)
+    ml_view = build_ml_view(contract, {}, artifact_index)
+    cleaning_view = build_cleaning_view(contract, {}, artifact_index)
+    qa_view = build_qa_view(contract, {}, artifact_index)
+    reviewer_view = build_reviewer_view(contract, {}, artifact_index)
+    translator_view = build_translator_view(contract, {}, artifact_index)
+    results_advisor_view = build_results_advisor_view(contract, {}, artifact_index)
     views = {
         "de_view": de_view,
         "ml_view": ml_view,
@@ -4607,7 +4594,6 @@ def _verify_run_bundle_contracts(
             _abs_in_work(work_dir_abs, "data/execution_contract.json"),
             _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
             _abs_in_work(work_dir_abs, "data/plan.json"),
-            _abs_in_work(work_dir_abs, "data/contract_min.json"),
         ],
     )
 
@@ -8218,9 +8204,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
             output_dialect=output_dialect,
             reason=f"Execution planner exception: {e}"
         )
-    contract = _normalize_execution_contract(contract)
-    # REMOVED: contract = ensure_role_runbooks(contract)  # V4.1 cutover: contract is immutable
-    contract = _ensure_alignment_check_output(contract)
+    if not isinstance(contract, dict):
+        contract = {}
     strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
     objective_type = None
     if isinstance(strategy_spec, dict):
@@ -8232,144 +8217,13 @@ def run_execution_planner(state: AgentState) -> AgentState:
     dataset_profile = build_dataset_profile(data_summary, column_inventory)
     execution_plan = build_execution_plan(str(objective_type or "unknown"), dataset_profile)
     # V4.1: Do NOT write execution_plan to contract (legacy key)
-    reporting_policy = {}
-    try:
-        reporting_policy = build_reporting_policy(execution_plan, strategy)
-    except Exception:
-        reporting_policy = {}
-    existing_policy = contract.get("reporting_policy") if isinstance(contract, dict) else {}
-    merged_policy = _merge_non_empty_policy(
-        reporting_policy if isinstance(reporting_policy, dict) else {},
-        existing_policy if isinstance(existing_policy, dict) else {},
-    )
-    if isinstance(contract, dict):
-        merged_policy = _ensure_plot_spec_in_policy(merged_policy, contract)
-        if merged_policy:
-            contract["reporting_policy"] = merged_policy
-    contract_min = getattr(execution_planner, "last_contract_min", None)
-    if not contract_min and isinstance(contract, dict):
-        try:
-            from src.agents.execution_planner import build_contract_min
-            contract_min = build_contract_min(
-                contract,
-                strategy,
-                column_inventory,
-                contract.get("canonical_columns", []) if isinstance(contract, dict) else [],
-                data_profile=planner_data_profile,
-            )
-        except Exception:
-            contract_min = None
-    column_inventory_state = state.get("column_inventory") if isinstance(state, dict) else None
-    n_columns = None
-    if isinstance(column_inventory_state, dict):
-        n_columns = column_inventory_state.get("n_columns")
-    if n_columns is None:
-        n_columns = len(column_inventory)
-    _apply_wide_dataset_contract_truth(
-        state=state if isinstance(state, dict) else None,
-        contract=contract if isinstance(contract, dict) else None,
-        contract_min=contract_min if isinstance(contract_min, dict) else None,
-        n_columns=n_columns,
-    )
-    column_sets_summary = state.get("column_sets_summary") if isinstance(state, dict) else None
-    if column_sets_summary:
-        if isinstance(contract, dict):
-            contract["column_sets_summary"] = column_sets_summary
-        if isinstance(contract_min, dict):
-            contract_min["column_sets_summary"] = column_sets_summary
-    dataset_semantics = state.get("dataset_semantics") if isinstance(state, dict) else {}
-    dataset_training_mask = state.get("dataset_training_mask") if isinstance(state, dict) else {}
-    partial_labels = bool(
-        isinstance(dataset_semantics, dict)
-        and isinstance(dataset_semantics.get("target_analysis"), dict)
-        and dataset_semantics.get("target_analysis", {}).get("partial_label_detected")
-    )
-    partition_cols = []
-    if isinstance(dataset_semantics, dict):
-        split_candidates = dataset_semantics.get("split_candidates")
-        if isinstance(split_candidates, list):
-            partition_cols = [str(col) for col in split_candidates if col]
-        elif isinstance(dataset_semantics.get("partition_analysis"), dict):
-            partition_cols = [
-                str(col)
-                for col in (dataset_semantics.get("partition_analysis", {}).get("partition_columns") or [])
-                if col
-            ]
-    training_rule = dataset_training_mask.get("training_rows_rule") if isinstance(dataset_training_mask, dict) else None
-    scoring_primary = dataset_training_mask.get("scoring_rows_rule_primary") if isinstance(dataset_training_mask, dict) else None
-    scoring_secondary = dataset_training_mask.get("scoring_rows_rule_secondary") if isinstance(dataset_training_mask, dict) else None
-    apply_training_rules = bool(training_rule or scoring_primary or scoring_secondary) and (partial_labels or partition_cols)
-    if apply_training_rules and isinstance(contract, dict):
-        if training_rule and not contract.get("training_rows_rule"):
-            contract["training_rows_rule"] = training_rule
-        if not scoring_primary:
-            scoring_primary = "use all rows"
-        if scoring_primary and not contract.get("scoring_rows_rule"):
-            contract["scoring_rows_rule"] = scoring_primary
-        if scoring_secondary and not contract.get("secondary_scoring_subset"):
-            contract["secondary_scoring_subset"] = scoring_secondary
-        if isinstance(contract_min, dict):
-            if training_rule and not contract_min.get("training_rows_rule"):
-                contract_min["training_rows_rule"] = training_rule
-            if scoring_primary and not contract_min.get("scoring_rows_rule"):
-                contract_min["scoring_rows_rule"] = scoring_primary
-            if scoring_secondary and not contract_min.get("secondary_scoring_subset"):
-                contract_min["secondary_scoring_subset"] = scoring_secondary
-    contract_for_eval = dict(contract) if isinstance(contract, dict) else {}
-    if isinstance(contract_min, dict) and contract_min:
-        artifact_requirements = contract_min.get(
-            "artifact_requirements",
-            contract_for_eval.get("artifact_requirements", {}),
-        )
-        required_outputs = contract_min.get(
-            "required_outputs",
-            contract_for_eval.get("required_outputs", []),
-        )
-        if isinstance(artifact_requirements, dict):
-            decisioning_names = _extract_decisioning_required_names(contract_min)
-            canonical_columns = contract_min.get("canonical_columns") or contract_for_eval.get("canonical_columns") or []
-            artifact_requirements = _filter_scored_rows_required_columns(
-                artifact_requirements,
-                decisioning_names,
-                canonical_columns if isinstance(canonical_columns, list) else [],
-            )
-        contract_for_eval["artifact_requirements"] = artifact_requirements
-        contract_for_eval["required_outputs"] = required_outputs
-        if contract_min.get("objective_type"):
-            contract_for_eval["objective_type"] = contract_min.get("objective_type")
-        if isinstance(contract_min.get("allowed_feature_sets"), dict):
-            contract_for_eval["allowed_feature_sets"] = contract_min.get("allowed_feature_sets")
-        if isinstance(contract_min.get("decisioning_requirements"), dict):
-            contract_for_eval["decisioning_requirements"] = contract_min.get("decisioning_requirements")
-    elif isinstance(contract_for_eval, dict):
-        decisioning_names = _extract_decisioning_required_names(contract_for_eval)
-        canonical_columns = contract_for_eval.get("canonical_columns") or []
-        artifact_requirements = contract_for_eval.get("artifact_requirements", {})
-        if isinstance(artifact_requirements, dict):
-            artifact_requirements = _filter_scored_rows_required_columns(
-                artifact_requirements,
-                decisioning_names,
-                canonical_columns if isinstance(canonical_columns, list) else [],
-            )
-            contract_for_eval["artifact_requirements"] = artifact_requirements
-    evaluation_spec = {}
-    try:
-        evaluation_spec = execution_planner.generate_evaluation_spec(
-            strategy=strategy,
-            contract=contract_for_eval,
-            data_summary=data_summary,
-            business_objective=business_objective,
-            column_inventory=column_inventory,
-        )
-        if not isinstance(evaluation_spec, dict):
-            evaluation_spec = {}
-    except Exception as spec_err:
-        print(f"Warning: evaluation spec generation failed: {spec_err}")
+    evaluation_spec = contract.get("evaluation_spec") if isinstance(contract, dict) else {}
+    if not isinstance(evaluation_spec, dict):
         evaluation_spec = {}
-    if evaluation_spec:
-        contract["evaluation_spec"] = evaluation_spec
-    contract = _ensure_scored_rows_output(contract, evaluation_spec if evaluation_spec else None)
-    _maybe_set_contract_min_policy(contract_min, merged_policy if isinstance(merged_policy, dict) else {})
+    if not isinstance(contract, dict):
+        contract = {}
+    if not evaluation_spec:
+        print("Warning: execution_contract has no evaluation_spec; reviewers will use contract-level gates only.")
     work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
     try:
         data_dir = _abs_in_work(work_dir_abs, "data")
@@ -8378,32 +8232,25 @@ def run_execution_planner(state: AgentState) -> AgentState:
         dump_json(_abs_in_work(work_dir_abs, "data/plan.json"), execution_plan)
         if evaluation_spec:
             dump_json(_abs_in_work(work_dir_abs, "data/evaluation_spec.json"), evaluation_spec)
-        if contract_min:
-            dump_json(_abs_in_work(work_dir_abs, "data/contract_min.json"), contract_min)
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
     try:
         _update_column_inventory_required_columns(
             column_inventory=column_inventory,
             contract=contract if isinstance(contract, dict) else {},
-            contract_min=contract_min if isinstance(contract_min, dict) else {},
+            contract_min={},
             csv_path=csv_path,
             state=state if isinstance(state, dict) else {},
         )
         required_cols_synced, _ = _extract_required_columns_from_contract(
             contract if isinstance(contract, dict) else {},
-            contract_min if isinstance(contract_min, dict) else {},
+            {},
         )
         _sync_required_columns_artifacts(
             required_cols=required_cols_synced,
             contract=contract if isinstance(contract, dict) else {},
             state=state if isinstance(state, dict) else {},
         )
-        # refresh contract_min column_sets_summary after sync
-        if isinstance(contract_min, dict):
-            refreshed_summary = (state.get("column_sets_summary") if isinstance(state, dict) else None)
-            if refreshed_summary:
-                contract_min["column_sets_summary"] = refreshed_summary
     except Exception as inv_err:
         print(f"Warning: column_inventory required_columns sync failed: {inv_err}")
     if run_id:
@@ -8413,7 +8260,6 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 _abs_in_work(work_dir_abs, "data/execution_contract.json"),
                 _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
                 _abs_in_work(work_dir_abs, "data/plan.json"),
-                _abs_in_work(work_dir_abs, "data/contract_min.json"),
             ],
         )
         _verify_run_bundle_contracts(run_id, contract, work_dir_abs)
@@ -8423,7 +8269,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
         contract_snapshot_payload = _persist_execution_contract_snapshot(
             state if isinstance(state, dict) else {},
             contract if isinstance(contract, dict) else {},
-            contract_min if isinstance(contract_min, dict) else {},
+            {},
         )
     except Exception as snapshot_err:
         print(f"Warning: failed to persist contract snapshot: {snapshot_err}")
@@ -8446,7 +8292,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
     except Exception as dp_err:
         print(f"Warning: data_profile preflight failed: {dp_err}")
 
-    view_payload = _build_contract_views(state if isinstance(state, dict) else {}, contract, contract_min)
+    view_payload = _build_contract_views(state if isinstance(state, dict) else {}, contract, {})
     if view_payload.get("contract_views"):
         try:
             de_len = len(json.dumps(view_payload["contract_views"].get("de_view", {}), ensure_ascii=True))
@@ -8475,8 +8321,6 @@ def run_execution_planner(state: AgentState) -> AgentState:
     # V4.1: Do NOT add execution_plan to result (legacy key)
     if evaluation_spec:
         result["evaluation_spec"] = evaluation_spec
-    if isinstance(contract_min, dict) and contract_min:
-        result["execution_contract_min"] = contract_min
     if isinstance(contract_snapshot_payload, dict) and contract_snapshot_payload:
         result["execution_contract_snapshot"] = contract_snapshot_payload.get("snapshot")
         result["execution_contract_snapshot_path"] = contract_snapshot_payload.get("snapshot_path")
@@ -8731,12 +8575,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
     data_engineer_audit_override = _append_run_facts_block(data_engineer_audit_override, state)
     state["data_engineer_audit_override"] = data_engineer_audit_override
-    contract_min = state.get("execution_contract_min") or _load_json_safe("data/contract_min.json") or {}
+    execution_contract = state.get("execution_contract") or _load_json_safe("data/execution_contract.json") or {}
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
     if not isinstance(de_view, dict) or not de_view:
-        de_view = build_de_view(state.get("execution_contract", {}) or {}, contract_min or {}, state.get("artifact_index") or [])
-    de_contract_min = sanitize_contract_min_for_de(contract_min if isinstance(contract_min, dict) else {})
-    de_objective = build_de_objective(de_contract_min or {})
+        de_view = build_de_view(execution_contract or {}, {}, state.get("artifact_index") or [])
+    de_objective = build_de_objective(execution_contract or {})
     try:
         de_view_len = len(json.dumps(de_view, ensure_ascii=True))
         print(f"Using DE_VIEW_CONTEXT length={de_view_len}")
@@ -8759,7 +8602,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         "dataset_semantics_summary": dataset_semantics_summary,
         "dataset_training_mask": state.get("dataset_training_mask"),
         "de_view": de_view,
-        "execution_contract_min": de_contract_min,
+        "execution_contract": execution_contract,
         "context_pack": context_pack,
     }
     try:
@@ -8783,9 +8626,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
     }
     sig = inspect.signature(data_engineer.generate_cleaning_script)
     if "execution_contract" in sig.parameters:
-        kwargs["execution_contract"] = de_contract_min
-    if "contract_min" in sig.parameters:
-        kwargs["contract_min"] = de_contract_min
+        kwargs["execution_contract"] = execution_contract
     if "de_view" in sig.parameters:
         kwargs["de_view"] = de_view
     code = data_engineer.generate_cleaning_script(**kwargs)
@@ -9293,7 +9134,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         "data/column_inventory.json",
                         "data/column_sets.json",
                         "data/required_columns.json",
-                        "data/contract_min.json",
                         "data/dataset_semantics.json",
                         "data/dataset_training_mask.json",
                         "data/execution_contract.json",
@@ -9490,11 +9330,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         review_context_payload = cleaning_view_copy
                                     else:
                                         contract = state.get("execution_contract", {}) or {}
-                                        contract_min = state.get("execution_contract_min", {}) or {}
                                         review_context = {
                                             "cleaning_view": {},
                                             "cleaning_gates": contract.get("cleaning_gates")
-                                            or contract_min.get("cleaning_gates")
                                             or [],
                                             "required_columns": _resolve_required_input_columns(contract, selected),
                                             "dialect": input_dialect,
@@ -10257,11 +10095,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         review_context_payload = cleaning_view_copy
                     else:
                         contract = state.get("execution_contract", {}) or {}
-                        contract_min = state.get("execution_contract_min", {}) or {}
                         review_context = {
                             "cleaning_view": {},
                             "cleaning_gates": contract.get("cleaning_gates")
-                            or contract_min.get("cleaning_gates")
                             or [],
                             "required_columns": _resolve_required_input_columns(contract, selected),
                             "dialect": input_dialect,
@@ -10702,17 +10538,8 @@ def run_engineer(state: AgentState) -> AgentState:
     csv_encoding = state.get('csv_encoding', 'utf-8') # Pass real encoding
     csv_sep = state.get('csv_sep', ',')
     csv_decimal = state.get('csv_decimal', '.')
-    execution_contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
+    execution_contract, _ = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     evaluation_spec = state.get("evaluation_spec") or (execution_contract or {}).get("evaluation_spec") or {}
-    if isinstance(execution_contract, dict) and evaluation_spec and not execution_contract.get("evaluation_spec"):
-        execution_contract["evaluation_spec"] = evaluation_spec
-    if not isinstance(contract_min, dict) or not contract_min:
-        contract_min = _build_contract_min(execution_contract, evaluation_spec)
-        try:
-            os.makedirs("data", exist_ok=True)
-            dump_json("data/contract_min.json", contract_min)
-        except Exception:
-            pass
     if not execution_contract:
         data_audit_context = _merge_de_audit_override(
             data_audit_context,
@@ -10803,7 +10630,7 @@ def run_engineer(state: AgentState) -> AgentState:
         )
         sig = inspect.signature(ml_engineer.generate_code)
         if "execution_contract" in sig.parameters:
-            kwargs["execution_contract"] = contract_min or execution_contract
+            kwargs["execution_contract"] = execution_contract
         if "dataset_scale" in sig.parameters:
             dataset_scale_hints = state.get("dataset_scale_hints") or {}
             kwargs["dataset_scale"] = dataset_scale_hints
@@ -10813,7 +10640,7 @@ def run_engineer(state: AgentState) -> AgentState:
         if "ml_view" in sig.parameters:
             ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
             if not isinstance(ml_view, dict) or not ml_view:
-                ml_view = build_ml_view(execution_contract or {}, contract_min or {}, state.get("artifact_index") or [])
+                ml_view = build_ml_view(execution_contract or {}, {}, state.get("artifact_index") or [])
             kwargs["ml_view"] = ml_view
             try:
                 ml_view_len = len(json.dumps(ml_view, ensure_ascii=True))
@@ -10846,11 +10673,6 @@ def run_engineer(state: AgentState) -> AgentState:
             memory_slice = iteration_memory[-2:]
             context_ops_blocks.append(
                 "ITERATION_MEMORY_CONTEXT:\n" + json.dumps(memory_slice, ensure_ascii=True)
-            )
-        if contract_min:
-            context_ops_blocks.append(
-                "CONTRACT_MIN_CONTEXT:\n"
-                + json.dumps(compress_long_lists(contract_min)[0], ensure_ascii=True)
             )
         ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
         if isinstance(ml_view, dict) and ml_view:
@@ -10973,7 +10795,6 @@ def run_engineer(state: AgentState) -> AgentState:
                 "context_ops_blocks": context_ops_blocks,
                 "required_features": strategy.get("required_columns", []),
                 "execution_contract": execution_contract,
-                "execution_contract_min": contract_min,
                 "ml_view": state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view"),
                 "data_audit_context": data_audit_context,
                 "ml_engineer_audit_override": ml_audit_override,
@@ -11141,7 +10962,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "raw_required_sample_context": sample_context,
                 "feature_semantics": (execution_contract or {}).get("feature_semantics", []),
                 "business_sanity_checks": (execution_contract or {}).get("business_sanity_checks", []),
-                "execution_contract_min": contract_min,
+                "execution_contract": execution_contract,
             },
             "budget_counters": counters,
             "strategy_lock_snapshot": strategy_lock_snapshot,
@@ -11217,7 +11038,7 @@ def run_reviewer(state: AgentState) -> AgentState:
     if not isinstance(reviewer_view, dict) or not reviewer_view:
         reviewer_view = build_reviewer_view(
             state.get("execution_contract", {}) or {},
-            _load_json_safe("data/contract_min.json") or {},
+            {},
             state.get("artifact_index") or [],
         )
     context_pack = build_context_pack("reviewer", state if isinstance(state, dict) else {})
@@ -11369,14 +11190,14 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     current_history = list(state.get('feedback_history', []))
     try:
         # Run QA Audit
-        contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
+        contract, _ = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
         qa_view = state.get("qa_view") or (state.get("contract_views") or {}).get("qa_view")
         if isinstance(qa_view, dict) and qa_view:
             qa_context = dict(qa_view)
             contract_source = "qa_view"
-        elif isinstance(contract_min, dict) and contract_min:
-            qa_context = dict(contract_min)
-            contract_source = "contract_min"
+        elif isinstance(contract, dict) and contract:
+            qa_context = dict(contract)
+            contract_source = "execution_contract"
         else:
             qa_context = {}
             contract_source = "fallback"
@@ -11620,8 +11441,9 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             if i not in {"TARGET_NOT_IN_X", "TARGET_VARIANCE_GUARD", "CROSS_VALIDATION_REQUIRED", "TIME_SERIES_SPLIT_REQUIRED"}
         ]
     # V4.1 Resolution for key columns
-    contract_min = state.get("execution_contract_min") or {}
-    base_cols = contract_min.get("relevant_columns")
+    base_cols = []
+    if isinstance(contract, dict):
+        base_cols = contract.get("relevant_columns") or []
     if not base_cols:
          base_cols = get_canonical_columns(contract) or []
 
@@ -11865,7 +11687,6 @@ def check_review(state: AgentState):
 def execute_code(state: AgentState) -> AgentState:
     print("--- [5] System: Executing Code ---")
     run_id = state.get("run_id")
-    contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
     ok, counters, err_msg = _consume_budget(state, "execution_calls", "max_execution_calls", "Execution")
     state["budget_counters"] = counters
     if not ok:
@@ -11929,8 +11750,8 @@ def execute_code(state: AgentState) -> AgentState:
             column_sets = state.get("column_sets")
             if not isinstance(column_sets, dict) or not column_sets:
                 column_sets = _load_json_safe("data/column_sets.json") or {}
-            roles = get_column_roles(contract_min or contract) if isinstance(contract, dict) else {}
-            target_cols = get_outcome_columns(contract_min or contract) or roles.get("outcome") or []
+            roles = get_column_roles(contract) if isinstance(contract, dict) else {}
+            target_cols = get_outcome_columns(contract) or roles.get("outcome") or []
             if not target_cols:
                 target_cols = list(state.get("target_columns") or [])
             target_col = target_cols[0] if target_cols else None
@@ -11973,7 +11794,7 @@ def execute_code(state: AgentState) -> AgentState:
                     "random_state": 42,
                 }
 
-            decisioning_names = _extract_decisioning_required_names(contract_min or contract)
+            decisioning_names = _extract_decisioning_required_names(contract)
 
             request = {
                 "run_id": run_id,
@@ -12012,7 +11833,6 @@ def execute_code(state: AgentState) -> AgentState:
                 "data/cleaning_manifest.json",
                 "data/column_sets.json",
                 "data/column_inventory.json",
-                "data/contract_min.json",
                 "data/execution_contract.json",
                 "data/ml_plan.json",
                 "data/evaluation_spec.json",
@@ -13369,12 +13189,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 alignment_check["status"] = raw_status
                 alignment_check["summary"] = summary
                 alignment_check["failure_mode"] = failure_mode
-            if not isinstance(contract_min, dict) or not contract_min:
-                contract_min = _load_json_safe("data/contract_min.json") or {}
             alignment_check, forbidden_violations = _apply_forbidden_feature_gate(
                 alignment_check,
                 contract,
-                contract_min,
+                {},
                 state.get("generated_code") or state.get("last_generated_code") or "",
             )
             if forbidden_violations:
@@ -13533,9 +13351,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if isinstance(qa_view, dict) and qa_view:
         qa_context = dict(qa_view)
         qa_context["_contract_source"] = "qa_view"
-    elif isinstance(contract_min, dict) and contract_min:
-        qa_context = dict(contract_min)
-        qa_context["_contract_source"] = "contract_min"
+    elif isinstance(contract, dict) and contract:
+        qa_context = dict(contract)
+        qa_context["_contract_source"] = "execution_contract"
     else:
         qa_context = {"_contract_source": "fallback"}
     qa_context["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
@@ -13575,7 +13393,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 if not isinstance(reviewer_view, dict) or not reviewer_view:
                     reviewer_view = build_reviewer_view(
                         contract,
-                        contract_min if isinstance(contract_min, dict) else {},
+                        {},
                         state.get("artifact_index") or [],
                     )
                 if isinstance(reviewer_view, dict):
@@ -14191,6 +14009,13 @@ def run_review_board(state: AgentState) -> AgentState:
         "feedback_history": history,
         "last_gate_context": gate_context,
     }
+    # Iteration counter guard:
+    # - run_result_evaluator already increments iteration_count when it returns NEEDS_IMPROVEMENT.
+    # - if review_board escalates a non-NEEDS_IMPROVEMENT status to NEEDS_IMPROVEMENT,
+    #   increment here to avoid retry loops on "Iteration 1".
+    prev_status = str(state.get("review_verdict") or "").strip().upper()
+    if final_status == "NEEDS_IMPROVEMENT" and prev_status != "NEEDS_IMPROVEMENT":
+        result["iteration_count"] = int(state.get("iteration_count", 0) or 0) + 1
     if final_status in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
         result["last_successful_review_verdict"] = final_status
         result["last_successful_gate_context"] = gate_context
@@ -14548,7 +14373,7 @@ def run_translator(state: AgentState) -> AgentState:
     if not isinstance(translator_view, dict) or not translator_view:
         translator_view = build_translator_view(
             report_state.get("execution_contract", {}) or {},
-            _load_json_safe("data/contract_min.json") or {},
+            {},
             report_state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json") or [],
         )
     context_pack = build_context_pack("business_translator", report_state if isinstance(report_state, dict) else {})
@@ -14833,7 +14658,6 @@ def run_translator(state: AgentState) -> AgentState:
                     _abs_in_work(work_dir_abs, "data/execution_contract.json"),
                     _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
                     _abs_in_work(work_dir_abs, "data/produced_artifact_index.json"),
-                    _abs_in_work(work_dir_abs, "data/contract_min.json"),
                 ],
             )
             _verify_run_bundle_contracts(run_id, state.get("execution_contract") or {}, work_dir_abs)

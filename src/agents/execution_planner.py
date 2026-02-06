@@ -5890,11 +5890,9 @@ class ExecutionPlannerAgent:
             if response_text is not None:
                 _write_text(os.path.join(planner_dir, response_name), response_text)
 
-        def _persist_contracts(full_contract: Dict[str, Any] | None, contract_min: Dict[str, Any] | None) -> None:
+        def _persist_contracts(full_contract: Dict[str, Any] | None) -> None:
             if not planner_dir:
                 return
-            if contract_min:
-                _write_json(os.path.join(planner_dir, "contract_min.json"), contract_min)
             if full_contract:
                 _write_json(os.path.join(planner_dir, "contract_full.json"), full_contract)
             if planner_diag:
@@ -5961,12 +5959,10 @@ class ExecutionPlannerAgent:
                     usage_payload[key] = value
             return usage_payload or {"value": str(raw_usage)}
 
-        def _finalize_and_persist(contract, contract_min, where):
+        def _finalize_and_persist(contract, where):
             from src.utils.contract_v41 import strip_legacy_keys, assert_no_legacy_keys, assert_only_allowed_v41_keys
             contract = ensure_v41_schema(contract, strict=False)
             contract = strip_legacy_keys(contract)
-            if contract_min:
-                contract_min = strip_legacy_keys(contract_min)
             assert_no_legacy_keys(contract, where=where)
             unknown = assert_only_allowed_v41_keys(contract, strict=False)
             if unknown:
@@ -5974,7 +5970,7 @@ class ExecutionPlannerAgent:
                 u = contract.setdefault("unknowns", [])
                 if isinstance(u, list):
                     u.append({"item": f"Unknown top-level keys detected: {unknown}", "impact":"May not be recognized", "mitigation":"Update allowed keys if needed", "requires_verification": False})
-            _persist_contracts(contract, contract_min)
+            _persist_contracts(contract)
             return contract
 
         target_candidates: List[Dict[str, Any]] = []
@@ -6007,10 +6003,8 @@ class ExecutionPlannerAgent:
                             break
                 if inferred:
                     contract["outcome_columns"] = inferred
-            contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns, target_candidates=target_candidates, data_profile=data_profile)
-            contract = _sync_execution_contract_outputs(contract, contract_min)
-            self.last_contract_min = contract_min
-            return _finalize_and_persist(contract, contract_min, where="execution_planner:no_client")
+            self.last_contract_min = None
+            return _finalize_and_persist(contract, where="execution_planner:no_client")
 
         target_candidates: List[Dict[str, Any]] = []
         resolved_target = None
@@ -6429,13 +6423,11 @@ domain_expert_critique:
                         break
             if inferred:
                 contract["outcome_columns"] = inferred
-        contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns, target_candidates=target_candidates, data_profile=data_profile)
-        contract = _sync_execution_contract_outputs(contract, contract_min)
-        self.last_contract_min = contract_min
+        self.last_contract_min = None
 
         if llm_success and planner_diag:
             print(f"SUCCESS: Execution Planner succeeded on attempt {planner_diag[-1]['attempt_index']}")
-        return _finalize_and_persist(contract, contract_min, where="execution_planner:final_contract")
+        return _finalize_and_persist(contract, where="execution_planner:final_contract")
 
     def generate_evaluation_spec(
         self,

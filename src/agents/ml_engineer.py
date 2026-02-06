@@ -346,7 +346,7 @@ class MLEngineerAgent:
     ) -> str:
         from src.utils.context_pack import compress_long_lists
 
-        contract_min = compress_long_lists(self._compact_execution_contract(execution_contract or {}))[0]
+        contract_context = compress_long_lists(self._compact_execution_contract(execution_contract or {}))[0]
         allowed_columns = compress_long_lists(self._resolve_allowed_columns_for_prompt(execution_contract or {}))[0]
         allowed_patterns = self._resolve_allowed_name_patterns_for_prompt(execution_contract or {})
         feedback_blocks = self._select_feedback_blocks(feedback_history, gate_context, max_blocks=2)
@@ -439,8 +439,8 @@ class MLEngineerAgent:
                 decisioning_policy_notes or "None",
                 "VISUAL_REQUIREMENTS_CONTEXT:",
                 visual_requirements_json,
-                "CONTRACT_MIN_CONTEXT:",
-                json.dumps(contract_min, indent=2),
+                "EXECUTION_CONTRACT_CONTEXT:",
+                json.dumps(contract_context, indent=2),
                 "REQUIRED OUTPUTS:",
                 json.dumps(required_outputs or [], indent=2),
                 "ALLOWED COLUMNS:",
@@ -1716,7 +1716,7 @@ $strategy_json
          - CRITICAL: If 'ML_PLAN_CONTEXT' is present (in Data Audit), you MUST implement that plan exactly (training_rows_policy, train_filter, metric_policy, cv_policy). Do not deviate.
 
          TRAINING DATA SELECTION (STEWARD-DRIVEN)
-         - Read execution_contract (or contract_min) for outcome_columns and optional fields:
+         - Read execution_contract for outcome_columns and optional fields:
            * training_rows_rule
            * scoring_rows_rule (primary)
            * secondary_scoring_subset (optional)
@@ -1958,7 +1958,7 @@ $strategy_json
         - DECISIONING POLICY NOTES: $decisioning_policy_notes
         - DECISIONING COLUMNS: $decisioning_columns_text
         - VISUAL_REQUIREMENTS_CONTEXT (json): $visual_requirements_context
-        - CONTRACT_MIN_CONTEXT (json): $contract_min_context
+        - EXECUTION_CONTRACT_CONTEXT (json): $execution_contract_context
         - Execution Contract (json): $execution_contract_json
         - Deliverables: $deliverables_json
         - Canonical Columns: $canonical_columns
@@ -2261,7 +2261,7 @@ $strategy_json
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
             execution_contract_json=json.dumps(execution_contract_compact, indent=2),
-            contract_min_context=json.dumps(execution_contract_compact, indent=2),
+            execution_contract_context=json.dumps(execution_contract_compact, indent=2),
             ml_view_context=ml_view_json,
             plot_spec_context=plot_spec_json,
             evaluation_spec_json=evaluation_spec_json,

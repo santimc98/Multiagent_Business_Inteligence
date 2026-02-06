@@ -39,7 +39,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Graph utilities")
     parser.add_argument("--dry_views", action="store_true", help="Generate contract views without invoking LLMs.")
     parser.add_argument("--contract_full", type=str, default="", help="Path to execution contract JSON.")
-    parser.add_argument("--contract_min", type=str, default="", help="Path to contract_min JSON.")
+    parser.add_argument("--contract_min", type=str, default="", help="Deprecated: ignored.")
     parser.add_argument("--artifact_index", type=str, default="", help="Path to artifact index JSON.")
     parser.add_argument("--output_dir", type=str, default="data", help="Base output directory.")
     parser.add_argument("--run_bundle_dir", type=str, default="", help="Optional run bundle dir for persistence.")
@@ -50,25 +50,25 @@ def main() -> int:
         return 1
 
     contract_full = _load_json(args.contract_full) if args.contract_full else _load_json("data/execution_contract.json") or {}
-    contract_min = _load_json(args.contract_min) if args.contract_min else _load_json("data/contract_min.json") or {}
+    contract_min = {}
     artifact_index = _load_json(args.artifact_index) if args.artifact_index else _load_json("data/produced_artifact_index.json")
     if not isinstance(artifact_index, list):
-        required_outputs = contract_min.get("required_outputs") if isinstance(contract_min, dict) else []
+        required_outputs = contract_full.get("required_outputs") if isinstance(contract_full, dict) else []
         if not isinstance(required_outputs, list):
             required_outputs = []
         artifact_index = _artifact_index_from_required_outputs(required_outputs)
 
-    if not contract_full and not contract_min:
-        print("dry_views error: missing contract_full/contract_min. Provide paths or data/*.json files.")
+    if not contract_full:
+        print("dry_views error: missing execution_contract. Provide --contract_full or data/execution_contract.json.")
         return 2
 
-    de_view = build_de_view(contract_full, contract_min, artifact_index)
-    ml_view = build_ml_view(contract_full, contract_min, artifact_index)
-    cleaning_view = build_cleaning_view(contract_full, contract_min, artifact_index)
-    qa_view = build_qa_view(contract_full, contract_min, artifact_index)
-    reviewer_view = build_reviewer_view(contract_full, contract_min, artifact_index)
-    translator_view = build_translator_view(contract_full, contract_min, artifact_index)
-    results_advisor_view = build_results_advisor_view(contract_full, contract_min, artifact_index)
+    de_view = build_de_view(contract_full, {}, artifact_index)
+    ml_view = build_ml_view(contract_full, {}, artifact_index)
+    cleaning_view = build_cleaning_view(contract_full, {}, artifact_index)
+    qa_view = build_qa_view(contract_full, {}, artifact_index)
+    reviewer_view = build_reviewer_view(contract_full, {}, artifact_index)
+    translator_view = build_translator_view(contract_full, {}, artifact_index)
+    results_advisor_view = build_results_advisor_view(contract_full, {}, artifact_index)
     views = {
         "de_view": de_view,
         "ml_view": ml_view,

@@ -9,7 +9,7 @@ def test_context_pack_long_list_compression():
         "csv_decimal": ".",
         "csv_encoding": "utf-8",
         "column_inventory": columns,
-        "execution_contract_min": {
+        "execution_contract": {
             "required_outputs": columns,
             "decisioning_requirements": {
                 "output": {"required_columns": columns},

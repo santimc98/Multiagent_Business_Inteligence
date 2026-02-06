@@ -33,7 +33,7 @@ def test_incomplete_reprompt_context_has_contract_and_outputs(monkeypatch):
         feedback_history=["REVIEWER FEEDBACK: add baseline metrics"],
         gate_context={"feedback": "QA TEAM FEEDBACK: fix outputs"},
     )
-    assert "CONTRACT_MIN_CONTEXT" in context
+    assert "EXECUTION_CONTRACT_CONTEXT" in context
     assert "REQUIRED OUTPUTS" in context
     # V4.1: Context may be smaller without legacy keys; adjust threshold
     assert len(context) > 1000

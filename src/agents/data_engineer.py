@@ -93,7 +93,7 @@ class DataEngineerAgent:
         """
         from src.utils.prompting import render_prompt
 
-        contract = contract_min or execution_contract or {}
+        contract = execution_contract or contract_min or {}
         from src.utils.context_pack import compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
 
         contract_json = json.dumps(compress_long_lists(contract)[0], indent=2)
@@ -191,7 +191,7 @@ class DataEngineerAgent:
         - Required Columns (DE View): $required_columns
         - Optional Passthrough Columns (keep if present): $optional_passthrough_columns
         - DE_VIEW_CONTEXT (json): $de_view_context
-        - CONTRACT_MIN_CONTEXT (json): $contract_min_context
+        - EXECUTION_CONTRACT_CONTEXT (json): $execution_contract_context
         - CLEANING_GATES_CONTEXT (json): $cleaning_gates_context
         - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
 
@@ -245,7 +245,7 @@ class DataEngineerAgent:
             required_columns=json.dumps(required_columns_payload),
             optional_passthrough_columns=json.dumps(optional_passthrough_payload),
             data_audit=data_audit,
-            contract_min_context=contract_json,
+            execution_contract_context=contract_json,
             de_view_context=de_view_json,
             data_engineer_runbook=de_runbook_json,
             cleaning_gates_context=cleaning_gates_json,
