@@ -16,7 +16,7 @@ from src.utils.senior_protocol import (
     SENIOR_ENGINEERING_PROTOCOL,
     SENIOR_REASONING_PROTOCOL_GENERAL,
 )
-from src.utils.llm_fallback import call_chat_with_fallback
+from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
 
 # NOTE: scan_code_safety referenced by tests as a required safety mechanism.
 # ML code executes in sandbox; keep the reference for integration checks.
@@ -1000,7 +1000,10 @@ class MLEngineerAgent:
                 )
                 self.last_model_used = model_used
                 self.logger.info("ML_ENGINEER_MODEL_USED: %s", model_used)
-                return response.choices[0].message.content
+                content = extract_response_text(response)
+                if not content:
+                    raise ValueError("EMPTY_COMPLETION")
+                return content
             elif self.provider in {"google", "gemini"}:
                 full_prompt = sys_prompt + "\n\nUSER INPUT:\n" + usr_prompt
                 from google.genai import types
@@ -2477,7 +2480,9 @@ $strategy_json
                         self.last_fallback_reason = "fallback_used"
                     self.last_model_used = model_used
                     self.logger.info("ML_ENGINEER_MODEL_USED: %s", model_used)
-                    content = response.choices[0].message.content
+                    content = extract_response_text(response)
+                    if not content:
+                        raise ValueError("EMPTY_COMPLETION")
                     self.last_response = content
                     if "504 Gateway Time-out" in content or "<html" in content.lower():
                         raise ConnectionError("LLM Server Timeout (504 Received)")

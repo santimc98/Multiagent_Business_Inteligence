@@ -9,7 +9,7 @@ from src.utils.static_safety_scan import scan_code_safety
 from src.utils.code_extract import extract_code_block
 from src.utils.senior_protocol import SENIOR_ENGINEERING_PROTOCOL
 from src.utils.contract_v41 import get_cleaning_gates
-from src.utils.llm_fallback import call_chat_with_fallback
+from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
 from openai import OpenAI
 
 load_dotenv()
@@ -67,14 +67,7 @@ class DataEngineerAgent:
         Raises ValueError("EMPTY_COMPLETION") if content is empty (CAUSA RAÍZ 2).
         This triggers retry logic in call_with_retries.
         """
-        msg = response.choices[0].message
-        content = (msg.content or "").strip()
-
-        # Fallback: some models expose reasoning separately
-        if not content:
-            reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
-            if isinstance(reasoning, str) and reasoning.strip():
-                content = reasoning.strip()
+        content = extract_response_text(response)
 
         if not content:
             print("ERROR: LLM returned EMPTY_COMPLETION. Will retry.")

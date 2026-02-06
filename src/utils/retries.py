@@ -25,6 +25,7 @@ def call_with_retries(
                 or "rate limit" in error_str
                 or "concurrency" in error_str
                 or "1302" in error_str
+                or "empty_completion" in error_str
             )
 
             if not is_retryable or attempt >= max_retries:
