@@ -5873,6 +5873,9 @@ class ExecutionPlannerAgent:
         planner_diag: List[Dict[str, Any]] = []
         self.last_planner_diag = planner_diag
         self.last_contract_min = None
+        planner_candidate_invalid: Dict[str, Any] | None = None
+        planner_candidate_invalid_raw: str | None = None
+        planner_candidate_invalid_meta: Dict[str, Any] | None = None
 
         def _write_text(path: str, content: str) -> None:
             try:
@@ -5899,6 +5902,9 @@ class ExecutionPlannerAgent:
         def _persist_contracts(
             full_contract: Dict[str, Any] | None,
             diagnostics_payload: Dict[str, Any] | None = None,
+            invalid_contract: Dict[str, Any] | None = None,
+            invalid_raw: str | None = None,
+            invalid_meta: Dict[str, Any] | None = None,
         ) -> None:
             if not planner_dir:
                 return
@@ -5910,6 +5916,21 @@ class ExecutionPlannerAgent:
                 _write_json(
                     os.path.join(planner_dir, "contract_diagnostics.json"),
                     diagnostics_payload,
+                )
+            if isinstance(invalid_contract, dict) and invalid_contract:
+                _write_json(
+                    os.path.join(planner_dir, "contract_candidate_invalid.json"),
+                    invalid_contract,
+                )
+            if isinstance(invalid_raw, str) and invalid_raw.strip():
+                _write_text(
+                    os.path.join(planner_dir, "contract_candidate_invalid_raw.txt"),
+                    invalid_raw,
+                )
+            if isinstance(invalid_meta, dict) and invalid_meta:
+                _write_json(
+                    os.path.join(planner_dir, "contract_candidate_invalid_meta.json"),
+                    invalid_meta,
                 )
 
         def _parse_json_response(raw_text: str) -> Tuple[Optional[Any], Optional[Exception]]:
@@ -5973,6 +5994,49 @@ class ExecutionPlannerAgent:
                     usage_payload[key] = value
             return usage_payload or {"value": str(raw_usage)}
 
+        def _build_parse_feedback(raw_text: str | None, parse_error: Exception | None) -> str:
+            if not parse_error and not raw_text:
+                return "No parse diagnostics available."
+            err_type = type(parse_error).__name__ if parse_error else "UnknownParseError"
+            err_msg = str(parse_error) if parse_error else "Unknown parsing error."
+            line_no: Optional[int] = None
+            col_no: Optional[int] = None
+            if parse_error is not None:
+                if hasattr(parse_error, "lineno"):
+                    try:
+                        line_no = int(getattr(parse_error, "lineno"))
+                    except Exception:
+                        line_no = None
+                if hasattr(parse_error, "colno"):
+                    try:
+                        col_no = int(getattr(parse_error, "colno"))
+                    except Exception:
+                        col_no = None
+                if line_no is None:
+                    m = re.search(r"line\s+(\d+)", err_msg)
+                    if m:
+                        try:
+                            line_no = int(m.group(1))
+                        except Exception:
+                            line_no = None
+            snippet = ""
+            if isinstance(raw_text, str) and raw_text.strip() and line_no and line_no > 0:
+                lines = raw_text.splitlines()
+                idx = line_no - 1
+                if 0 <= idx < len(lines):
+                    snippet = lines[idx]
+            out_lines = [
+                f"- parse_error_type: {err_type}",
+                f"- parse_error_message: {err_msg}",
+            ]
+            if line_no is not None:
+                out_lines.append(f"- parse_error_line: {line_no}")
+            if col_no is not None:
+                out_lines.append(f"- parse_error_col: {col_no}")
+            if snippet:
+                out_lines.append(f"- parse_error_snippet: {snippet[:300]}")
+            return "\n".join(out_lines)
+
         def _contract_is_accepted(validation_result: Dict[str, Any] | None) -> bool:
             if not isinstance(validation_result, dict):
                 return False
@@ -6004,6 +6068,8 @@ class ExecutionPlannerAgent:
             previous_contract: Dict[str, Any] | None,
             previous_validation: Dict[str, Any] | None,
             previous_response_text: str | None,
+            previous_parse_feedback: str | None,
+            original_inputs_text: str | None,
         ) -> str:
             required_top_level = [
                 "contract_version",
@@ -6024,6 +6090,7 @@ class ExecutionPlannerAgent:
                 "iteration_policy",
             ]
             validation_feedback = _compact_validation_feedback(previous_validation)
+            parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
             previous_payload = (
                 json.dumps(previous_contract, indent=2, ensure_ascii=False)
                 if isinstance(previous_contract, dict)
@@ -6035,10 +6102,15 @@ class ExecutionPlannerAgent:
                 f"contract_version MUST be exactly {json.dumps(CONTRACT_VERSION_V41)}.\n"
                 "Do not invent columns outside column_inventory.\n"
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
+                "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
                 "Top-level required keys (all mandatory): "
                 + json.dumps(required_top_level)
+                + "\n\nORIGINAL INPUTS (source of truth):\n"
+                + (original_inputs_text or "")
                 + "\n\nValidation issues to fix:\n"
                 + validation_feedback
+                + "\n\nParse diagnostics from previous attempt:\n"
+                + parse_feedback
                 + "\n\nPrevious candidate contract/response:\n"
                 + previous_payload
             )
@@ -6112,7 +6184,13 @@ class ExecutionPlannerAgent:
         def _finalize_and_persist(contract, where, llm_success: bool):
             diagnostics = _build_contract_diagnostics(contract if isinstance(contract, dict) else {}, where, llm_success)
             self.last_contract_diagnostics = diagnostics
-            _persist_contracts(contract if isinstance(contract, dict) else {}, diagnostics)
+            _persist_contracts(
+                contract if isinstance(contract, dict) else {},
+                diagnostics,
+                invalid_contract=planner_candidate_invalid,
+                invalid_raw=planner_candidate_invalid_raw,
+                invalid_meta=planner_candidate_invalid_meta,
+            )
             return contract
 
         target_candidates: List[Dict[str, Any]] = []
@@ -6227,6 +6305,7 @@ domain_expert_critique:
         best_candidate: Dict[str, Any] | None = None
         best_validation: Dict[str, Any] | None = None
         best_response_text: str | None = None
+        best_parse_feedback: str | None = None
         best_error_count: Optional[int] = None
 
         max_quality_rounds = 3
@@ -6324,6 +6403,12 @@ domain_expert_critique:
                                 best_validation = validation_result
                                 best_response_text = response_text
                                 best_error_count = error_count
+                                best_parse_feedback = None
+                else:
+                    parse_feedback = _build_parse_feedback(response_text, parse_error)
+                    if best_response_text is None:
+                        best_response_text = response_text
+                        best_parse_feedback = parse_feedback
 
                 planner_diag.append(
                     {
@@ -6371,6 +6456,8 @@ domain_expert_critique:
                 previous_contract=best_candidate,
                 previous_validation=best_validation,
                 previous_response_text=best_response_text,
+                previous_parse_feedback=best_parse_feedback,
+                original_inputs_text=user_input,
             )
             if not round_has_candidate:
                 current_prompt = (
@@ -6381,6 +6468,13 @@ domain_expert_critique:
         if contract is None:
             contract = {}
             llm_success = False
+            planner_candidate_invalid = best_candidate if isinstance(best_candidate, dict) else None
+            planner_candidate_invalid_raw = best_response_text
+            planner_candidate_invalid_meta = {
+                "best_validation": best_validation if isinstance(best_validation, dict) else None,
+                "best_parse_feedback": best_parse_feedback,
+                "attempt_count": len(planner_diag),
+            }
 
         if llm_success and resolved_target:
             print(

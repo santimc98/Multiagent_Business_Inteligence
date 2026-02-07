@@ -11125,6 +11125,14 @@ def check_data_success(state: AgentState):
 
     return "success"
 
+
+def check_execution_planner_success(state: AgentState):
+    if state.get("execution_planner_failed"):
+        return "failed"
+    if state.get("pipeline_aborted_reason") == "execution_contract_invalid":
+        return "failed"
+    return "success"
+
 def run_engineer(state: AgentState) -> AgentState:
     print(f"--- [4] ML Engineer: Generating Code (Iteration {state.get('iteration_count', 0) + 1}) ---")
     abort_state = _abort_if_requested(state, "ml_engineer")
@@ -15539,7 +15547,14 @@ workflow.set_entry_point("steward")
 workflow.add_edge("steward", "strategist")
 workflow.add_edge("strategist", "domain_expert") # Rewire
 workflow.add_edge("domain_expert", "execution_planner")
-workflow.add_edge("execution_planner", "data_engineer")
+workflow.add_conditional_edges(
+    "execution_planner",
+    check_execution_planner_success,
+    {
+        "success": "data_engineer",
+        "failed": "translator",
+    }
+)
 
 # workflow.add_edge("data_engineer", "engineer") -> Replaced by Conditional Edge
 # workflow.add_edge("engineer", "reviewer") -> Replaced by Conditional Edge
