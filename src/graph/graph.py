@@ -11671,6 +11671,10 @@ def run_engineer(state: AgentState) -> AgentState:
             "generated_code": code,
             "last_generated_code": code, # Update for next patch
             "ml_training_policy_warnings": policy_warnings,
+            # Reset sandbox retry counters on every new code generation.
+            # Retries are scoped to an execution attempt, not carried across iterations.
+            "sandbox_retry_count": 0,
+            "sandbox_failed": False,
             "ml_data_path": data_path,
             "csv_sep": csv_sep,
             "csv_decimal": csv_decimal,
@@ -14791,8 +14795,11 @@ def check_execution_status(state: AgentState):
         max_retries = int(state.get("max_sandbox_retries", 2))
         if retry_count < max_retries:
             return "retry_sandbox"
-        print(f"Sandbox failure detected. Max retries reached ({retry_count}/{max_retries}).")
-        return "failed"
+        print(
+            f"Sandbox failure detected. Max retries reached ({retry_count}/{max_retries}). "
+            "Escalating to evaluator for reviewer/QA-guided retry."
+        )
+        return "evaluate"
 
     if has_error:
         max_runtime_fixes = int(state.get("max_runtime_fix_attempts", 3))

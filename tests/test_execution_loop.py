@@ -25,3 +25,21 @@ def test_check_execution_status_max_retries():
         "max_runtime_fix_attempts": 3,
     }
     assert check_execution_status(state) == "failed_runtime"
+
+
+def test_check_execution_status_sandbox_retry_until_limit_then_evaluate():
+    retry_state = {
+        "execution_output": "Sandbox Execution Failed: peer closed connection without sending complete message body",
+        "sandbox_failed": True,
+        "sandbox_retry_count": 1,
+        "max_sandbox_retries": 2,
+    }
+    assert check_execution_status(retry_state) == "retry_sandbox"
+
+    exhausted_state = {
+        "execution_output": "Sandbox Execution Failed: peer closed connection without sending complete message body",
+        "sandbox_failed": True,
+        "sandbox_retry_count": 2,
+        "max_sandbox_retries": 2,
+    }
+    assert check_execution_status(exhausted_state) == "evaluate"
