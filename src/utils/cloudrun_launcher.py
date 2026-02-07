@@ -159,6 +159,13 @@ def _normalize_prefix(prefix: str) -> str:
     return prefix
 
 
+def _normalize_rel_path(path: Any) -> str:
+    value = str(path or "").strip()
+    if not value:
+        return ""
+    return value.lstrip("/").replace("\\", "/")
+
+
 def launch_heavy_runner_job(
     *,
     run_id: str,
@@ -264,14 +271,31 @@ def launch_heavy_runner_job(
     downloaded: Dict[str, str] = {}
     if download_map:
         for filename, local_path in download_map.items():
-            if not filename:
+            rel_name = _normalize_rel_path(filename)
+            if not rel_name:
                 continue
-            remote_path = output_uri + filename
+            remote_path = output_uri + rel_name
             if not _gsutil_exists(remote_path, gsutil_bin):
                 continue
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
             _gsutil_cp(remote_path, local_path, gsutil_bin)
-            downloaded[filename] = local_path
+            downloaded[rel_name] = local_path
+
+    # Always attempt to fetch required artifacts even when they are absent from download_map.
+    if required_artifacts:
+        for artifact in required_artifacts:
+            rel_name = _normalize_rel_path(artifact)
+            if not rel_name or rel_name in downloaded:
+                continue
+            remote_path = output_uri + rel_name
+            if not _gsutil_exists(remote_path, gsutil_bin):
+                continue
+            local_path = rel_name
+            if isinstance(download_map, dict):
+                local_path = str(download_map.get(rel_name) or local_path)
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+            _gsutil_cp(remote_path, local_path, gsutil_bin)
+            downloaded[rel_name] = local_path
 
     # Always attempt to pull plots if present
     plot_listing = _gsutil_ls(output_uri + "static/plots/*", gsutil_bin)
@@ -315,8 +339,9 @@ def launch_heavy_runner_job(
     missing_artifacts: list[str] = []
     if required_artifacts:
         for artifact in required_artifacts:
-            if artifact not in downloaded:
-                missing_artifacts.append(artifact)
+            rel_name = _normalize_rel_path(artifact)
+            if rel_name and rel_name not in downloaded:
+                missing_artifacts.append(rel_name)
 
     # Build diagnostic info if job failed or artifacts are missing
     gcs_listing: list[str] = []
@@ -330,16 +355,6 @@ def launch_heavy_runner_job(
             "downloaded": list(downloaded.keys()),
             "gcs_listing": gcs_listing,
             "message": f"Cloud Run Job execution failed: {job_error_msg[:500]}",
-        }
-
-    if missing_artifacts and not error_payload:
-        gcs_listing = _gsutil_ls(output_uri, gsutil_bin)
-        error_payload = {
-            "error": "missing_required_artifacts",
-            "missing": missing_artifacts,
-            "downloaded": list(downloaded.keys()),
-            "gcs_listing": gcs_listing,
-            "message": f"Heavy runner job completed but required artifacts missing: {missing_artifacts}",
         }
 
     raw_job_failed = job_failed

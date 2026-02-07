@@ -2,15 +2,15 @@
 Tests for cloudrun_launcher required artifacts validation.
 
 Ensures that:
-1. When required artifacts are missing, status is "error"
-2. Missing artifacts are listed in the response
-3. GCS listing is included for diagnostics when artifacts are missing
+1. Missing artifacts are listed in the response
+2. Missing artifacts do not force launcher runtime error status
+3. Required artifacts can be fetched even if absent from download_map
 """
 from unittest.mock import patch
 
 
-def test_missing_required_artifacts_marks_error():
-    """When required artifacts are not downloaded, status should be 'error'."""
+def test_missing_required_artifacts_marks_missing_only():
+    """Missing required artifacts are non-blocking at launcher level."""
     from src.utils.cloudrun_launcher import launch_heavy_runner_job
 
     # Mock all external dependencies
@@ -46,14 +46,14 @@ def test_missing_required_artifacts_marks_error():
             required_artifacts=["metrics.json", "scored_rows.csv"],
         )
 
-        assert result["status"] == "error"
+        assert result["status"] == "success"
         assert "missing_artifacts" in result
         assert set(result["missing_artifacts"]) == {"metrics.json", "scored_rows.csv"}
-        assert result["error"]["error"] == "missing_required_artifacts"
+        assert result["error"] is None
 
 
-def test_partial_artifacts_marks_error():
-    """When only some required artifacts are downloaded, status should be 'error'."""
+def test_partial_artifacts_still_success_with_missing_list():
+    """When only some required artifacts are downloaded, missing list is populated."""
     from src.utils.cloudrun_launcher import launch_heavy_runner_job
 
     with patch("src.utils.cloudrun_launcher._ensure_cli"), \
@@ -88,7 +88,7 @@ def test_partial_artifacts_marks_error():
             required_artifacts=["metrics.json", "scored_rows.csv", "alignment_check.json"],
         )
 
-        assert result["status"] == "error"
+        assert result["status"] == "success"
         assert "scored_rows.csv" in result["missing_artifacts"]
         assert "alignment_check.json" in result["missing_artifacts"]
         assert "metrics.json" not in result["missing_artifacts"]
@@ -166,6 +166,42 @@ def test_no_required_artifacts_legacy_behavior():
         # Without required_artifacts, no artifact check happens
         assert result["status"] == "success"
         assert result["missing_artifacts"] == []
+
+
+def test_required_artifacts_download_even_without_download_map_entry():
+    """Required artifacts should be fetched directly from output URI when available."""
+    from src.utils.cloudrun_launcher import launch_heavy_runner_job
+
+    with patch("src.utils.cloudrun_launcher._ensure_cli"), \
+         patch("src.utils.cloudrun_launcher._gsutil_cp"), \
+         patch("src.utils.cloudrun_launcher._gsutil_exists") as mock_exists, \
+         patch("src.utils.cloudrun_launcher._gsutil_ls"), \
+         patch("src.utils.cloudrun_launcher._run_gcloud_job_execute") as mock_execute, \
+         patch("os.path.exists") as mock_path_exists, \
+         patch("os.makedirs"):
+
+        mock_execute.return_value = ("stdout", "stderr", "update-env-vars")
+        mock_path_exists.return_value = True
+
+        def exists_side_effect(uri, _):
+            return uri.endswith("outputs/test_run/reports/summary.json")
+
+        mock_exists.side_effect = exists_side_effect
+
+        result = launch_heavy_runner_job(
+            run_id="test_run",
+            request={"dataset_uri": "gs://bucket/test.csv"},
+            dataset_path="data/test.csv",
+            bucket="test-bucket",
+            job="test-job",
+            region="us-central1",
+            download_map={"status.json": "artifacts/heavy_status.json"},
+            required_artifacts=["reports/summary.json"],
+        )
+
+        assert result["status"] == "success"
+        assert result["missing_artifacts"] == []
+        assert "reports/summary.json" in result["downloaded"]
 
 
 def test_stale_error_json_is_ignored_when_status_ok_and_artifacts_present():

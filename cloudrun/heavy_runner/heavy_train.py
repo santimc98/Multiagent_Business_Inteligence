@@ -31,13 +31,6 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 
 
-# Required outputs for execute_code mode in ML execution.
-REQUIRED_OUTPUTS_EXECUTE_CODE_ML = [
-    "data/metrics.json",
-    "data/scored_rows.csv",
-    "data/alignment_check.json",
-]
-
 # Required outputs for execute_code mode in DE execution.
 REQUIRED_OUTPUTS_EXECUTE_CODE_DE = [
     "data/cleaned_data.csv",
@@ -278,7 +271,14 @@ def _resolve_execute_code_mode(payload: Dict[str, Any]) -> Tuple[str, List[str],
         required = list(REQUIRED_OUTPUTS_EXECUTE_CODE_DE)
         skip_paths = {os.path.join("data", "cleaned_full.csv")}
         return mode, required, skip_paths
-    required = list(REQUIRED_OUTPUTS_EXECUTE_CODE_ML)
+    required_payload = payload.get("required_outputs")
+    required = []
+    if isinstance(required_payload, list):
+        required = [
+            str(path).strip().lstrip("/").replace("\\", "/")
+            for path in required_payload
+            if path
+        ]
     # For ML, treat cleaned datasets as input artifacts to avoid re-upload noise.
     skip_paths = {
         os.path.join("data", "cleaned_data.csv"),
@@ -418,7 +418,7 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     # Verify required outputs for this execute_code mode
     present, missing = _check_required_outputs(work_dir, required_outputs)
 
-    if missing:
+    if missing and mode == "data_engineer_cleaning":
         log(f"WARNING: Missing required outputs: {missing}")
         # Still upload what we have, but report the issue
         _write_json_output(
@@ -439,6 +439,8 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
             "error.json",
         )
         raise RuntimeError(f"Script completed but missing required outputs: {missing}")
+    if missing:
+        log(f"WARNING: Missing contract-required outputs: {missing}")
 
     # Write success status
     status_payload = {
@@ -451,7 +453,9 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
         "exit_code": exit_code,
         "execution_time_seconds": round(exec_time, 2),
         "uploaded_outputs": uploaded,
+        "required_outputs_expected": required_outputs,
         "required_outputs_present": present,
+        "required_outputs_missing": missing,
     }
     _write_json_output(status_payload, output_uri, "status.json")
 

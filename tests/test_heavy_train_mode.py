@@ -49,10 +49,20 @@ def test_resolve_execute_code_mode_for_ml_default():
     mode, required, skip_paths = heavy_train._resolve_execute_code_mode({"mode": "execute_code"})
     normalized_skip = {str(path).replace("\\", "/") for path in skip_paths}
     assert mode == "execute_code"
-    assert "data/metrics.json" in required
-    assert "data/scored_rows.csv" in required
-    assert "data/alignment_check.json" in required
+    assert required == []
     assert "data/cleaned_data.csv" in normalized_skip
+
+
+def test_resolve_execute_code_mode_for_ml_uses_contract_required_outputs():
+    heavy_train = _load_heavy_train_module()
+    mode, required, _ = heavy_train._resolve_execute_code_mode(
+        {
+            "mode": "execute_code",
+            "required_outputs": ["reports/summary.json", "data/metrics.json"],
+        }
+    )
+    assert mode == "execute_code"
+    assert required == ["reports/summary.json", "data/metrics.json"]
 
 
 def test_collect_output_files_respects_skip_paths(tmp_path):

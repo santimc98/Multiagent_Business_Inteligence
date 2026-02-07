@@ -12732,6 +12732,15 @@ def execute_code(state: AgentState) -> AgentState:
 
             decisioning_names = _extract_decisioning_required_names(contract)
 
+            required_artifacts = _resolve_required_outputs(contract, state)
+            if not isinstance(required_artifacts, list):
+                required_artifacts = []
+            required_artifacts = [
+                str(path).strip().lstrip("/").replace("\\", "/")
+                for path in required_artifacts
+                if path
+            ]
+
             request = {
                 "run_id": run_id,
                 "dataset_uri": None,
@@ -12745,22 +12754,26 @@ def execute_code(state: AgentState) -> AgentState:
                 "model": {"type": model_type, "params": model_params},
                 "cv": cv_cfg,
                 "decisioning_required_names": decisioning_names,
+                "required_outputs": required_artifacts,
             }
 
             if not os.path.exists(local_csv):
                 return {"error_message": "HEAVY_RUNNER: cleaned_data.csv missing", "execution_output": "HEAVY_RUNNER_ERROR: cleaned_data.csv missing", "budget_counters": counters}
 
-            # Download map: GCS filename -> local path
-            # Heavy runner uploads with full relative paths (data/metrics.json)
+            # Download map: GCS filename -> local path.
+            # Contract-required artifacts are downloaded with 1:1 local paths.
             download_map = {
-                "data/metrics.json": "data/metrics.json",
-                "data/scored_rows.csv": "data/scored_rows.csv",
-                "data/alignment_check.json": "data/alignment_check.json",
-                "model.joblib": os.path.join("artifacts", "heavy_model.joblib"),
                 "error.json": os.path.join("artifacts", "heavy_error.json"),
                 "status.json": os.path.join("artifacts", "heavy_status.json"),
                 "artifacts/execution_log.txt": os.path.join("artifacts", "heavy_execution_log.txt"),
             }
+            for rel_path in required_artifacts:
+                download_map.setdefault(rel_path, rel_path)
+            # Keep legacy artifacts as optional diagnostics (not required by runtime).
+            download_map.setdefault("data/metrics.json", "data/metrics.json")
+            download_map.setdefault("data/scored_rows.csv", "data/scored_rows.csv")
+            download_map.setdefault("data/alignment_check.json", "data/alignment_check.json")
+            download_map.setdefault("model.joblib", os.path.join("artifacts", "heavy_model.joblib"))
             support_files = []
             for rel_path in [
                 "data/cleaning_manifest.json",
@@ -12789,14 +12802,13 @@ def execute_code(state: AgentState) -> AgentState:
                         "model_type": model_type,
                         "model_params_keys": list(model_params.keys()) if isinstance(model_params, dict) else [],
                         "download_keys": list(download_map.keys()),
+                        "required_artifacts": required_artifacts,
                         "support_files": [item.get("path") for item in support_files],
                         "attempt_id": attempt_id,
                     },
                 )
             if run_id:
                 log_run_event(run_id, "heavy_runner_start", {"reason": heavy_reason})
-            # Required artifacts for output contract compliance (with full paths as uploaded by heavy runner)
-            required_artifacts = ["data/metrics.json", "data/scored_rows.csv", "data/alignment_check.json"]
             try:
                 heavy_result = launch_heavy_runner_job(
                     run_id=run_id or "unknown",
