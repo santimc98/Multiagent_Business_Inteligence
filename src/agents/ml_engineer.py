@@ -1715,6 +1715,39 @@ $strategy_json
          - If Evaluation Spec says requires_target=false, DO NOT train a supervised model. Produce descriptive/segmentation insights and still write data/metrics.json with model_trained=false.
          - CRITICAL: If 'ML_PLAN_CONTEXT' is present (in Data Audit), you MUST implement that plan exactly (training_rows_policy, train_filter, metric_policy, cv_policy). Do not deviate.
 
+         CONTRACT-FIRST EXECUTION MAP (MANDATORY)
+         - Before any training/model code, construct a CONTRACT_EXECUTION_MAP dictionary and print it.
+         - CONTRACT_EXECUTION_MAP must include at least:
+           * target_columns
+           * training_rows_policy
+           * train_filter
+           * primary_metric
+           * required_outputs
+           * allowed_feature_sets summary
+           * required_plot_ids (if any)
+         - If any mandatory map field is unknown or contradictory, raise ValueError and stop.
+         - Do not silently continue on ambiguous contract interpretation.
+
+         UNIVERSAL PREFLIGHT GATES (RUN BEFORE model.fit)
+         - Gate A: Required columns exist in the loaded dataframe.
+         - Gate B: Target is resolved and has at least 2 classes/values for supervised tasks.
+         - Gate C: Training mask/filter is explicitly applied and logged.
+         - Gate D: Forbidden/audit-only columns are excluded from modeling features.
+         - Gate E: Planned outputs paths are known and writable.
+         - Print a compact PRE_FLIGHT_GATES block with PASS/FAIL per gate.
+         - If any HARD gate fails, raise ValueError with the failing gate name.
+
+         API COMPATIBILITY & PORTABILITY GUARD (UNIVERSAL)
+         - Use portable pandas/sklearn patterns only.
+         - When extracting indices from boolean masks, prefer numpy-compatible operations after explicit conversion.
+         - Avoid brittle version-dependent behavior (chained assignment, implicit inplace mutation).
+         - Prefer explicit type conversion and shape checks before fit/predict.
+
+         ROOT-CAUSE REPAIR BEHAVIOR (ITERATIVE RUNS)
+         - If runtime feedback includes traceback, first patch the exact root cause before other refactors.
+         - Keep changes minimal: preserve previously valid logic and outputs.
+         - In Decision Log, include ROOT_CAUSE and FIX_APPLIED for the current iteration.
+
          TRAINING DATA SELECTION (STEWARD-DRIVEN)
          - Read execution_contract for outcome_columns and optional fields:
            * training_rows_rule
@@ -2056,6 +2089,11 @@ $strategy_json
           ❌ FAIL: features = [F1, F2, decision_variable].
 
         SENIOR WORKFLOW (do this, not a checklist)
+        Step -1) Contract-first map:
+        - Build and print CONTRACT_EXECUTION_MAP from execution_contract + ML_PLAN_CONTEXT before touching modeling logic.
+        - Validate that map.target_columns, map.train_filter, and map.required_outputs are all resolved.
+        - If unresolved, raise ValueError("CONTRACT_EXECUTION_MAP_INVALID: ...").
+
         Step 0) LOAD DIALECT FIRST (MANDATORY):
         - BEFORE any data loading, define load_dialect() function and call it to get (sep, decimal, encoding).
         - Pattern (copy this exactly):
@@ -2085,6 +2123,11 @@ $strategy_json
         - Build y as a pandas Series and enforce ONE variance guard:
         if y.nunique() <= 1: raise ValueError("CRITICAL: Target variable has no variation.")
         - Never add noise/jitter.
+
+        Step 1.5) Compatibility gate:
+        - Validate that boolean masks and indices use numpy-compatible operations.
+        - Avoid relying on dataframe/series-specific index helpers that may vary by runtime version for positional index extraction.
+        - Log COMPATIBILITY_GUARD: PASS when these checks are satisfied.
 
         Step 2) Diagnose the dataset quickly:
         - Determine task type (classification/regression) and key risks:
@@ -2192,7 +2235,7 @@ $strategy_json
         - If there are no alignment requirements provided, write WARN with failure_mode=data_limited and explain.
 
         FINAL SELF-CHECK
-        - Print QA_SELF_CHECK: PASS with a short bullet list of what was satisfied (target guard, split choice, model choice, required deliverables, no forbidden imports/ops).
+        - Print QA_SELF_CHECK: PASS with a short bullet list of what was satisfied (contract map, target guard, split choice, model choice, required deliverables, no forbidden imports/ops).
 
         Return Python code only.
 
