@@ -21,6 +21,8 @@ _CONTRACT_MISSING_CLEANING_GATES = "CONTRACT_MISSING_CLEANING_GATES"
 _LLM_DISABLED_WARNING = "LLM_DISABLED_NO_API_KEY"
 _LLM_PARSE_WARNING = "LLM_PARSE_FAILED"
 _LLM_CALL_WARNING = "LLM_CALL_FAILED"
+_UNEVALUATED_HARD_GATES_WARNING = "UNEVALUATED_HARD_GATES"
+_LLM_FAIL_CLOSED_REASON = "LLM_UNAVAILABLE_WITH_UNEVALUATED_HARD_GATES"
 
 _DEFAULT_ID_REGEX = r"(?i)(^id$|id$|entity|cod|code|key|partida|invoice|account)"
 _DEFAULT_PERCENT_REGEX = r"(?i)%|pct|percent|plazo"
@@ -376,6 +378,10 @@ def _review_cleaning_impl(
 
     if not client or provider == "none":
         deterministic_result["warnings"].append(_LLM_DISABLED_WARNING)
+        deterministic_result = _enforce_fail_closed_when_llm_unavailable(
+            deterministic_result,
+            reason=_LLM_DISABLED_WARNING,
+        )
         # V4.1: Enforce contract-strict rejection before returning
         final_result = _enforce_contract_strict_rejection(normalize_cleaning_reviewer_result(deterministic_result))
         return final_result, "LLM_DISABLED", "deterministic"
@@ -414,6 +420,10 @@ def _review_cleaning_impl(
             content = response.choices[0].message.content
     except Exception as exc:
         deterministic_result["warnings"].append(f"{_LLM_CALL_WARNING}: {exc}")
+        deterministic_result = _enforce_fail_closed_when_llm_unavailable(
+            deterministic_result,
+            reason=_LLM_CALL_WARNING,
+        )
         # V4.1: Enforce contract-strict rejection before returning
         final_result = _enforce_contract_strict_rejection(normalize_cleaning_reviewer_result(deterministic_result))
         return final_result, prompt, str(exc)
@@ -421,6 +431,10 @@ def _review_cleaning_impl(
     parsed = _parse_llm_json(content)
     if not parsed:
         deterministic_result["warnings"].append(_LLM_PARSE_WARNING)
+        deterministic_result = _enforce_fail_closed_when_llm_unavailable(
+            deterministic_result,
+            reason=_LLM_PARSE_WARNING,
+        )
         # V4.1: Enforce contract-strict rejection before returning
         final_result = _enforce_contract_strict_rejection(normalize_cleaning_reviewer_result(deterministic_result))
         return final_result, prompt, content
@@ -1210,7 +1224,119 @@ def _parse_llm_json(content: str) -> Optional[Dict[str, Any]]:
         parsed = json.loads(cleaned)
     except Exception:
         return None
-    return parsed if isinstance(parsed, dict) else None
+    expected_keys = {
+        "status",
+        "feedback",
+        "failed_checks",
+        "required_fixes",
+        "warnings",
+        "hard_failures",
+        "soft_failures",
+        "gate_results",
+        "contract_source_used",
+    }
+
+    def _is_reviewer_payload(obj: Any) -> bool:
+        return isinstance(obj, dict) and bool(expected_keys.intersection(set(obj.keys())))
+
+    if _is_reviewer_payload(parsed):
+        return parsed
+
+    if isinstance(parsed, list):
+        for item in parsed:
+            if _is_reviewer_payload(item):
+                return item
+        return None
+
+    if isinstance(parsed, dict):
+        for key in ("result", "review", "data", "payload", "response", "output"):
+            nested = parsed.get(key)
+            if _is_reviewer_payload(nested):
+                return nested
+            if isinstance(nested, list):
+                for item in nested:
+                    if _is_reviewer_payload(item):
+                        return item
+    return None
+
+
+def _collect_unresolved_hard_gates(result: Dict[str, Any]) -> List[str]:
+    unresolved: List[str] = []
+    seen: set[str] = set()
+    gate_results = result.get("gate_results")
+    if not isinstance(gate_results, list):
+        return unresolved
+    for gate in gate_results:
+        if not isinstance(gate, dict):
+            continue
+        severity = str(gate.get("severity", "HARD")).strip().upper()
+        passed = gate.get("passed")
+        if severity != "HARD" or passed is not None:
+            continue
+        name = str(gate.get("name") or "").strip() or "unknown_gate"
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unresolved.append(name)
+    return unresolved
+
+
+def _enforce_fail_closed_when_llm_unavailable(result: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
+    unresolved_hard = _collect_unresolved_hard_gates(result)
+    if not unresolved_hard:
+        return result
+
+    warnings = result.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    if reason and reason not in warnings:
+        warnings.append(reason)
+    unresolved_note = f"{_UNEVALUATED_HARD_GATES_WARNING}: {', '.join(unresolved_hard)}"
+    if unresolved_note not in warnings:
+        warnings.append(unresolved_note)
+    if _LLM_FAIL_CLOSED_REASON not in warnings:
+        warnings.append(_LLM_FAIL_CLOSED_REASON)
+    result["warnings"] = warnings
+
+    hard_failures = result.get("hard_failures")
+    if not isinstance(hard_failures, list):
+        hard_failures = []
+    for gate_name in unresolved_hard:
+        if gate_name not in hard_failures:
+            hard_failures.append(gate_name)
+    result["hard_failures"] = hard_failures
+
+    failed_checks = result.get("failed_checks")
+    if not isinstance(failed_checks, list):
+        failed_checks = []
+    for gate_name in unresolved_hard:
+        if gate_name not in failed_checks:
+            failed_checks.append(gate_name)
+    result["failed_checks"] = failed_checks
+
+    required_fixes = result.get("required_fixes")
+    if not isinstance(required_fixes, list):
+        required_fixes = []
+    fix_msg = (
+        "Cleaning reviewer could not evaluate all HARD gates because LLM output was unavailable/invalid. "
+        "Retry reviewer evaluation and ensure valid JSON response."
+    )
+    if fix_msg not in required_fixes:
+        required_fixes.insert(0, fix_msg)
+    result["required_fixes"] = required_fixes
+
+    result["status"] = "REJECTED"
+    feedback = str(result.get("feedback") or "").strip()
+    reject_prefix = (
+        "Cleaning reviewer rejected: unresolved HARD gates due to unavailable/invalid LLM review "
+        f"({', '.join(unresolved_hard)})."
+    )
+    if reject_prefix not in feedback:
+        result["feedback"] = f"{reject_prefix} {feedback}".strip()
+    return result
 
 
 def _merge_llm_with_deterministic(
