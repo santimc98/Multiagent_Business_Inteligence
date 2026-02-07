@@ -341,6 +341,17 @@ def get_outcome_columns(contract: Dict[str, Any]) -> List[str]:
     # Fallback: validation_requirements.params
     val_req = contract.get("validation_requirements")
     if isinstance(val_req, dict):
+        # Preferred direct fields under validation_requirements
+        for key in ("target_column", "outcome_column", "target", "outcome", "label"):
+            val = val_req.get(key)
+            if isinstance(val, str) and val.strip() and val.lower() != "unknown":
+                return [val.strip()]
+            if isinstance(val, list):
+                result = [str(v).strip() for v in val if v and str(v).lower() != "unknown"]
+                if result:
+                    return result
+
+        # Legacy nested fields under validation_requirements.params
         params = val_req.get("params", {})
         if isinstance(params, dict):
             for key in ("target", "target_column", "label_column", "outcome_column", "y_column"):

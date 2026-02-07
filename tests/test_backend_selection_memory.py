@@ -63,6 +63,39 @@ def test_backend_selection_promotes_to_heavy_after_e2b_memory_failure():
     assert reason == "e2b_memory_failure_fallback"
 
 
+def test_backend_selection_uses_heavy_for_large_dataset_with_uncertain_estimate():
+    state = {
+        "dataset_scale_hints": {
+            "file_mb": 120.0,
+            "est_rows": 1_400_000,
+            # Emulates stale hints without explicit cols.
+        },
+        # Runtime knows columns from inventory even when profile is sampled/truncated.
+        "column_inventory": [f"c{i}" for i in range(60)],
+    }
+    data_profile = {
+        "basic_stats": {
+            "n_rows": 7_800,
+            "n_cols": 0,
+        },
+        "dtypes": {},
+        "sampling": {
+            "was_sampled": True,
+            "total_rows_in_file": 1_400_000,
+        },
+    }
+    ml_plan = {"cv_policy": {"n_splits": 5}}
+
+    use_heavy, reason = graph_mod._should_use_heavy_runner(state, data_profile, ml_plan)
+
+    assert use_heavy is True
+    assert reason in {"large_dataset_uncertain_memory_estimate", "est_memory_exceeds_e2b_safe"}
+    decision = state.get("backend_memory_estimate") or {}
+    estimate = decision.get("estimate") or {}
+    assert (estimate.get("n_rows") or 0) >= 1_400_000
+    assert (estimate.get("n_cols") or 0) >= 60
+
+
 def test_memory_pressure_detector_matches_common_oom_signatures():
     assert graph_mod._is_memory_pressure_error("MemoryError: Unable to allocate 3.2 GiB")
     assert graph_mod._is_memory_pressure_error("Process Killed (exit code 137)")

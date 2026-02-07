@@ -7537,6 +7537,57 @@ def _dtype_bytes_estimate(dtype_name: str) -> float:
     return 24.0
 
 
+def _downgrade_confidence(label: str) -> str:
+    val = str(label or "").strip().lower()
+    if val == "high":
+        return "medium"
+    if val == "medium":
+        return "low"
+    return "low"
+
+
+def _infer_column_count_from_state(state: Dict[str, Any], hints: Dict[str, Any]) -> int:
+    candidates: List[int] = []
+
+    hint_cols = _safe_int((hints or {}).get("cols") or (hints or {}).get("n_cols"), 0)
+    if hint_cols > 0:
+        candidates.append(hint_cols)
+
+    inventory = state.get("column_inventory")
+    if isinstance(inventory, list) and inventory:
+        candidates.append(len(inventory))
+    else:
+        inv = _load_json_safe("data/column_inventory.json")
+        if isinstance(inv, dict):
+            cols = inv.get("columns") or inv.get("column_inventory")
+            if isinstance(cols, list) and cols:
+                candidates.append(len(cols))
+
+    contract = state.get("execution_contract")
+    if isinstance(contract, dict):
+        canonical = contract.get("canonical_columns")
+        if isinstance(canonical, list) and canonical:
+            candidates.append(len(canonical))
+
+    csv_path = state.get("ml_data_path") or "data/cleaned_data.csv"
+    if not os.path.exists(csv_path) and csv_path != "data/cleaned_data.csv":
+        csv_path = "data/cleaned_data.csv"
+    if os.path.exists(csv_path):
+        try:
+            sep = state.get("csv_sep") or ","
+            decimal = state.get("csv_decimal") or "."
+            encoding = state.get("csv_encoding") or "utf-8"
+            header = pd.read_csv(csv_path, nrows=0, sep=sep, decimal=decimal, encoding=encoding)
+            if hasattr(header, "columns"):
+                header_cols = len(list(header.columns))
+                if header_cols > 0:
+                    candidates.append(header_cols)
+        except Exception:
+            pass
+
+    return max(candidates) if candidates else 0
+
+
 def _estimate_dataframe_memory_gb(
     data_profile: Dict[str, Any],
     state: Dict[str, Any],
@@ -7546,14 +7597,46 @@ def _estimate_dataframe_memory_gb(
     basic = profile.get("basic_stats") if isinstance(profile.get("basic_stats"), dict) else {}
     dtypes = profile.get("dtypes") if isinstance(profile.get("dtypes"), dict) else {}
 
-    n_rows = _safe_int(basic.get("n_rows"), 0)
-    if n_rows <= 0:
-        n_rows = _safe_int(hints.get("est_rows"), 0)
+    sampling = profile.get("sampling") if isinstance(profile.get("sampling"), dict) else {}
+    profile_rows = _safe_int(basic.get("n_rows"), 0)
+    hint_rows = _safe_int(hints.get("est_rows"), 0)
+    sampling_rows = 0
+    if sampling.get("was_sampled"):
+        sampling_rows = _safe_int(sampling.get("total_rows_in_file"), 0)
+
+    row_candidates: List[tuple[str, int]] = []
+    if profile_rows > 0:
+        row_candidates.append(("profile_basic_stats", profile_rows))
+    if sampling_rows > 0:
+        row_candidates.append(("profile_sampling_total", sampling_rows))
+    if hint_rows > 0:
+        row_candidates.append(("dataset_scale_hint", hint_rows))
+
+    row_source = "none"
+    n_rows = 0
+    if row_candidates:
+        row_source, n_rows = max(row_candidates, key=lambda item: item[1])
+
     n_cols = _safe_int(basic.get("n_cols"), 0)
+    col_source = "profile_basic_stats" if n_cols > 0 else "none"
+    if n_cols <= 0:
+        basic_cols = basic.get("columns")
+        if isinstance(basic_cols, list) and basic_cols:
+            n_cols = len(basic_cols)
+            col_source = "profile_columns"
     if n_cols <= 0 and isinstance(dtypes, dict) and dtypes:
         n_cols = len(dtypes)
+        col_source = "profile_dtypes"
     if n_cols <= 0:
-        n_cols = _safe_int(hints.get("cols") or hints.get("n_cols"), 0)
+        hint_cols = _safe_int(hints.get("cols") or hints.get("n_cols"), 0)
+        if hint_cols > 0:
+            n_cols = hint_cols
+            col_source = "dataset_scale_hint"
+    if n_cols <= 0:
+        inferred_cols = _infer_column_count_from_state(state, hints)
+        if inferred_cols > 0:
+            n_cols = inferred_cols
+            col_source = "state_inventory_or_header"
 
     if n_rows <= 0 and n_cols <= 0:
         return {
@@ -7563,6 +7646,9 @@ def _estimate_dataframe_memory_gb(
             "raw_df_gb": None,
             "bytes_per_row": None,
             "dtype_confidence": "none",
+            "row_source": row_source,
+            "col_source": col_source,
+            "profile_sampled": bool(sampling.get("was_sampled")),
         }
 
     object_cols = 0
@@ -7573,13 +7659,26 @@ def _estimate_dataframe_memory_gb(
             if "object" in dtype or "string" in dtype:
                 object_cols += 1
             bytes_per_row += _dtype_bytes_estimate(dtype_name)
-        if n_cols <= 0:
-            n_cols = len(dtypes)
-        dtype_confidence = "high"
+        known_cols = len(dtypes)
+        if known_cols > 0 and n_cols > known_cols:
+            avg_bytes = bytes_per_row / float(max(known_cols, 1))
+            bytes_per_row += float(n_cols - known_cols) * avg_bytes
+            object_ratio = float(object_cols) / float(max(known_cols, 1))
+            object_cols = int(round(object_ratio * n_cols))
+            dtype_confidence = "medium"
+        else:
+            dtype_confidence = "high"
     else:
         # Unknown dtypes: assume mixed schema with overhead.
-        bytes_per_row = max(n_cols, 1) * 20.0
+        bytes_per_row = max(n_cols, 1) * 24.0
         dtype_confidence = "low"
+
+    if bool(sampling.get("was_sampled")):
+        dtype_confidence = _downgrade_confidence(dtype_confidence)
+    if row_source != "profile_basic_stats":
+        dtype_confidence = _downgrade_confidence(dtype_confidence)
+    if col_source not in {"profile_basic_stats", "profile_columns", "profile_dtypes"}:
+        dtype_confidence = _downgrade_confidence(dtype_confidence)
 
     # Index overhead + object overhead adjustment.
     index_bytes = max(n_rows, 1) * 8.0
@@ -7594,6 +7693,9 @@ def _estimate_dataframe_memory_gb(
         "bytes_per_row": float(bytes_per_row),
         "raw_df_gb": float(raw_df_gb),
         "dtype_confidence": dtype_confidence,
+        "row_source": row_source,
+        "col_source": col_source,
+        "profile_sampled": bool(sampling.get("was_sampled")),
     }
 
 
@@ -7641,7 +7743,7 @@ def _estimate_e2b_peak_memory_gb(
     if estimated_peak_gb < raw_df_gb:
         estimated_peak_gb = raw_df_gb + 0.5
 
-    confidence = "high" if df_est.get("dtype_confidence") == "high" else "medium"
+    confidence = str(df_est.get("dtype_confidence") or "low")
     return {
         "available": True,
         "estimated_peak_gb": float(estimated_peak_gb),
@@ -7654,6 +7756,9 @@ def _estimate_e2b_peak_memory_gb(
         "n_rows": int(n_rows),
         "n_cols": int(n_cols),
         "object_cols": int(object_cols),
+        "row_source": str(df_est.get("row_source") or "none"),
+        "col_source": str(df_est.get("col_source") or "none"),
+        "profile_sampled": bool(df_est.get("profile_sampled")),
     }
 
 
@@ -7685,6 +7790,27 @@ def _build_backend_memory_decision(
 
     if estimate.get("available"):
         peak_gb = _safe_float(estimate.get("estimated_peak_gb"), 0.0)
+        confidence = str(estimate.get("confidence") or "low").strip().lower()
+        sampled_profile = bool(estimate.get("profile_sampled"))
+        row_source = str(estimate.get("row_source") or "none").strip().lower()
+        col_source = str(estimate.get("col_source") or "none").strip().lower()
+        large_uncertain_estimate = bool(
+            heavy_size_signal
+            and (
+                confidence in {"low", "medium"}
+                or sampled_profile
+                or row_source != "profile_basic_stats"
+                or col_source not in {"profile_basic_stats", "profile_columns", "profile_dtypes"}
+            )
+        )
+        if large_uncertain_estimate:
+            return {
+                "use_heavy": True,
+                "reason": "large_dataset_uncertain_memory_estimate",
+                "safe_budget_gb": safe_budget_gb,
+                "e2b_limit_gb": e2b_limit_gb,
+                "estimate": estimate,
+            }
         if peak_gb <= safe_budget_gb:
             return {
                 "use_heavy": False,
@@ -12508,6 +12634,9 @@ def execute_code(state: AgentState) -> AgentState:
             required_outputs = _resolve_required_outputs(contract, state)
             expected_outputs = _resolve_expected_output_paths(contract, state)
             _purge_execution_outputs(required_outputs, expected_outputs)
+            local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
+            if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
+                local_csv = "data/cleaned_data.csv"
             column_inventory = state.get("column_inventory")
             if not isinstance(column_inventory, list) or not column_inventory:
                 inv = _load_json_safe("data/column_inventory.json")
@@ -12519,12 +12648,51 @@ def execute_code(state: AgentState) -> AgentState:
             if not isinstance(column_sets, dict) or not column_sets:
                 column_sets = _load_json_safe("data/column_sets.json") or {}
             roles = get_column_roles(contract) if isinstance(contract, dict) else {}
-            target_cols = get_outcome_columns(contract) or roles.get("outcome") or []
-            if not target_cols:
-                target_cols = list(state.get("target_columns") or [])
-            target_col = target_cols[0] if target_cols else None
+            target_col = _resolve_primary_target_column(eval_spec, contract, state.get("contract_min"))
+            if not target_col:
+                target_cols = get_outcome_columns(contract) or roles.get("outcome") or []
+                if not target_cols and isinstance(ml_plan, dict):
+                    train_filter = ml_plan.get("train_filter")
+                    if isinstance(train_filter, dict):
+                        tf_col = train_filter.get("column")
+                        tf_type = str(train_filter.get("type") or "").strip().lower()
+                        if isinstance(tf_col, str) and tf_col.strip() and tf_type in {
+                            "label_not_null",
+                            "label_notna",
+                            "label_present",
+                        }:
+                            target_cols = [tf_col.strip()]
+                if not target_cols:
+                    target_cols = list(state.get("target_columns") or [])
+                target_col = target_cols[0] if target_cols else None
+
+            header_cols: List[str] = []
+            if os.path.exists(local_csv):
+                try:
+                    header_df = pd.read_csv(
+                        local_csv,
+                        nrows=0,
+                        sep=csv_sep,
+                        decimal=csv_decimal,
+                        encoding=csv_encoding,
+                    )
+                    if hasattr(header_df, "columns"):
+                        header_cols = [str(col) for col in list(header_df.columns)]
+                except Exception:
+                    header_cols = []
+
+            if target_col and header_cols and target_col not in header_cols:
+                lower_map = {str(col).lower(): col for col in header_cols}
+                target_col = lower_map.get(str(target_col).lower(), target_col)
+
             if not target_col:
                 return {"error_message": "HEAVY_RUNNER: target column missing", "execution_output": "HEAVY_RUNNER_ERROR: target column missing", "budget_counters": counters}
+            if header_cols and target_col not in header_cols:
+                return {
+                    "error_message": f"HEAVY_RUNNER: target column '{target_col}' not present in cleaned_data header",
+                    "execution_output": "HEAVY_RUNNER_ERROR: target column missing",
+                    "budget_counters": counters,
+                }
 
             feature_cols = _resolve_heavy_feature_columns(column_inventory, column_sets, roles, target_col)
             problem_type = _infer_problem_type_for_heavy(contract, eval_spec or {}, data_profile or {}, target_col)
@@ -12579,9 +12747,6 @@ def execute_code(state: AgentState) -> AgentState:
                 "decisioning_required_names": decisioning_names,
             }
 
-            local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
-            if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
-                local_csv = "data/cleaned_data.csv"
             if not os.path.exists(local_csv):
                 return {"error_message": "HEAVY_RUNNER: cleaned_data.csv missing", "execution_output": "HEAVY_RUNNER_ERROR: cleaned_data.csv missing", "budget_counters": counters}
 
