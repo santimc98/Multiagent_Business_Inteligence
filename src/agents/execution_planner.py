@@ -6115,6 +6115,345 @@ class ExecutionPlannerAgent:
                 + previous_payload
             )
 
+        _SECTION_REQUIRED_TYPES: Dict[str, type] = {
+            "contract_version": str,
+            "strategy_title": str,
+            "business_objective": str,
+            "output_dialect": dict,
+            "canonical_columns": list,
+            "column_roles": dict,
+            "allowed_feature_sets": dict,
+            "artifact_requirements": dict,
+            "required_outputs": list,
+            "validation_requirements": dict,
+            "qa_gates": list,
+            "cleaning_gates": list,
+            "reviewer_gates": list,
+            "data_engineer_runbook": dict,
+            "ml_engineer_runbook": dict,
+            "iteration_policy": dict,
+        }
+
+        def _extract_section_payload(parsed: Any, keys: List[str]) -> Dict[str, Any]:
+            if not isinstance(parsed, dict):
+                return {}
+            payload: Dict[str, Any] = {}
+            for key in keys:
+                if key in parsed:
+                    payload[key] = parsed.get(key)
+            return payload
+
+        def _validate_section_payload(section_id: str, payload: Dict[str, Any], required_keys: List[str]) -> List[str]:
+            errors: List[str] = []
+            if not isinstance(payload, dict):
+                return [f"{section_id}: payload is not an object"]
+            for key in required_keys:
+                if key not in payload:
+                    errors.append(f"{section_id}: missing key '{key}'")
+                    continue
+                value = payload.get(key)
+                expected_type = _SECTION_REQUIRED_TYPES.get(key)
+                if expected_type and not isinstance(value, expected_type):
+                    errors.append(
+                        f"{section_id}: key '{key}' must be {expected_type.__name__}, got {type(value).__name__}"
+                    )
+                    continue
+                if expected_type in (dict, list) and not value:
+                    errors.append(f"{section_id}: key '{key}' cannot be empty")
+                    continue
+                if expected_type is str and not str(value).strip():
+                    errors.append(f"{section_id}: key '{key}' cannot be blank")
+            if "contract_version" in payload and str(payload.get("contract_version")) != CONTRACT_VERSION_V41:
+                errors.append(f"{section_id}: contract_version must be '{CONTRACT_VERSION_V41}'")
+            return errors
+
+        def _merge_section_payload(working: Dict[str, Any], section_payload: Dict[str, Any]) -> Dict[str, Any]:
+            merged = dict(working) if isinstance(working, dict) else {}
+            for key, value in section_payload.items():
+                if value is None:
+                    continue
+                merged[key] = value
+            return merged
+
+        def _build_section_prompt(
+            *,
+            section_id: str,
+            section_goal: str,
+            required_keys: List[str],
+            current_contract: Dict[str, Any],
+            original_inputs_text: str,
+        ) -> str:
+            return (
+                "You are Execution Contract Compiler.\n"
+                f"SECTION: {section_id}\n"
+                f"GOAL: {section_goal}\n"
+                "Return ONLY one JSON object with EXACT required keys for this section.\n"
+                "Do not include markdown, comments, explanations, or extra keys.\n"
+                "Use only data from ORIGINAL INPUTS; do not invent columns.\n"
+                "Keep semantics aligned with strategy/business objective.\n"
+                "required_outputs entries must be file paths.\n"
+                f"Required keys for this section: {json.dumps(required_keys)}\n\n"
+                "ORIGINAL INPUTS:\n"
+                + (original_inputs_text or "")
+                + "\n\nCURRENT CONTRACT DRAFT (from previous compiled sections):\n"
+                + json.dumps(current_contract or {}, ensure_ascii=False, indent=2)
+            )
+
+        def _build_section_repair_prompt(
+            *,
+            section_id: str,
+            section_goal: str,
+            required_keys: List[str],
+            current_contract: Dict[str, Any],
+            original_inputs_text: str,
+            previous_response_text: str | None,
+            previous_parse_feedback: str | None,
+            previous_validation_errors: List[str] | None,
+        ) -> str:
+            validation_feedback = "\n".join(f"- {msg}" for msg in (previous_validation_errors or [])) or "None"
+            parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
+            return (
+                "Repair the section output.\n"
+                f"SECTION: {section_id}\n"
+                f"GOAL: {section_goal}\n"
+                "Return ONLY one JSON object with EXACT required keys for this section.\n"
+                "No markdown, no comments, no extra keys.\n"
+                f"Required keys: {json.dumps(required_keys)}\n"
+                "Use ORIGINAL INPUTS as source of truth and keep compatibility with CURRENT CONTRACT DRAFT.\n"
+                "Do not invent columns not present in column_inventory.\n\n"
+                "ORIGINAL INPUTS:\n"
+                + (original_inputs_text or "")
+                + "\n\nCURRENT CONTRACT DRAFT:\n"
+                + json.dumps(current_contract or {}, ensure_ascii=False, indent=2)
+                + "\n\nValidation issues to fix:\n"
+                + validation_feedback
+                + "\n\nParse diagnostics:\n"
+                + parse_feedback
+                + "\n\nPrevious section response:\n"
+                + (previous_response_text or "")
+            )
+
+        def _compile_contract_by_sections(
+            *,
+            original_inputs_text: str,
+            model_names: List[str],
+            max_rounds: int,
+        ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+            section_specs: List[Dict[str, Any]] = [
+                {
+                    "id": "core",
+                    "goal": "Define core contract identity, schema columns, roles, and feature sets.",
+                    "required_keys": [
+                        "contract_version",
+                        "strategy_title",
+                        "business_objective",
+                        "output_dialect",
+                        "canonical_columns",
+                        "column_roles",
+                        "allowed_feature_sets",
+                    ],
+                    "optional": False,
+                },
+                {
+                    "id": "artifacts_validation",
+                    "goal": "Define artifact requirements, required outputs paths, and validation requirements.",
+                    "required_keys": [
+                        "artifact_requirements",
+                        "required_outputs",
+                        "validation_requirements",
+                    ],
+                    "optional": False,
+                },
+                {
+                    "id": "gates_runbooks",
+                    "goal": "Define QA/cleaning/reviewer gates and both engineer runbooks plus iteration policy.",
+                    "required_keys": [
+                        "qa_gates",
+                        "cleaning_gates",
+                        "reviewer_gates",
+                        "data_engineer_runbook",
+                        "ml_engineer_runbook",
+                        "iteration_policy",
+                    ],
+                    "optional": False,
+                },
+                {
+                    "id": "optional_context",
+                    "goal": "Add optional but useful execution context sections consistent with existing draft.",
+                    "required_keys": [
+                        "objective_analysis",
+                        "data_analysis",
+                        "preprocessing_requirements",
+                        "feature_engineering_plan",
+                        "leakage_execution_plan",
+                        "decisioning_requirements",
+                        "reporting_policy",
+                        "data_limited_mode",
+                        "execution_constraints",
+                        "missing_columns_handling",
+                        "visualization_requirements",
+                        "available_columns",
+                        "derived_columns",
+                        "unknowns",
+                        "assumptions",
+                        "notes_for_engineers",
+                        "training_rows_rule",
+                        "scoring_rows_rule",
+                        "secondary_scoring_subset",
+                        "data_partitioning_notes",
+                    ],
+                    "optional": True,
+                },
+            ]
+            working_contract: Dict[str, Any] = {}
+            section_diag: List[Dict[str, Any]] = []
+            invalid_candidate: Dict[str, Any] | None = None
+            invalid_raw: str | None = None
+            invalid_meta: Dict[str, Any] = {}
+
+            for spec in section_specs:
+                section_id = str(spec.get("id"))
+                section_goal = str(spec.get("goal") or "")
+                required_keys = [str(k) for k in (spec.get("required_keys") or []) if k]
+                optional_section = bool(spec.get("optional"))
+
+                current_prompt = _build_section_prompt(
+                    section_id=section_id,
+                    section_goal=section_goal,
+                    required_keys=required_keys,
+                    current_contract=working_contract,
+                    original_inputs_text=original_inputs_text,
+                )
+                prompt_name = f"prompt_section_{section_id}_r1.txt"
+                section_success = False
+                best_errors: List[str] = []
+                best_parse: str | None = None
+                best_raw: str | None = None
+                best_payload: Dict[str, Any] | None = None
+
+                for round_idx in range(1, max_rounds + 1):
+                    for model_idx, model_name in enumerate(model_names, start=1):
+                        response_name = f"response_section_{section_id}_r{round_idx}_m{model_idx}.txt"
+                        response_text = ""
+                        parse_error: Optional[Exception] = None
+                        finish_reason = None
+                        usage_metadata = None
+                        parsed: Any = None
+                        validation_errors: List[str] = []
+                        parse_feedback: str | None = None
+
+                        try:
+                            model_client = self._build_model_client(model_name)
+                            if model_client is None:
+                                parse_error = ValueError(f"Planner client unavailable for model {model_name}")
+                            else:
+                                response = model_client.generate_content(current_prompt)
+                                response_text = getattr(response, "text", "") or ""
+                                self.last_prompt = current_prompt
+                                self.last_response = response_text
+                                try:
+                                    candidates = getattr(response, "candidates", None)
+                                    if candidates:
+                                        finish_reason = getattr(candidates[0], "finish_reason", None)
+                                except Exception:
+                                    finish_reason = None
+                                usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
+                        except Exception as err:
+                            parse_error = err
+
+                        _persist_attempt(prompt_name, response_name, current_prompt, response_text)
+
+                        parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
+                        if parse_exc:
+                            parse_error = parse_exc
+                            parse_feedback = _build_parse_feedback(response_text, parse_error)
+                            validation_errors = ["section output is not parseable JSON object"]
+                        elif isinstance(parsed, dict):
+                            payload = _extract_section_payload(parsed, required_keys)
+                            if optional_section:
+                                payload = _extract_section_payload(parsed, required_keys)
+                                validation_errors = []
+                            else:
+                                validation_errors = _validate_section_payload(section_id, payload, required_keys)
+                            if not validation_errors:
+                                working_contract = _merge_section_payload(working_contract, payload)
+                                section_success = True
+                                parsed = payload
+                            else:
+                                if isinstance(payload, dict) and payload:
+                                    parsed = payload
+                        else:
+                            validation_errors = ["section output is not an object"]
+
+                        section_diag.append(
+                            {
+                                "compiler_mode": "sectional",
+                                "section_id": section_id,
+                                "section_round": round_idx,
+                                "model_name": model_name,
+                                "prompt_char_len": len(current_prompt or ""),
+                                "response_char_len": len(response_text or ""),
+                                "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                                "usage_metadata": usage_metadata,
+                                "parse_error_type": type(parse_error).__name__ if parse_error else None,
+                                "parse_error_message": str(parse_error) if parse_error else None,
+                                "section_success": section_success,
+                                "section_validation_errors": validation_errors,
+                            }
+                        )
+
+                        if section_success:
+                            break
+
+                        if isinstance(parsed, dict) and parsed:
+                            best_payload = parsed
+                        if response_text and best_raw is None:
+                            best_raw = response_text
+                        if parse_feedback and best_parse is None:
+                            best_parse = parse_feedback
+                        if validation_errors:
+                            best_errors = validation_errors
+
+                    if section_success:
+                        break
+                    if optional_section:
+                        break
+                    prompt_name = f"prompt_section_{section_id}_r{round_idx + 1}.txt"
+                    current_prompt = _build_section_repair_prompt(
+                        section_id=section_id,
+                        section_goal=section_goal,
+                        required_keys=required_keys,
+                        current_contract=working_contract,
+                        original_inputs_text=original_inputs_text,
+                        previous_response_text=best_raw,
+                        previous_parse_feedback=best_parse,
+                        previous_validation_errors=best_errors,
+                    )
+
+                if not section_success and not optional_section:
+                    invalid_candidate = best_payload if isinstance(best_payload, dict) else None
+                    invalid_raw = best_raw
+                    invalid_meta = {
+                        "mode": "sectional",
+                        "failed_section": section_id,
+                        "validation_errors": best_errors,
+                        "parse_feedback": best_parse,
+                        "section_diag": section_diag,
+                    }
+                    return None, {
+                        "invalid_candidate": invalid_candidate,
+                        "invalid_raw": invalid_raw,
+                        "invalid_meta": invalid_meta,
+                        "section_diag": section_diag,
+                    }
+
+            return working_contract, {
+                "invalid_candidate": invalid_candidate,
+                "invalid_raw": invalid_raw,
+                "invalid_meta": invalid_meta,
+                "section_diag": section_diag,
+            }
+
         def _build_contract_diagnostics(contract: Dict[str, Any], where: str, llm_success: bool) -> Dict[str, Any]:
             diagnostics: Dict[str, Any] = {
                 "schema_version": 1,
@@ -6466,15 +6805,100 @@ domain_expert_critique:
                 )
 
         if contract is None:
-            contract = {}
-            llm_success = False
-            planner_candidate_invalid = best_candidate if isinstance(best_candidate, dict) else None
-            planner_candidate_invalid_raw = best_response_text
-            planner_candidate_invalid_meta = {
-                "best_validation": best_validation if isinstance(best_validation, dict) else None,
-                "best_parse_feedback": best_parse_feedback,
-                "attempt_count": len(planner_diag),
-            }
+            sectional_rounds = 2
+            try:
+                sectional_rounds = max(1, int(os.getenv("EXECUTION_PLANNER_SECTION_ROUNDS", "2")))
+            except Exception:
+                sectional_rounds = 2
+
+            sectional_contract: Dict[str, Any] | None = None
+            sectional_payload: Dict[str, Any] = {}
+            try:
+                sectional_contract, sectional_payload = _compile_contract_by_sections(
+                    original_inputs_text=user_input,
+                    model_names=model_chain,
+                    max_rounds=sectional_rounds,
+                )
+            except Exception as section_err:
+                sectional_contract = None
+                sectional_payload = {
+                    "invalid_candidate": None,
+                    "invalid_raw": None,
+                    "invalid_meta": {
+                        "mode": "sectional",
+                        "section_compiler_exception": str(section_err),
+                    },
+                    "section_diag": [],
+                }
+
+            section_diag = sectional_payload.get("section_diag")
+            if isinstance(section_diag, list) and section_diag:
+                base_attempt_index = len(planner_diag)
+                for idx, item in enumerate(section_diag, start=1):
+                    if isinstance(item, dict):
+                        row = dict(item)
+                    else:
+                        row = {"compiler_mode": "sectional", "detail": str(item)}
+                    if "attempt_index" not in row:
+                        row["attempt_index"] = base_attempt_index + idx
+                    planner_diag.append(row)
+
+            sectional_validation: Dict[str, Any] | None = None
+            sectional_accepted = False
+            if isinstance(sectional_contract, dict) and sectional_contract:
+                try:
+                    sectional_validation = validate_contract_readonly(copy.deepcopy(sectional_contract))
+                except Exception as section_val_err:
+                    sectional_validation = {
+                        "status": "error",
+                        "accepted": False,
+                        "issues": [
+                            {
+                                "severity": "error",
+                                "rule": "sectional_contract_validation_exception",
+                                "message": str(section_val_err),
+                            }
+                        ],
+                        "summary": {"error_count": 1, "warning_count": 0},
+                    }
+                sectional_accepted = _contract_is_accepted(sectional_validation)
+
+            if sectional_accepted and isinstance(sectional_contract, dict):
+                contract = sectional_contract
+                llm_success = True
+                print("SUCCESS: Execution Planner succeeded via sectional compiler fallback.")
+            else:
+                contract = {}
+                llm_success = False
+                planner_candidate_invalid = (
+                    best_candidate
+                    if isinstance(best_candidate, dict)
+                    else (
+                        sectional_payload.get("invalid_candidate")
+                        if isinstance(sectional_payload.get("invalid_candidate"), dict)
+                        else (sectional_contract if isinstance(sectional_contract, dict) else None)
+                    )
+                )
+                planner_candidate_invalid_raw = (
+                    best_response_text
+                    if isinstance(best_response_text, str) and best_response_text.strip()
+                    else (
+                        sectional_payload.get("invalid_raw")
+                        if isinstance(sectional_payload.get("invalid_raw"), str)
+                        else None
+                    )
+                )
+                planner_candidate_invalid_meta = {
+                    "best_validation": best_validation if isinstance(best_validation, dict) else None,
+                    "best_parse_feedback": best_parse_feedback,
+                    "attempt_count": len(planner_diag),
+                    "sectional_validation": sectional_validation if isinstance(sectional_validation, dict) else None,
+                    "sectional_meta": (
+                        sectional_payload.get("invalid_meta")
+                        if isinstance(sectional_payload.get("invalid_meta"), dict)
+                        else {}
+                    ),
+                }
 
         if llm_success and resolved_target:
             print(
@@ -6484,7 +6908,11 @@ domain_expert_critique:
         self.last_contract_min = None
 
         if llm_success and planner_diag:
-            print(f"SUCCESS: Execution Planner succeeded on attempt {planner_diag[-1]['attempt_index']}")
+            last_attempt = planner_diag[-1]
+            if isinstance(last_attempt, dict) and last_attempt.get("attempt_index") is not None:
+                print(f"SUCCESS: Execution Planner succeeded on attempt {last_attempt.get('attempt_index')}")
+            else:
+                print("SUCCESS: Execution Planner succeeded.")
         where = "execution_planner:final_contract" if llm_success else "execution_planner:quality_gate_failed"
         return _finalize_and_persist(contract, where=where, llm_success=llm_success)
 
