@@ -31,11 +31,17 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 
 
-# Required outputs that must exist for execute_code mode to be considered successful
-REQUIRED_OUTPUTS_EXECUTE_CODE = [
+# Required outputs for execute_code mode in ML execution.
+REQUIRED_OUTPUTS_EXECUTE_CODE_ML = [
     "data/metrics.json",
     "data/scored_rows.csv",
     "data/alignment_check.json",
+]
+
+# Required outputs for execute_code mode in DE execution.
+REQUIRED_OUTPUTS_EXECUTE_CODE_DE = [
+    "data/cleaned_data.csv",
+    "data/cleaning_manifest.json",
 ]
 
 
@@ -201,7 +207,7 @@ def _run_script(script_path: str, work_dir: str, timeout_seconds: int = 1200) ->
         return -1, e.stdout or "", f"TIMEOUT: Script exceeded {timeout_seconds}s limit\n{e.stderr or ''}"
 
 
-def _collect_output_files(work_dir: str) -> List[str]:
+def _collect_output_files(work_dir: str, skip_paths: Optional[set[str]] = None) -> List[str]:
     """
     Collect all output files from working directory.
 
@@ -219,10 +225,7 @@ def _collect_output_files(work_dir: str) -> List[str]:
         "report",
         "artifacts",
     ]
-    skip = {
-        os.path.join("data", "cleaned_data.csv"),
-        os.path.join("data", "cleaned_full.csv"),
-    }
+    skip = set(skip_paths or set())
     collected = []
     for root in roots:
         base = os.path.join(work_dir, root)
@@ -257,12 +260,34 @@ def _check_required_outputs(work_dir: str, required: List[str]) -> Tuple[List[st
     return present, missing
 
 
+def _resolve_execute_code_mode(payload: Dict[str, Any]) -> Tuple[str, List[str], set[str]]:
+    """
+    Resolve execute_code behavior from payload mode.
+
+    Returns:
+        (mode, required_outputs, skip_paths_for_upload_scan)
+    """
+    mode = str(payload.get("mode") or "execute_code").strip().lower()
+    if mode == "data_engineer_cleaning":
+        # For DE, cleaned_data.csv is a required output and must be uploaded.
+        required = list(REQUIRED_OUTPUTS_EXECUTE_CODE_DE)
+        skip_paths = {os.path.join("data", "cleaned_full.csv")}
+        return mode, required, skip_paths
+    required = list(REQUIRED_OUTPUTS_EXECUTE_CODE_ML)
+    # For ML, treat cleaned datasets as input artifacts to avoid re-upload noise.
+    skip_paths = {
+        os.path.join("data", "cleaned_data.csv"),
+        os.path.join("data", "cleaned_full.csv"),
+    }
+    return mode, required, skip_paths
+
+
 def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> int:
     """
     Execute user-provided Python script (same behavior as E2B sandbox).
 
     This mode:
-    1. Downloads cleaned data to data/cleaned_data.csv
+    1. Downloads dataset to payload data_path (e.g., data/raw.csv or data/cleaned_data.csv)
     2. Downloads support files (manifests, column configs, etc.)
     3. Executes the ML script from the working directory
     4. Collects and uploads all generated outputs
@@ -278,6 +303,9 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     """
     work_dir = "/tmp/run"
     os.makedirs(work_dir, exist_ok=True)
+
+    mode, required_outputs, skip_paths = _resolve_execute_code_mode(payload)
+    log(f"execute_code.mode={mode}; required_outputs={required_outputs}")
 
     # Setup data directories (same structure as E2B)
     for subdir in ["data", "static/plots", "report", "artifacts"]:
@@ -366,7 +394,7 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
 
     # Collect and upload outputs
     log("Collecting output files...")
-    collected_outputs = _collect_output_files(work_dir)
+    collected_outputs = _collect_output_files(work_dir, skip_paths=skip_paths)
     log(f"Found {len(collected_outputs)} output files")
 
     uploaded = []
@@ -377,8 +405,8 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
             uploaded.append(rel_path)
             log(f"  Uploaded: {rel_path}")
 
-    # Verify required outputs
-    present, missing = _check_required_outputs(work_dir, REQUIRED_OUTPUTS_EXECUTE_CODE)
+    # Verify required outputs for this execute_code mode
+    present, missing = _check_required_outputs(work_dir, required_outputs)
 
     if missing:
         log(f"WARNING: Missing required outputs: {missing}")
@@ -404,6 +432,7 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
         "ok": True,
         "run_id": run_id,
         "mode": "execute_code",
+        "execute_code_mode": mode,
         "exit_code": exit_code,
         "execution_time_seconds": round(exec_time, 2),
         "uploaded_outputs": uploaded,

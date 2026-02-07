@@ -67,3 +67,39 @@ def test_memory_pressure_detector_matches_common_oom_signatures():
     assert graph_mod._is_memory_pressure_error("MemoryError: Unable to allocate 3.2 GiB")
     assert graph_mod._is_memory_pressure_error("Process Killed (exit code 137)")
     assert not graph_mod._is_memory_pressure_error("ValueError: invalid literal for int()")
+
+
+def test_extract_required_columns_falls_back_to_canonical_columns():
+    contract = {
+        "canonical_columns": ["id", "target", "feature_a"],
+        "artifact_requirements": {},
+    }
+    required, source = graph_mod._extract_required_columns_from_contract(contract, {})
+    assert required == ["id", "target", "feature_a"]
+    assert source == "contract.canonical_columns"
+
+
+def test_de_backend_selection_uses_total_header_columns_signal():
+    state = {
+        "dataset_scale_hints": {
+            "file_mb": 278.0,
+            "est_rows": 1_498_232,
+            # intentionally missing "cols" to emulate stale/incomplete hint payload
+        }
+    }
+    use_heavy, reason = graph_mod._should_use_heavy_runner_for_data_engineer(
+        state,
+        required_cols_count=10,
+        total_cols_count=60,
+    )
+    assert use_heavy is True
+    assert reason in {"de_est_memory_exceeds_e2b_safe", "de_memory_uncertain_guard"}
+    decision = state.get("de_backend_memory_estimate") or {}
+    assert decision.get("n_cols") == 60
+
+
+def test_de_heavy_failure_does_not_fallback_to_e2b_in_same_cycle():
+    assert graph_mod._should_run_e2b_after_de_heavy_result(None) is True
+    assert graph_mod._should_run_e2b_after_de_heavy_result({"unavailable": True}) is True
+    assert graph_mod._should_run_e2b_after_de_heavy_result({"ok": True, "unavailable": False}) is False
+    assert graph_mod._should_run_e2b_after_de_heavy_result({"ok": False, "unavailable": False}) is False

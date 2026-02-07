@@ -7756,11 +7756,14 @@ def _should_use_heavy_runner(
 def _build_de_backend_memory_decision(
     state: Dict[str, Any],
     required_cols_count: int = 0,
+    total_cols_count: int = 0,
 ) -> Dict[str, Any]:
     hints = state.get("dataset_scale_hints") or {}
     file_mb = _safe_float(hints.get("file_mb"), 0.0)
     est_rows = _safe_int(hints.get("est_rows"), 0)
     n_cols = _safe_int(hints.get("cols") or hints.get("n_cols"), 0)
+    if total_cols_count > 0:
+        n_cols = max(n_cols, _safe_int(total_cols_count, 0))
     if n_cols <= 0:
         n_cols = max(0, _safe_int(required_cols_count, 0))
 
@@ -7862,6 +7865,7 @@ def _build_de_backend_memory_decision(
 def _should_use_heavy_runner_for_data_engineer(
     state: Dict[str, Any],
     required_cols_count: int = 0,
+    total_cols_count: int = 0,
 ) -> tuple[bool, str]:
     if state.get("heavy_runner_unavailable"):
         return False, "unavailable"
@@ -7871,7 +7875,11 @@ def _should_use_heavy_runner_for_data_engineer(
         return True, "forced"
     if state.get("de_force_heavy_runner"):
         return True, "forced_retry"
-    decision = _build_de_backend_memory_decision(state, required_cols_count=required_cols_count)
+    decision = _build_de_backend_memory_decision(
+        state,
+        required_cols_count=required_cols_count,
+        total_cols_count=total_cols_count,
+    )
     state["de_backend_memory_estimate"] = decision
     return bool(decision.get("use_heavy")), str(decision.get("reason") or "unknown")
 
@@ -8035,6 +8043,20 @@ def _execute_data_engineer_via_heavy_runner(
         "error_details": error_details,
         "heavy_result": heavy_result,
     }
+
+
+def _should_run_e2b_after_de_heavy_result(de_heavy_result: Dict[str, Any] | None) -> bool:
+    """
+    Decide whether to run E2B after a DE heavy-runner attempt.
+
+    Policy:
+    - No heavy result: run E2B.
+    - Heavy runner unavailable: run E2B fallback.
+    - Heavy runner attempted (ok or failed): do not run E2B in same cycle.
+    """
+    if not isinstance(de_heavy_result, dict):
+        return True
+    return bool(de_heavy_result.get("unavailable"))
 
 
 def _finalize_heavy_execution(
@@ -8301,6 +8323,15 @@ def _extract_required_columns_from_contract(
             required = schema_binding.get("required_columns")
             if isinstance(required, list) and required:
                 return [str(c) for c in required if c], source_name
+    # Keep DE required columns in sync with DE view semantics:
+    # when clean_dataset/schema_binding are absent, canonical_columns are the
+    # contract-declared input columns and must seed required_columns.json.
+    for source_name, cfg in sources:
+        if not isinstance(cfg, dict):
+            continue
+        canonical = cfg.get("canonical_columns")
+        if isinstance(canonical, list) and canonical:
+            return [str(c) for c in canonical if c], f"{source_name}.canonical_columns"
     return [], ""
 
 
@@ -8889,6 +8920,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         de_use_heavy_runner, de_heavy_reason = _should_use_heavy_runner_for_data_engineer(
             state if isinstance(state, dict) else {},
             required_cols_count=len(required_cols or []),
+            total_cols_count=n_cols,
         )
     if run_id:
         try:
@@ -9520,8 +9552,21 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         print(
                             f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}"
                         )
+            run_e2b_after_heavy = _should_run_e2b_after_de_heavy_result(de_heavy_result)
+            if not run_e2b_after_heavy and isinstance(de_heavy_result, dict) and not de_heavy_result.get("ok"):
+                heavy_error = str(
+                    de_heavy_result.get("error_details")
+                    or "HEAVY_RUNNER_ERROR: data engineer execution failed."
+                )
+                print("HEAVY_RUNNER_DE_FAILED: skipping E2B fallback for this iteration.")
+                return {
+                    "cleaning_code": code,
+                    "cleaned_data_preview": "Error: Cleaning Failed",
+                    "error_message": heavy_error,
+                    "budget_counters": counters,
+                }
 
-            if not (isinstance(de_heavy_result, dict) and de_heavy_result.get("ok")):
+            if run_e2b_after_heavy and not (isinstance(de_heavy_result, dict) and de_heavy_result.get("ok")):
                 # load_dotenv() is called at module level or main
                 api_key = os.getenv("E2B_API_KEY")
                 if not api_key:

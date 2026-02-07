@@ -1,0 +1,67 @@
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+
+def _load_heavy_train_module():
+    # Provide a lightweight stub when google cloud client isn't installed.
+    if "google.cloud.storage" not in sys.modules:
+        google_mod = sys.modules.setdefault("google", types.ModuleType("google"))
+        cloud_mod = sys.modules.setdefault("google.cloud", types.ModuleType("google.cloud"))
+        storage_mod = sys.modules.setdefault("google.cloud.storage", types.ModuleType("google.cloud.storage"))
+
+        class _DummyClient:
+            pass
+
+        storage_mod.Client = _DummyClient
+        setattr(cloud_mod, "storage", storage_mod)
+        setattr(google_mod, "cloud", cloud_mod)
+
+    module_path = Path(__file__).resolve().parents[1] / "cloudrun" / "heavy_runner" / "heavy_train.py"
+    spec = importlib.util.spec_from_file_location("heavy_train_module_for_tests", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_resolve_execute_code_mode_for_data_engineer():
+    heavy_train = _load_heavy_train_module()
+    mode, required, skip_paths = heavy_train._resolve_execute_code_mode({"mode": "data_engineer_cleaning"})
+    assert mode == "data_engineer_cleaning"
+    assert "data/cleaned_data.csv" in required
+    assert "data/cleaning_manifest.json" in required
+    assert "data/cleaned_data.csv" not in skip_paths
+
+
+def test_resolve_execute_code_mode_for_ml_default():
+    heavy_train = _load_heavy_train_module()
+    mode, required, skip_paths = heavy_train._resolve_execute_code_mode({"mode": "execute_code"})
+    normalized_skip = {str(path).replace("\\", "/") for path in skip_paths}
+    assert mode == "execute_code"
+    assert "data/metrics.json" in required
+    assert "data/scored_rows.csv" in required
+    assert "data/alignment_check.json" in required
+    assert "data/cleaned_data.csv" in normalized_skip
+
+
+def test_collect_output_files_respects_skip_paths(tmp_path):
+    heavy_train = _load_heavy_train_module()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "raw.csv").write_text("a\n1\n", encoding="utf-8")
+    (data_dir / "cleaned_data.csv").write_text("a\n1\n", encoding="utf-8")
+    (data_dir / "cleaning_manifest.json").write_text("{}", encoding="utf-8")
+
+    collected_ml = heavy_train._collect_output_files(
+        str(tmp_path),
+        skip_paths={"data/cleaned_data.csv"},
+    )
+    collected_de = heavy_train._collect_output_files(
+        str(tmp_path),
+        skip_paths={"data/cleaned_full.csv"},
+    )
+
+    assert "data/cleaned_data.csv" not in collected_ml
+    assert "data/cleaned_data.csv" in collected_de
