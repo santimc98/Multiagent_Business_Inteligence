@@ -44,6 +44,9 @@ REQUIRED_OUTPUTS_EXECUTE_CODE_DE = [
     "data/cleaning_manifest.json",
 ]
 
+# Protocol marker for orchestrator/runner compatibility.
+HEAVY_RUNNER_PROTOCOL_VERSION = "de_mode_v1"
+
 
 def log(message: str) -> None:
     """Print timestamped log message."""
@@ -268,7 +271,9 @@ def _resolve_execute_code_mode(payload: Dict[str, Any]) -> Tuple[str, List[str],
         (mode, required_outputs, skip_paths_for_upload_scan)
     """
     mode = str(payload.get("mode") or "execute_code").strip().lower()
-    if mode == "data_engineer_cleaning":
+    # Accept both legacy and explicit DE mode tags.
+    if mode in {"data_engineer_cleaning", "data_engineer"}:
+        mode = "data_engineer_cleaning"
         # For DE, cleaned_data.csv is a required output and must be uploaded.
         required = list(REQUIRED_OUTPUTS_EXECUTE_CODE_DE)
         skip_paths = {os.path.join("data", "cleaned_full.csv")}
@@ -305,7 +310,12 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     os.makedirs(work_dir, exist_ok=True)
 
     mode, required_outputs, skip_paths = _resolve_execute_code_mode(payload)
-    log(f"execute_code.mode={mode}; required_outputs={required_outputs}")
+    requested_mode = str(payload.get("mode") or "execute_code").strip().lower()
+    log(
+        "execute_code.mode="
+        + str(mode)
+        + f"; requested_mode={requested_mode}; required_outputs={required_outputs}"
+    )
 
     # Setup data directories (same structure as E2B)
     for subdir in ["data", "static/plots", "report", "artifacts"]:
@@ -415,6 +425,9 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
             {
                 "ok": False,
                 "run_id": run_id,
+                "runner_protocol_version": HEAVY_RUNNER_PROTOCOL_VERSION,
+                "requested_mode": requested_mode,
+                "resolved_mode": mode,
                 "error": "missing_required_outputs",
                 "missing": missing,
                 "present": present,
@@ -433,6 +446,8 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
         "run_id": run_id,
         "mode": "execute_code",
         "execute_code_mode": mode,
+        "requested_mode": requested_mode,
+        "runner_protocol_version": HEAVY_RUNNER_PROTOCOL_VERSION,
         "exit_code": exit_code,
         "execution_time_seconds": round(exec_time, 2),
         "uploaded_outputs": uploaded,

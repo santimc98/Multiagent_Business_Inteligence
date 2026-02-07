@@ -7884,6 +7884,42 @@ def _should_use_heavy_runner_for_data_engineer(
     return bool(decision.get("use_heavy")), str(decision.get("reason") or "unknown")
 
 
+def _detect_de_heavy_runner_protocol_mismatch(
+    request_mode: Any,
+    error_payload: Any,
+    downloaded: Dict[str, Any],
+    heavy_log_text: str,
+) -> bool:
+    """Detect stale heavy-runner behavior: DE mode requested but ML outputs enforced."""
+    mode_text = str(request_mode or "").strip().lower()
+    if mode_text not in {"data_engineer_cleaning", "data_engineer"}:
+        return False
+    err_parts: List[str] = []
+    if isinstance(error_payload, dict):
+        err_parts.extend(
+            [
+                str(error_payload.get("error") or ""),
+                str(error_payload.get("message") or ""),
+                str(error_payload.get("stacktrace") or ""),
+                str(error_payload.get("raw") or ""),
+            ]
+        )
+    elif error_payload:
+        err_parts.append(str(error_payload))
+    err_text = " ".join(part for part in err_parts if part).lower()
+    missing_ml_outputs = all(
+        token in err_text
+        for token in ["data/metrics.json", "data/scored_rows.csv", "data/alignment_check.json"]
+    )
+    if not missing_ml_outputs:
+        return False
+    cleaned_success_logged = "cleaned data written to data/cleaned_data.csv" in str(heavy_log_text or "").lower()
+    downloaded_keys = set(downloaded.keys()) if isinstance(downloaded, dict) else set()
+    cleaned_output_seen = "data/cleaned_data.csv" in downloaded_keys
+    manifest_output_seen = "data/cleaning_manifest.json" in downloaded_keys
+    return bool(cleaned_success_logged or cleaned_output_seen or manifest_output_seen)
+
+
 def _execute_data_engineer_via_heavy_runner(
     *,
     state: Dict[str, Any],
@@ -7922,6 +7958,12 @@ def _execute_data_engineer_via_heavy_runner(
         "dataset_uri": None,
         "output_uri": None,
         "mode": "data_engineer_cleaning",
+        "orchestrator_protocol": {
+            "name": "latiax_heavy_runner_execute_code",
+            "version": "de_mode_v1",
+            "expected_execute_mode": "data_engineer_cleaning",
+            "step": "data_engineer",
+        },
         "read": {"sep": csv_sep, "decimal": csv_decimal, "encoding": csv_encoding},
     }
     if run_id:
@@ -7929,7 +7971,7 @@ def _execute_data_engineer_via_heavy_runner(
             run_id,
             "heavy_runner_request",
             {
-                "mode": "data_engineer",
+                "mode": request.get("mode"),
                 "reason": reason,
                 "attempt_id": attempt_id,
                 "download_keys": list(download_map.keys()),
@@ -7992,7 +8034,50 @@ def _execute_data_engineer_via_heavy_runner(
     missing = list(heavy_result.get("missing_artifacts") or [])
     status_ok = str(heavy_result.get("status") or "").lower() == "success"
     required_ok = all(path in downloaded for path in required_artifacts)
-    ok = bool(status_ok and required_ok and not heavy_result.get("error") and not heavy_result.get("job_failed"))
+    protocol_mismatch = False
+    protocol_mismatch_hint = ""
+    try:
+        heavy_log_text = ""
+        heavy_log_path = os.path.join("artifacts", "heavy_execution_log.txt")
+        if os.path.exists(heavy_log_path):
+            try:
+                with open(heavy_log_path, "r", encoding="utf-8", errors="replace") as f_log:
+                    heavy_log_text = f_log.read().lower()
+            except Exception:
+                heavy_log_text = ""
+        if _detect_de_heavy_runner_protocol_mismatch(
+            request.get("mode"),
+            heavy_result.get("error"),
+            downloaded,
+            heavy_log_text,
+        ):
+            protocol_mismatch = True
+            protocol_mismatch_hint = (
+                "Heavy runner appears to enforce ML required outputs while DE mode was requested. "
+                "This usually means Cloud Run job is running an outdated image without DE mode support. "
+                "Redeploy cloudrun/heavy_runner image and retry."
+            )
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "heavy_runner_protocol_mismatch",
+                    {
+                        "step": "data_engineer",
+                        "attempt_id": attempt_id,
+                        "requested_mode": request.get("mode"),
+                        "downloaded": list(downloaded.keys()),
+                    },
+                )
+    except Exception:
+        protocol_mismatch = False
+        protocol_mismatch_hint = ""
+    ok = bool(
+        status_ok
+        and required_ok
+        and not heavy_result.get("error")
+        and not heavy_result.get("job_failed")
+        and not protocol_mismatch
+    )
 
     heavy_log_path = os.path.join("artifacts", "heavy_execution_log.txt")
     try:
@@ -8010,6 +8095,8 @@ def _execute_data_engineer_via_heavy_runner(
     error_details = ""
     if not ok:
         err_parts: List[str] = []
+        if protocol_mismatch and protocol_mismatch_hint:
+            err_parts.append(protocol_mismatch_hint)
         if heavy_result.get("job_error"):
             err_parts.append(str(heavy_result.get("job_error")))
         if heavy_result.get("error"):
@@ -8018,10 +8105,13 @@ def _execute_data_engineer_via_heavy_runner(
             err_parts.append(f"missing_artifacts={missing}")
         if not err_parts:
             err_parts.append(f"status={heavy_result.get('status')}")
-        error_details = "HEAVY_RUNNER_ERROR: " + " | ".join(err_parts)
+        if protocol_mismatch:
+            error_details = "HEAVY_RUNNER_PROTOCOL_MISMATCH: " + " | ".join(err_parts)
+        else:
+            error_details = "HEAVY_RUNNER_ERROR: " + " | ".join(err_parts)
         error_payload = {
             "stage": "heavy_runner_error",
-            "exception_type": "HeavyRunnerError",
+            "exception_type": "HeavyRunnerProtocolMismatch" if protocol_mismatch else "HeavyRunnerError",
             "exception_msg": error_details,
             "traceback": error_details,
             "attempt": attempt_id,
@@ -8039,7 +8129,8 @@ def _execute_data_engineer_via_heavy_runner(
 
     return {
         "ok": ok,
-        "unavailable": False,
+        "unavailable": bool(protocol_mismatch),
+        "protocol_mismatch": bool(protocol_mismatch),
         "error_details": error_details,
         "heavy_result": heavy_result,
     }

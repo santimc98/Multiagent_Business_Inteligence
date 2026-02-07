@@ -103,3 +103,37 @@ def test_de_heavy_failure_does_not_fallback_to_e2b_in_same_cycle():
     assert graph_mod._should_run_e2b_after_de_heavy_result({"unavailable": True}) is True
     assert graph_mod._should_run_e2b_after_de_heavy_result({"ok": True, "unavailable": False}) is False
     assert graph_mod._should_run_e2b_after_de_heavy_result({"ok": False, "unavailable": False}) is False
+
+
+def test_detect_de_heavy_runner_protocol_mismatch_from_ml_missing_outputs():
+    error_payload = {
+        "error": "Script completed but missing required outputs: ['data/metrics.json', 'data/scored_rows.csv', 'data/alignment_check.json']"
+    }
+    downloaded = {"data/cleaning_manifest.json": "data/cleaning_manifest.json"}
+    heavy_log = "SUCCESS: Cleaned data written to data/cleaned_data.csv"
+    assert (
+        graph_mod._detect_de_heavy_runner_protocol_mismatch(
+            "data_engineer_cleaning",
+            error_payload,
+            downloaded,
+            heavy_log,
+        )
+        is True
+    )
+
+
+def test_detect_de_heavy_runner_protocol_mismatch_requires_de_mode():
+    error_payload = {
+        "error": "Script completed but missing required outputs: ['data/metrics.json', 'data/scored_rows.csv', 'data/alignment_check.json']"
+    }
+    downloaded = {"data/cleaning_manifest.json": "data/cleaning_manifest.json"}
+    heavy_log = "SUCCESS: Cleaned data written to data/cleaned_data.csv"
+    assert (
+        graph_mod._detect_de_heavy_runner_protocol_mismatch(
+            "execute_code",
+            error_payload,
+            downloaded,
+            heavy_log,
+        )
+        is False
+    )

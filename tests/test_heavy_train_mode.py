@@ -35,6 +35,15 @@ def test_resolve_execute_code_mode_for_data_engineer():
     assert "data/cleaned_data.csv" not in skip_paths
 
 
+def test_resolve_execute_code_mode_for_data_engineer_legacy_alias():
+    heavy_train = _load_heavy_train_module()
+    mode, required, skip_paths = heavy_train._resolve_execute_code_mode({"mode": "data_engineer"})
+    assert mode == "data_engineer_cleaning"
+    assert "data/cleaned_data.csv" in required
+    assert "data/cleaning_manifest.json" in required
+    assert "data/cleaned_data.csv" not in skip_paths
+
+
 def test_resolve_execute_code_mode_for_ml_default():
     heavy_train = _load_heavy_train_module()
     mode, required, skip_paths = heavy_train._resolve_execute_code_mode({"mode": "execute_code"})
