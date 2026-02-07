@@ -4644,6 +4644,7 @@ def _verify_run_bundle_contracts(
         run_id,
         [
             _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+            _abs_in_work(work_dir_abs, "data/execution_contract_diagnostics.json"),
             _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
             _abs_in_work(work_dir_abs, "data/plan.json"),
         ],
@@ -7752,6 +7753,290 @@ def _should_use_heavy_runner(
     return bool(memory_decision.get("use_heavy")), str(memory_decision.get("reason") or "unknown")
 
 
+def _build_de_backend_memory_decision(
+    state: Dict[str, Any],
+    required_cols_count: int = 0,
+) -> Dict[str, Any]:
+    hints = state.get("dataset_scale_hints") or {}
+    file_mb = _safe_float(hints.get("file_mb"), 0.0)
+    est_rows = _safe_int(hints.get("est_rows"), 0)
+    n_cols = _safe_int(hints.get("cols") or hints.get("n_cols"), 0)
+    if n_cols <= 0:
+        n_cols = max(0, _safe_int(required_cols_count, 0))
+
+    e2b_limit_gb = _safe_float(os.getenv("E2B_MEMORY_LIMIT_GB"), 8.0)
+    safe_fraction = _safe_float(os.getenv("E2B_MEMORY_SAFE_FRACTION"), 0.72)
+    min_margin_gb = _safe_float(os.getenv("E2B_MEMORY_MIN_MARGIN_GB"), 1.5)
+    safe_budget_gb = min(e2b_limit_gb * safe_fraction, max(0.1, e2b_limit_gb - min_margin_gb))
+
+    bytes_per_cell = _safe_float(os.getenv("DE_STRING_BYTES_PER_CELL"), 48.0)
+    working_mult = _safe_float(os.getenv("DE_E2B_WORKING_MULT"), 2.2)
+    base_overhead_gb = _safe_float(os.getenv("DE_E2B_BASE_OVERHEAD_GB"), 0.8)
+
+    raw_df_gb = None
+    estimated_peak_gb = None
+    if est_rows > 0 and n_cols > 0:
+        raw_bytes = float(est_rows) * float(n_cols) * max(bytes_per_cell, 8.0)
+        raw_df_gb = raw_bytes / float(1024 ** 3)
+        estimated_peak_gb = (raw_df_gb * max(working_mult, 1.0)) + max(base_overhead_gb, 0.0)
+        if file_mb >= 200:
+            estimated_peak_gb += 0.5
+
+    large_signal = bool(file_mb >= 200 or est_rows >= 800_000 or n_cols >= 1_000)
+    medium_signal = bool(file_mb >= 50 or est_rows >= 200_000)
+    if state.get("de_e2b_memory_failure_detected"):
+        return {
+            "use_heavy": True,
+            "reason": "e2b_memory_failure_fallback",
+            "safe_budget_gb": safe_budget_gb,
+            "e2b_limit_gb": e2b_limit_gb,
+            "estimated_peak_gb": estimated_peak_gb,
+            "raw_df_gb": raw_df_gb,
+            "file_mb": file_mb,
+            "est_rows": est_rows,
+            "n_cols": n_cols,
+        }
+
+    if estimated_peak_gb is not None:
+        if estimated_peak_gb <= safe_budget_gb:
+            return {
+                "use_heavy": False,
+                "reason": "e2b_memory_safe_de",
+                "safe_budget_gb": safe_budget_gb,
+                "e2b_limit_gb": e2b_limit_gb,
+                "estimated_peak_gb": estimated_peak_gb,
+                "raw_df_gb": raw_df_gb,
+                "file_mb": file_mb,
+                "est_rows": est_rows,
+                "n_cols": n_cols,
+            }
+        return {
+            "use_heavy": True,
+            "reason": "de_est_memory_exceeds_e2b_safe",
+            "safe_budget_gb": safe_budget_gb,
+            "e2b_limit_gb": e2b_limit_gb,
+            "estimated_peak_gb": estimated_peak_gb,
+            "raw_df_gb": raw_df_gb,
+            "file_mb": file_mb,
+            "est_rows": est_rows,
+            "n_cols": n_cols,
+        }
+
+    if large_signal:
+        return {
+            "use_heavy": True,
+            "reason": "de_memory_uncertain_guard",
+            "safe_budget_gb": safe_budget_gb,
+            "e2b_limit_gb": e2b_limit_gb,
+            "estimated_peak_gb": None,
+            "raw_df_gb": raw_df_gb,
+            "file_mb": file_mb,
+            "est_rows": est_rows,
+            "n_cols": n_cols,
+        }
+    if medium_signal:
+        return {
+            "use_heavy": False,
+            "reason": "de_e2b_preferred_medium_scale",
+            "safe_budget_gb": safe_budget_gb,
+            "e2b_limit_gb": e2b_limit_gb,
+            "estimated_peak_gb": None,
+            "raw_df_gb": raw_df_gb,
+            "file_mb": file_mb,
+            "est_rows": est_rows,
+            "n_cols": n_cols,
+        }
+    return {
+        "use_heavy": False,
+        "reason": "de_e2b_default",
+        "safe_budget_gb": safe_budget_gb,
+        "e2b_limit_gb": e2b_limit_gb,
+        "estimated_peak_gb": None,
+        "raw_df_gb": raw_df_gb,
+        "file_mb": file_mb,
+        "est_rows": est_rows,
+        "n_cols": n_cols,
+    }
+
+
+def _should_use_heavy_runner_for_data_engineer(
+    state: Dict[str, Any],
+    required_cols_count: int = 0,
+) -> tuple[bool, str]:
+    if state.get("heavy_runner_unavailable"):
+        return False, "unavailable"
+    if not _env_flag("HEAVY_RUNNER_DE_ENABLED", True):
+        return False, "disabled"
+    if _env_flag("HEAVY_RUNNER_FORCE_DE", False) or _env_flag("HEAVY_RUNNER_FORCE", False):
+        return True, "forced"
+    if state.get("de_force_heavy_runner"):
+        return True, "forced_retry"
+    decision = _build_de_backend_memory_decision(state, required_cols_count=required_cols_count)
+    state["de_backend_memory_estimate"] = decision
+    return bool(decision.get("use_heavy")), str(decision.get("reason") or "unknown")
+
+
+def _execute_data_engineer_via_heavy_runner(
+    *,
+    state: Dict[str, Any],
+    code: str,
+    csv_path: str,
+    csv_sep: str,
+    csv_decimal: str,
+    csv_encoding: str,
+    heavy_cfg: Dict[str, Any],
+    run_id: Optional[str],
+    attempt_id: int,
+    reason: str,
+) -> Dict[str, Any]:
+    required_artifacts = ["data/cleaned_data.csv", "data/cleaning_manifest.json"]
+    download_map = {
+        "data/cleaned_data.csv": "data/cleaned_data.csv",
+        "data/cleaning_manifest.json": "data/cleaning_manifest.json",
+        "error.json": os.path.join("artifacts", "heavy_error.json"),
+        "status.json": os.path.join("artifacts", "heavy_status.json"),
+        "artifacts/execution_log.txt": os.path.join("artifacts", "heavy_execution_log.txt"),
+    }
+    support_files: List[Dict[str, str]] = []
+    for rel_path in [
+        "data/required_columns.json",
+        "data/column_sets.json",
+        "data/column_inventory.json",
+        "data/dataset_semantics.json",
+        "data/dataset_training_mask.json",
+        "data/execution_contract.json",
+    ]:
+        if os.path.exists(rel_path):
+            support_files.append({"local_path": rel_path, "path": rel_path})
+
+    request = {
+        "run_id": run_id,
+        "dataset_uri": None,
+        "output_uri": None,
+        "mode": "data_engineer_cleaning",
+        "read": {"sep": csv_sep, "decimal": csv_decimal, "encoding": csv_encoding},
+    }
+    if run_id:
+        log_run_event(
+            run_id,
+            "heavy_runner_request",
+            {
+                "mode": "data_engineer",
+                "reason": reason,
+                "attempt_id": attempt_id,
+                "download_keys": list(download_map.keys()),
+                "support_files": [item.get("path") for item in support_files],
+            },
+        )
+        log_run_event(run_id, "heavy_runner_start", {"step": "data_engineer", "reason": reason})
+
+    try:
+        heavy_result = launch_heavy_runner_job(
+            run_id=run_id or "unknown",
+            request=request,
+            dataset_path=csv_path,
+            bucket=heavy_cfg["bucket"],
+            job=heavy_cfg["job"],
+            region=heavy_cfg["region"],
+            project=heavy_cfg.get("project"),
+            input_prefix=heavy_cfg.get("input_prefix", "inputs"),
+            output_prefix=heavy_cfg.get("output_prefix", "outputs"),
+            dataset_prefix=heavy_cfg.get("dataset_prefix", "datasets"),
+            download_map=download_map,
+            code_text=code,
+            support_files=support_files,
+            data_path="data/raw.csv",
+            required_artifacts=required_artifacts,
+            attempt_id=attempt_id,
+        )
+    except CloudRunLaunchError as exc:
+        msg = str(exc)
+        unavailable = "Required CLI not found" in msg
+        if run_id:
+            log_run_event(
+                run_id,
+                "heavy_runner_failed",
+                {"step": "data_engineer", "error": msg, "unavailable": unavailable},
+            )
+        return {
+            "ok": False,
+            "unavailable": unavailable,
+            "error_details": f"HEAVY_RUNNER_ERROR: {msg}",
+            "heavy_result": None,
+        }
+
+    if run_id:
+        log_run_event(
+            run_id,
+            "heavy_runner_complete",
+            {
+                "step": "data_engineer",
+                "status": heavy_result.get("status"),
+                "downloaded": list((heavy_result.get("downloaded") or {}).keys()),
+                "missing_artifacts": heavy_result.get("missing_artifacts") or [],
+                "error_present": bool(heavy_result.get("error")),
+                "status_ok": bool(heavy_result.get("status_ok")),
+                "attempt_id": attempt_id,
+            },
+        )
+
+    downloaded = heavy_result.get("downloaded") or {}
+    missing = list(heavy_result.get("missing_artifacts") or [])
+    status_ok = str(heavy_result.get("status") or "").lower() == "success"
+    required_ok = all(path in downloaded for path in required_artifacts)
+    ok = bool(status_ok and required_ok and not heavy_result.get("error") and not heavy_result.get("job_failed"))
+
+    heavy_log_path = os.path.join("artifacts", "heavy_execution_log.txt")
+    try:
+        os.makedirs("artifacts", exist_ok=True)
+        if os.path.exists(heavy_log_path):
+            with open(heavy_log_path, "r", encoding="utf-8", errors="replace") as f_src:
+                heavy_log = f_src.read()
+        else:
+            heavy_log = str(heavy_result.get("job_error") or "")
+        with open(os.path.join("artifacts", "data_engineer_sandbox_last.log"), "w", encoding="utf-8") as f_log:
+            f_log.write(heavy_log or "")
+    except Exception:
+        pass
+
+    error_details = ""
+    if not ok:
+        err_parts: List[str] = []
+        if heavy_result.get("job_error"):
+            err_parts.append(str(heavy_result.get("job_error")))
+        if heavy_result.get("error"):
+            err_parts.append(str(heavy_result.get("error")))
+        if missing:
+            err_parts.append(f"missing_artifacts={missing}")
+        if not err_parts:
+            err_parts.append(f"status={heavy_result.get('status')}")
+        error_details = "HEAVY_RUNNER_ERROR: " + " | ".join(err_parts)
+        error_payload = {
+            "stage": "heavy_runner_error",
+            "exception_type": "HeavyRunnerError",
+            "exception_msg": error_details,
+            "traceback": error_details,
+            "attempt": attempt_id,
+        }
+        try:
+            os.makedirs("artifacts", exist_ok=True)
+            with open(
+                os.path.join("artifacts", "data_engineer_sandbox_last_error.json"),
+                "w",
+                encoding="utf-8",
+            ) as f_err:
+                json.dump(error_payload, f_err, indent=2, ensure_ascii=True)
+        except Exception:
+            pass
+
+    return {
+        "ok": ok,
+        "unavailable": False,
+        "error_details": error_details,
+        "heavy_result": heavy_result,
+    }
+
+
 def _finalize_heavy_execution(
     state: Dict[str, Any],
     output: str,
@@ -8241,6 +8526,10 @@ def run_execution_planner(state: AgentState) -> AgentState:
         env_constraints = {"forbid_inplace_column_creation": True}
 
         domain_expert_critique = state.get("selection_reason", "")
+        try:
+            execution_planner.last_contract_diagnostics = None
+        except Exception:
+            pass
 
         contract = execution_planner.generate_contract(
             strategy=strategy,
@@ -8266,6 +8555,9 @@ def run_execution_planner(state: AgentState) -> AgentState:
         )
     if not isinstance(contract, dict):
         contract = {}
+    planner_contract_diagnostics = getattr(execution_planner, "last_contract_diagnostics", None)
+    if not isinstance(planner_contract_diagnostics, dict):
+        planner_contract_diagnostics = {}
     strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
     objective_type = None
     if isinstance(strategy_spec, dict):
@@ -8289,6 +8581,11 @@ def run_execution_planner(state: AgentState) -> AgentState:
         data_dir = _abs_in_work(work_dir_abs, "data")
         os.makedirs(data_dir, exist_ok=True)
         dump_json(_abs_in_work(work_dir_abs, "data/execution_contract.json"), contract)
+        if planner_contract_diagnostics:
+            dump_json(
+                _abs_in_work(work_dir_abs, "data/execution_contract_diagnostics.json"),
+                planner_contract_diagnostics,
+            )
         dump_json(_abs_in_work(work_dir_abs, "data/plan.json"), execution_plan)
         if evaluation_spec:
             dump_json(_abs_in_work(work_dir_abs, "data/evaluation_spec.json"), evaluation_spec)
@@ -8318,6 +8615,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
             run_id,
             [
                 _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+                _abs_in_work(work_dir_abs, "data/execution_contract_diagnostics.json"),
                 _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
                 _abs_in_work(work_dir_abs, "data/plan.json"),
             ],
@@ -8378,6 +8676,9 @@ def run_execution_planner(state: AgentState) -> AgentState:
         )
     policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
     result = {"execution_contract": contract}
+    if planner_contract_diagnostics:
+        result["execution_contract_diagnostics"] = planner_contract_diagnostics
+        result["execution_contract_diagnostics_path"] = "data/execution_contract_diagnostics.json"
     # V4.1: Do NOT add execution_plan to result (legacy key)
     if evaluation_spec:
         result["evaluation_spec"] = evaluation_spec
@@ -8417,6 +8718,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 "strategy": strategy,
                 "business_objective": business_objective,
                 "planner_diag": getattr(execution_planner, "last_planner_diag", None),
+                "contract_diagnostics": planner_contract_diagnostics,
             },
         )
     return result
@@ -8488,7 +8790,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
     leakage_audit_summary = state.get("leakage_audit_summary", "")
     minimal_context_mode = _minimal_agent_context_enabled()
     if minimal_context_mode:
-        data_engineer_audit_override = _build_agent_feedback_context(state if isinstance(state, dict) else {}, "data_engineer")
+        feedback_context = _build_agent_feedback_context(state if isinstance(state, dict) else {}, "data_engineer")
+        persisted_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
+        data_engineer_audit_override = _merge_de_audit_override(feedback_context, persisted_override)
     else:
         data_engineer_audit_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
     dataset_scale_hints = state.get("dataset_scale_hints")
@@ -8578,6 +8882,35 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if scale_flag in {"medium", "large"} or file_mb >= 50 or est_rows >= 200_000 or n_cols >= 500:
             memory_guard_active = True
     state["de_memory_guard_active"] = memory_guard_active
+    de_heavy_cfg = _get_heavy_runner_config()
+    de_use_heavy_runner = False
+    de_heavy_reason = "disabled"
+    if de_heavy_cfg:
+        de_use_heavy_runner, de_heavy_reason = _should_use_heavy_runner_for_data_engineer(
+            state if isinstance(state, dict) else {},
+            required_cols_count=len(required_cols or []),
+        )
+    if run_id:
+        try:
+            log_run_event(
+                run_id,
+                "data_engineer_backend_selection",
+                {
+                    "backend": "heavy_runner" if de_use_heavy_runner else "e2b",
+                    "reason": de_heavy_reason,
+                    "dataset_scale": {
+                        "scale": dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None,
+                        "file_mb": dataset_scale_hints.get("file_mb") if isinstance(dataset_scale_hints, dict) else None,
+                        "est_rows": dataset_scale_hints.get("est_rows") if isinstance(dataset_scale_hints, dict) else None,
+                        "cols": n_cols,
+                    },
+                    "memory_decision": state.get("de_backend_memory_estimate")
+                    if isinstance(state.get("de_backend_memory_estimate"), dict)
+                    else None,
+                },
+            )
+        except Exception:
+            pass
     norm_map: Dict[str, str] = {}
     if header_cols and not minimal_context_mode:
         for col in header_cols:
@@ -9152,16 +9485,55 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 msg = f"Host Cleaning Plan Failed: {plan_err}"
                 return {"cleaning_code": code, "cleaned_data_preview": "Error: Plan Failed", "error_message": msg, "budget_counters": counters}
         else:
-            # load_dotenv() is called at module level or main
-            api_key = os.getenv("E2B_API_KEY")
-            if not api_key:
-                msg = "CRITICAL: E2B_API_KEY missing in .env file."
-                return {"error_message": msg, "cleaned_data_preview": "Error: Missing E2B Key", "budget_counters": counters}
+            de_heavy_result = None
+            if de_use_heavy_runner and de_heavy_cfg:
+                print(f"    Backend: Cloud Run Heavy Runner (DE, reason={de_heavy_reason})")
+                de_heavy_result = _execute_data_engineer_via_heavy_runner(
+                    state=state,
+                    code=code,
+                    csv_path=csv_path,
+                    csv_sep=csv_sep,
+                    csv_decimal=csv_decimal,
+                    csv_encoding=csv_encoding,
+                    heavy_cfg=de_heavy_cfg,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    reason=de_heavy_reason,
+                )
+                if de_heavy_result.get("unavailable"):
+                    state["heavy_runner_unavailable"] = True
+                    print("HEAVY_RUNNER_UNAVAILABLE for Data Engineer: falling back to E2B.")
+                elif de_heavy_result.get("ok"):
+                    if os.path.exists(local_cleaned_path):
+                        try:
+                            with open(local_cleaned_path, "rb") as f_local:
+                                downloaded_cleaned_content = f_local.read()
+                        except Exception:
+                            downloaded_cleaned_content = None
+                        downloaded_paths.append(local_cleaned_path)
+                    if os.path.exists(local_manifest_path):
+                        downloaded_paths.append(local_manifest_path)
+                    csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
+                        local_manifest_path, csv_sep, csv_decimal, csv_encoding
+                    )
+                    if dialect_updated:
+                        print(
+                            f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}"
+                        )
 
-            os.environ["E2B_API_KEY"] = api_key
+            if not (isinstance(de_heavy_result, dict) and de_heavy_result.get("ok")):
+                # load_dotenv() is called at module level or main
+                api_key = os.getenv("E2B_API_KEY")
+                if not api_key:
+                    msg = "CRITICAL: E2B_API_KEY missing in .env file."
+                    return {"error_message": msg, "cleaned_data_preview": "Error: Missing E2B Key", "budget_counters": counters}
+
+                os.environ["E2B_API_KEY"] = api_key
 
             step_name = "data_engineer"
             for sb_attempt in range(2):
+              if isinstance(de_heavy_result, dict) and de_heavy_result.get("ok"):
+                break
               try:
                 with create_sandbox_with_retry(Sandbox, max_attempts=2, run_id=run_id, step="data_engineer") as sandbox:
                     if not hasattr(sandbox, "commands"):
@@ -9304,6 +9676,37 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 exception_type=execution.error.name,
                                 exception_msg=str(execution.error.value),
                             )
+                        memory_error_detected = _is_memory_pressure_error(error_details)
+                        can_try_heavy_after_memory_error = bool(
+                            de_heavy_cfg
+                            and _env_flag("HEAVY_RUNNER_DE_ENABLED", True)
+                            and not state.get("heavy_runner_unavailable")
+                        )
+                        if memory_error_detected and can_try_heavy_after_memory_error and not _flag_active_for_run(
+                            state,
+                            "de_memory_backend_retry_done",
+                            run_id,
+                        ):
+                                new_state = dict(state)
+                                new_state["de_memory_backend_retry_done"] = True
+                                if run_id:
+                                    new_state["de_memory_backend_retry_done_run_id"] = run_id
+                                new_state["de_e2b_memory_failure_detected"] = True
+                                new_state["de_force_heavy_runner"] = True
+                                new_state["execution_error_message"] = error_details[-4000:]
+                                if run_id:
+                                    log_run_event(
+                                        run_id,
+                                        "data_engineer_backend_escalation",
+                                        {
+                                            "source_backend": "e2b",
+                                            "target_backend": "heavy_runner",
+                                            "reason": "memory_pressure",
+                                            "attempt": attempt_id,
+                                        },
+                                    )
+                                print("Memory fallback: retrying Data Engineer on Cloud Run heavy runner.")
+                                return run_data_engineer(new_state)
                         contract = state.get("execution_contract", {}) or {}
                         derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
                         if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
@@ -9465,6 +9868,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 new_state["de_runtime_retry_done"] = True
                                 if run_id:
                                     new_state["de_runtime_retry_done_run_id"] = run_id
+                                new_state["execution_error_message"] = error_details[-4000:]
                                 if reviewer_done:
                                     new_state["de_runtime_reviewer_done"] = True
                                     if run_id:
@@ -9780,11 +10184,43 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         exception_msg=str(e),
                     )
                 err_msg = str(e)
-                err_lower = err_msg.lower()
-                is_oom_like = any(token in err_lower for token in ["killed", "exit code 137", "oom", "out of memory"])
+                err_trace = traceback.format_exc()
+                err_details = f"{type(e).__name__}: {err_msg}\n{err_trace}"
+                is_oom_like = _is_memory_pressure_error(err_details)
+                can_try_heavy_after_memory_error = bool(
+                    de_heavy_cfg
+                    and _env_flag("HEAVY_RUNNER_DE_ENABLED", True)
+                    and not state.get("heavy_runner_unavailable")
+                )
+                if is_oom_like and can_try_heavy_after_memory_error and not _flag_active_for_run(
+                    state,
+                    "de_memory_backend_retry_done",
+                    run_id,
+                ):
+                    new_state = dict(state)
+                    new_state["de_memory_backend_retry_done"] = True
+                    if run_id:
+                        new_state["de_memory_backend_retry_done_run_id"] = run_id
+                    new_state["de_e2b_memory_failure_detected"] = True
+                    new_state["de_force_heavy_runner"] = True
+                    new_state["execution_error_message"] = err_details[-4000:]
+                    if run_id:
+                        log_run_event(
+                            run_id,
+                            "data_engineer_backend_escalation",
+                            {
+                                "source_backend": "e2b",
+                                "target_backend": "heavy_runner",
+                                "reason": "memory_pressure_exception",
+                                "attempt": attempt_id,
+                            },
+                        )
+                    print("Memory fallback (exception): retrying Data Engineer on Cloud Run heavy runner.")
+                    return run_data_engineer(new_state)
                 if is_oom_like and not state.get("de_oom_retry_done") and state.get("de_memory_guard_active"):
                     new_state = dict(state)
                     new_state["de_oom_retry_done"] = True
+                    new_state["execution_error_message"] = err_details[-4000:]
                     base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                     payload = (
                         "RUNTIME_ERROR_CONTEXT: Sandbox process was killed (likely OOM / exit code 137). "
@@ -9798,6 +10234,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     new_state["de_runtime_retry_done"] = True
                     if run_id:
                         new_state["de_runtime_retry_done_run_id"] = run_id
+                    new_state["execution_error_message"] = err_details[-4000:]
                     base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                     payload = (
                         "RUNTIME_ERROR_CONTEXT:\n"
@@ -14715,6 +15152,7 @@ def run_translator(state: AgentState) -> AgentState:
                 run_id,
                 [
                     _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+                    _abs_in_work(work_dir_abs, "data/execution_contract_diagnostics.json"),
                     _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
                     _abs_in_work(work_dir_abs, "data/produced_artifact_index.json"),
                 ],

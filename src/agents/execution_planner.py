@@ -1,6 +1,7 @@
 import json
 import os
 import ast
+import copy
 from typing import Dict, Any, List, Optional, Tuple
 from string import Template
 import re
@@ -19,9 +20,8 @@ from src.utils.contract_v41 import (
     get_column_roles,
     get_derived_column_names,
     get_required_outputs,
-    strip_legacy_keys,
-    assert_no_legacy_keys,
     assert_only_allowed_v41_keys,
+    warn_legacy_keys,
     LEGACY_KEYS,
     CONTRACT_VERSION_V41,
     normalize_contract_version,
@@ -3433,6 +3433,7 @@ class ExecutionPlannerAgent:
         self.model_chain = chain
         self.last_prompt = None
         self.last_response = None
+        self.last_contract_diagnostics = None
 
     def _build_model_client(self, model_name: str) -> Any:
         if not self.api_key:
@@ -5890,13 +5891,21 @@ class ExecutionPlannerAgent:
             if response_text is not None:
                 _write_text(os.path.join(planner_dir, response_name), response_text)
 
-        def _persist_contracts(full_contract: Dict[str, Any] | None) -> None:
+        def _persist_contracts(
+            full_contract: Dict[str, Any] | None,
+            diagnostics_payload: Dict[str, Any] | None = None,
+        ) -> None:
             if not planner_dir:
                 return
             if full_contract:
                 _write_json(os.path.join(planner_dir, "contract_full.json"), full_contract)
             if planner_diag:
                 _write_json(os.path.join(planner_dir, "planner_diag.json"), {"attempts": planner_diag})
+            if diagnostics_payload:
+                _write_json(
+                    os.path.join(planner_dir, "contract_diagnostics.json"),
+                    diagnostics_payload,
+                )
 
         def _parse_json_response(raw_text: str) -> Tuple[Optional[Any], Optional[Exception]]:
             if not raw_text:
@@ -5959,18 +5968,72 @@ class ExecutionPlannerAgent:
                     usage_payload[key] = value
             return usage_payload or {"value": str(raw_usage)}
 
-        def _finalize_and_persist(contract, where):
-            from src.utils.contract_v41 import strip_legacy_keys, assert_no_legacy_keys, assert_only_allowed_v41_keys
-            contract = ensure_v41_schema(contract, strict=False)
-            contract = strip_legacy_keys(contract)
-            assert_no_legacy_keys(contract, where=where)
+        def _build_contract_diagnostics(contract: Dict[str, Any], where: str, llm_success: bool) -> Dict[str, Any]:
+            diagnostics: Dict[str, Any] = {
+                "schema_version": 1,
+                "policy": "llm_contract_immutable_post_generation",
+                "where": where,
+                "llm_success": bool(llm_success),
+                "legacy_keys": [],
+                "unknown_top_level_keys": [],
+                "validation": {},
+            }
+            if not isinstance(contract, dict):
+                diagnostics["validation"] = {
+                    "status": "error",
+                    "issues": [{"severity": "error", "rule": "contract_not_object", "message": "Contract is not a dictionary"}],
+                }
+                return diagnostics
+
+            legacy = warn_legacy_keys(contract, where=where)
             unknown = assert_only_allowed_v41_keys(contract, strict=False)
+            diagnostics["legacy_keys"] = legacy
+            diagnostics["unknown_top_level_keys"] = unknown
+            if legacy:
+                print(f"WARNING: Legacy keys in contract ({where}): {legacy}")
             if unknown:
-                print(f"WARNING: Unknown keys in contract: {unknown}")
-                u = contract.setdefault("unknowns", [])
-                if isinstance(u, list):
-                    u.append({"item": f"Unknown top-level keys detected: {unknown}", "impact":"May not be recognized", "mitigation":"Update allowed keys if needed", "requires_verification": False})
-            _persist_contracts(contract)
+                print(f"WARNING: Unknown keys in contract ({where}): {unknown}")
+
+            try:
+                validation_result = validate_contract(copy.deepcopy(contract))
+            except Exception as err:
+                validation_result = {
+                    "status": "error",
+                    "issues": [
+                        {
+                            "severity": "error",
+                            "rule": "contract_validation_exception",
+                            "message": str(err),
+                        }
+                    ],
+                }
+
+            status = str(validation_result.get("status") or "unknown").lower()
+            issues = validation_result.get("issues") if isinstance(validation_result, dict) else []
+            if status == "error":
+                print(f"CONTRACT_VALIDATION_ERROR: {len(issues) if isinstance(issues, list) else 0} issues found")
+                if isinstance(issues, list):
+                    for issue in issues:
+                        if isinstance(issue, dict):
+                            print(f"  - [{issue.get('severity')}] {issue.get('rule')}: {issue.get('message')}")
+            elif status == "warning":
+                print(f"CONTRACT_VALIDATION_WARNING: {len(issues) if isinstance(issues, list) else 0} issues found")
+                if isinstance(issues, list):
+                    for issue in issues:
+                        if isinstance(issue, dict):
+                            print(f"  - [{issue.get('severity')}] {issue.get('rule')}: {issue.get('message')}")
+
+            diagnostics["validation"] = validation_result if isinstance(validation_result, dict) else {}
+            diagnostics["summary"] = {
+                "status": status,
+                "issue_count": len(issues) if isinstance(issues, list) else 0,
+            }
+            return diagnostics
+
+        def _finalize_and_persist(contract, where, llm_success: bool):
+            diagnostics = _build_contract_diagnostics(contract if isinstance(contract, dict) else {}, where, llm_success)
+            self.last_contract_diagnostics = diagnostics
+            _persist_contracts(contract if isinstance(contract, dict) else {}, diagnostics)
             return contract
 
         target_candidates: List[Dict[str, Any]] = []
@@ -5978,33 +6041,8 @@ class ExecutionPlannerAgent:
             contract = _fallback()
             contract = _attach_reporting_policy(contract)
             contract = _attach_contract_execution_blueprint(contract)
-            if isinstance(data_profile, dict):
-                try:
-                    from src.utils.data_profile_compact import compact_data_profile_for_llm
-                    compact = compact_data_profile_for_llm(data_profile, contract=contract)
-                    target_candidates = compact.get("target_candidates") if isinstance(compact, dict) else []
-                except Exception:
-                    target_candidates = []
-            if isinstance(target_candidates, list) and target_candidates:
-                contract["target_candidates"] = target_candidates
-            explicit_outcomes = contract.get("outcome_columns")
-            has_outcomes = False
-            if isinstance(explicit_outcomes, list):
-                has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
-            elif isinstance(explicit_outcomes, str):
-                has_outcomes = explicit_outcomes.strip().lower() != "unknown"
-            if not has_outcomes:
-                inferred = []
-                for item in target_candidates or []:
-                    if isinstance(item, dict):
-                        col = item.get("column") or item.get("name") or item.get("candidate")
-                        if col:
-                            inferred.append(col)
-                            break
-                if inferred:
-                    contract["outcome_columns"] = inferred
             self.last_contract_min = None
-            return _finalize_and_persist(contract, where="execution_planner:no_client")
+            return _finalize_and_persist(contract, where="execution_planner:no_client", llm_success=False)
 
         target_candidates: List[Dict[str, Any]] = []
         resolved_target = None
@@ -6255,179 +6293,19 @@ domain_expert_critique:
 
         if contract is None:
             contract = _fallback("JSON Parse Error after retries")
+            contract = _attach_reporting_policy(contract)
+            contract = _attach_contract_execution_blueprint(contract)
 
-        contract = ensure_v41_schema(contract)
-        if resolved_target:
-            explicit_outcomes = contract.get("outcome_columns")
-            has_outcomes = False
-            if isinstance(explicit_outcomes, list):
-                has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
-            elif isinstance(explicit_outcomes, str):
-                has_outcomes = explicit_outcomes.strip().lower() != "unknown"
-            if not has_outcomes:
-                contract["outcome_columns"] = [resolved_target]
-        elif isinstance(target_candidates, list) and target_candidates:
-            explicit_outcomes = contract.get("outcome_columns")
-            has_outcomes = False
-            if isinstance(explicit_outcomes, list):
-                has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
-            elif isinstance(explicit_outcomes, str):
-                has_outcomes = explicit_outcomes.strip().lower() != "unknown"
-            if not has_outcomes:
-                inferred = []
-                for item in target_candidates:
-                    if isinstance(item, dict):
-                        col = item.get("column") or item.get("name") or item.get("candidate")
-                        if col:
-                            inferred.append(col)
-                            break
-                if inferred:
-                    contract["outcome_columns"] = inferred
-        contract["qa_gates"] = _apply_qa_gate_policy(
-            contract.get("qa_gates"),
-            strategy,
-            business_objective or "",
-            contract,
-        )
-        contract = _ensure_benchmark_kpi_gate(contract, strategy, business_objective or "")
-        contract["cleaning_gates"] = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
-        contract = _ensure_missing_category_values(contract)
-
-        if isinstance(column_inventory, list) and column_inventory:
-            # Always preserve full inventory as available_columns; use focus_columns for relevance.
-            contract["available_columns"] = [str(c) for c in column_inventory if c]
-            contract["available_columns_source"] = "column_inventory"
-
-        available_columns = contract.get("available_columns")
-        if isinstance(available_columns, list) and available_columns:
-            contract["canonical_columns"] = [str(c) for c in available_columns if c]
-            if len(available_columns) > 200:
-                feature_selectors, _remaining = infer_feature_selectors(
-                    available_columns, max_list_size=200, min_group_size=50
-                )
-                if feature_selectors:
-                    contract["feature_selectors"] = feature_selectors
-                    contract["canonical_columns_compact"] = compact_column_representation(
-                        available_columns, max_display=40
-                    )
-
-        if relevant_columns:
-            contract["focus_columns"] = list(relevant_columns)
-            contract["omitted_columns_policy"] = omitted_columns_policy
-
-        contract = _prune_identifier_model_features(contract)
-        contract = _apply_sparse_optional_columns(contract, data_profile)
-
-        contract = validate_artifact_requirements(contract)
-
-        # P1.2: Contract Self-Consistency Gate
-        validation_result = validate_contract(contract)
-        contract["_contract_validation"] = validation_result
-        if validation_result["status"] == "error":
-            print(f"CONTRACT_VALIDATION_ERROR: {len(validation_result['issues'])} issues found")
-            for issue in validation_result["issues"]:
-                print(f"  - [{issue['severity']}] {issue['rule']}: {issue['message']}")
-        elif validation_result["status"] == "warning":
-            print(f"CONTRACT_VALIDATION_WARNING: {len(validation_result['issues'])} issues found")
-            for issue in validation_result["issues"]:
-                print(f"  - [{issue['severity']}] {issue['rule']}: {issue['message']}")
-        issues = validation_result.get("issues") if isinstance(validation_result, dict) else []
-        if isinstance(issues, list):
-            if any(issue.get("rule") == "output_ambiguity" for issue in issues if isinstance(issue, dict)):
-                planner_self_check = contract.get("planner_self_check")
-                if not isinstance(planner_self_check, list):
-                    planner_self_check = []
-                msg = (
-                    "OUTPUT_AMBIGUITY: required_outputs contained non-file entries. "
-                    "Ensure required_outputs are file paths only; move columns to scored_rows_schema "
-                    "and conceptual deliverables to reporting_requirements."
-                )
-                if msg not in planner_self_check:
-                    planner_self_check.append(msg)
-                contract["planner_self_check"] = planner_self_check
-        # Store normalized artifact_requirements
-        if validation_result.get("normalized_artifact_requirements"):
-            contract["artifact_requirements"] = validation_result["normalized_artifact_requirements"]
-
-        artifact_reqs = contract.get("artifact_requirements")
-        if not isinstance(artifact_reqs, dict):
-            artifact_reqs = {}
-        artifact_reqs["visual_requirements"] = _build_visual_requirements(
-            contract,
-            strategy,
-            business_objective or "",
-        )
-        contract["artifact_requirements"] = artifact_reqs
-        contract["decisioning_requirements"] = _build_decisioning_requirements(
-            contract,
-            strategy,
-            business_objective or "",
-        )
-
-        contract = _attach_reporting_policy(contract)
-        contract = _attach_contract_execution_blueprint(contract)
-
-        def _sanitize_runbook_text(text: str) -> str:
-            """Replace hardcoded dialect instructions with dynamic manifest reference."""
-            if not isinstance(text, str):
-                return text
-            import re
-            patterns = [
-                (r'sep\s*=\s*[\'"]?[;,\t][\'"]?', "sep from cleaning_manifest.json"),
-                (r'decimal\s*=\s*[\'"]?[.,][\'"]?', "decimal from cleaning_manifest.json"),
-                (r"Load.*CSV.*using.*sep.*=.*[;,]", "Load CSV using dialect from data/cleaning_manifest.json"),
-            ]
-            for pattern, replacement in patterns:
-                text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-            return text
-
-        def _sanitize_runbook(runbook: Any) -> Any:
-            if isinstance(runbook, str):
-                return _sanitize_runbook_text(runbook)
-            if isinstance(runbook, dict):
-                return {k: _sanitize_runbook(v) for k, v in runbook.items()}
-            if isinstance(runbook, list):
-                return [_sanitize_runbook(item) for item in runbook]
-            return runbook
-
-        if contract.get("data_engineer_runbook"):
-            contract["data_engineer_runbook"] = _sanitize_runbook(contract["data_engineer_runbook"])
-        if contract.get("ml_engineer_runbook"):
-            contract["ml_engineer_runbook"] = _sanitize_runbook(contract["ml_engineer_runbook"])
-
-        # V4.1: Do NOT write role_runbooks - use direct data_engineer_runbook/ml_engineer_runbook keys
-
-        target_candidates = []
-        if isinstance(data_profile, dict):
-            try:
-                from src.utils.data_profile_compact import compact_data_profile_for_llm
-                compact = compact_data_profile_for_llm(data_profile, contract=contract)
-                target_candidates = compact.get("target_candidates") if isinstance(compact, dict) else []
-            except Exception:
-                target_candidates = []
-        if isinstance(target_candidates, list) and target_candidates:
-            contract["target_candidates"] = target_candidates
-        explicit_outcomes = contract.get("outcome_columns")
-        has_outcomes = False
-        if isinstance(explicit_outcomes, list):
-            has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
-        elif isinstance(explicit_outcomes, str):
-            has_outcomes = explicit_outcomes.strip().lower() != "unknown"
-        if not has_outcomes:
-            inferred = []
-            for item in target_candidates or []:
-                if isinstance(item, dict):
-                    col = item.get("column") or item.get("name") or item.get("candidate")
-                    if col:
-                        inferred.append(col)
-                        break
-            if inferred:
-                contract["outcome_columns"] = inferred
+        if llm_success and resolved_target:
+            print(
+                f"INFO: Planner resolved target candidate '{resolved_target}' from profile context; "
+                "contract remains immutable (diagnostic only)."
+            )
         self.last_contract_min = None
 
         if llm_success and planner_diag:
             print(f"SUCCESS: Execution Planner succeeded on attempt {planner_diag[-1]['attempt_index']}")
-        return _finalize_and_persist(contract, where="execution_planner:final_contract")
+        return _finalize_and_persist(contract, where="execution_planner:final_contract", llm_success=llm_success)
 
     def generate_evaluation_spec(
         self,
