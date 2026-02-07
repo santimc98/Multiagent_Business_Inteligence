@@ -6846,6 +6846,9 @@ class AgentState(TypedDict):
     review_abort_reason: str
     # Failure State
     error_message: str
+    pipeline_aborted_reason: str
+    execution_planner_failed: bool
+    data_engineer_failed: bool
     # Domain Expert
     domain_expert_reviews: List[Dict[str, Any]]
     # Visuals State
@@ -8687,12 +8690,18 @@ def run_execution_planner(state: AgentState) -> AgentState:
     validation_payload = planner_contract_diagnostics.get("validation")
     planner_contract_accepted = False
     if isinstance(validation_payload, dict):
-        planner_contract_accepted = bool(validation_payload.get("accepted"))
-        if not planner_contract_accepted:
-            planner_contract_accepted = str(validation_payload.get("status") or "").lower() != "error"
+        accepted_flag = validation_payload.get("accepted")
+        validation_status = str(validation_payload.get("status") or "").lower()
+        if isinstance(accepted_flag, bool):
+            planner_contract_accepted = bool(accepted_flag and validation_status != "error")
     summary_payload = planner_contract_diagnostics.get("summary")
-    if isinstance(summary_payload, dict) and "accepted" in summary_payload:
-        planner_contract_accepted = bool(summary_payload.get("accepted"))
+    if isinstance(summary_payload, dict):
+        summary_accepted = summary_payload.get("accepted")
+        if isinstance(summary_accepted, bool):
+            if isinstance(validation_payload, dict):
+                planner_contract_accepted = planner_contract_accepted and summary_accepted
+            else:
+                planner_contract_accepted = summary_accepted
     strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
     objective_type = None
     if isinstance(strategy_spec, dict):
@@ -8848,7 +8857,10 @@ def run_execution_planner(state: AgentState) -> AgentState:
             {"required_outputs": contract.get("required_outputs", [])},
         )
     policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
-    result = {"execution_contract": contract}
+    result = {
+        "execution_contract": contract,
+        "execution_planner_failed": False,
+    }
     if planner_contract_diagnostics:
         result["execution_contract_diagnostics"] = planner_contract_diagnostics
         result["execution_contract_diagnostics_path"] = "data/execution_contract_diagnostics.json"
@@ -8899,12 +8911,43 @@ def run_execution_planner(state: AgentState) -> AgentState:
 
 
 
+def _planner_contract_invalid_for_execution(state: Dict[str, Any]) -> bool:
+    """Conservative fail-closed check before Data Engineer execution."""
+    if not isinstance(state, dict):
+        return True
+    if bool(state.get("execution_planner_failed")):
+        return True
+    if state.get("pipeline_aborted_reason") == "execution_contract_invalid":
+        return True
+
+    diagnostics = state.get("execution_contract_diagnostics")
+    if isinstance(diagnostics, dict):
+        validation = diagnostics.get("validation")
+        summary = diagnostics.get("summary")
+        if isinstance(validation, dict):
+            accepted_flag = validation.get("accepted")
+            if isinstance(accepted_flag, bool) and not accepted_flag:
+                return True
+            if str(validation.get("status") or "").lower() == "error":
+                return True
+        if isinstance(summary, dict):
+            accepted_summary = summary.get("accepted")
+            if isinstance(accepted_summary, bool) and not accepted_summary:
+                return True
+
+    contract = state.get("execution_contract")
+    if not isinstance(contract, dict) or not contract:
+        return True
+
+    return False
+
+
 def run_data_engineer(state: AgentState) -> AgentState:
     print("--- [3] Data Engineer: Cleaning Data (E2B Sandbox) ---")
     abort_state = _abort_if_requested(state, "data_engineer")
     if abort_state:
         return abort_state
-    if state.get("execution_planner_failed") or state.get("pipeline_aborted_reason") == "execution_contract_invalid":
+    if _planner_contract_invalid_for_execution(state if isinstance(state, dict) else {}):
         msg = "Execution contract is invalid; Data Engineer halted by fail-closed planner policy."
         run_id = state.get("run_id")
         if run_id:
@@ -11127,9 +11170,7 @@ def check_data_success(state: AgentState):
 
 
 def check_execution_planner_success(state: AgentState):
-    if state.get("execution_planner_failed"):
-        return "failed"
-    if state.get("pipeline_aborted_reason") == "execution_contract_invalid":
+    if _planner_contract_invalid_for_execution(state if isinstance(state, dict) else {}):
         return "failed"
     return "success"
 

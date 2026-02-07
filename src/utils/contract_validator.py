@@ -34,6 +34,17 @@ CANONICAL_ROLES = {
     "pre_decision", "post_decision_audit_only", "unknown", "identifiers", "time_columns",
 }
 
+# Strict role-bucket ontology for V4.1 execution contracts.
+STRICT_ROLE_BUCKETS = {
+    "pre_decision",
+    "decision",
+    "outcome",
+    "post_decision_audit_only",
+    "unknown",
+    "identifiers",
+    "time_columns",
+}
+
 # Role synonym mapping for normalization
 ROLE_SYNONYM_MAP = {
     "target": "outcome",
@@ -1901,64 +1912,101 @@ def validate_contract_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
 
     role_map = contract.get("column_roles")
     role_values: Dict[str, List[str]] = {}
-    if isinstance(role_map, dict):
-        if role_map:
-            first_value = next(iter(role_map.values()))
-            if isinstance(first_value, list):
-                for role_name, columns in role_map.items():
-                    if isinstance(columns, list):
-                        role_values[str(role_name)] = [str(col) for col in columns if col]
-            else:
-                for column_name, role_name in role_map.items():
-                    if isinstance(role_name, str):
-                        role_values.setdefault(role_name, []).append(str(column_name))
-        else:
-            issues.append(
-                _strict_issue(
-                    "contract.column_roles_empty",
-                    "error",
-                    "column_roles cannot be empty.",
-                    "column_roles",
-                )
-            )
-    else:
+    if not isinstance(role_map, dict):
         issues.append(
             _strict_issue(
                 "contract.column_roles_type",
                 "error",
-                "column_roles must be a dictionary.",
+                "column_roles must be a dictionary in role->list format.",
                 "column_roles",
             )
         )
-
-    allowed_roles = {
-        "pre_decision",
-        "decision",
-        "outcome",
-        "post_decision_audit_only",
-        "audit_only",
-        "id",
-        "identifier",
-        "feature",
-        "timestamp",
-        "group",
-        "weight",
-        "ignore",
-        "forbidden",
-        "unknown",
-        "protected",
-    }
-    role_keys = set(role_values.keys())
-    unknown_roles = sorted([r for r in role_keys if r not in allowed_roles])
-    if unknown_roles:
+    elif not role_map:
         issues.append(
             _strict_issue(
-                "contract.role_ontology",
+                "contract.column_roles_empty",
                 "error",
-                "column_roles contains unknown role buckets outside the shared ontology.",
-                unknown_roles,
+                "column_roles cannot be empty.",
+                "column_roles",
             )
         )
+    else:
+        non_canonical_keys: List[str] = []
+        unknown_roles: List[str] = []
+        non_list_roles: List[str] = []
+        non_string_columns: List[Any] = []
+        blank_columns: List[str] = []
+
+        for raw_role_name, columns in role_map.items():
+            role_name = str(raw_role_name).strip()
+            role_norm = _normalize_bucket_role_key(role_name)
+            if role_name != role_norm:
+                non_canonical_keys.append(role_name)
+            if role_norm not in STRICT_ROLE_BUCKETS:
+                unknown_roles.append(role_name)
+                continue
+            if not isinstance(columns, list):
+                non_list_roles.append(role_name)
+                continue
+
+            cleaned_columns: List[str] = []
+            for col in columns:
+                if not isinstance(col, str):
+                    non_string_columns.append(col)
+                    continue
+                col_clean = col.strip()
+                if not col_clean:
+                    blank_columns.append(role_name)
+                    continue
+                cleaned_columns.append(col_clean)
+            role_values[role_norm] = cleaned_columns
+
+        if non_canonical_keys:
+            issues.append(
+                _strict_issue(
+                    "contract.role_ontology",
+                    "error",
+                    "column_roles keys must use canonical bucket names only.",
+                    sorted(list(dict.fromkeys(non_canonical_keys))),
+                )
+            )
+        if unknown_roles:
+            issues.append(
+                _strict_issue(
+                    "contract.role_ontology",
+                    "error",
+                    "column_roles contains unknown role buckets outside the shared ontology.",
+                    sorted(list(dict.fromkeys(unknown_roles))),
+                )
+            )
+        if non_list_roles:
+            issues.append(
+                _strict_issue(
+                    "contract.column_roles_format",
+                    "error",
+                    "column_roles must be role->list[str]; found non-list bucket values.",
+                    sorted(list(dict.fromkeys(non_list_roles))),
+                )
+            )
+        if non_string_columns:
+            issues.append(
+                _strict_issue(
+                    "contract.column_roles_format",
+                    "error",
+                    "column_roles bucket entries must be strings.",
+                    non_string_columns[:10],
+                )
+            )
+        if blank_columns:
+            issues.append(
+                _strict_issue(
+                    "contract.column_roles_format",
+                    "error",
+                    "column_roles bucket entries must not be blank strings.",
+                    sorted(list(dict.fromkeys(blank_columns))),
+                )
+            )
+
     if role_values and not role_values.get("pre_decision"):
         issues.append(
             _strict_issue(
@@ -1980,17 +2028,44 @@ def validate_contract_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
                     "required_outputs",
                 )
             )
+        seen_paths: set[str] = set()
+        duplicate_paths: List[str] = []
         for item in required_outputs:
-            path = item.get("path") if isinstance(item, dict) else item
-            if not path or not is_probably_path(str(path)):
+            if not isinstance(item, str):
+                issues.append(
+                    _strict_issue(
+                        "contract.required_outputs_type",
+                        "error",
+                        "required_outputs entries must be strings (artifact file paths).",
+                        item,
+                    )
+                )
+                continue
+            path = item.strip()
+            if not path or not is_file_path(path):
                 issues.append(
                     _strict_issue(
                         "contract.required_outputs_path",
                         "error",
-                        "required_outputs entries must be file-like paths.",
+                        "required_outputs entries must be file-like paths (not logical labels).",
                         item,
                     )
                 )
+                continue
+            normalized_path = path.replace("\\", "/").strip().lower()
+            if normalized_path in seen_paths:
+                duplicate_paths.append(path)
+            else:
+                seen_paths.add(normalized_path)
+        if duplicate_paths:
+            issues.append(
+                _strict_issue(
+                    "contract.required_outputs_duplicates",
+                    "warning",
+                    "required_outputs contains duplicate artifact paths.",
+                    sorted(list(dict.fromkeys(duplicate_paths))),
+                )
+            )
     elif required_outputs is not None:
         issues.append(
             _strict_issue(

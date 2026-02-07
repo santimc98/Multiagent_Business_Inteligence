@@ -59,6 +59,11 @@ def test_cleaning_reviewer_failure_fail_closed(tmp_workdir, monkeypatch):
             "csv_decimal": ".",
             "data_summary": "",
             "leakage_audit_summary": "",
+            "execution_contract": {"contract_version": "4.1"},
+            "execution_contract_diagnostics": {
+                "validation": {"accepted": True, "status": "ok"},
+                "summary": {"accepted": True},
+            },
             "cleaning_view": {
                 "cleaning_gates": [],
                 "required_columns": [],

@@ -33,6 +33,7 @@ from src.utils.contract_validator import (
     validate_contract_readonly,
     normalize_artifact_requirements,
     is_probably_path,
+    is_file_path,
 )
 
 load_dotenv()
@@ -3409,7 +3410,6 @@ class ExecutionPlannerAgent:
             "temperature": 0.0,
             "top_p": 0.9,
             "top_k": 40,
-            "max_output_tokens": 8192,
             "response_mime_type": "application/json",
         }
         self._safety_settings = {
@@ -6133,6 +6133,15 @@ class ExecutionPlannerAgent:
             "ml_engineer_runbook": dict,
             "iteration_policy": dict,
         }
+        _SECTION_ROLE_BUCKETS = {
+            "pre_decision",
+            "decision",
+            "outcome",
+            "post_decision_audit_only",
+            "unknown",
+            "identifiers",
+            "time_columns",
+        }
 
         def _extract_section_payload(parsed: Any, keys: List[str]) -> Dict[str, Any]:
             if not isinstance(parsed, dict):
@@ -6142,6 +6151,122 @@ class ExecutionPlannerAgent:
                 if key in parsed:
                     payload[key] = parsed.get(key)
             return payload
+
+        def _normalize_role_bucket(role: Any) -> str:
+            role_text = str(role or "").strip().lower()
+            role_text = re.sub(r"[^a-z0-9]+", "_", role_text).strip("_")
+            if role_text == "audit_only":
+                return "post_decision_audit_only"
+            return role_text
+
+        def _validate_section_semantics(section_id: str, payload: Dict[str, Any]) -> List[str]:
+            errors: List[str] = []
+
+            if section_id == "core":
+                role_map = payload.get("column_roles")
+                if isinstance(role_map, dict):
+                    non_canonical_keys: List[str] = []
+                    unknown_roles: List[str] = []
+                    non_list_roles: List[str] = []
+                    bad_entries = 0
+                    for raw_role, columns in role_map.items():
+                        role_name = str(raw_role).strip()
+                        role_norm = _normalize_role_bucket(role_name)
+                        if role_name != role_norm:
+                            non_canonical_keys.append(role_name)
+                        if role_norm not in _SECTION_ROLE_BUCKETS:
+                            unknown_roles.append(role_name)
+                        if not isinstance(columns, list):
+                            non_list_roles.append(role_name)
+                            continue
+                        for col in columns:
+                            if not isinstance(col, str) or not col.strip():
+                                bad_entries += 1
+                    if non_canonical_keys:
+                        errors.append(
+                            f"{section_id}: column_roles keys must be canonical role buckets; invalid keys={sorted(list(dict.fromkeys(non_canonical_keys)))}"
+                        )
+                    if unknown_roles:
+                        errors.append(
+                            f"{section_id}: column_roles contains unknown role buckets={sorted(list(dict.fromkeys(unknown_roles)))}"
+                        )
+                    if non_list_roles:
+                        errors.append(
+                            f"{section_id}: column_roles must be role->list[str]; non-list buckets={sorted(list(dict.fromkeys(non_list_roles)))}"
+                        )
+                    if bad_entries:
+                        errors.append(
+                            f"{section_id}: column_roles contains {bad_entries} non-string/blank column entries"
+                        )
+                    pre_decision_cols = role_map.get("pre_decision")
+                    if not isinstance(pre_decision_cols, list) or not any(
+                        isinstance(col, str) and col.strip() for col in pre_decision_cols
+                    ):
+                        errors.append(f"{section_id}: column_roles.pre_decision must be a non-empty list[str]")
+
+                feature_sets = payload.get("allowed_feature_sets")
+                if isinstance(feature_sets, dict):
+                    for key in (
+                        "model_features",
+                        "segmentation_features",
+                        "audit_only_features",
+                        "forbidden_for_modeling",
+                    ):
+                        value = feature_sets.get(key)
+                        if not isinstance(value, list):
+                            errors.append(f"{section_id}: allowed_feature_sets.{key} must be a list")
+
+            if section_id == "artifacts_validation":
+                required_outputs = payload.get("required_outputs")
+                if isinstance(required_outputs, list):
+                    seen: set[str] = set()
+                    for item in required_outputs:
+                        if not isinstance(item, str):
+                            errors.append(f"{section_id}: required_outputs entries must be strings (artifact paths)")
+                            continue
+                        path = item.strip()
+                        if not path or not is_file_path(path):
+                            errors.append(
+                                f"{section_id}: required_outputs entry '{item}' must be a file path (not a logical label)"
+                            )
+                            continue
+                        path_norm = path.replace("\\", "/").lower()
+                        if path_norm in seen:
+                            errors.append(f"{section_id}: required_outputs contains duplicate path '{path}'")
+                        else:
+                            seen.add(path_norm)
+
+            if section_id == "gates_runbooks":
+                for gate_key in ("qa_gates", "cleaning_gates", "reviewer_gates"):
+                    gate_list = payload.get(gate_key)
+                    if isinstance(gate_list, list):
+                        for idx, gate in enumerate(gate_list, start=1):
+                            if not isinstance(gate, dict):
+                                errors.append(f"{section_id}: {gate_key}[{idx}] must be an object")
+                                continue
+                            gate_name = str(gate.get("name") or "").strip()
+                            severity = str(gate.get("severity") or "").upper().strip()
+                            if not gate_name:
+                                errors.append(f"{section_id}: {gate_key}[{idx}] missing non-empty name")
+                            if severity not in {"HARD", "SOFT"}:
+                                errors.append(
+                                    f"{section_id}: {gate_key}[{idx}] has invalid severity '{severity}' (expected HARD|SOFT)"
+                                )
+
+                for runbook_key in ("data_engineer_runbook", "ml_engineer_runbook"):
+                    runbook = payload.get(runbook_key)
+                    if isinstance(runbook, dict):
+                        steps = runbook.get("steps")
+                        if not isinstance(steps, list) or not steps:
+                            errors.append(f"{section_id}: {runbook_key}.steps must be a non-empty list")
+
+                iteration_policy = payload.get("iteration_policy")
+                if isinstance(iteration_policy, dict):
+                    max_iterations = iteration_policy.get("max_iterations")
+                    if not isinstance(max_iterations, int) or max_iterations < 1:
+                        errors.append(f"{section_id}: iteration_policy.max_iterations must be an integer >= 1")
+
+            return errors
 
         def _validate_section_payload(section_id: str, payload: Dict[str, Any], required_keys: List[str]) -> List[str]:
             errors: List[str] = []
@@ -6165,6 +6290,7 @@ class ExecutionPlannerAgent:
                     errors.append(f"{section_id}: key '{key}' cannot be blank")
             if "contract_version" in payload and str(payload.get("contract_version")) != CONTRACT_VERSION_V41:
                 errors.append(f"{section_id}: contract_version must be '{CONTRACT_VERSION_V41}'")
+            errors.extend(_validate_section_semantics(section_id, payload))
             return errors
 
         def _merge_section_payload(working: Dict[str, Any], section_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -6191,7 +6317,8 @@ class ExecutionPlannerAgent:
                 "Do not include markdown, comments, explanations, or extra keys.\n"
                 "Use only data from ORIGINAL INPUTS; do not invent columns.\n"
                 "Keep semantics aligned with strategy/business objective.\n"
-                "required_outputs entries must be file paths.\n"
+                "column_roles MUST use canonical role-bucket format {role: [columns]} (never {column: role}).\n"
+                "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
                 f"Required keys for this section: {json.dumps(required_keys)}\n\n"
                 "ORIGINAL INPUTS:\n"
                 + (original_inputs_text or "")
@@ -6221,6 +6348,7 @@ class ExecutionPlannerAgent:
                 f"Required keys: {json.dumps(required_keys)}\n"
                 "Use ORIGINAL INPUTS as source of truth and keep compatibility with CURRENT CONTRACT DRAFT.\n"
                 "Do not invent columns not present in column_inventory.\n\n"
+                "Use canonical role buckets for column_roles and artifact file paths for required_outputs.\n\n"
                 "ORIGINAL INPUTS:\n"
                 + (original_inputs_text or "")
                 + "\n\nCURRENT CONTRACT DRAFT:\n"
@@ -6371,8 +6499,12 @@ class ExecutionPlannerAgent:
                         elif isinstance(parsed, dict):
                             payload = _extract_section_payload(parsed, required_keys)
                             if optional_section:
-                                payload = _extract_section_payload(parsed, required_keys)
-                                validation_errors = []
+                                optional_keys = [key for key in required_keys if key in payload]
+                                validation_errors = (
+                                    _validate_section_payload(section_id, payload, optional_keys)
+                                    if optional_keys
+                                    else []
+                                )
                             else:
                                 validation_errors = _validate_section_payload(section_id, payload, required_keys)
                             if not validation_errors:

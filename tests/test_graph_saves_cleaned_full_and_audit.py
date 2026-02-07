@@ -63,7 +63,12 @@ def test_graph_saves_cleaned_full_and_audit(tmp_workdir, monkeypatch):
             "csv_sep": ",",
             "csv_decimal": ".",
             "data_summary": "",
-            "leakage_audit_summary": ""
+            "leakage_audit_summary": "",
+            "execution_contract": {"contract_version": "4.1"},
+            "execution_contract_diagnostics": {
+                "validation": {"accepted": True, "status": "ok"},
+                "summary": {"accepted": True},
+            },
         }
 
         result = run_data_engineer(state)
