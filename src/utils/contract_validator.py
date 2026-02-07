@@ -45,6 +45,8 @@ STRICT_ROLE_BUCKETS = {
     "time_columns",
 }
 
+CONTRACT_SCOPE_VALUES = {"cleaning_only", "ml_only", "full_pipeline"}
+
 # Role synonym mapping for normalization
 ROLE_SYNONYM_MAP = {
     "target": "outcome",
@@ -2162,6 +2164,244 @@ def validate_contract_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
         "summary": {
             "error_count": error_count,
             "warning_count": warning_count,
+        },
+    }
+
+
+def normalize_contract_scope(scope_value: Any) -> str:
+    token = str(scope_value or "").strip().lower()
+    if token in CONTRACT_SCOPE_VALUES:
+        return token
+    if token in {"cleaning", "clean", "clean_only"}:
+        return "cleaning_only"
+    if token in {"ml", "training", "modeling", "model_only"}:
+        return "ml_only"
+    return "full_pipeline"
+
+
+def _gate_list_valid(gates: Any) -> bool:
+    if not isinstance(gates, list) or not gates:
+        return False
+    for gate in gates:
+        if isinstance(gate, str) and gate.strip():
+            continue
+        if isinstance(gate, dict) and gate:
+            continue
+        return False
+    return True
+
+
+def _runbook_present(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return any(bool(str(item).strip()) for item in value if item is not None)
+    if isinstance(value, dict):
+        if "steps" in value and isinstance(value.get("steps"), list):
+            return any(bool(str(step).strip()) for step in value.get("steps") or [] if step is not None)
+        return bool(value)
+    return False
+
+
+def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Minimal, scope-driven contract validation.
+
+    Designed for LLM freedom: validates only the stable interface needed by the
+    orchestrator and downstream agents, without enforcing a rigid monolithic schema.
+    """
+    issues: List[Dict[str, Any]] = []
+
+    if not isinstance(contract, dict):
+        issues.append(
+            _strict_issue(
+                "contract.structure",
+                "error",
+                "Contract must be a dictionary.",
+                type(contract).__name__,
+            )
+        )
+        return {
+            "status": "error",
+            "accepted": False,
+            "issues": issues,
+            "summary": {"error_count": 1, "warning_count": 0},
+        }
+
+    scope_raw = contract.get("scope")
+    scope = normalize_contract_scope(scope_raw)
+    if scope_raw is None:
+        issues.append(
+            _strict_issue(
+                "contract.scope_missing",
+                "error",
+                "scope missing; scope is required and must be one of cleaning_only/ml_only/full_pipeline.",
+                "scope",
+            )
+        )
+    elif str(scope_raw).strip().lower() not in CONTRACT_SCOPE_VALUES:
+        issues.append(
+            _strict_issue(
+                "contract.scope_unknown",
+                "error",
+                f"Unknown scope '{scope_raw}'. Normalized to '{scope}'.",
+                scope_raw,
+            )
+        )
+
+    strategy_title = contract.get("strategy_title")
+    if not isinstance(strategy_title, str) or not strategy_title.strip():
+        issues.append(
+            _strict_issue(
+                "contract.strategy_title",
+                "error",
+                "strategy_title must be a non-empty string.",
+                strategy_title,
+            )
+        )
+
+    business_objective = contract.get("business_objective")
+    if not isinstance(business_objective, str) or not business_objective.strip():
+        issues.append(
+            _strict_issue(
+                "contract.business_objective",
+                "error",
+                "business_objective must be a non-empty string.",
+                business_objective,
+            )
+        )
+
+    output_dialect = contract.get("output_dialect")
+    if not isinstance(output_dialect, dict) or not output_dialect:
+        issues.append(
+            _strict_issue(
+                "contract.output_dialect",
+                "warning",
+                "output_dialect missing or empty; execution may fall back to runtime dialect detection.",
+                output_dialect,
+            )
+        )
+
+    canonical_columns = contract.get("canonical_columns")
+    if not isinstance(canonical_columns, list) or not any(
+        isinstance(col, str) and col.strip() for col in (canonical_columns or [])
+    ):
+        issues.append(
+            _strict_issue(
+                "contract.canonical_columns",
+                "error",
+                "canonical_columns must contain at least one non-empty column name.",
+                canonical_columns,
+            )
+        )
+
+    required_outputs = contract.get("required_outputs")
+    if not isinstance(required_outputs, list) or not required_outputs:
+        issues.append(
+            _strict_issue(
+                "contract.required_outputs",
+                "error",
+                "required_outputs must be a non-empty list of artifact file paths.",
+                required_outputs,
+            )
+        )
+    else:
+        invalid_outputs: List[Any] = []
+        for output in required_outputs:
+            if not isinstance(output, str) or not is_file_path(output.strip()):
+                invalid_outputs.append(output)
+        if invalid_outputs:
+            issues.append(
+                _strict_issue(
+                    "contract.required_outputs_path",
+                    "error",
+                    "required_outputs entries must be file-like paths.",
+                    invalid_outputs[:10],
+                )
+            )
+
+    requires_cleaning = scope in {"cleaning_only", "full_pipeline"}
+    requires_ml = scope in {"ml_only", "full_pipeline"}
+
+    if requires_cleaning:
+        if not _gate_list_valid(contract.get("cleaning_gates")):
+            issues.append(
+                _strict_issue(
+                    "contract.cleaning_gates",
+                    "error",
+                    "cleaning_gates must be a non-empty list of gate objects/labels for cleaning scope.",
+                    contract.get("cleaning_gates"),
+                )
+            )
+        if not _runbook_present(contract.get("data_engineer_runbook")):
+            issues.append(
+                _strict_issue(
+                    "contract.data_engineer_runbook",
+                    "error",
+                    "data_engineer_runbook must be provided for cleaning scope.",
+                    contract.get("data_engineer_runbook"),
+                )
+            )
+
+    if requires_ml:
+        if not _gate_list_valid(contract.get("qa_gates")):
+            issues.append(
+                _strict_issue(
+                    "contract.qa_gates",
+                    "error",
+                    "qa_gates must be a non-empty list for ML scope.",
+                    contract.get("qa_gates"),
+                )
+            )
+        if not _gate_list_valid(contract.get("reviewer_gates")):
+            issues.append(
+                _strict_issue(
+                    "contract.reviewer_gates",
+                    "error",
+                    "reviewer_gates must be a non-empty list for ML scope.",
+                    contract.get("reviewer_gates"),
+                )
+            )
+        if not isinstance(contract.get("validation_requirements"), dict) or not contract.get("validation_requirements"):
+            issues.append(
+                _strict_issue(
+                    "contract.validation_requirements",
+                    "error",
+                    "validation_requirements must be a non-empty object for ML scope.",
+                    contract.get("validation_requirements"),
+                )
+            )
+        if not _runbook_present(contract.get("ml_engineer_runbook")):
+            issues.append(
+                _strict_issue(
+                    "contract.ml_engineer_runbook",
+                    "error",
+                    "ml_engineer_runbook must be provided for ML scope.",
+                    contract.get("ml_engineer_runbook"),
+                )
+            )
+
+    if "iteration_policy" not in contract:
+        issues.append(
+            _strict_issue(
+                "contract.iteration_policy_missing",
+                "warning",
+                "iteration_policy is missing; runtime will use defaults.",
+                "iteration_policy",
+            )
+        )
+
+    status = _status_from_issues(issues)
+    error_count = sum(1 for issue in issues if str(issue.get("severity", "")).lower() in {"error", "fail"})
+    warning_count = sum(1 for issue in issues if str(issue.get("severity", "")).lower() == "warning")
+    return {
+        "status": status,
+        "accepted": status != "error",
+        "issues": issues,
+        "summary": {
+            "error_count": error_count,
+            "warning_count": warning_count,
+            "scope": scope,
         },
     }
 

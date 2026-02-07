@@ -8,7 +8,6 @@ import re
 import difflib
 
 from dotenv import load_dotenv
-from src.agents.prompts import SENIOR_PLANNER_PROMPT
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from src.utils.contract_validation import (
@@ -20,17 +19,14 @@ from src.utils.contract_v41 import (
     get_column_roles,
     get_derived_column_names,
     get_required_outputs,
-    assert_only_allowed_v41_keys,
-    warn_legacy_keys,
-    LEGACY_KEYS,
     CONTRACT_VERSION_V41,
     normalize_contract_version,
 )
 from src.utils.run_bundle import get_run_dir
 from src.utils.feature_selectors import infer_feature_selectors, compact_column_representation
 from src.utils.contract_validator import (
-    validate_contract,
-    validate_contract_readonly,
+    validate_contract_minimal_readonly,
+    normalize_contract_scope,
     normalize_artifact_requirements,
     is_probably_path,
     is_file_path,
@@ -166,6 +162,41 @@ _VISUAL_REQUIRED_PHRASES = {
     "explicar drivers",
     "explain drivers",
 }
+
+MINIMAL_CONTRACT_COMPILER_PROMPT = """
+You are an Execution Contract Compiler for a multi-agent business intelligence system.
+
+Goal:
+- Produce ONE JSON execution contract that downstream agents can execute and review.
+- Keep reasoning freedom, but obey a minimal stable interface.
+
+Return format:
+- Return ONLY valid JSON (no markdown, no code fences, no comments).
+
+Minimal contract interface:
+- scope: one of ["cleaning_only", "ml_only", "full_pipeline"]
+- strategy_title: string
+- business_objective: string
+- output_dialect: object (csv sep/decimal/encoding when known)
+- canonical_columns: list[str]
+- required_outputs: list[str] file paths
+
+Scope-dependent required fields:
+- If scope includes cleaning ("cleaning_only" or "full_pipeline"):
+  - cleaning_gates: list (gate objects or labels)
+  - data_engineer_runbook: object/list/string with actionable steps
+- If scope includes ML ("ml_only" or "full_pipeline"):
+  - qa_gates: list
+  - reviewer_gates: list
+  - validation_requirements: object
+  - ml_engineer_runbook: object/list/string with actionable steps
+
+Hard rules:
+- Do not invent columns not present in column_inventory.
+- required_outputs must be artifact paths, never conceptual labels.
+- Keep contract coherent with strategy + business objective.
+- You may add extra fields if useful, but do not omit required minimum fields.
+"""
 
 
 def _normalize_text(*values: Any) -> str:
@@ -6072,22 +6103,12 @@ class ExecutionPlannerAgent:
             original_inputs_text: str | None,
         ) -> str:
             required_top_level = [
-                "contract_version",
+                "scope",
                 "strategy_title",
                 "business_objective",
                 "output_dialect",
                 "canonical_columns",
-                "column_roles",
-                "allowed_feature_sets",
-                "artifact_requirements",
                 "required_outputs",
-                "validation_requirements",
-                "qa_gates",
-                "cleaning_gates",
-                "reviewer_gates",
-                "data_engineer_runbook",
-                "ml_engineer_runbook",
-                "iteration_policy",
             ]
             validation_feedback = _compact_validation_feedback(previous_validation)
             parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
@@ -6099,7 +6120,7 @@ class ExecutionPlannerAgent:
             return (
                 "Repair the previous execution contract.\n"
                 "Return ONLY one valid JSON object (no markdown, no comments, no code fences).\n"
-                f"contract_version MUST be exactly {json.dumps(CONTRACT_VERSION_V41)}.\n"
+                "scope MUST be one of: cleaning_only, ml_only, full_pipeline.\n"
                 "Do not invent columns outside column_inventory.\n"
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
@@ -6115,33 +6136,56 @@ class ExecutionPlannerAgent:
                 + previous_payload
             )
 
-        _SECTION_REQUIRED_TYPES: Dict[str, type] = {
-            "contract_version": str,
+        _SECTION_REQUIRED_TYPES: Dict[str, Any] = {
+            "scope": str,
             "strategy_title": str,
             "business_objective": str,
             "output_dialect": dict,
             "canonical_columns": list,
-            "column_roles": dict,
-            "allowed_feature_sets": dict,
-            "artifact_requirements": dict,
             "required_outputs": list,
-            "validation_requirements": dict,
-            "qa_gates": list,
             "cleaning_gates": list,
+            "qa_gates": list,
             "reviewer_gates": list,
-            "data_engineer_runbook": dict,
-            "ml_engineer_runbook": dict,
+            "validation_requirements": dict,
+            "data_engineer_runbook": (dict, list, str),
+            "ml_engineer_runbook": (dict, list, str),
             "iteration_policy": dict,
         }
-        _SECTION_ROLE_BUCKETS = {
-            "pre_decision",
-            "decision",
-            "outcome",
-            "post_decision_audit_only",
-            "unknown",
-            "identifiers",
-            "time_columns",
-        }
+        _SCOPE_VALUES = {"cleaning_only", "ml_only", "full_pipeline"}
+
+        def _scope_requires_cleaning(scope: str) -> bool:
+            return scope in {"cleaning_only", "full_pipeline"}
+
+        def _scope_requires_ml(scope: str) -> bool:
+            return scope in {"ml_only", "full_pipeline"}
+
+        def _normalize_scope(scope_value: Any) -> str:
+            token = str(scope_value or "").strip().lower()
+            if token in _SCOPE_VALUES:
+                return token
+            return normalize_contract_scope(scope_value)
+
+        def _runbook_non_empty(value: Any) -> bool:
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, list):
+                return any(bool(str(item).strip()) for item in value if item is not None)
+            if isinstance(value, dict):
+                if "steps" in value and isinstance(value.get("steps"), list):
+                    return any(bool(str(step).strip()) for step in value.get("steps") or [] if step is not None)
+                return bool(value)
+            return False
+
+        def _gate_list_valid(value: Any) -> bool:
+            if not isinstance(value, list) or not value:
+                return False
+            for gate in value:
+                if isinstance(gate, str) and gate.strip():
+                    continue
+                if isinstance(gate, dict) and gate:
+                    continue
+                return False
+            return True
 
         def _extract_section_payload(parsed: Any, keys: List[str]) -> Dict[str, Any]:
             if not isinstance(parsed, dict):
@@ -6152,145 +6196,116 @@ class ExecutionPlannerAgent:
                     payload[key] = parsed.get(key)
             return payload
 
-        def _normalize_role_bucket(role: Any) -> str:
-            role_text = str(role or "").strip().lower()
-            role_text = re.sub(r"[^a-z0-9]+", "_", role_text).strip("_")
-            if role_text == "audit_only":
-                return "post_decision_audit_only"
-            return role_text
+        def _effective_required_keys(
+            section_id: str,
+            required_keys: List[str],
+            current_contract: Dict[str, Any] | None = None,
+            payload: Dict[str, Any] | None = None,
+        ) -> List[str]:
+            baseline = current_contract if isinstance(current_contract, dict) else {}
+            incoming = payload if isinstance(payload, dict) else {}
+            scope = _normalize_scope(incoming.get("scope") or baseline.get("scope"))
+            if section_id == "cleaning_contract" and not _scope_requires_cleaning(scope):
+                return []
+            if section_id == "ml_contract" and not _scope_requires_ml(scope):
+                return []
+            return [str(k) for k in required_keys if k]
 
-        def _validate_section_semantics(section_id: str, payload: Dict[str, Any]) -> List[str]:
+        def _validate_section_semantics(
+            section_id: str,
+            payload: Dict[str, Any],
+            current_contract: Dict[str, Any] | None = None,
+        ) -> List[str]:
             errors: List[str] = []
+            baseline = current_contract if isinstance(current_contract, dict) else {}
+            candidate_scope = _normalize_scope(payload.get("scope") or baseline.get("scope"))
 
             if section_id == "core":
-                role_map = payload.get("column_roles")
-                if isinstance(role_map, dict):
-                    non_canonical_keys: List[str] = []
-                    unknown_roles: List[str] = []
-                    non_list_roles: List[str] = []
-                    bad_entries = 0
-                    for raw_role, columns in role_map.items():
-                        role_name = str(raw_role).strip()
-                        role_norm = _normalize_role_bucket(role_name)
-                        if role_name != role_norm:
-                            non_canonical_keys.append(role_name)
-                        if role_norm not in _SECTION_ROLE_BUCKETS:
-                            unknown_roles.append(role_name)
-                        if not isinstance(columns, list):
-                            non_list_roles.append(role_name)
-                            continue
-                        for col in columns:
-                            if not isinstance(col, str) or not col.strip():
-                                bad_entries += 1
-                    if non_canonical_keys:
+                scope_raw = payload.get("scope")
+                if not isinstance(scope_raw, str) or not scope_raw.strip():
+                    errors.append(f"{section_id}: scope must be provided as non-empty string")
+                elif _normalize_scope(scope_raw) not in _SCOPE_VALUES:
+                    errors.append(
+                        f"{section_id}: scope '{scope_raw}' is invalid; expected one of {sorted(_SCOPE_VALUES)}"
+                    )
+
+                canonical = payload.get("canonical_columns")
+                if isinstance(canonical, list) and not any(
+                    isinstance(col, str) and col.strip() for col in canonical
+                ):
+                    errors.append(f"{section_id}: canonical_columns must include at least one non-empty column")
+
+                outputs = payload.get("required_outputs")
+                if isinstance(outputs, list):
+                    invalid_outputs = [
+                        item for item in outputs if not isinstance(item, str) or not is_file_path(str(item).strip())
+                    ]
+                    if invalid_outputs:
                         errors.append(
-                            f"{section_id}: column_roles keys must be canonical role buckets; invalid keys={sorted(list(dict.fromkeys(non_canonical_keys)))}"
+                            f"{section_id}: required_outputs entries must be file paths; invalid={invalid_outputs[:5]}"
                         )
-                    if unknown_roles:
-                        errors.append(
-                            f"{section_id}: column_roles contains unknown role buckets={sorted(list(dict.fromkeys(unknown_roles)))}"
-                        )
-                    if non_list_roles:
-                        errors.append(
-                            f"{section_id}: column_roles must be role->list[str]; non-list buckets={sorted(list(dict.fromkeys(non_list_roles)))}"
-                        )
-                    if bad_entries:
-                        errors.append(
-                            f"{section_id}: column_roles contains {bad_entries} non-string/blank column entries"
-                        )
-                    pre_decision_cols = role_map.get("pre_decision")
-                    if not isinstance(pre_decision_cols, list) or not any(
-                        isinstance(col, str) and col.strip() for col in pre_decision_cols
-                    ):
-                        errors.append(f"{section_id}: column_roles.pre_decision must be a non-empty list[str]")
 
-                feature_sets = payload.get("allowed_feature_sets")
-                if isinstance(feature_sets, dict):
-                    for key in (
-                        "model_features",
-                        "segmentation_features",
-                        "audit_only_features",
-                        "forbidden_for_modeling",
-                    ):
-                        value = feature_sets.get(key)
-                        if not isinstance(value, list):
-                            errors.append(f"{section_id}: allowed_feature_sets.{key} must be a list")
+            if section_id == "cleaning_contract" and _scope_requires_cleaning(candidate_scope):
+                if not _gate_list_valid(payload.get("cleaning_gates")):
+                    errors.append(f"{section_id}: cleaning_gates must be a non-empty list")
+                if not _runbook_non_empty(payload.get("data_engineer_runbook")):
+                    errors.append(f"{section_id}: data_engineer_runbook must be non-empty")
 
-            if section_id == "artifacts_validation":
-                required_outputs = payload.get("required_outputs")
-                if isinstance(required_outputs, list):
-                    seen: set[str] = set()
-                    for item in required_outputs:
-                        if not isinstance(item, str):
-                            errors.append(f"{section_id}: required_outputs entries must be strings (artifact paths)")
-                            continue
-                        path = item.strip()
-                        if not path or not is_file_path(path):
-                            errors.append(
-                                f"{section_id}: required_outputs entry '{item}' must be a file path (not a logical label)"
-                            )
-                            continue
-                        path_norm = path.replace("\\", "/").lower()
-                        if path_norm in seen:
-                            errors.append(f"{section_id}: required_outputs contains duplicate path '{path}'")
-                        else:
-                            seen.add(path_norm)
-
-            if section_id == "gates_runbooks":
-                for gate_key in ("qa_gates", "cleaning_gates", "reviewer_gates"):
-                    gate_list = payload.get(gate_key)
-                    if isinstance(gate_list, list):
-                        for idx, gate in enumerate(gate_list, start=1):
-                            if not isinstance(gate, dict):
-                                errors.append(f"{section_id}: {gate_key}[{idx}] must be an object")
-                                continue
-                            gate_name = str(gate.get("name") or "").strip()
-                            severity = str(gate.get("severity") or "").upper().strip()
-                            if not gate_name:
-                                errors.append(f"{section_id}: {gate_key}[{idx}] missing non-empty name")
-                            if severity not in {"HARD", "SOFT"}:
-                                errors.append(
-                                    f"{section_id}: {gate_key}[{idx}] has invalid severity '{severity}' (expected HARD|SOFT)"
-                                )
-
-                for runbook_key in ("data_engineer_runbook", "ml_engineer_runbook"):
-                    runbook = payload.get(runbook_key)
-                    if isinstance(runbook, dict):
-                        steps = runbook.get("steps")
-                        if not isinstance(steps, list) or not steps:
-                            errors.append(f"{section_id}: {runbook_key}.steps must be a non-empty list")
-
-                iteration_policy = payload.get("iteration_policy")
-                if isinstance(iteration_policy, dict):
-                    max_iterations = iteration_policy.get("max_iterations")
-                    if not isinstance(max_iterations, int) or max_iterations < 1:
-                        errors.append(f"{section_id}: iteration_policy.max_iterations must be an integer >= 1")
+            if section_id == "ml_contract" and _scope_requires_ml(candidate_scope):
+                if not _gate_list_valid(payload.get("qa_gates")):
+                    errors.append(f"{section_id}: qa_gates must be a non-empty list")
+                if not _gate_list_valid(payload.get("reviewer_gates")):
+                    errors.append(f"{section_id}: reviewer_gates must be a non-empty list")
+                validation_reqs = payload.get("validation_requirements")
+                if not isinstance(validation_reqs, dict) or not validation_reqs:
+                    errors.append(f"{section_id}: validation_requirements must be a non-empty object")
+                if not _runbook_non_empty(payload.get("ml_engineer_runbook")):
+                    errors.append(f"{section_id}: ml_engineer_runbook must be non-empty")
 
             return errors
 
-        def _validate_section_payload(section_id: str, payload: Dict[str, Any], required_keys: List[str]) -> List[str]:
+        def _validate_section_payload(
+            section_id: str,
+            payload: Dict[str, Any],
+            required_keys: List[str],
+            current_contract: Dict[str, Any] | None = None,
+        ) -> List[str]:
             errors: List[str] = []
             if not isinstance(payload, dict):
                 return [f"{section_id}: payload is not an object"]
-            for key in required_keys:
+
+            effective_required = _effective_required_keys(
+                section_id,
+                required_keys,
+                current_contract=current_contract,
+                payload=payload,
+            )
+            if not effective_required:
+                return []
+
+            for key in effective_required:
                 if key not in payload:
                     errors.append(f"{section_id}: missing key '{key}'")
                     continue
                 value = payload.get(key)
                 expected_type = _SECTION_REQUIRED_TYPES.get(key)
                 if expected_type and not isinstance(value, expected_type):
+                    expected_name = (
+                        " | ".join(t.__name__ for t in expected_type)
+                        if isinstance(expected_type, tuple)
+                        else expected_type.__name__
+                    )
                     errors.append(
-                        f"{section_id}: key '{key}' must be {expected_type.__name__}, got {type(value).__name__}"
+                        f"{section_id}: key '{key}' must be {expected_name}, got {type(value).__name__}"
                     )
                     continue
-                if expected_type in (dict, list) and not value:
+                if isinstance(value, (dict, list)) and not value:
                     errors.append(f"{section_id}: key '{key}' cannot be empty")
                     continue
-                if expected_type is str and not str(value).strip():
+                if isinstance(value, str) and not value.strip():
                     errors.append(f"{section_id}: key '{key}' cannot be blank")
-            if "contract_version" in payload and str(payload.get("contract_version")) != CONTRACT_VERSION_V41:
-                errors.append(f"{section_id}: contract_version must be '{CONTRACT_VERSION_V41}'")
-            errors.extend(_validate_section_semantics(section_id, payload))
+
+            errors.extend(_validate_section_semantics(section_id, payload, current_contract=current_contract))
             return errors
 
         def _merge_section_payload(working: Dict[str, Any], section_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -6313,13 +6328,13 @@ class ExecutionPlannerAgent:
                 "You are Execution Contract Compiler.\n"
                 f"SECTION: {section_id}\n"
                 f"GOAL: {section_goal}\n"
-                "Return ONLY one JSON object with EXACT required keys for this section.\n"
-                "Do not include markdown, comments, explanations, or extra keys.\n"
+                "Return ONLY one JSON object.\n"
+                "Do not include markdown, comments, or explanations.\n"
                 "Use only data from ORIGINAL INPUTS; do not invent columns.\n"
                 "Keep semantics aligned with strategy/business objective.\n"
-                "column_roles MUST use canonical role-bucket format {role: [columns]} (never {column: role}).\n"
                 "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
-                f"Required keys for this section: {json.dumps(required_keys)}\n\n"
+                f"Required keys for this section: {json.dumps(required_keys)}\n"
+                "If this section has no required keys for the selected scope, return {}.\n\n"
                 "ORIGINAL INPUTS:\n"
                 + (original_inputs_text or "")
                 + "\n\nCURRENT CONTRACT DRAFT (from previous compiled sections):\n"
@@ -6343,12 +6358,12 @@ class ExecutionPlannerAgent:
                 "Repair the section output.\n"
                 f"SECTION: {section_id}\n"
                 f"GOAL: {section_goal}\n"
-                "Return ONLY one JSON object with EXACT required keys for this section.\n"
-                "No markdown, no comments, no extra keys.\n"
+                "Return ONLY one JSON object.\n"
+                "No markdown, no comments.\n"
                 f"Required keys: {json.dumps(required_keys)}\n"
                 "Use ORIGINAL INPUTS as source of truth and keep compatibility with CURRENT CONTRACT DRAFT.\n"
                 "Do not invent columns not present in column_inventory.\n\n"
-                "Use canonical role buckets for column_roles and artifact file paths for required_outputs.\n\n"
+                "Use artifact file paths for required_outputs.\n\n"
                 "ORIGINAL INPUTS:\n"
                 + (original_inputs_text or "")
                 + "\n\nCURRENT CONTRACT DRAFT:\n"
@@ -6370,66 +6385,41 @@ class ExecutionPlannerAgent:
             section_specs: List[Dict[str, Any]] = [
                 {
                     "id": "core",
-                    "goal": "Define core contract identity, schema columns, roles, and feature sets.",
+                    "goal": "Define minimal contract identity, declared scope, columns, and required output artifacts.",
                     "required_keys": [
-                        "contract_version",
+                        "scope",
                         "strategy_title",
                         "business_objective",
                         "output_dialect",
                         "canonical_columns",
-                        "column_roles",
-                        "allowed_feature_sets",
-                    ],
-                    "optional": False,
-                },
-                {
-                    "id": "artifacts_validation",
-                    "goal": "Define artifact requirements, required outputs paths, and validation requirements.",
-                    "required_keys": [
-                        "artifact_requirements",
                         "required_outputs",
-                        "validation_requirements",
                     ],
                     "optional": False,
                 },
                 {
-                    "id": "gates_runbooks",
-                    "goal": "Define QA/cleaning/reviewer gates and both engineer runbooks plus iteration policy.",
+                    "id": "cleaning_contract",
+                    "goal": "Define cleaning gates and data engineer runbook when scope includes cleaning.",
+                    "required_keys": [
+                        "cleaning_gates",
+                        "data_engineer_runbook",
+                    ],
+                    "optional": False,
+                },
+                {
+                    "id": "ml_contract",
+                    "goal": "Define ML QA/reviewer gates, validation requirements, and ML runbook when scope includes ML.",
                     "required_keys": [
                         "qa_gates",
-                        "cleaning_gates",
                         "reviewer_gates",
-                        "data_engineer_runbook",
+                        "validation_requirements",
                         "ml_engineer_runbook",
-                        "iteration_policy",
                     ],
                     "optional": False,
                 },
                 {
                     "id": "optional_context",
-                    "goal": "Add optional but useful execution context sections consistent with existing draft.",
-                    "required_keys": [
-                        "objective_analysis",
-                        "data_analysis",
-                        "preprocessing_requirements",
-                        "feature_engineering_plan",
-                        "leakage_execution_plan",
-                        "decisioning_requirements",
-                        "reporting_policy",
-                        "data_limited_mode",
-                        "execution_constraints",
-                        "missing_columns_handling",
-                        "visualization_requirements",
-                        "available_columns",
-                        "derived_columns",
-                        "unknowns",
-                        "assumptions",
-                        "notes_for_engineers",
-                        "training_rows_rule",
-                        "scoring_rows_rule",
-                        "secondary_scoring_subset",
-                        "data_partitioning_notes",
-                    ],
+                    "goal": "Optionally add useful context such as iteration_policy and additional execution hints.",
+                    "required_keys": [],
                     "optional": True,
                 },
             ]
@@ -6442,8 +6432,24 @@ class ExecutionPlannerAgent:
             for spec in section_specs:
                 section_id = str(spec.get("id"))
                 section_goal = str(spec.get("goal") or "")
-                required_keys = [str(k) for k in (spec.get("required_keys") or []) if k]
+                base_required_keys = [str(k) for k in (spec.get("required_keys") or []) if k]
+                required_keys = _effective_required_keys(
+                    section_id,
+                    base_required_keys,
+                    current_contract=working_contract,
+                )
                 optional_section = bool(spec.get("optional"))
+                if not required_keys:
+                    section_diag.append(
+                        {
+                            "compiler_mode": "sectional",
+                            "section_id": section_id,
+                            "section_skipped": True,
+                            "skip_reason": "scope_or_optional_without_required_keys",
+                            "scope": _normalize_scope(working_contract.get("scope")),
+                        }
+                    )
+                    continue
 
                 current_prompt = _build_section_prompt(
                     section_id=section_id,
@@ -6501,12 +6507,22 @@ class ExecutionPlannerAgent:
                             if optional_section:
                                 optional_keys = [key for key in required_keys if key in payload]
                                 validation_errors = (
-                                    _validate_section_payload(section_id, payload, optional_keys)
+                                    _validate_section_payload(
+                                        section_id,
+                                        payload,
+                                        optional_keys,
+                                        current_contract=working_contract,
+                                    )
                                     if optional_keys
                                     else []
                                 )
                             else:
-                                validation_errors = _validate_section_payload(section_id, payload, required_keys)
+                                validation_errors = _validate_section_payload(
+                                    section_id,
+                                    payload,
+                                    required_keys,
+                                    current_contract=working_contract,
+                                )
                             if not validation_errors:
                                 working_contract = _merge_section_payload(working_contract, payload)
                                 section_success = True
@@ -6590,6 +6606,7 @@ class ExecutionPlannerAgent:
             diagnostics: Dict[str, Any] = {
                 "schema_version": 1,
                 "policy": "llm_contract_immutable_post_generation",
+                "interface_profile": "minimal_scope_v1",
                 "where": where,
                 "llm_success": bool(llm_success),
                 "legacy_keys": [],
@@ -6603,17 +6620,8 @@ class ExecutionPlannerAgent:
                 }
                 return diagnostics
 
-            legacy = warn_legacy_keys(contract, where=where)
-            unknown = assert_only_allowed_v41_keys(contract, strict=False)
-            diagnostics["legacy_keys"] = legacy
-            diagnostics["unknown_top_level_keys"] = unknown
-            if legacy:
-                print(f"WARNING: Legacy keys in contract ({where}): {legacy}")
-            if unknown:
-                print(f"WARNING: Unknown keys in contract ({where}): {unknown}")
-
             try:
-                validation_result = validate_contract_readonly(copy.deepcopy(contract))
+                validation_result = validate_contract_minimal_readonly(copy.deepcopy(contract))
             except Exception as err:
                 validation_result = {
                     "status": "error",
@@ -6725,9 +6733,6 @@ relevant_sources:
 omitted_columns_policy:
 {omitted_columns_policy}
 
-contract_version_required:
-{json.dumps(CONTRACT_VERSION_V41)}
-
 column_inventory_count:
 {column_inventory_count}
 
@@ -6768,7 +6773,7 @@ domain_expert_critique:
 {critique_for_prompt or "None"}
 """
 
-        full_prompt = SENIOR_PLANNER_PROMPT + "\n\nINPUTS:\n" + user_input
+        full_prompt = MINIMAL_CONTRACT_COMPILER_PROMPT + "\n\nINPUTS:\n" + user_input
         model_chain = [m for m in (self.model_chain or [self.model_name]) if m]
 
         contract: Dict[str, Any] | None = None
@@ -6839,42 +6844,37 @@ domain_expert_critique:
 
                 quality_error_message = None
                 if parsed is not None and isinstance(parsed, dict):
-                    version = normalize_contract_version(parsed.get("contract_version"))
-                    if version != CONTRACT_VERSION_V41:
-                        parse_error = ValueError("contract_version_mismatch")
-                        quality_error_message = "contract_version_mismatch"
-                    else:
-                        round_has_candidate = True
-                        try:
-                            validation_result = validate_contract_readonly(copy.deepcopy(parsed))
-                        except Exception as val_err:
-                            validation_result = {
-                                "status": "error",
-                                "accepted": False,
-                                "issues": [
-                                    {
-                                        "severity": "error",
-                                        "rule": "contract_validation_exception",
-                                        "message": str(val_err),
-                                    }
-                                ],
-                                "summary": {"error_count": 1, "warning_count": 0},
-                            }
-                        quality_accepted = _contract_is_accepted(validation_result)
-                        if not quality_accepted:
-                            quality_error_message = "contract_quality_failed"
-                            summary = validation_result.get("summary") if isinstance(validation_result, dict) else {}
-                            error_count = (
-                                int(summary.get("error_count", 0))
-                                if isinstance(summary, dict)
-                                else 0
-                            )
-                            if best_error_count is None or error_count < best_error_count:
-                                best_candidate = parsed
-                                best_validation = validation_result
-                                best_response_text = response_text
-                                best_error_count = error_count
-                                best_parse_feedback = None
+                    round_has_candidate = True
+                    try:
+                        validation_result = validate_contract_minimal_readonly(copy.deepcopy(parsed))
+                    except Exception as val_err:
+                        validation_result = {
+                            "status": "error",
+                            "accepted": False,
+                            "issues": [
+                                {
+                                    "severity": "error",
+                                    "rule": "contract_validation_exception",
+                                    "message": str(val_err),
+                                }
+                            ],
+                            "summary": {"error_count": 1, "warning_count": 0},
+                        }
+                    quality_accepted = _contract_is_accepted(validation_result)
+                    if not quality_accepted:
+                        quality_error_message = "contract_quality_failed"
+                        summary = validation_result.get("summary") if isinstance(validation_result, dict) else {}
+                        error_count = (
+                            int(summary.get("error_count", 0))
+                            if isinstance(summary, dict)
+                            else 0
+                        )
+                        if best_error_count is None or error_count < best_error_count:
+                            best_candidate = parsed
+                            best_validation = validation_result
+                            best_response_text = response_text
+                            best_error_count = error_count
+                            best_parse_feedback = None
                 else:
                     parse_feedback = _build_parse_feedback(response_text, parse_error)
                     if best_response_text is None:
@@ -6905,9 +6905,6 @@ domain_expert_critique:
 
                 if parsed is None or not isinstance(parsed, dict):
                     print(f"WARNING: Planner parse failed on attempt {attempt_counter} (model={model_name}).")
-                    continue
-                if quality_error_message == "contract_version_mismatch":
-                    print(f"WARNING: Planner contract_version mismatch on attempt {attempt_counter} (model={model_name}).")
                     continue
                 if not quality_accepted:
                     print(f"WARNING: Planner contract rejected by quality gate on attempt {attempt_counter} (model={model_name}).")
@@ -6979,7 +6976,7 @@ domain_expert_critique:
             sectional_accepted = False
             if isinstance(sectional_contract, dict) and sectional_contract:
                 try:
-                    sectional_validation = validate_contract_readonly(copy.deepcopy(sectional_contract))
+                    sectional_validation = validate_contract_minimal_readonly(copy.deepcopy(sectional_contract))
                 except Exception as section_val_err:
                     sectional_validation = {
                         "status": "error",

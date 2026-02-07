@@ -90,6 +90,7 @@ from src.utils.contract_v41 import (
     get_reviewer_gates,
     get_decision_columns,
 )
+from src.utils.contract_validator import normalize_contract_scope
 from src.utils.contract_views import (
     build_contract_views_projection,
     persist_views,
@@ -8737,7 +8738,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
 
     if not planner_contract_accepted:
-        error_message = "Execution planner produced a contract that failed strict validation (fail-closed)."
+        error_message = "Execution planner produced a contract that failed validation (fail-closed)."
         if run_id:
             log_run_event(
                 run_id,
@@ -11165,6 +11166,13 @@ def check_data_success(state: AgentState):
     if str(preview).startswith("Error") or "Error reading preview" in str(preview):
         print(f"❌ Data Engineer Failed (Preview Error): {preview}")
         return "failed"
+
+    contract = state.get("execution_contract") if isinstance(state, dict) else {}
+    if not isinstance(contract, dict):
+        contract = {}
+    scope = normalize_contract_scope(contract.get("scope"))
+    if scope == "cleaning_only":
+        return "success_cleaning_only"
 
     return "success"
 
@@ -15622,6 +15630,7 @@ workflow.add_conditional_edges(
     check_data_success,
     {
         "success": "engineer",
+        "success_cleaning_only": "translator",
         "failed": "translator"
     }
 )
