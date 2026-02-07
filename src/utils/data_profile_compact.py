@@ -195,14 +195,14 @@ def _extract_outcome_columns(contract: Dict[str, Any]) -> List[str]:
     This is NOT dataset-specific: it's schema-aware extraction.
     """
     try:
-        from src.utils.contract_v41 import get_outcome_columns
+        from src.utils.contract_accessors import get_outcome_columns
         outcomes = get_outcome_columns(contract)
         if outcomes:
             return outcomes
     except ImportError:
         pass
 
-    # Legacy fallback if contract_v41 not available
+    # Legacy fallback if contract accessors are not available
     outcome_cols = []
 
     # Try outcome_columns first

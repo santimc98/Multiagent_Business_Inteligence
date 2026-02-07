@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from src.utils.run_logger import register_run_log
 from src.utils.context_pack import compress_long_lists
-from src.utils.contract_v41 import get_required_outputs
+from src.utils.contract_accessors import get_required_outputs
 from src.utils.review_status import normalize_status as normalize_review_status
 from src.utils.text_encoding import sanitize_text, sanitize_text_payload
 

@@ -6,7 +6,7 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
-from src.utils.contract_v41 import get_required_outputs, get_artifact_requirements
+from src.utils.contract_accessors import get_required_outputs, get_artifact_requirements
 
 
 def _safe_load_json(path: str) -> Any:

@@ -14,7 +14,7 @@ from src.utils.contract_validation import (
     DEFAULT_DATA_ENGINEER_RUNBOOK,
     DEFAULT_ML_ENGINEER_RUNBOOK,
 )
-from src.utils.contract_v41 import (
+from src.utils.contract_accessors import (
     get_canonical_columns,
     get_column_roles,
     get_derived_column_names,
@@ -772,7 +772,7 @@ def _apply_sparse_optional_columns(
         return contract
 
     try:
-        from src.utils.contract_v41 import get_outcome_columns, get_decision_columns, get_column_roles
+        from src.utils.contract_accessors import get_outcome_columns, get_decision_columns, get_column_roles
     except Exception:
         return contract
 
@@ -2226,7 +2226,7 @@ def build_contract_min(
     if not isinstance(data_partitioning_notes, list):
         data_partitioning_notes = []
 
-    from src.utils.contract_v41 import CONTRACT_VERSION_V41, normalize_contract_version
+    from src.utils.contract_accessors import CONTRACT_VERSION_V41, normalize_contract_version
     contract_min = {
         "contract_version": normalize_contract_version(contract.get("contract_version")),
         "strategy_title": contract.get("strategy_title") or strategy_dict.get("title", ""),
@@ -2282,7 +2282,7 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
     Returns:
         Contract with all V4.1 keys present
     """
-    from src.utils.contract_v41 import CONTRACT_VERSION_V41, normalize_contract_version
+    from src.utils.contract_accessors import CONTRACT_VERSION_V41, normalize_contract_version
 
     if not isinstance(contract, dict):
         return contract

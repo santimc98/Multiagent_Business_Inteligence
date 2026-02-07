@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.code_extract import extract_code_block
 from src.utils.senior_protocol import SENIOR_ENGINEERING_PROTOCOL
-from src.utils.contract_v41 import get_cleaning_gates
+from src.utils.contract_accessors import get_cleaning_gates
 from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
 from openai import OpenAI
 

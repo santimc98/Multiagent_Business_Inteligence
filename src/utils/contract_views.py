@@ -5,7 +5,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
-from src.utils.contract_v41 import (
+from src.utils.contract_accessors import (
     get_canonical_columns,
     get_column_roles,
     get_cleaning_gates,

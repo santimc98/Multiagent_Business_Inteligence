@@ -7,7 +7,7 @@ import pandas as pd
 
 from src.utils.missing import is_effectively_missing_series
 from src.utils.type_inference import safe_convert_numeric_currency
-from src.utils.contract_v41 import (
+from src.utils.contract_accessors import (
     get_canonical_columns,
     get_column_roles,
     get_preprocessing_requirements,

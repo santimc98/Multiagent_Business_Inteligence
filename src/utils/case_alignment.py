@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from src.utils.contract_v41 import get_outcome_columns
+from src.utils.contract_accessors import get_outcome_columns
 
 
 def _safe_load_json(path: str) -> Optional[Dict[str, Any]]:
@@ -308,7 +308,7 @@ def build_case_alignment_report(
     data_paths = data_paths or []
     contract = contract or {}
     # V4.1: Use qa_gates instead of legacy quality_gates
-    from src.utils.contract_v41 import get_qa_gates
+    from src.utils.contract_accessors import get_qa_gates
     qa_gates = get_qa_gates(contract)
 
     # Extract thresholds from qa_gates if available

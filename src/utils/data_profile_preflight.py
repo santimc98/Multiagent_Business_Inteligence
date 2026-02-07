@@ -98,7 +98,7 @@ def ensure_data_profile_artifact(
         try:
             import pandas as pd
             from src.utils.missing import is_effectively_missing_series
-            from src.utils.contract_v41 import get_outcome_columns
+            from src.utils.contract_accessors import get_outcome_columns
         except Exception:
             return False
 
@@ -178,7 +178,7 @@ def ensure_data_profile_artifact(
     try:
         from src.utils.data_profile_compact import convert_dataset_profile_to_data_profile
         from src.agents.steward import write_data_profile
-        from src.utils.contract_v41 import get_outcome_columns
+        from src.utils.contract_accessors import get_outcome_columns
 
         data_profile = None
         profile_source = "failed"

@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple, Any
 
 import pandas as pd
 
-from src.utils.contract_v41 import (
+from src.utils.contract_accessors import (
     get_canonical_columns,
     get_column_roles,
     get_validation_requirements,

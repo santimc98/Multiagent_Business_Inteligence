@@ -1,7 +1,7 @@
 import json
 from typing import Any, Dict, List, Optional
 
-from src.utils.contract_v41 import get_outcome_columns
+from src.utils.contract_accessors import get_outcome_columns
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:

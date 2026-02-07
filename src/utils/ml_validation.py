@@ -2,7 +2,7 @@ import ast
 import re
 from typing import Dict, Any, List
 
-from src.utils.contract_v41 import get_decision_columns
+from src.utils.contract_accessors import get_decision_columns
 
 
 def validate_decision_variable_isolation(

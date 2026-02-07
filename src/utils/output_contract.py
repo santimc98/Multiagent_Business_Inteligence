@@ -380,7 +380,7 @@ def build_output_contract_report(
         }
     """
     # Import here to avoid circular imports
-    from src.utils.contract_v41 import get_required_outputs, get_artifact_requirements
+    from src.utils.contract_accessors import get_required_outputs, get_artifact_requirements
 
     # 1) Check required outputs presence (backward compatible)
     required_outputs = get_required_outputs(contract) if isinstance(contract, dict) else []
@@ -417,4 +417,3 @@ def build_output_contract_report(
         report["reason"] = reason
 
     return report
-

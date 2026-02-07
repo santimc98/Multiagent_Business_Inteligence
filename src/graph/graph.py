@@ -78,7 +78,7 @@ from src.utils.sandbox_deps import (
 from src.utils.case_alignment import build_case_alignment_report
 # REMOVED: from src.utils.contract_validation import ensure_role_runbooks  # V4.1 cutover
 from src.utils.data_engineer_preflight import data_engineer_preflight
-from src.utils.contract_v41 import (
+from src.utils.contract_accessors import (
     get_canonical_columns,
     get_artifact_requirements,
     get_derived_column_names,
@@ -1224,7 +1224,7 @@ def _resolve_requirement_meta(contract: Dict[str, Any], col: str) -> Dict[str, A
     norm_col = _norm_name(col)
 
     # Check optional passthrough (override canonical requirement if explicitly set)
-    from src.utils.contract_v41 import get_canonical_columns, get_artifact_requirements
+    from src.utils.contract_accessors import get_canonical_columns, get_artifact_requirements
     artifact_reqs = get_artifact_requirements(contract)
     schema = artifact_reqs.get("schema_binding", {})
     optional = schema.get("optional_passthrough_columns", [])
@@ -1758,7 +1758,7 @@ def _resolve_contract_deliverables(contract: Dict[str, Any]) -> List[Dict[str, A
     V4.1 compatible deliverables resolver.
     Returns a list of dicts [{'path': str, 'required': bool, ...}]
     """
-    from src.utils.contract_v41 import get_required_outputs
+    from src.utils.contract_accessors import get_required_outputs
 
     # V4.1: get_required_outputs returns List[str]
     outputs = get_required_outputs(contract)
@@ -1777,16 +1777,16 @@ def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None
 
     # If sources contains 'input', valid V4.1 sources are canonical_columns
     if sources and 'input' in sources:
-        from src.utils.contract_v41 import get_canonical_columns
+        from src.utils.contract_accessors import get_canonical_columns
         return get_canonical_columns(contract)
 
     # If asking for 'derived', check derived_columns
     if sources and 'derived' in sources:
-        from src.utils.contract_v41 import get_derived_column_names
+        from src.utils.contract_accessors import get_derived_column_names
         return get_derived_column_names(contract)
 
     # Default: return canonical columns (input columns)
-    from src.utils.contract_v41 import get_canonical_columns
+    from src.utils.contract_accessors import get_canonical_columns
     return get_canonical_columns(contract)
 
 def _resolve_allowed_columns_for_gate(
@@ -1809,7 +1809,7 @@ def _resolve_allowed_columns_for_gate(
             pass
 
     if isinstance(contract, dict):
-        from src.utils.contract_v41 import get_derived_column_names
+        from src.utils.contract_accessors import get_derived_column_names
         derived_cols = get_derived_column_names(contract)
         allowed.extend([str(c) for c in derived_cols if c])
         # V4.1: No legacy data_requirements fallback
@@ -1854,7 +1854,7 @@ def _resolve_contract_columns_for_cleaning(contract: Dict[str, Any], sources: se
     if not contract or not isinstance(contract, dict):
         return []
     # V4.1: Cleaning uses canonical_columns + optional_passthrough_columns from artifact_requirements
-    from src.utils.contract_v41 import get_canonical_columns, get_artifact_requirements
+    from src.utils.contract_accessors import get_canonical_columns, get_artifact_requirements
     columns = list(get_canonical_columns(contract))
     artifacts = get_artifact_requirements(contract)
     schema_binding = artifacts.get("schema_binding", {})
@@ -3323,7 +3323,7 @@ def _detect_refscore_alias(execution_output: str, contract: Dict[str, Any]) -> b
     derived_target = False
 
     # V4.1: Check derived_columns for refscore
-    from src.utils.contract_v41 import get_derived_column_names, get_column_roles
+    from src.utils.contract_accessors import get_derived_column_names, get_column_roles
     derived_cols = get_derived_column_names(contract)
     outcome_roles = get_column_roles(contract).get("outcome", [])
 
@@ -4271,7 +4271,7 @@ def _collect_derived_targets(contract: Dict[str, Any]) -> List[str]:
         return derived_targets
 
     # V4.1: Get derived columns and outcome columns
-    from src.utils.contract_v41 import get_derived_column_names, get_outcome_columns
+    from src.utils.contract_accessors import get_derived_column_names, get_outcome_columns
     derived_cols = set(get_derived_column_names(contract))
     outcome_cols = get_outcome_columns(contract)
 
@@ -10553,7 +10553,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             required_cols = _resolve_required_input_columns(contract, selected)
             contract_all_cols = _resolve_contract_columns(contract)
             try:
-                from src.utils.contract_v41 import get_derived_column_names
+                from src.utils.contract_accessors import get_derived_column_names
                 contract_derived_cols = get_derived_column_names(contract)
             except Exception:
                 contract_derived_cols = []
