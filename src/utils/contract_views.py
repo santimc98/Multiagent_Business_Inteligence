@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from src.utils.contract_v41 import (
     get_canonical_columns,
@@ -11,6 +11,7 @@ from src.utils.contract_v41 import (
     get_cleaning_gates,
     get_derived_column_names,
     get_qa_gates,
+    get_reviewer_gates,
     get_required_outputs,
     get_validation_requirements,
 )
@@ -1284,6 +1285,310 @@ def build_cleaning_view(
         code_to_include = cleaning_code[:max_code_len] if len(cleaning_code) > max_code_len else cleaning_code
         view["cleaning_code"] = code_to_include
     return trim_to_budget(view, 15000)
+
+
+def _project_decisioning_requirements(contract_full: Dict[str, Any]) -> Dict[str, Any]:
+    decisioning = contract_full.get("decisioning_requirements")
+    if isinstance(decisioning, dict):
+        return {
+            "enabled": bool(decisioning.get("enabled")),
+            "required": bool(decisioning.get("required")),
+            "output": decisioning.get("output", {}),
+            "policy_notes": decisioning.get("policy_notes", ""),
+        }
+    return {"enabled": False, "required": False, "output": {}, "policy_notes": ""}
+
+
+def _project_objective_type(contract_full: Dict[str, Any]) -> str:
+    objective_analysis = contract_full.get("objective_analysis")
+    if isinstance(objective_analysis, dict) and objective_analysis.get("problem_type"):
+        return str(objective_analysis.get("problem_type"))
+    evaluation_spec = contract_full.get("evaluation_spec")
+    if isinstance(evaluation_spec, dict) and evaluation_spec.get("objective_type"):
+        return str(evaluation_spec.get("objective_type"))
+    return "unknown"
+
+
+def _project_required_outputs(contract_full: Dict[str, Any]) -> List[str]:
+    outputs = get_required_outputs(contract_full)
+    return [str(item) for item in outputs if item]
+
+
+def _project_artifact_requirements(contract_full: Dict[str, Any]) -> Dict[str, Any]:
+    artifact_reqs = contract_full.get("artifact_requirements")
+    if isinstance(artifact_reqs, dict):
+        return artifact_reqs
+    return {}
+
+
+def _project_plot_payload(contract_full: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any] | None]:
+    artifact_reqs = _project_artifact_requirements(contract_full)
+    visual_requirements = artifact_reqs.get("visual_requirements")
+    if not isinstance(visual_requirements, dict):
+        visual_requirements = {}
+    plot_spec = visual_requirements.get("plot_spec")
+    if not isinstance(plot_spec, dict):
+        reporting_policy = contract_full.get("reporting_policy")
+        if isinstance(reporting_policy, dict):
+            rp_plot_spec = reporting_policy.get("plot_spec")
+            if isinstance(rp_plot_spec, dict):
+                plot_spec = rp_plot_spec
+    return visual_requirements, plot_spec if isinstance(plot_spec, dict) else None
+
+
+def build_contract_views_projection(
+    contract_full: Dict[str, Any] | None,
+    artifact_index: Any,
+    cleaning_code: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Build agent views as pure projection from validated execution contract.
+
+    No fallback inference from auxiliary artifacts and no deterministic synthesis
+    beyond safe defaults for missing optional fields.
+    """
+    contract_full = contract_full if isinstance(contract_full, dict) else {}
+    artifact_reqs = _project_artifact_requirements(contract_full)
+    required_outputs = _project_required_outputs(contract_full)
+    objective_type = _project_objective_type(contract_full)
+    canonical_columns = [str(c) for c in get_canonical_columns(contract_full) if c]
+    column_roles = get_column_roles(contract_full)
+    decision_columns = [str(c) for c in get_column_roles(contract_full).get("decision", []) if c]
+    outcome_columns = [str(c) for c in get_column_roles(contract_full).get("outcome", []) if c]
+    if not outcome_columns:
+        outcome_columns = [str(c) for c in contract_full.get("outcome_columns", []) if c]
+    audit_only_columns = [
+        str(c)
+        for c in (
+            column_roles.get("post_decision_audit_only")
+            or column_roles.get("audit_only")
+            or []
+        )
+        if c
+    ]
+    decisioning_requirements = _project_decisioning_requirements(contract_full)
+    visual_requirements, plot_spec = _project_plot_payload(contract_full)
+    derived_columns = [str(c) for c in get_derived_column_names(contract_full) if c]
+    validation_requirements = contract_full.get("validation_requirements")
+    if not isinstance(validation_requirements, dict):
+        validation_requirements = {}
+    allowed_feature_sets = contract_full.get("allowed_feature_sets")
+    if not isinstance(allowed_feature_sets, dict):
+        allowed_feature_sets = {
+            "model_features": [],
+            "segmentation_features": [],
+            "audit_only_features": [],
+            "forbidden_for_modeling": [],
+        }
+    forbidden_features = allowed_feature_sets.get("forbidden_for_modeling")
+    if not isinstance(forbidden_features, list):
+        forbidden_features = allowed_feature_sets.get("forbidden_features")
+    if not isinstance(forbidden_features, list):
+        forbidden_features = []
+    forbidden_features = [str(c) for c in forbidden_features if c]
+    model_features = allowed_feature_sets.get("model_features")
+    if not isinstance(model_features, list):
+        model_features = []
+    segmentation_features = allowed_feature_sets.get("segmentation_features")
+    if not isinstance(segmentation_features, list):
+        segmentation_features = []
+    clean_cfg = artifact_reqs.get("clean_dataset")
+    if not isinstance(clean_cfg, dict):
+        clean_cfg = {}
+    de_required_columns = clean_cfg.get("required_columns")
+    if not isinstance(de_required_columns, list) or not de_required_columns:
+        de_required_columns = list(canonical_columns)
+    de_required_columns = [str(c) for c in de_required_columns if c]
+    de_passthrough = clean_cfg.get("optional_passthrough_columns")
+    if not isinstance(de_passthrough, list):
+        de_passthrough = []
+    de_passthrough = [str(c) for c in de_passthrough if c]
+
+    output_path = clean_cfg.get("output_path") or clean_cfg.get("output")
+    if not isinstance(output_path, str) or not output_path.strip():
+        output_path = "data/cleaned_data.csv"
+    manifest_path = clean_cfg.get("manifest_path") or clean_cfg.get("output_manifest_path")
+    if not isinstance(manifest_path, str) or not manifest_path.strip():
+        manifest_path = "data/cleaning_manifest.json"
+
+    required_files: List[str] = []
+    for entry in artifact_reqs.get("required_files", []) if isinstance(artifact_reqs.get("required_files"), list) else []:
+        if isinstance(entry, dict):
+            path = entry.get("path") or entry.get("output") or entry.get("artifact")
+            if path:
+                required_files.append(str(path))
+        elif entry:
+            required_files.append(str(entry))
+    scored_rows_schema = artifact_reqs.get("scored_rows_schema")
+    if not isinstance(scored_rows_schema, dict):
+        scored_rows_schema = {}
+
+    artifact_payload: Dict[str, Any] = {"required_outputs": required_outputs}
+    if required_files:
+        artifact_payload["required_files"] = required_files
+    if scored_rows_schema:
+        artifact_payload["scored_rows_schema"] = scored_rows_schema
+
+    strategy_title = str(contract_full.get("strategy_title") or "")
+    business_objective = str(contract_full.get("business_objective") or "")
+    reviewer_gates = get_reviewer_gates(contract_full)
+    qa_gates = get_qa_gates(contract_full)
+    cleaning_gates = get_cleaning_gates(contract_full)
+    reporting_policy = contract_full.get("reporting_policy")
+    if not isinstance(reporting_policy, dict):
+        reporting_policy = {}
+    expected_metrics = []
+    primary_metric = validation_requirements.get("primary_metric")
+    if isinstance(primary_metric, str) and primary_metric.strip():
+        expected_metrics.append(primary_metric.strip())
+    metrics_to_report = validation_requirements.get("metrics_to_report")
+    if isinstance(metrics_to_report, list):
+        for metric in metrics_to_report:
+            if metric and str(metric) not in expected_metrics:
+                expected_metrics.append(str(metric))
+    id_columns = []
+    for bucket in ("id", "identifier", "identifiers"):
+        values = column_roles.get(bucket)
+        if isinstance(values, list):
+            id_columns.extend([str(c) for c in values if c])
+    id_columns = list(dict.fromkeys(id_columns))
+
+    de_view: DEView = {
+        "role": "data_engineer",
+        "required_columns": de_required_columns,
+        "optional_passthrough_columns": de_passthrough,
+        "output_path": output_path,
+        "required_columns_path": "data/required_columns.json",
+        "constraints": {
+            "scope": "cleaning_only",
+            "hard_constraints": [
+                "no_modeling",
+                "no_score_fitting",
+                "no_prescriptive_tuning",
+                "no_analytics",
+            ],
+        },
+    }
+    if manifest_path:
+        de_view["output_manifest_path"] = manifest_path
+    output_dialect = contract_full.get("output_dialect")
+    if isinstance(output_dialect, dict) and output_dialect:
+        de_view["output_dialect"] = output_dialect
+
+    ml_view: MLView = {
+        "role": "ml_engineer",
+        "objective_type": objective_type,
+        "canonical_columns": canonical_columns,
+        "derived_features": [c for c in derived_columns if c in set(model_features + segmentation_features)],
+        "column_roles": column_roles,
+        "decision_columns": decision_columns,
+        "outcome_columns": outcome_columns,
+        "audit_only_columns": audit_only_columns,
+        "identifier_columns": id_columns,
+        "allowed_feature_sets": allowed_feature_sets,
+        "forbidden_features": forbidden_features,
+        "required_outputs": required_outputs,
+        "validation_requirements": validation_requirements,
+        "artifact_requirements": artifact_payload,
+        "decisioning_requirements": decisioning_requirements,
+        "visual_requirements": visual_requirements,
+    }
+    if plot_spec is not None:
+        ml_view["plot_spec"] = plot_spec
+    case_rules = contract_full.get("case_rules")
+    if case_rules is not None:
+        ml_view["case_rules"] = case_rules
+    for opt_key in ("training_rows_rule", "scoring_rows_rule", "secondary_scoring_subset", "data_partitioning_notes"):
+        value = contract_full.get(opt_key)
+        if value:
+            ml_view[opt_key] = value
+
+    reviewer_summary_parts = [strategy_title.strip(), objective_type.strip()]
+    reviewer_summary = " | ".join([part for part in reviewer_summary_parts if part]) or "contract_based_review"
+    reviewer_view: ReviewerView = {
+        "role": "reviewer",
+        "objective_type": objective_type,
+        "reviewer_gates": reviewer_gates if isinstance(reviewer_gates, list) else [],
+        "required_outputs": required_outputs,
+        "expected_metrics": expected_metrics,
+        "strategy_summary": reviewer_summary,
+        "verification": {
+            "required_outputs": required_outputs,
+            "artifact_index_expected": bool(artifact_index),
+        },
+    }
+    reviewer_view["decisioning_requirements"] = decisioning_requirements
+
+    qa_artifact_payload: Dict[str, Any] = {
+        "required_outputs": required_outputs,
+        "optional_outputs": [str(item) for item in (artifact_reqs.get("optional_outputs") or []) if item],
+    }
+    file_schemas = artifact_reqs.get("file_schemas")
+    if isinstance(file_schemas, dict) and file_schemas:
+        qa_artifact_payload["file_schemas"] = file_schemas
+    qa_view: QAView = {
+        "role": "qa_reviewer",
+        "qa_gates": qa_gates if isinstance(qa_gates, list) else [],
+        "artifact_requirements": qa_artifact_payload,
+        "allowed_feature_sets": allowed_feature_sets,
+        "column_roles": column_roles,
+        "canonical_columns": canonical_columns,
+        "objective_summary": {
+            "strategy_title": strategy_title,
+            "business_objective": business_objective,
+        },
+        "decisioning_requirements": decisioning_requirements,
+    }
+    if reporting_policy:
+        qa_view["reporting_policy"] = reporting_policy
+
+    cleaning_view: CleaningView = {
+        "role": "cleaning_reviewer",
+        "strategy_title": strategy_title,
+        "business_objective": business_objective,
+        "required_columns": de_required_columns,
+        "dialect": output_dialect if isinstance(output_dialect, dict) else {},
+        "cleaning_gates": cleaning_gates if isinstance(cleaning_gates, list) else [],
+        "column_roles": column_roles,
+        "allowed_feature_sets": allowed_feature_sets,
+    }
+    if cleaning_code and isinstance(cleaning_code, str):
+        max_code_len = 8000
+        cleaning_view["cleaning_code"] = cleaning_code[:max_code_len] if len(cleaning_code) > max_code_len else cleaning_code
+
+    evidence = _normalize_artifact_index(artifact_index)
+    translator_view: TranslatorView = {
+        "role": "translator",
+        "reporting_policy": reporting_policy,
+        "evidence_inventory": evidence,
+        "key_decisions": [
+            f"objective_type:{objective_type}",
+            f"required_outputs:{len(required_outputs)}",
+        ],
+        "limitations": [str(item) for item in (contract_full.get("data_risks") or []) if item],
+        "constraints": {"no_markdown_tables": True, "cite_sources": True},
+        "decisioning_requirements": decisioning_requirements,
+        "visual_requirements": visual_requirements,
+    }
+    if plot_spec is not None:
+        translator_view["plot_spec"] = plot_spec
+
+    results_advisor_view: ResultsAdvisorView = {
+        "role": "results_advisor",
+        "objective_type": objective_type,
+        "reporting_policy": reporting_policy,
+        "evidence_inventory": evidence,
+    }
+
+    return {
+        "de_view": trim_to_budget(de_view, 8000),
+        "ml_view": trim_to_budget(ml_view, 16000),
+        "cleaning_view": trim_to_budget(cleaning_view, 15000),
+        "qa_view": trim_to_budget(qa_view, 12000),
+        "reviewer_view": trim_to_budget(reviewer_view, 12000),
+        "translator_view": trim_to_budget(translator_view, 16000),
+        "results_advisor_view": trim_to_budget(results_advisor_view, 12000),
+    }
 
 
 def sanitize_contract_min_for_de(contract_min: Dict[str, Any] | None) -> Dict[str, Any]:

@@ -6,6 +6,7 @@ Ensures contract self-consistency and detects ambiguity between
 """
 import os
 import re
+import copy
 from typing import Any, Dict, List, Tuple, Optional
 
 
@@ -1752,6 +1753,341 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
         "status": status,
         "issues": issues,
         "normalized_artifact_requirements": artifact_req
+    }
+
+
+def _strict_issue(rule: str, severity: str, message: str, item: Any = None) -> Dict[str, Any]:
+    return {
+        "rule": rule,
+        "severity": severity,
+        "message": message,
+        "item": item,
+    }
+
+
+def _status_from_issues(issues: List[Dict[str, Any]]) -> str:
+    has_error = any(str(issue.get("severity", "")).lower() in {"error", "fail"} for issue in issues)
+    if has_error:
+        return "error"
+    has_warning = any(str(issue.get("severity", "")).lower() == "warning" for issue in issues)
+    if has_warning:
+        return "warning"
+    return "ok"
+
+
+def validate_contract_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strict contract validation without mutating input payload.
+
+    This validator enforces planner acceptance policy:
+    - schema/type integrity for core contract keys
+    - single ontology for roles and gates
+    - outputs as paths
+    - semantic checks from validate_contract(copy)
+    """
+    issues: List[Dict[str, Any]] = []
+
+    if not isinstance(contract, dict):
+        issues.append(
+            _strict_issue(
+                "contract.structure",
+                "error",
+                "Contract must be a dictionary.",
+                type(contract).__name__,
+            )
+        )
+        return {
+            "status": "error",
+            "accepted": False,
+            "issues": issues,
+            "summary": {"error_count": 1, "warning_count": 0},
+        }
+
+    required_keys = {
+        "contract_version": str,
+        "strategy_title": str,
+        "business_objective": str,
+        "output_dialect": dict,
+        "canonical_columns": list,
+        "column_roles": dict,
+        "allowed_feature_sets": dict,
+        "artifact_requirements": dict,
+        "required_outputs": list,
+        "validation_requirements": dict,
+        "qa_gates": list,
+        "cleaning_gates": list,
+        "reviewer_gates": list,
+        "data_engineer_runbook": dict,
+        "ml_engineer_runbook": dict,
+        "iteration_policy": dict,
+    }
+    for key, expected_type in required_keys.items():
+        value = contract.get(key)
+        if value is None:
+            issues.append(
+                _strict_issue(
+                    "contract.required_key_missing",
+                    "error",
+                    f"Missing required top-level key '{key}'.",
+                    key,
+                )
+            )
+            continue
+        if not isinstance(value, expected_type):
+            issues.append(
+                _strict_issue(
+                    "contract.required_key_type",
+                    "error",
+                    f"Key '{key}' must be of type {expected_type.__name__}.",
+                    key,
+                )
+            )
+            continue
+        if expected_type in (list, dict) and not value:
+            issues.append(
+                _strict_issue(
+                    "contract.required_key_empty",
+                    "error",
+                    f"Key '{key}' must not be empty.",
+                    key,
+                )
+            )
+        if expected_type is str and not str(value).strip():
+            issues.append(
+                _strict_issue(
+                    "contract.required_key_empty",
+                    "error",
+                    f"Key '{key}' must not be blank.",
+                    key,
+                )
+            )
+
+    contract_version = contract.get("contract_version")
+    if str(contract_version) != "4.1":
+        issues.append(
+            _strict_issue(
+                "contract.version",
+                "error",
+                "contract_version must be exactly '4.1'.",
+                contract_version,
+            )
+        )
+
+    legacy_keys = sorted(
+        {
+            "spec_extraction",
+            "data_requirements",
+            "role_runbooks",
+            "validations",
+            "quality_gates",
+            "execution_plan",
+            "artifact_schemas",
+            "required_columns",
+            "feature_availability",
+            "decision_variables",
+            "availability_summary",
+        }
+        & set(contract.keys())
+    )
+    if legacy_keys:
+        issues.append(
+            _strict_issue(
+                "contract.legacy_keys",
+                "error",
+                "Legacy keys are not allowed in V4.1 contract.",
+                legacy_keys,
+            )
+        )
+
+    role_map = contract.get("column_roles")
+    role_values: Dict[str, List[str]] = {}
+    if isinstance(role_map, dict):
+        if role_map:
+            first_value = next(iter(role_map.values()))
+            if isinstance(first_value, list):
+                for role_name, columns in role_map.items():
+                    if isinstance(columns, list):
+                        role_values[str(role_name)] = [str(col) for col in columns if col]
+            else:
+                for column_name, role_name in role_map.items():
+                    if isinstance(role_name, str):
+                        role_values.setdefault(role_name, []).append(str(column_name))
+        else:
+            issues.append(
+                _strict_issue(
+                    "contract.column_roles_empty",
+                    "error",
+                    "column_roles cannot be empty.",
+                    "column_roles",
+                )
+            )
+    else:
+        issues.append(
+            _strict_issue(
+                "contract.column_roles_type",
+                "error",
+                "column_roles must be a dictionary.",
+                "column_roles",
+            )
+        )
+
+    allowed_roles = {
+        "pre_decision",
+        "decision",
+        "outcome",
+        "post_decision_audit_only",
+        "audit_only",
+        "id",
+        "identifier",
+        "feature",
+        "timestamp",
+        "group",
+        "weight",
+        "ignore",
+        "forbidden",
+        "unknown",
+        "protected",
+    }
+    role_keys = set(role_values.keys())
+    unknown_roles = sorted([r for r in role_keys if r not in allowed_roles])
+    if unknown_roles:
+        issues.append(
+            _strict_issue(
+                "contract.role_ontology",
+                "error",
+                "column_roles contains unknown role buckets outside the shared ontology.",
+                unknown_roles,
+            )
+        )
+    if role_values and not role_values.get("pre_decision"):
+        issues.append(
+            _strict_issue(
+                "contract.role_ontology",
+                "error",
+                "column_roles must include non-empty 'pre_decision' bucket.",
+                "pre_decision",
+            )
+        )
+
+    required_outputs = contract.get("required_outputs")
+    if isinstance(required_outputs, list):
+        if not required_outputs:
+            issues.append(
+                _strict_issue(
+                    "contract.required_outputs",
+                    "error",
+                    "required_outputs cannot be empty.",
+                    "required_outputs",
+                )
+            )
+        for item in required_outputs:
+            path = item.get("path") if isinstance(item, dict) else item
+            if not path or not is_probably_path(str(path)):
+                issues.append(
+                    _strict_issue(
+                        "contract.required_outputs_path",
+                        "error",
+                        "required_outputs entries must be file-like paths.",
+                        item,
+                    )
+                )
+    elif required_outputs is not None:
+        issues.append(
+            _strict_issue(
+                "contract.required_outputs_type",
+                "error",
+                "required_outputs must be a list.",
+                type(required_outputs).__name__,
+            )
+        )
+
+    gate_keys = ("qa_gates", "cleaning_gates", "reviewer_gates")
+    for gate_key in gate_keys:
+        gates = contract.get(gate_key)
+        if not isinstance(gates, list):
+            issues.append(
+                _strict_issue(
+                    "contract.gates_type",
+                    "error",
+                    f"{gate_key} must be a list.",
+                    gate_key,
+                )
+            )
+            continue
+        if not gates:
+            issues.append(
+                _strict_issue(
+                    "contract.gates_empty",
+                    "error",
+                    f"{gate_key} cannot be empty.",
+                    gate_key,
+                )
+            )
+        for gate in gates:
+            if not isinstance(gate, dict):
+                issues.append(
+                    _strict_issue(
+                        "contract.gate_entry_type",
+                        "error",
+                        f"All {gate_key} entries must be objects.",
+                        gate,
+                    )
+                )
+                continue
+            gate_name = gate.get("name")
+            if not isinstance(gate_name, str) or not gate_name.strip():
+                issues.append(
+                    _strict_issue(
+                        "contract.gate_name",
+                        "error",
+                        f"Gate in {gate_key} is missing valid name.",
+                        gate,
+                    )
+                )
+            severity = str(gate.get("severity") or "").upper()
+            if severity not in {"HARD", "SOFT"}:
+                issues.append(
+                    _strict_issue(
+                        "contract.gate_severity",
+                        "error",
+                        f"Gate '{gate_name or '<unknown>'}' in {gate_key} has invalid severity.",
+                        severity,
+                    )
+                )
+
+    # Semantic/lint checks from current validator logic, but on a deep copy only.
+    try:
+        semantic_result = validate_contract(copy.deepcopy(contract))
+    except Exception as err:
+        issues.append(
+            _strict_issue(
+                "contract.semantic_validation_exception",
+                "error",
+                f"Semantic validation crashed: {err}",
+                "validate_contract",
+            )
+        )
+        semantic_result = {"status": "error", "issues": []}
+
+    semantic_issues = semantic_result.get("issues") if isinstance(semantic_result, dict) else []
+    for item in semantic_issues if isinstance(semantic_issues, list) else []:
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity") or "warning").lower()
+        if severity in {"error", "fail"}:
+            issues.append(item)
+
+    status = _status_from_issues(issues)
+    error_count = sum(1 for issue in issues if str(issue.get("severity", "")).lower() in {"error", "fail"})
+    warning_count = sum(1 for issue in issues if str(issue.get("severity", "")).lower() == "warning")
+    return {
+        "status": status,
+        "accepted": status != "error",
+        "issues": issues,
+        "summary": {
+            "error_count": error_count,
+            "warning_count": warning_count,
+        },
     }
 
 

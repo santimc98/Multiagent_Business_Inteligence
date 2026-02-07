@@ -91,13 +91,7 @@ from src.utils.contract_v41 import (
     get_decision_columns,
 )
 from src.utils.contract_views import (
-    build_de_view,
-    build_ml_view,
-    build_cleaning_view,
-    build_qa_view,
-    build_reviewer_view,
-    build_translator_view,
-    build_results_advisor_view,
+    build_contract_views_projection,
     persist_views,
 )
 from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
@@ -2436,21 +2430,20 @@ def _build_contract_views(
     contract: Dict[str, Any],
     contract_min: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
-    # P0 FIX: Do NOT read from disk fallback - prevents cross-run contamination.
-    # If artifact_index is empty, code below will build it fresh from contract.
     artifact_index = state.get("artifact_index") or []
     if not artifact_index:
         required_outputs = []
         required_outputs = _resolve_required_outputs(contract, state)
         deliverables = _resolve_contract_deliverables(contract)
         artifact_index = _build_artifact_index(required_outputs, deliverables)
-    de_view = build_de_view(contract, {}, artifact_index)
-    ml_view = build_ml_view(contract, {}, artifact_index)
-    cleaning_view = build_cleaning_view(contract, {}, artifact_index)
-    qa_view = build_qa_view(contract, {}, artifact_index)
-    reviewer_view = build_reviewer_view(contract, {}, artifact_index)
-    translator_view = build_translator_view(contract, {}, artifact_index)
-    results_advisor_view = build_results_advisor_view(contract, {}, artifact_index)
+    projected_views = build_contract_views_projection(contract, artifact_index)
+    de_view = projected_views.get("de_view") or {}
+    ml_view = projected_views.get("ml_view") or {}
+    cleaning_view = projected_views.get("cleaning_view") or {}
+    qa_view = projected_views.get("qa_view") or {}
+    reviewer_view = projected_views.get("reviewer_view") or {}
+    translator_view = projected_views.get("translator_view") or {}
+    results_advisor_view = projected_views.get("results_advisor_view") or {}
     views = {
         "de_view": de_view,
         "ml_view": ml_view,
@@ -8665,21 +8658,41 @@ def run_execution_planner(state: AgentState) -> AgentState:
             run_id=run_id,
         )
     except Exception as e:
-        print(f"Warning: execution planner failed ({e}); using fallback contract.")
-        # Use V4.1 skeleton fallback instead of legacy
-        from src.agents.execution_planner import _create_v41_skeleton
-        contract = _create_v41_skeleton(
-            strategy=strategy,
-            business_objective=business_objective,
-            column_inventory=column_inventory,
-            output_dialect=output_dialect,
-            reason=f"Execution planner exception: {e}"
-        )
+        print(f"Warning: execution planner failed ({e}); fail-closed contract path.")
+        contract = {}
     if not isinstance(contract, dict):
         contract = {}
     planner_contract_diagnostics = getattr(execution_planner, "last_contract_diagnostics", None)
     if not isinstance(planner_contract_diagnostics, dict):
         planner_contract_diagnostics = {}
+    if not planner_contract_diagnostics:
+        planner_contract_diagnostics = {
+            "schema_version": 1,
+            "where": "execution_planner:graph_fallback",
+            "llm_success": False,
+            "validation": {
+                "status": "error",
+                "accepted": False,
+                "issues": [
+                    {
+                        "severity": "error",
+                        "rule": "planner_no_contract",
+                        "message": "Planner did not produce diagnostics/contract payload.",
+                    }
+                ],
+                "summary": {"error_count": 1, "warning_count": 0},
+            },
+            "summary": {"status": "error", "issue_count": 1, "accepted": False},
+        }
+    validation_payload = planner_contract_diagnostics.get("validation")
+    planner_contract_accepted = False
+    if isinstance(validation_payload, dict):
+        planner_contract_accepted = bool(validation_payload.get("accepted"))
+        if not planner_contract_accepted:
+            planner_contract_accepted = str(validation_payload.get("status") or "").lower() != "error"
+    summary_payload = planner_contract_diagnostics.get("summary")
+    if isinstance(summary_payload, dict) and "accepted" in summary_payload:
+        planner_contract_accepted = bool(summary_payload.get("accepted"))
     strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
     objective_type = None
     if isinstance(strategy_spec, dict):
@@ -8713,6 +8726,44 @@ def run_execution_planner(state: AgentState) -> AgentState:
             dump_json(_abs_in_work(work_dir_abs, "data/evaluation_spec.json"), evaluation_spec)
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
+
+    if not planner_contract_accepted:
+        error_message = "Execution planner produced a contract that failed strict validation (fail-closed)."
+        if run_id:
+            log_run_event(
+                run_id,
+                "pipeline_aborted_reason",
+                {"reason": "execution_contract_invalid"},
+            )
+            copy_run_contracts(
+                run_id,
+                [
+                    _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+                    _abs_in_work(work_dir_abs, "data/execution_contract_diagnostics.json"),
+                ],
+            )
+            log_agent_snapshot(
+                run_id,
+                "execution_planner",
+                prompt=getattr(execution_planner, "last_prompt", None),
+                response=getattr(execution_planner, "last_response", None) or planner_contract_diagnostics,
+                context={
+                    "strategy": strategy,
+                    "business_objective": business_objective,
+                    "planner_diag": getattr(execution_planner, "last_planner_diag", None),
+                    "contract_diagnostics": planner_contract_diagnostics,
+                    "fail_closed": True,
+                },
+                verdicts={"status": "REJECTED", "reason": "execution_contract_invalid"},
+            )
+        return {
+            "error_message": error_message,
+            "pipeline_aborted_reason": "execution_contract_invalid",
+            "execution_planner_failed": True,
+            "execution_contract": contract,
+            "execution_contract_diagnostics": planner_contract_diagnostics,
+            "execution_contract_diagnostics_path": "data/execution_contract_diagnostics.json",
+        }
     try:
         _update_column_inventory_required_columns(
             column_inventory=column_inventory,
@@ -8853,6 +8904,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "data_engineer")
     if abort_state:
         return abort_state
+    if state.get("execution_planner_failed") or state.get("pipeline_aborted_reason") == "execution_contract_invalid":
+        msg = "Execution contract is invalid; Data Engineer halted by fail-closed planner policy."
+        run_id = state.get("run_id")
+        if run_id:
+            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "execution_contract_invalid"})
+        return {
+            "cleaning_code": "",
+            "cleaned_data_preview": "Error: invalid execution contract",
+            "error_message": msg,
+            "pipeline_aborted_reason": "execution_contract_invalid",
+            "data_engineer_failed": True,
+            "budget_counters": state.get("budget_counters"),
+        }
     run_id = state.get("run_id")
     ok, counters, err_msg = _consume_budget(state, "de_calls", "max_de_calls", "Data Engineer")
     state["budget_counters"] = counters
@@ -9096,7 +9160,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
     execution_contract = state.get("execution_contract") or _load_json_safe("data/execution_contract.json") or {}
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
     if not isinstance(de_view, dict) or not de_view:
-        de_view = build_de_view(execution_contract or {}, {}, state.get("artifact_index") or [])
+        projected_views = build_contract_views_projection(execution_contract or {}, state.get("artifact_index") or [])
+        de_view = projected_views.get("de_view") or {}
     de_objective = build_de_objective(execution_contract or {})
     try:
         de_view_len = len(json.dumps(de_view, ensure_ascii=True))
@@ -11277,7 +11342,8 @@ def run_engineer(state: AgentState) -> AgentState:
         if "ml_view" in sig.parameters:
             ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
             if not isinstance(ml_view, dict) or not ml_view:
-                ml_view = build_ml_view(execution_contract or {}, {}, state.get("artifact_index") or [])
+                projected_views = build_contract_views_projection(execution_contract or {}, state.get("artifact_index") or [])
+                ml_view = projected_views.get("ml_view") or {}
             kwargs["ml_view"] = ml_view
             try:
                 ml_view_len = len(json.dumps(ml_view, ensure_ascii=True))
@@ -11685,11 +11751,11 @@ def run_reviewer(state: AgentState) -> AgentState:
     evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
     reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
     if not isinstance(reviewer_view, dict) or not reviewer_view:
-        reviewer_view = build_reviewer_view(
+        projected_views = build_contract_views_projection(
             state.get("execution_contract", {}) or {},
-            {},
             state.get("artifact_index") or [],
         )
+        reviewer_view = projected_views.get("reviewer_view") or {}
     dataset_semantics_summary = state.get("dataset_semantics_summary")
     if dataset_semantics_summary and isinstance(reviewer_view, dict):
         reviewer_view = dict(reviewer_view)
@@ -14032,11 +14098,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             if ok:
                 reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
                 if not isinstance(reviewer_view, dict) or not reviewer_view:
-                    reviewer_view = build_reviewer_view(
+                    projected_views = build_contract_views_projection(
                         contract,
-                        {},
                         state.get("artifact_index") or [],
                     )
+                    reviewer_view = projected_views.get("reviewer_view") or {}
                 if isinstance(reviewer_view, dict):
                     reviewer_view = compress_long_lists(reviewer_view)[0]
                 review_result = reviewer.review_code(
@@ -15010,11 +15076,11 @@ def run_translator(state: AgentState) -> AgentState:
     report_state.setdefault("sandbox_failed", state.get("sandbox_failed", False))
     translator_view = state.get("translator_view") or (state.get("contract_views") or {}).get("translator_view")
     if not isinstance(translator_view, dict) or not translator_view:
-        translator_view = build_translator_view(
+        projected_views = build_contract_views_projection(
             report_state.get("execution_contract", {}) or {},
-            {},
             report_state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json") or [],
         )
+        translator_view = projected_views.get("translator_view") or {}
     if isinstance(translator_view, dict):
         translator_view = compress_long_lists(translator_view)[0]
     report_state["translator_view"] = translator_view

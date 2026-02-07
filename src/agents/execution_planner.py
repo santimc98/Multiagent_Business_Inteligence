@@ -28,7 +28,12 @@ from src.utils.contract_v41 import (
 )
 from src.utils.run_bundle import get_run_dir
 from src.utils.feature_selectors import infer_feature_selectors, compact_column_representation
-from src.utils.contract_validator import validate_contract, normalize_artifact_requirements, is_probably_path
+from src.utils.contract_validator import (
+    validate_contract,
+    validate_contract_readonly,
+    normalize_artifact_requirements,
+    is_probably_path,
+)
 
 load_dotenv()
 
@@ -5968,6 +5973,76 @@ class ExecutionPlannerAgent:
                     usage_payload[key] = value
             return usage_payload or {"value": str(raw_usage)}
 
+        def _contract_is_accepted(validation_result: Dict[str, Any] | None) -> bool:
+            if not isinstance(validation_result, dict):
+                return False
+            if not bool(validation_result.get("accepted", False)):
+                return False
+            return str(validation_result.get("status") or "").lower() != "error"
+
+        def _compact_validation_feedback(validation_result: Dict[str, Any] | None, max_issues: int = 10) -> str:
+            if not isinstance(validation_result, dict):
+                return "No validation feedback available."
+            issues = validation_result.get("issues")
+            if not isinstance(issues, list) or not issues:
+                return "No issues reported."
+            lines: List[str] = []
+            for issue in issues[:max_issues]:
+                if not isinstance(issue, dict):
+                    continue
+                severity = str(issue.get("severity") or "warning").upper()
+                rule = str(issue.get("rule") or "unknown_rule")
+                message = str(issue.get("message") or "").strip()
+                if message:
+                    lines.append(f"- [{severity}] {rule}: {message}")
+            if len(issues) > max_issues:
+                lines.append(f"- ... ({len(issues) - max_issues} more issues)")
+            return "\n".join(lines) if lines else "No issues reported."
+
+        def _build_quality_repair_prompt(
+            *,
+            previous_contract: Dict[str, Any] | None,
+            previous_validation: Dict[str, Any] | None,
+            previous_response_text: str | None,
+        ) -> str:
+            required_top_level = [
+                "contract_version",
+                "strategy_title",
+                "business_objective",
+                "output_dialect",
+                "canonical_columns",
+                "column_roles",
+                "allowed_feature_sets",
+                "artifact_requirements",
+                "required_outputs",
+                "validation_requirements",
+                "qa_gates",
+                "cleaning_gates",
+                "reviewer_gates",
+                "data_engineer_runbook",
+                "ml_engineer_runbook",
+                "iteration_policy",
+            ]
+            validation_feedback = _compact_validation_feedback(previous_validation)
+            previous_payload = (
+                json.dumps(previous_contract, indent=2, ensure_ascii=False)
+                if isinstance(previous_contract, dict)
+                else (previous_response_text or "")
+            )
+            return (
+                "Repair the previous execution contract.\n"
+                "Return ONLY one valid JSON object (no markdown, no comments, no code fences).\n"
+                f"contract_version MUST be exactly {json.dumps(CONTRACT_VERSION_V41)}.\n"
+                "Do not invent columns outside column_inventory.\n"
+                "Do not remove required business intent; fix only structural/semantic contract errors.\n"
+                "Top-level required keys (all mandatory): "
+                + json.dumps(required_top_level)
+                + "\n\nValidation issues to fix:\n"
+                + validation_feedback
+                + "\n\nPrevious candidate contract/response:\n"
+                + previous_payload
+            )
+
         def _build_contract_diagnostics(contract: Dict[str, Any], where: str, llm_success: bool) -> Dict[str, Any]:
             diagnostics: Dict[str, Any] = {
                 "schema_version": 1,
@@ -5995,10 +6070,11 @@ class ExecutionPlannerAgent:
                 print(f"WARNING: Unknown keys in contract ({where}): {unknown}")
 
             try:
-                validation_result = validate_contract(copy.deepcopy(contract))
+                validation_result = validate_contract_readonly(copy.deepcopy(contract))
             except Exception as err:
                 validation_result = {
                     "status": "error",
+                    "accepted": False,
                     "issues": [
                         {
                             "severity": "error",
@@ -6006,10 +6082,12 @@ class ExecutionPlannerAgent:
                             "message": str(err),
                         }
                     ],
+                    "summary": {"error_count": 1, "warning_count": 0},
                 }
 
             status = str(validation_result.get("status") or "unknown").lower()
             issues = validation_result.get("issues") if isinstance(validation_result, dict) else []
+            accepted = _contract_is_accepted(validation_result if isinstance(validation_result, dict) else None)
             if status == "error":
                 print(f"CONTRACT_VALIDATION_ERROR: {len(issues) if isinstance(issues, list) else 0} issues found")
                 if isinstance(issues, list):
@@ -6027,6 +6105,7 @@ class ExecutionPlannerAgent:
             diagnostics["summary"] = {
                 "status": status,
                 "issue_count": len(issues) if isinstance(issues, list) else 0,
+                "accepted": accepted,
             }
             return diagnostics
 
@@ -6038,9 +6117,7 @@ class ExecutionPlannerAgent:
 
         target_candidates: List[Dict[str, Any]] = []
         if not self.client:
-            contract = _fallback()
-            contract = _attach_reporting_policy(contract)
-            contract = _attach_contract_execution_blueprint(contract)
+            contract = {}
             self.last_contract_min = None
             return _finalize_and_persist(contract, where="execution_planner:no_client", llm_success=False)
 
@@ -6143,158 +6220,167 @@ domain_expert_critique:
 """
 
         full_prompt = SENIOR_PLANNER_PROMPT + "\n\nINPUTS:\n" + user_input
-        repair_keys = [
-            "contract_version",
-            "strategy_title",
-            "business_objective",
-            "output_dialect",
-            "canonical_columns",
-            "outcome_columns",
-            "decision_columns",
-            "column_roles",
-            "allowed_feature_sets",
-            "artifact_requirements",
-            "required_outputs",
-            "validation_requirements",
-            "qa_gates",
-            "cleaning_gates",
-            "reviewer_gates",
-            "data_engineer_runbook",
-            "ml_engineer_runbook",
-            "decisioning_requirements",
-            "reporting_policy",
-            "omitted_columns_policy",
-        ]
-        compressed_objective = _compress_text_preserve_ends(business_objective or "")
-        success_metric = strategy.get("success_metric") if isinstance(strategy, dict) else None
-        recommended_metrics = (
-            strategy.get("recommended_evaluation_metrics") if isinstance(strategy, dict) else None
-        )
-        validation_strategy = strategy.get("validation_strategy") if isinstance(strategy, dict) else None
-        repair_prompt = (
-            "Return ONLY valid JSON with EXACT keys: "
-            + json.dumps(repair_keys)
-            + ". Do not include any other keys or commentary.\n"
-            + f"contract_version MUST be {json.dumps(CONTRACT_VERSION_V41)}.\n"
-            + "Return a single JSON object and close all strings, braces, and arrays.\n"
-            + "Use RELEVANT_COLUMNS as focus_columns only; do NOT truncate canonical_columns.\n"
-            + "RELEVANT_COLUMNS must NOT be used to build canonical_columns; use full column inventory or feature selectors.\n"
-            + "RELEVANT_COLUMNS: "
-            + json.dumps(relevant_columns)
-            + "\n"
-            + "OUTPUT_DIALECT: "
-            + json.dumps(output_dialect or {})
-            + "\n"
-            + "TARGET_CANDIDATES: "
-            + json.dumps(target_candidates)
-            + "\n"
-            + "RESOLVED_TARGET: "
-            + json.dumps(resolved_target)
-            + "\n"
-            + "If RESOLVED_TARGET is provided, outcome_columns MUST include it.\n"
-            + "STRATEGY_TITLE: "
-            + json.dumps(strategy.get("title", "") if isinstance(strategy, dict) else "")
-            + "\n"
-            + "BUSINESS_OBJECTIVE: "
-            + json.dumps(compressed_objective)
-            + "\n"
-            + "SUCCESS_METRIC: "
-            + json.dumps(success_metric or "")
-            + "\n"
-            + "RECOMMENDED_EVALUATION_METRICS: "
-            + json.dumps(recommended_metrics or [])
-            + "\n"
-            + "VALIDATION_STRATEGY: "
-            + json.dumps(validation_strategy or "")
-        )
-
-        attempt_prompts = [
-            ("prompt_attempt_1.txt", "response_attempt_1.txt", full_prompt),
-            ("prompt_attempt_2_repair.txt", "response_attempt_2.txt", repair_prompt),
-        ]
         model_chain = [m for m in (self.model_chain or [self.model_name]) if m]
-        attempt_specs: List[Tuple[str, str, str, str]] = []
-        for prompt_name, response_name, prompt_text in attempt_prompts:
-            for model_idx, model_name in enumerate(model_chain, start=1):
-                if len(model_chain) > 1:
-                    response_name_model = response_name.replace(".txt", f"_m{model_idx}.txt")
-                else:
-                    response_name_model = response_name
-                attempt_specs.append((prompt_name, response_name_model, prompt_text, model_name))
 
         contract: Dict[str, Any] | None = None
         llm_success = False
+        best_candidate: Dict[str, Any] | None = None
+        best_validation: Dict[str, Any] | None = None
+        best_response_text: str | None = None
+        best_error_count: Optional[int] = None
 
-        for attempt_index, (prompt_name, response_name, prompt_text, model_name) in enumerate(attempt_specs, start=1):
-            self.last_prompt = prompt_text
-            response_text = ""
-            response = None
-            parse_error: Optional[Exception] = None
-            finish_reason = None
-            usage_metadata = None
+        max_quality_rounds = 3
+        try:
+            max_quality_rounds = max(1, int(os.getenv("EXECUTION_PLANNER_QUALITY_ROUNDS", "3")))
+        except Exception:
+            max_quality_rounds = 3
 
-            try:
-                model_client = self._build_model_client(model_name)
-                if model_client is None:
-                    parse_error = ValueError(f"Planner client unavailable for model {model_name}")
+        current_prompt = full_prompt
+        current_prompt_name = "prompt_attempt_1.txt"
+        attempt_counter = 0
+
+        for quality_round in range(1, max_quality_rounds + 1):
+            round_has_candidate = False
+            for model_idx, model_name in enumerate(model_chain, start=1):
+                attempt_counter += 1
+                self.last_prompt = current_prompt
+                response_text = ""
+                response = None
+                parse_error: Optional[Exception] = None
+                finish_reason = None
+                usage_metadata = None
+                validation_result: Dict[str, Any] | None = None
+                quality_accepted = False
+
+                if len(model_chain) > 1:
+                    response_name = f"response_attempt_{quality_round}_m{model_idx}.txt"
                 else:
-                    response = model_client.generate_content(prompt_text)
-                    response_text = getattr(response, "text", "") or ""
-                    self.last_response = response_text
-            except Exception as err:
-                parse_error = err
+                    response_name = f"response_attempt_{quality_round}.txt"
 
-            if response is not None:
                 try:
-                    candidates = getattr(response, "candidates", None)
-                    if candidates:
-                        finish_reason = getattr(candidates[0], "finish_reason", None)
-                except Exception:
-                    finish_reason = None
-                usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
+                    model_client = self._build_model_client(model_name)
+                    if model_client is None:
+                        parse_error = ValueError(f"Planner client unavailable for model {model_name}")
+                    else:
+                        response = model_client.generate_content(current_prompt)
+                        response_text = getattr(response, "text", "") or ""
+                        self.last_response = response_text
+                except Exception as err:
+                    parse_error = err
 
-            _persist_attempt(prompt_name, response_name, prompt_text, response_text)
+                if response is not None:
+                    try:
+                        candidates = getattr(response, "candidates", None)
+                        if candidates:
+                            finish_reason = getattr(candidates[0], "finish_reason", None)
+                    except Exception:
+                        finish_reason = None
+                    usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
 
-            parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
-            if parse_exc:
-                parse_error = parse_exc
+                _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
 
-            had_json_parse_error = parsed is None or not isinstance(parsed, dict)
-            if parsed is not None and not isinstance(parsed, dict):
-                parse_error = ValueError("Parsed JSON is not an object")
+                parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
+                if parse_exc:
+                    parse_error = parse_exc
 
-            planner_diag.append(
-                {
-                    "model_name": model_name,
-                    "attempt_index": attempt_index,
-                    "prompt_char_len": len(prompt_text or ""),
-                    "response_char_len": len(response_text or ""),
-                    "finish_reason": str(finish_reason) if finish_reason is not None else None,
-                    "usage_metadata": usage_metadata,
-                    "had_json_parse_error": bool(had_json_parse_error),
-                    "parse_error_type": type(parse_error).__name__ if parse_error else None,
-                    "parse_error_message": str(parse_error) if parse_error else None,
-                }
+                had_json_parse_error = parsed is None or not isinstance(parsed, dict)
+                if parsed is not None and not isinstance(parsed, dict):
+                    parse_error = ValueError("Parsed JSON is not an object")
+
+                quality_error_message = None
+                if parsed is not None and isinstance(parsed, dict):
+                    version = normalize_contract_version(parsed.get("contract_version"))
+                    if version != CONTRACT_VERSION_V41:
+                        parse_error = ValueError("contract_version_mismatch")
+                        quality_error_message = "contract_version_mismatch"
+                    else:
+                        round_has_candidate = True
+                        try:
+                            validation_result = validate_contract_readonly(copy.deepcopy(parsed))
+                        except Exception as val_err:
+                            validation_result = {
+                                "status": "error",
+                                "accepted": False,
+                                "issues": [
+                                    {
+                                        "severity": "error",
+                                        "rule": "contract_validation_exception",
+                                        "message": str(val_err),
+                                    }
+                                ],
+                                "summary": {"error_count": 1, "warning_count": 0},
+                            }
+                        quality_accepted = _contract_is_accepted(validation_result)
+                        if not quality_accepted:
+                            quality_error_message = "contract_quality_failed"
+                            summary = validation_result.get("summary") if isinstance(validation_result, dict) else {}
+                            error_count = (
+                                int(summary.get("error_count", 0))
+                                if isinstance(summary, dict)
+                                else 0
+                            )
+                            if best_error_count is None or error_count < best_error_count:
+                                best_candidate = parsed
+                                best_validation = validation_result
+                                best_response_text = response_text
+                                best_error_count = error_count
+
+                planner_diag.append(
+                    {
+                        "model_name": model_name,
+                        "attempt_index": attempt_counter,
+                        "quality_round": quality_round,
+                        "prompt_char_len": len(current_prompt or ""),
+                        "response_char_len": len(response_text or ""),
+                        "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                        "usage_metadata": usage_metadata,
+                        "had_json_parse_error": bool(had_json_parse_error),
+                        "parse_error_type": type(parse_error).__name__ if parse_error else None,
+                        "parse_error_message": str(parse_error) if parse_error else None,
+                        "quality_status": (
+                            str(validation_result.get("status") or "").lower()
+                            if isinstance(validation_result, dict)
+                            else None
+                        ),
+                        "quality_accepted": quality_accepted,
+                        "quality_error": quality_error_message,
+                    }
+                )
+
+                if parsed is None or not isinstance(parsed, dict):
+                    print(f"WARNING: Planner parse failed on attempt {attempt_counter} (model={model_name}).")
+                    continue
+                if quality_error_message == "contract_version_mismatch":
+                    print(f"WARNING: Planner contract_version mismatch on attempt {attempt_counter} (model={model_name}).")
+                    continue
+                if not quality_accepted:
+                    print(f"WARNING: Planner contract rejected by quality gate on attempt {attempt_counter} (model={model_name}).")
+                    continue
+
+                contract = parsed
+                llm_success = True
+                break
+
+            if contract is not None:
+                break
+            if quality_round >= max_quality_rounds:
+                break
+
+            current_prompt_name = f"prompt_attempt_{quality_round + 1}_repair.txt"
+            current_prompt = _build_quality_repair_prompt(
+                previous_contract=best_candidate,
+                previous_validation=best_validation,
+                previous_response_text=best_response_text,
             )
-
-            if parsed is None or not isinstance(parsed, dict):
-                print(f"WARNING: Planner parse failed on attempt {attempt_index} (model={model_name}).")
-                continue
-
-            version = normalize_contract_version(parsed.get("contract_version"))
-            if version != CONTRACT_VERSION_V41:
-                parse_error = ValueError("contract_version_mismatch")
-                print(f"WARNING: Planner contract_version mismatch on attempt {attempt_index} (model={model_name}).")
-                continue
-
-            contract = parsed
-            llm_success = True
-            break
+            if not round_has_candidate:
+                current_prompt = (
+                    current_prompt
+                    + "\n\nPrevious attempts failed JSON parsing. Repair by returning syntactically valid JSON only."
+                )
 
         if contract is None:
-            contract = _fallback("JSON Parse Error after retries")
-            contract = _attach_reporting_policy(contract)
-            contract = _attach_contract_execution_blueprint(contract)
+            contract = {}
+            llm_success = False
 
         if llm_success and resolved_target:
             print(
@@ -6305,7 +6391,8 @@ domain_expert_critique:
 
         if llm_success and planner_diag:
             print(f"SUCCESS: Execution Planner succeeded on attempt {planner_diag[-1]['attempt_index']}")
-        return _finalize_and_persist(contract, where="execution_planner:final_contract", llm_success=llm_success)
+        where = "execution_planner:final_contract" if llm_success else "execution_planner:quality_gate_failed"
+        return _finalize_and_persist(contract, where=where, llm_success=llm_success)
 
     def generate_evaluation_spec(
         self,
