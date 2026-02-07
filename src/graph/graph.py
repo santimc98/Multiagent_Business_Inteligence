@@ -620,6 +620,58 @@ def _append_run_facts_block(text: str, state: Dict[str, Any]) -> str:
     return block
 
 
+_RUN_FACTS_BLOCK_RE = re.compile(
+    r"=== RUN_FACTS_PACK_JSON \(read-only\) ===.*?=== END RUN_FACTS_PACK_JSON ===",
+    re.DOTALL,
+)
+
+
+def _minimal_agent_context_enabled() -> bool:
+    raw = os.getenv("AGENT_MINIMAL_CONTEXT_MODE", "1")
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _strip_run_facts_blocks(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+    cleaned = _RUN_FACTS_BLOCK_RE.sub("", text)
+    return cleaned.strip()
+
+
+def _build_senior_summary_context(state: Dict[str, Any]) -> str:
+    base = _strip_run_facts_blocks(str((state or {}).get("data_summary", "") or ""))
+    return _prepend_dataset_semantics_summary(base, state if isinstance(state, dict) else {})
+
+
+def _build_agent_feedback_context(state: Dict[str, Any], agent_label: str) -> str:
+    gate = state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+    failed_gates = [str(g) for g in (gate.get("failed_gates") or []) if g]
+    required_fixes = [str(x) for x in (gate.get("required_fixes") or []) if x]
+    lines = [
+        "ITERATION_FEEDBACK_CONTEXT:",
+        f"- agent: {agent_label}",
+        f"- iteration_count: {int(state.get('iteration_count', 0) or 0)}",
+    ]
+    review_verdict = state.get("review_verdict")
+    if review_verdict:
+        lines.append(f"- last_review_verdict: {review_verdict}")
+    review_feedback = str(state.get("review_feedback") or "").strip()
+    if review_feedback:
+        lines.append("- last_review_feedback:")
+        lines.append(review_feedback[:2400])
+    if failed_gates:
+        lines.append("- failed_gates:")
+        lines.extend([f"  - {g}" for g in failed_gates[:20]])
+    if required_fixes:
+        lines.append("- required_fixes:")
+        lines.extend([f"  - {fx}" for fx in required_fixes[:20]])
+    runtime_error = str(state.get("execution_error_message") or state.get("error_message") or "").strip()
+    if runtime_error:
+        lines.append("- runtime_error:")
+        lines.append(runtime_error[:1800])
+    return "\n".join(lines).strip()
+
+
 def _prepend_dataset_semantics_summary(text: str, state: Dict[str, Any]) -> str:
     if not isinstance(state, dict):
         return text
@@ -7191,11 +7243,15 @@ def run_strategist(state: AgentState) -> AgentState:
 
     # Strategist now returns a dict with "strategies": [list of 3]
     user_context = state.get("strategist_context_override") or state.get("business_objective", "")
-    context_pack = build_context_pack("strategist", state if isinstance(state, dict) else {})
-    data_summary = _append_run_facts_block(state.get("data_summary", ""), state)
-    data_summary = _prepend_dataset_semantics_summary(data_summary, state)
-    if context_pack:
-        data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
+    if _minimal_agent_context_enabled():
+        data_summary = _build_senior_summary_context(state if isinstance(state, dict) else {})
+        context_pack = ""
+    else:
+        context_pack = build_context_pack("strategist", state if isinstance(state, dict) else {})
+        data_summary = state.get("data_summary", "")
+        data_summary = _prepend_dataset_semantics_summary(data_summary, state)
+        if context_pack:
+            data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
     result = strategist.generate_strategies(data_summary, user_context)
     run_id = state.get("run_id")
     if run_id:
@@ -7204,7 +7260,7 @@ def run_strategist(state: AgentState) -> AgentState:
             "strategist",
             prompt=getattr(strategist, "last_prompt", None),
             response=getattr(strategist, "last_response", None) or result,
-            context={"data_summary": data_summary, "user_context": user_context, "context_pack": context_pack},
+            context={"data_summary": data_summary, "user_context": user_context},
         )
     # Defensive handling of strategist result types (Fix for potential crashes)
     strategies_list = []
@@ -7262,11 +7318,15 @@ def run_domain_expert(state: AgentState) -> AgentState:
     strategies_wrapper = state.get('strategies', {})
     strategies_list = strategies_wrapper.get('strategies', [])
     business_objective = state.get("business_objective", "")
-    context_pack = build_context_pack("domain_expert", state if isinstance(state, dict) else {})
-    data_summary = _append_run_facts_block(state.get('data_summary', ''), state)
-    data_summary = _prepend_dataset_semantics_summary(data_summary, state)
-    if context_pack:
-        data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
+    if _minimal_agent_context_enabled():
+        data_summary = _build_senior_summary_context(state if isinstance(state, dict) else {})
+        context_pack = ""
+    else:
+        context_pack = build_context_pack("domain_expert", state if isinstance(state, dict) else {})
+        data_summary = state.get('data_summary', '')
+        data_summary = _prepend_dataset_semantics_summary(data_summary, state)
+        if context_pack:
+            data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
 
     # Deliberation Step
     evaluation = domain_expert.evaluate_strategies(data_summary, business_objective, strategies_list)
@@ -7282,7 +7342,6 @@ def run_domain_expert(state: AgentState) -> AgentState:
                 "data_summary": data_summary,
                 "business_objective": business_objective,
                 "strategy_count": len(strategies_list) if isinstance(strategies_list, list) else 0,
-                "context_pack": context_pack,
             },
         )
 
@@ -8102,14 +8161,15 @@ def run_execution_planner(state: AgentState) -> AgentState:
     if abort_state:
         return abort_state
     strategy = state.get("selected_strategy", {})
-    data_summary = state.get("data_summary", "")
-    data_summary = _prepend_dataset_semantics_summary(data_summary, state)
+    data_summary = _build_senior_summary_context(state if isinstance(state, dict) else {})
     memory_context = state.get("dataset_memory_context")
     if memory_context:
         data_summary = f"{data_summary}\n\n{memory_context}"
-    context_pack = build_context_pack("execution_planner", state if isinstance(state, dict) else {})
-    if context_pack:
-        data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
+    context_pack = ""
+    if not _minimal_agent_context_enabled():
+        context_pack = build_context_pack("execution_planner", state if isinstance(state, dict) else {})
+        if context_pack:
+            data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
     # Provide compact data_profile context for the planner without mutating state["data_summary"].
     data_summary_for_planner = data_summary
     planner_data_profile = None
@@ -8347,9 +8407,6 @@ def run_execution_planner(state: AgentState) -> AgentState:
     merged_state = dict(state or {})
     merged_state.update(result)
     _refresh_run_facts_pack(merged_state)
-    if merged_state.get("run_facts_pack"):
-        result["run_facts_pack"] = merged_state.get("run_facts_pack")
-        result["run_facts_block"] = merged_state.get("run_facts_block")
     if run_id:
         log_agent_snapshot(
             run_id,
@@ -8360,7 +8417,6 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 "strategy": strategy,
                 "business_objective": business_objective,
                 "planner_diag": getattr(execution_planner, "last_planner_diag", None),
-                "context_pack": context_pack,
             },
         )
     return result
@@ -8430,7 +8486,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
     csv_sep = state.get('csv_sep', ',')
     input_dialect = {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal}
     leakage_audit_summary = state.get("leakage_audit_summary", "")
-    data_engineer_audit_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
+    minimal_context_mode = _minimal_agent_context_enabled()
+    if minimal_context_mode:
+        data_engineer_audit_override = _build_agent_feedback_context(state if isinstance(state, dict) else {}, "data_engineer")
+    else:
+        data_engineer_audit_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
     dataset_scale_hints = state.get("dataset_scale_hints")
     if not isinstance(dataset_scale_hints, dict) or not dataset_scale_hints:
         dataset_scale_hints = {}
@@ -8443,29 +8503,32 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 state["dataset_scale_hints"] = dataset_scale_hints
             except Exception:
                 pass
-    context_pack = build_context_pack("data_engineer", state if isinstance(state, dict) else {})
-    if context_pack:
-        data_engineer_audit_override = _merge_de_audit_override(context_pack, data_engineer_audit_override)
+    context_pack = ""
     dataset_semantics_summary = state.get("dataset_semantics_summary")
-    if dataset_semantics_summary:
-        data_engineer_audit_override = _merge_de_audit_override(
-            data_engineer_audit_override,
-            dataset_semantics_summary,
-        )
+    if not minimal_context_mode:
+        context_pack = build_context_pack("data_engineer", state if isinstance(state, dict) else {})
+        if context_pack:
+            data_engineer_audit_override = _merge_de_audit_override(context_pack, data_engineer_audit_override)
+        if dataset_semantics_summary:
+            data_engineer_audit_override = _merge_de_audit_override(
+                data_engineer_audit_override,
+                dataset_semantics_summary,
+            )
 
     # Add numeric ranges summary for Data Engineer to understand actual data scales
-    try:
-        from src.utils.data_profile_compact import build_numeric_ranges_summary
-        dataset_profile = state.get("dataset_profile") or _load_json_safe("data/dataset_profile.json")
-        if isinstance(dataset_profile, dict) and dataset_profile.get("numeric_summary"):
-            numeric_ranges_summary = build_numeric_ranges_summary(dataset_profile)
-            if numeric_ranges_summary:
-                data_engineer_audit_override = _merge_de_audit_override(
-                    data_engineer_audit_override,
-                    numeric_ranges_summary,
-                )
-    except Exception as nr_err:
-        print(f"Warning: failed to build numeric_ranges_summary: {nr_err}")
+    if not minimal_context_mode:
+        try:
+            from src.utils.data_profile_compact import build_numeric_ranges_summary
+            dataset_profile = state.get("dataset_profile") or _load_json_safe("data/dataset_profile.json")
+            if isinstance(dataset_profile, dict) and dataset_profile.get("numeric_summary"):
+                numeric_ranges_summary = build_numeric_ranges_summary(dataset_profile)
+                if numeric_ranges_summary:
+                    data_engineer_audit_override = _merge_de_audit_override(
+                        data_engineer_audit_override,
+                        numeric_ranges_summary,
+                    )
+        except Exception as nr_err:
+            print(f"Warning: failed to build numeric_ranges_summary: {nr_err}")
 
     required_cols = []
     required_raw_map = {}
@@ -8516,7 +8579,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             memory_guard_active = True
     state["de_memory_guard_active"] = memory_guard_active
     norm_map: Dict[str, str] = {}
-    if header_cols:
+    if header_cols and not minimal_context_mode:
         for col in header_cols:
             normed = _norm_name(col)
             if normed and normed not in norm_map:
@@ -8542,7 +8605,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             hints = _infer_parsing_hints_from_sample_context(sample_context)
             if hints:
                 data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, hints)
-    if memory_guard_active:
+    if memory_guard_active and not minimal_context_mode:
         scale_text = dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else "unknown"
         file_mb = dataset_scale_hints.get("file_mb") if isinstance(dataset_scale_hints, dict) else None
         est_rows = dataset_scale_hints.get("est_rows") if isinstance(dataset_scale_hints, dict) else None
@@ -8573,7 +8636,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
     # except Exception as e:
     #     print(f"Warning: could not read raw snippet for DE: {e}")
 
-    data_engineer_audit_override = _append_run_facts_block(data_engineer_audit_override, state)
     state["data_engineer_audit_override"] = data_engineer_audit_override
     execution_contract = state.get("execution_contract") or _load_json_safe("data/execution_contract.json") or {}
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
@@ -8588,23 +8650,34 @@ def run_data_engineer(state: AgentState) -> AgentState:
     except Exception:
         pass
     required_all_columns = _resolve_contract_columns_for_cleaning(state.get("execution_contract", {}))
-    context_payload = {
-        "csv_path": csv_path,
-        "csv_encoding": csv_encoding,
-        "csv_sep": csv_sep,
-        "csv_decimal": csv_decimal,
-        "header_cols": header_cols,
-        "required_input_columns": required_cols,
-        "required_all_columns": required_all_columns,
-        "required_raw_header_map": required_raw_map,
-        "raw_required_sample_context": sample_context,
-        "data_engineer_audit_override": data_engineer_audit_override,
-        "dataset_semantics_summary": dataset_semantics_summary,
-        "dataset_training_mask": state.get("dataset_training_mask"),
-        "de_view": de_view,
-        "execution_contract": execution_contract,
-        "context_pack": context_pack,
-    }
+    if minimal_context_mode:
+        context_payload = {
+            "csv_path": csv_path,
+            "csv_encoding": csv_encoding,
+            "csv_sep": csv_sep,
+            "csv_decimal": csv_decimal,
+            "de_view": de_view,
+            "feedback_context": data_engineer_audit_override,
+            "last_gate_context": state.get("last_gate_context"),
+        }
+    else:
+        context_payload = {
+            "csv_path": csv_path,
+            "csv_encoding": csv_encoding,
+            "csv_sep": csv_sep,
+            "csv_decimal": csv_decimal,
+            "header_cols": header_cols,
+            "required_input_columns": required_cols,
+            "required_all_columns": required_all_columns,
+            "required_raw_header_map": required_raw_map,
+            "raw_required_sample_context": sample_context,
+            "data_engineer_audit_override": data_engineer_audit_override,
+            "dataset_semantics_summary": dataset_semantics_summary,
+            "dataset_training_mask": state.get("dataset_training_mask"),
+            "de_view": de_view,
+            "execution_contract": execution_contract,
+            "context_pack": context_pack,
+        }
     try:
         os.makedirs("artifacts", exist_ok=True)
         with open(os.path.join("artifacts", "data_engineer_context.json"), "w", encoding="utf-8") as f_ctx:
@@ -8625,7 +8698,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         "csv_decimal": csv_decimal,
     }
     sig = inspect.signature(data_engineer.generate_cleaning_script)
-    if "execution_contract" in sig.parameters:
+    if "execution_contract" in sig.parameters and not minimal_context_mode:
         kwargs["execution_contract"] = execution_contract
     if "de_view" in sig.parameters:
         kwargs["de_view"] = de_view
@@ -9286,7 +9359,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         runtime_reviewer_done = _flag_active_for_run(state, "de_runtime_reviewer_done", run_id)
                         if cleaning_reviewer and not runtime_reviewer_done:
                                 try:
-                                    context_pack = build_context_pack("cleaning_reviewer", state if isinstance(state, dict) else {})
                                     failure_context = {
                                         "error_details": error_details,
                                         "code": code,
@@ -9313,8 +9385,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         cleaning_code_for_reviewer = None
                                     if cleaning_view:
                                         cleaning_view_copy = dict(cleaning_view)
-                                        if context_pack:
-                                            cleaning_view_copy["context_pack"] = context_pack
                                         if isinstance(input_dialect, dict):
                                             cleaning_view_copy["input_dialect"] = input_dialect
                                         if cleaning_code_for_reviewer:
@@ -9338,8 +9408,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             "dialect": input_dialect,
                                             "column_roles": contract.get("column_roles") if isinstance(contract, dict) else {},
                                         }
-                                        if context_pack:
-                                            review_context["context_pack"] = context_pack
                                         if cleaning_code_for_reviewer:
                                             review_context["cleaning_code"] = cleaning_code_for_reviewer
                                         review_context = compress_long_lists(review_context)[0]
@@ -10053,7 +10121,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
             # --- CLEANING REVIEWER (contract-driven) ---
             if cleaning_reviewer:
                 try:
-                    context_pack = build_context_pack("cleaning_reviewer", state if isinstance(state, dict) else {})
                     manifest_for_review = _load_json_safe(local_manifest_path)
                     output_dialect = None
                     output_payload = manifest_for_review.get("output_dialect")
@@ -10075,8 +10142,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         cleaning_code_for_normal_review = None
                     if cleaning_view:
                         cleaning_view_copy = dict(cleaning_view)
-                        if context_pack:
-                            cleaning_view_copy["context_pack"] = context_pack
                         if output_dialect:
                             cleaning_view_copy["output_dialect"] = output_dialect
                         if isinstance(input_dialect, dict):
@@ -10112,8 +10177,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             review_context["output_dialect"] = output_dialect
                         if isinstance(input_dialect, dict):
                             review_context["input_dialect"] = input_dialect
-                        if context_pack:
-                            review_context["context_pack"] = context_pack
                         if cleaning_code_for_normal_review:
                             review_context["cleaning_code"] = cleaning_code_for_normal_review
                         review_context = compress_long_lists(review_context)[0]
@@ -10386,9 +10449,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
         merged_state = dict(state or {})
         merged_state.update(result)
         _refresh_run_facts_pack(merged_state)
-        if merged_state.get("run_facts_pack"):
-            result["run_facts_pack"] = merged_state.get("run_facts_pack")
-            result["run_facts_block"] = merged_state.get("run_facts_block")
         return result
 
     except Exception as e:
@@ -10511,6 +10571,8 @@ def run_engineer(state: AgentState) -> AgentState:
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
     if isinstance(de_view, dict) and de_view.get("output_path"):
         data_path = str(de_view.get("output_path"))
+    minimal_context_mode = _minimal_agent_context_enabled()
+    data_audit_context = _build_agent_feedback_context(state if isinstance(state, dict) else {}, "ml_engineer")
     if os.path.basename(data_path).lower() == "cleaned_full.csv":
         data_audit_context = _merge_de_audit_override(
             data_audit_context,
@@ -10519,21 +10581,23 @@ def run_engineer(state: AgentState) -> AgentState:
         data_path = "data/cleaned_data.csv"
     feedback_history = state.get('feedback_history', [])
     leakage_summary = state.get("leakage_audit_summary", "")
-    data_audit_context = state.get('data_summary', '')
-    if leakage_summary:
-        data_audit_context = f"{data_audit_context}\nLEAKAGE_AUDIT: {leakage_summary}"
     dataset_semantics_summary = state.get("dataset_semantics_summary")
-    if dataset_semantics_summary:
-        data_audit_context = _merge_de_audit_override(
-            data_audit_context,
-            dataset_semantics_summary,
-        )
     ml_audit_override = state.get("ml_engineer_audit_override", "")
-    if ml_audit_override:
-        data_audit_context = _merge_de_audit_override(data_audit_context, ml_audit_override)
-    context_pack = build_context_pack("ml_engineer", state if isinstance(state, dict) else {})
-    if context_pack:
-        data_audit_context = _merge_de_audit_override(context_pack, data_audit_context)
+    context_pack = ""
+    if not minimal_context_mode:
+        data_audit_context = _strip_run_facts_blocks(str(state.get('data_summary', '') or ""))
+        if leakage_summary:
+            data_audit_context = f"{data_audit_context}\nLEAKAGE_AUDIT: {leakage_summary}"
+        if dataset_semantics_summary:
+            data_audit_context = _merge_de_audit_override(
+                data_audit_context,
+                dataset_semantics_summary,
+            )
+        if ml_audit_override:
+            data_audit_context = _merge_de_audit_override(data_audit_context, ml_audit_override)
+        context_pack = build_context_pack("ml_engineer", state if isinstance(state, dict) else {})
+        if context_pack:
+            data_audit_context = _merge_de_audit_override(context_pack, data_audit_context)
     business_objective = state.get('business_objective', '')
     csv_encoding = state.get('csv_encoding', 'utf-8') # Pass real encoding
     csv_sep = state.get('csv_sep', ',')
@@ -10566,7 +10630,7 @@ def run_engineer(state: AgentState) -> AgentState:
         )
     required_input_cols = _resolve_required_input_columns(execution_contract, strategy)
     header_cols = _read_csv_header(data_path, csv_encoding, csv_sep) if os.path.exists(data_path) else []
-    if required_input_cols and header_cols:
+    if required_input_cols and header_cols and not minimal_context_mode:
         header_norm = {_norm_name(c) for c in header_cols}
         missing_required = [c for c in required_input_cols if _norm_name(c) not in header_norm]
         constant_cols = _load_constant_columns_from_profile()
@@ -10597,7 +10661,7 @@ def run_engineer(state: AgentState) -> AgentState:
         if journal_block:
             iteration_memory_block = journal_block
     compliance_checklist = (execution_contract or {}).get("compliance_checklist", [])
-    if compliance_checklist and not state.get("compliance_passed", False):
+    if compliance_checklist and not state.get("compliance_passed", False) and not minimal_context_mode:
         checklist_payload = "COMPLIANCE_BOOTSTRAP_CHECKLIST:\n" + json.dumps(compliance_checklist, ensure_ascii=True)
         data_audit_context = _merge_de_audit_override(data_audit_context, checklist_payload)
 
@@ -10629,7 +10693,7 @@ def run_engineer(state: AgentState) -> AgentState:
             iteration_memory_block=iteration_memory_block,
         )
         sig = inspect.signature(ml_engineer.generate_code)
-        if "execution_contract" in sig.parameters:
+        if "execution_contract" in sig.parameters and not minimal_context_mode:
             kwargs["execution_contract"] = execution_contract
         if "dataset_scale" in sig.parameters:
             dataset_scale_hints = state.get("dataset_scale_hints") or {}
@@ -10659,159 +10723,172 @@ def run_engineer(state: AgentState) -> AgentState:
         sample_context = ""
         context_ops_blocks = []
         dataset_scale_hints = state.get("dataset_scale_hints") or {}
-        scale_line = (
-            "POST-CLEAN DATASET SCALE: "
-            f"scale={dataset_scale_hints.get('scale') or 'unknown'} "
-            f"file_mb={dataset_scale_hints.get('file_mb') or 'unknown'} "
-            f"est_rows={dataset_scale_hints.get('est_rows') or 'unknown'} "
-            f"max_train_rows={dataset_scale_hints.get('max_train_rows') or 'unknown'} "
-            f"chunk_size={dataset_scale_hints.get('chunk_size') or 'unknown'}"
-        )
-        context_ops_blocks.append(scale_line)
-        # V4.1: Removed feature_availability and availability_summary blocks
-        if iteration_memory:
-            memory_slice = iteration_memory[-2:]
-            context_ops_blocks.append(
-                "ITERATION_MEMORY_CONTEXT:\n" + json.dumps(memory_slice, ensure_ascii=True)
+        if not minimal_context_mode:
+            scale_line = (
+                "POST-CLEAN DATASET SCALE: "
+                f"scale={dataset_scale_hints.get('scale') or 'unknown'} "
+                f"file_mb={dataset_scale_hints.get('file_mb') or 'unknown'} "
+                f"est_rows={dataset_scale_hints.get('est_rows') or 'unknown'} "
+                f"max_train_rows={dataset_scale_hints.get('max_train_rows') or 'unknown'} "
+                f"chunk_size={dataset_scale_hints.get('chunk_size') or 'unknown'}"
             )
-        ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
-        if isinstance(ml_view, dict) and ml_view:
-            context_ops_blocks.append(
-                "ML_VIEW_CONTEXT:\n" + json.dumps(compress_long_lists(ml_view)[0], ensure_ascii=True)
-            )
-        if header_cols:
-            norm_map = {}
-            norm_buckets = {}
-            for col in header_cols:
-                normed = _norm_name(col)
-                if normed and normed not in norm_map:
-                    norm_map[normed] = col
-                if normed:
-                    norm_buckets.setdefault(normed, []).append(col)
-            aliasing = {k: v for k, v in norm_buckets.items() if len(v) > 1}
-            try:
-                derived_cols = _resolve_contract_columns(execution_contract, sources={"derived"})
-                if derived_cols:
-                    derived_present = [c for c in derived_cols if c in set(header_cols)]
-            except Exception:
-                derived_present = []
-            cleaned_payload: Dict[str, Any] = {
-                "cleaned_column_inventory_raw": header_cols,
-                "cleaned_aliasing_collisions": aliasing,
-                "derived_columns_present": derived_present,
-            }
-            if len(header_cols) > 80:
-                norm_items = [f"{k}->{v}" for k, v in norm_map.items()]
-                norm_summary = summarize_long_list(norm_items)
-                norm_summary["note"] = COLUMN_LIST_POINTER
-                cleaned_payload["normalized_cleaned_header_map"] = norm_summary
-            else:
-                cleaned_payload["normalized_cleaned_header_map"] = norm_map
-            cleaned_payload, _ = compress_long_lists(cleaned_payload)
-            header_context = "CLEANED_COLUMN_INVENTORY_CONTEXT: " + json.dumps(
-                cleaned_payload, ensure_ascii=False
-            )
-            data_audit_context = _merge_de_audit_override(data_audit_context, header_context)
-            kwargs["data_audit_context"] = data_audit_context
-            required_input_cols = _resolve_required_input_columns(execution_contract, strategy)
-            sample_context = _build_required_sample_context(
-                data_path,
-                {"sep": csv_sep, "encoding": csv_encoding, "decimal": csv_decimal},
-                required_input_cols,
-                norm_map,
-                max_rows=80,
-            )
-            if sample_context:
-                data_audit_context = _merge_de_audit_override(data_audit_context, sample_context)
-                kwargs["data_audit_context"] = data_audit_context
-            signal_summary = _build_signal_summary_context(
-                data_path,
-                {"sep": csv_sep, "encoding": csv_encoding, "decimal": csv_decimal},
-                required_input_cols,
-                norm_map,
-                header_cols,
-                state.get("dataset_semantics") if isinstance(state, dict) else None,
-            )
-            if signal_summary:
+            context_ops_blocks.append(scale_line)
+            # V4.1: Removed feature_availability and availability_summary blocks
+            if iteration_memory:
+                memory_slice = iteration_memory[-2:]
                 context_ops_blocks.append(
-                    "SIGNAL_SUMMARY_CONTEXT:\n" + json.dumps(signal_summary, ensure_ascii=True)
+                    "ITERATION_MEMORY_CONTEXT:\n" + json.dumps(memory_slice, ensure_ascii=True)
                 )
-                kwargs["signal_summary"] = signal_summary
-            try:
-                derived_cols = _resolve_contract_columns(execution_contract, sources={"derived"}) or []
-                output_cols = _resolve_contract_columns(execution_contract, sources={"output"}) or []
-                target_cols = [c for c in derived_cols + output_cols if c]
-                if target_cols:
-                    summary = {}
-                    for tgt in target_cols:
-                        norm = _norm_name(tgt)
-                        actual = norm_map.get(norm, tgt if tgt in header_cols else None)
-                        if not actual:
-                            continue
-                        series_stats = {"present": True}
-                        try:
-                            import pandas as pd
-                            df_preview = pd.read_csv(
-                                data_path,
-                                sep=csv_sep,
-                                decimal=csv_decimal,
-                                encoding=csv_encoding,
-                                usecols=[actual],
-                                nrows=200,
-                                low_memory=False,
-                            )
-                            series = df_preview[actual]
-                            series_stats["non_null"] = int(series.notna().sum())
-                            series_stats["nunique"] = int(series.nunique(dropna=False))
-                            series_stats["sample"] = [str(v) for v in series.dropna().head(3).tolist()]
-                        except Exception:
-                            pass
-                        summary[tgt] = series_stats
-                    if summary:
-                        context_ops_blocks.append(
-                            "DERIVED_OUTPUT_OBSERVATIONS:\n" + json.dumps(summary, ensure_ascii=True)
-                        )
-            except Exception:
-                pass
-            try:
-                business_alignment = (execution_contract or {}).get("business_alignment", {})
-                if business_alignment:
+            ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
+            if isinstance(ml_view, dict) and ml_view:
+                context_ops_blocks.append(
+                    "ML_VIEW_CONTEXT:\n" + json.dumps(compress_long_lists(ml_view)[0], ensure_ascii=True)
+                )
+            if header_cols:
+                norm_map = {}
+                norm_buckets = {}
+                for col in header_cols:
+                    normed = _norm_name(col)
+                    if normed and normed not in norm_map:
+                        norm_map[normed] = col
+                    if normed:
+                        norm_buckets.setdefault(normed, []).append(col)
+                aliasing = {k: v for k, v in norm_buckets.items() if len(v) > 1}
+                try:
+                    derived_cols = _resolve_contract_columns(execution_contract, sources={"derived"})
+                    if derived_cols:
+                        derived_present = [c for c in derived_cols if c in set(header_cols)]
+                except Exception:
+                    derived_present = []
+                cleaned_payload: Dict[str, Any] = {
+                    "cleaned_column_inventory_raw": header_cols,
+                    "cleaned_aliasing_collisions": aliasing,
+                    "derived_columns_present": derived_present,
+                }
+                if len(header_cols) > 80:
+                    norm_items = [f"{k}->{v}" for k, v in norm_map.items()]
+                    norm_summary = summarize_long_list(norm_items)
+                    norm_summary["note"] = COLUMN_LIST_POINTER
+                    cleaned_payload["normalized_cleaned_header_map"] = norm_summary
+                else:
+                    cleaned_payload["normalized_cleaned_header_map"] = norm_map
+                cleaned_payload, _ = compress_long_lists(cleaned_payload)
+                header_context = "CLEANED_COLUMN_INVENTORY_CONTEXT: " + json.dumps(
+                    cleaned_payload, ensure_ascii=False
+                )
+                data_audit_context = _merge_de_audit_override(data_audit_context, header_context)
+                kwargs["data_audit_context"] = data_audit_context
+                required_input_cols = _resolve_required_input_columns(execution_contract, strategy)
+                sample_context = _build_required_sample_context(
+                    data_path,
+                    {"sep": csv_sep, "encoding": csv_encoding, "decimal": csv_decimal},
+                    required_input_cols,
+                    norm_map,
+                    max_rows=80,
+                )
+                if sample_context:
+                    data_audit_context = _merge_de_audit_override(data_audit_context, sample_context)
+                    kwargs["data_audit_context"] = data_audit_context
+                signal_summary = _build_signal_summary_context(
+                    data_path,
+                    {"sep": csv_sep, "encoding": csv_encoding, "decimal": csv_decimal},
+                    required_input_cols,
+                    norm_map,
+                    header_cols,
+                    state.get("dataset_semantics") if isinstance(state, dict) else None,
+                )
+                if signal_summary:
                     context_ops_blocks.append(
-                        "BUSINESS_ALIGNMENT_OPERATIVE:\n" + json.dumps(business_alignment, ensure_ascii=True)
+                        "SIGNAL_SUMMARY_CONTEXT:\n" + json.dumps(signal_summary, ensure_ascii=True)
                     )
-            except Exception:
-                pass
+                    kwargs["signal_summary"] = signal_summary
+                try:
+                    derived_cols = _resolve_contract_columns(execution_contract, sources={"derived"}) or []
+                    output_cols = _resolve_contract_columns(execution_contract, sources={"output"}) or []
+                    target_cols = [c for c in derived_cols + output_cols if c]
+                    if target_cols:
+                        summary = {}
+                        for tgt in target_cols:
+                            norm = _norm_name(tgt)
+                            actual = norm_map.get(norm, tgt if tgt in header_cols else None)
+                            if not actual:
+                                continue
+                            series_stats = {"present": True}
+                            try:
+                                import pandas as pd
+                                df_preview = pd.read_csv(
+                                    data_path,
+                                    sep=csv_sep,
+                                    decimal=csv_decimal,
+                                    encoding=csv_encoding,
+                                    usecols=[actual],
+                                    nrows=200,
+                                    low_memory=False,
+                                )
+                                series = df_preview[actual]
+                                series_stats["non_null"] = int(series.notna().sum())
+                                series_stats["nunique"] = int(series.nunique(dropna=False))
+                                series_stats["sample"] = [str(v) for v in series.dropna().head(3).tolist()]
+                            except Exception:
+                                pass
+                            summary[tgt] = series_stats
+                        if summary:
+                            context_ops_blocks.append(
+                                "DERIVED_OUTPUT_OBSERVATIONS:\n" + json.dumps(summary, ensure_ascii=True)
+                            )
+                except Exception:
+                    pass
+                try:
+                    business_alignment = (execution_contract or {}).get("business_alignment", {})
+                    if business_alignment:
+                        context_ops_blocks.append(
+                            "BUSINESS_ALIGNMENT_OPERATIVE:\n" + json.dumps(business_alignment, ensure_ascii=True)
+                        )
+                except Exception:
+                    pass
         try:
             os.makedirs("artifacts", exist_ok=True)
-            ctx_payload = {
-                "data_path": data_path,
-                "csv_encoding": csv_encoding,
-                "csv_sep": csv_sep,
-                "csv_decimal": csv_decimal,
-                "header_cols": header_cols,
-                "cleaned_aliasing_collisions": aliasing if header_cols else {},
-                "derived_columns_present": derived_present if header_cols else [],
-                "raw_required_sample_context": sample_context,
-                "context_ops_blocks": context_ops_blocks,
-                "required_features": strategy.get("required_columns", []),
-                "execution_contract": execution_contract,
-                "ml_view": state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view"),
-                "data_audit_context": data_audit_context,
-                "ml_engineer_audit_override": ml_audit_override,
-                "dataset_semantics_summary": dataset_semantics_summary,
-                "dataset_training_mask": state.get("dataset_training_mask"),
-                "context_pack": context_pack,
-                # V4.1: Removed feature_availability and availability_summary
-                "dataset_scale_hints": dataset_scale_hints,
-                "signal_summary": kwargs.get("signal_summary", {}),
-                "iteration_memory": iteration_memory,
-                "iteration_memory_block": iteration_memory_block,
-            }
+            if minimal_context_mode:
+                ctx_payload = {
+                    "data_path": data_path,
+                    "csv_encoding": csv_encoding,
+                    "csv_sep": csv_sep,
+                    "csv_decimal": csv_decimal,
+                    "ml_view": kwargs.get("ml_view"),
+                    "data_audit_context": data_audit_context,
+                    "last_gate_context": gate_context,
+                    "iteration_memory_block": iteration_memory_block,
+                }
+            else:
+                ctx_payload = {
+                    "data_path": data_path,
+                    "csv_encoding": csv_encoding,
+                    "csv_sep": csv_sep,
+                    "csv_decimal": csv_decimal,
+                    "header_cols": header_cols,
+                    "cleaned_aliasing_collisions": aliasing if header_cols else {},
+                    "derived_columns_present": derived_present if header_cols else [],
+                    "raw_required_sample_context": sample_context,
+                    "context_ops_blocks": context_ops_blocks,
+                    "required_features": strategy.get("required_columns", []),
+                    "execution_contract": execution_contract,
+                    "ml_view": state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view"),
+                    "data_audit_context": data_audit_context,
+                    "ml_engineer_audit_override": ml_audit_override,
+                    "dataset_semantics_summary": dataset_semantics_summary,
+                    "dataset_training_mask": state.get("dataset_training_mask"),
+                    "context_pack": context_pack,
+                    # V4.1: Removed feature_availability and availability_summary
+                    "dataset_scale_hints": dataset_scale_hints,
+                    "signal_summary": kwargs.get("signal_summary", {}),
+                    "iteration_memory": iteration_memory,
+                    "iteration_memory_block": iteration_memory_block,
+                }
             with open(os.path.join("artifacts", "ml_engineer_context.json"), "w", encoding="utf-8") as f_ctx:
                 json.dump(ctx_payload, f_ctx, indent=2, ensure_ascii=False)
         except Exception as ctx_err:
             print(f"Warning: failed to persist ml_engineer_context.json: {ctx_err}")
-        if context_ops_blocks:
+        if context_ops_blocks and not minimal_context_mode:
             ops_payload = "\n\n".join(context_ops_blocks)
             data_audit_context = _merge_de_audit_override(data_audit_context, ops_payload)
             kwargs["data_audit_context"] = data_audit_context
@@ -10827,7 +10904,6 @@ def run_engineer(state: AgentState) -> AgentState:
                     log_run_event(run_id, "ml_context_ops_preview", {"preview": ops_preview})
             except Exception as ops_err:
                 print(f"Warning: failed to persist ml_engineer_context_ops.txt: {ops_err}")
-        data_audit_context = _append_run_facts_block(data_audit_context, state)
         data_audit_context = _truncate_text(data_audit_context)
         iteration_memory_block = _truncate_text(iteration_memory_block, max_len=6000, head_len=3500, tail_len=2000)
         kwargs["data_audit_context"] = data_audit_context
@@ -11041,10 +11117,6 @@ def run_reviewer(state: AgentState) -> AgentState:
             {},
             state.get("artifact_index") or [],
         )
-    context_pack = build_context_pack("reviewer", state if isinstance(state, dict) else {})
-    if context_pack and isinstance(reviewer_view, dict):
-        reviewer_view = dict(reviewer_view)
-        reviewer_view["context_pack"] = context_pack
     dataset_semantics_summary = state.get("dataset_semantics_summary")
     if dataset_semantics_summary and isinstance(reviewer_view, dict):
         reviewer_view = dict(reviewer_view)
@@ -11136,7 +11208,6 @@ def run_reviewer(state: AgentState) -> AgentState:
             context={
                 "analysis_type": analysis_type,
                 "business_objective": business_objective,
-                "context_pack": context_pack,
             },
             verdicts=review,
         )
@@ -11185,7 +11256,6 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     code = state['generated_code']
     strategy = state.get('selected_strategy', {})
     business_objective = state.get('business_objective', '')
-    context_pack = build_context_pack("qa_reviewer", state if isinstance(state, dict) else {})
 
     current_history = list(state.get('feedback_history', []))
     try:
@@ -11202,8 +11272,6 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             qa_context = {}
             contract_source = "fallback"
         qa_context["_contract_source"] = contract_source
-        if context_pack:
-            qa_context["context_pack"] = context_pack
 
         # Wire ML Plan for QA coherence check (Senior Reasoning)
         qa_context.setdefault("evaluation_spec", {})
@@ -11333,7 +11401,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                 "qa_reviewer",
                 prompt=getattr(qa_reviewer, "last_prompt", None),
                 response=getattr(qa_reviewer, "last_response", None) or qa_result,
-                context={"business_objective": business_objective, "context_pack": context_pack},
+                context={"business_objective": business_objective},
                 verdicts=qa_result,
             )
         return {
@@ -13683,7 +13751,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 objective_type = evaluation_spec.get("objective_type")
         normalized_review_status = _normalize_review_status(status)
         normalized_review_feedback = _normalize_review_feedback(feedback, normalized_review_status)
-        context_pack = build_context_pack("results_advisor", state if isinstance(state, dict) else {})
         insights_context = {
             "objective_type": objective_type,
             "artifact_index": state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json"),
@@ -13698,7 +13765,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "iteration_policy": (contract or {}).get("iteration_policy", {}) if isinstance(contract, dict) else {},
             "strategy_spec": strategy_spec,
             "reporting_policy": contract.get("reporting_policy", {}) if isinstance(contract, dict) else {},
-            "context_pack": context_pack,
         }
         insights = results_advisor.generate_insights(insights_context)
         if insights:
@@ -14376,15 +14442,9 @@ def run_translator(state: AgentState) -> AgentState:
             {},
             report_state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json") or [],
         )
-    context_pack = build_context_pack("business_translator", report_state if isinstance(report_state, dict) else {})
-    if context_pack and isinstance(translator_view, dict):
-        translator_view = dict(translator_view)
-        translator_view["context_pack"] = context_pack
     if isinstance(translator_view, dict):
         translator_view = compress_long_lists(translator_view)[0]
     report_state["translator_view"] = translator_view
-    if context_pack:
-        report_state["context_pack"] = context_pack
     normalized_review_status = _normalize_review_status(report_state.get("review_verdict"))
     normalized_review_feedback = _normalize_review_feedback(report_state.get("review_feedback"), normalized_review_status)
     review_verdict_normalized = normalize_review_status(normalized_review_status)
@@ -14565,18 +14625,17 @@ def run_translator(state: AgentState) -> AgentState:
     report = sanitize_text(report or "")
     report_state["final_report"] = report
     if run_id:
-        log_agent_snapshot(
-            run_id,
-            "translator",
-            prompt=getattr(translator, "last_prompt", None),
-            response=getattr(translator, "last_response", None) or report,
-            context={
-                "error_message": report_error,
-                "has_partial_visuals": report_has_partial,
-                "plot_count": len(report_plots) if isinstance(report_plots, list) else 0,
-                "context_pack": context_pack,
-            },
-        )
+            log_agent_snapshot(
+                run_id,
+                "translator",
+                prompt=getattr(translator, "last_prompt", None),
+                response=getattr(translator, "last_response", None) or report,
+                context={
+                    "error_message": report_error,
+                    "has_partial_visuals": report_has_partial,
+                    "plot_count": len(report_plots) if isinstance(report_plots, list) else 0,
+                },
+            )
 
     try:
         os.makedirs("data", exist_ok=True)

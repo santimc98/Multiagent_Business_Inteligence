@@ -1117,9 +1117,6 @@ class BusinessTranslatorAgent:
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
         run_summary = _safe_load_json("data/run_summary.json") or {}
-        run_facts_pack = state.get("run_facts_pack") or _safe_load_json("data/run_facts_pack.json") or {}
-        if not isinstance(run_facts_pack, dict):
-            run_facts_pack = {}
         recommendations_preview = _safe_load_json("reports/recommendations_preview.json") or {}
         metrics_payload = _safe_load_json("data/metrics.json") or {}
         weights_path = _first_artifact_path(artifact_index, "weights")
@@ -1290,8 +1287,6 @@ class BusinessTranslatorAgent:
 
         def _summarize_run():
             if not run_summary:
-                if run_facts_pack:
-                    return {"status": None, "run_outcome": None, "run_facts_pack": run_facts_pack}
                 return "No run_summary.json."
             payload = {
                 "status": run_summary.get("status"),
@@ -1303,8 +1298,6 @@ class BusinessTranslatorAgent:
                 "ceiling_reason": run_summary.get("ceiling_reason"),
                 "baseline_vs_model": run_summary.get("baseline_vs_model", []),
             }
-            if run_facts_pack:
-                payload["run_facts_pack"] = run_facts_pack
             return payload
 
         def _summarize_gate_context():

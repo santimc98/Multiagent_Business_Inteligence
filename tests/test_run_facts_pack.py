@@ -50,3 +50,19 @@ def test_run_facts_pack_falls_back_to_execution_contract():
     assert facts["contract_version"] == "4.1"
     assert facts["objective_type"] == "ranking"
     assert facts["target_columns"] == ["target"]
+
+
+def test_run_facts_pack_extracts_targets_from_outcome_columns_and_roles():
+    state = {
+        "run_id": "run_3",
+        "execution_contract": {
+            "contract_version": "4.1",
+            "column_roles": {
+                "target": {"role": "outcome"},
+            },
+        },
+    }
+
+    facts = build_run_facts_pack(state)
+    # role-derived outcome should be captured via canonical resolver
+    assert "target" in facts["target_columns"]

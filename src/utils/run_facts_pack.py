@@ -1,6 +1,8 @@
 import json
 from typing import Any, Dict, List, Optional
 
+from src.utils.contract_v41 import get_outcome_columns
+
 
 def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
@@ -48,14 +50,22 @@ def _extract_objective_type(contract: Dict[str, Any], state: Dict[str, Any]) -> 
 
 def _extract_target_columns(contract: Dict[str, Any]) -> List[str]:
     targets: List[Any] = []
-    column_roles = _as_dict(contract.get("column_roles"))
-    targets.extend(_as_list(column_roles.get("outcome")))
+
+    # V4.1 canonical resolver first (handles multiple column_roles formats safely).
+    try:
+        targets.extend(get_outcome_columns(contract))
+    except Exception:
+        pass
+
+    # Contract-explicit target hints (LLM/contract derived).
     if contract.get("target_column"):
         targets.append(contract.get("target_column"))
     targets.extend(_as_list(contract.get("target_columns")))
+
     eval_spec = _as_dict(contract.get("evaluation_spec"))
     if eval_spec.get("target_column"):
         targets.append(eval_spec.get("target_column"))
+    targets.extend(_as_list(eval_spec.get("outcome_columns")))
     return _unique_strings(targets)
 
 
@@ -65,20 +75,21 @@ def _extract_required_outputs(contract: Dict[str, Any]) -> List[str]:
         return _unique_strings(required)
     artifact_reqs = _as_dict(contract.get("artifact_requirements"))
     files = _as_list(artifact_reqs.get("required_files"))
-    return _unique_strings(files)
+    normalized: List[str] = []
+    for entry in files:
+        if not entry:
+            continue
+        if isinstance(entry, dict):
+            path = entry.get("path") or entry.get("output") or entry.get("artifact")
+            if path:
+                normalized.append(str(path))
+            continue
+        normalized.append(str(entry))
+    return _unique_strings(normalized)
 
 
-def _extract_columns_sample(state: Dict[str, Any], max_cols: int = 40) -> Dict[str, Any]:
-    columns = (
-        state.get("column_inventory")
-        or state.get("cleaned_column_inventory")
-        or _as_dict(state.get("ml_context_snapshot")).get("cleaned_column_inventory")
-        or []
-    )
-    if isinstance(columns, dict):
-        columns_list = [str(c) for c in _as_list(columns.get("columns")) if c]
-    else:
-        columns_list = [str(c) for c in _as_list(columns) if c]
+def _extract_contract_columns(contract: Dict[str, Any], max_cols: int = 40) -> Dict[str, Any]:
+    columns_list = [str(c) for c in _as_list(contract.get("canonical_columns")) if c]
     return {
         "n_cols": len(columns_list) if columns_list else None,
         "sample": columns_list[:max_cols],
@@ -96,7 +107,7 @@ def build_run_facts_pack(state: Dict[str, Any]) -> Dict[str, Any]:
         "decimal": state.get("csv_decimal"),
         "encoding": state.get("csv_encoding"),
     }
-    column_info = _extract_columns_sample(state)
+    column_info = _extract_contract_columns(contract)
     dataset_scale_hints = state.get("dataset_scale_hints")
     if not isinstance(dataset_scale_hints, dict):
         dataset_scale_hints = {}
