@@ -204,8 +204,97 @@ Hard rules:
 - required_outputs must be artifact paths, never conceptual labels.
 - Keep de_view executable from contract alone: include both cleaned output CSV and cleaning manifest JSON paths.
 - Keep contract coherent with strategy + business objective.
+- Every requirement must be consumable by at least one downstream agent view.
+- Follow evidence_policy from INPUTS: use direct evidence first, grounded inference second, and avoid unsupported assumptions.
 - You may add extra fields if useful, but do not omit required minimum fields.
 """
+
+CONTRACT_SOURCE_OF_TRUTH_POLICY_V1 = {
+    "contract_is_single_source_of_truth": True,
+    "views_are_projection_only": True,
+    "runtime_must_not_inject_out_of_contract_requirements": True,
+    "reviewers_validate_against_contract_plus_execution_evidence": True,
+}
+
+DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
+    "data_engineer": {
+        "consumes_view": "de_view",
+        "must_be_executable_from_contract": True,
+        "required_contract_inputs": [
+            "scope",
+            "artifact_requirements.clean_dataset.output_path",
+            "artifact_requirements.clean_dataset.output_manifest_path|manifest_path",
+            "artifact_requirements.clean_dataset.required_columns",
+            "cleaning_gates",
+            "data_engineer_runbook",
+        ],
+    },
+    "cleaning_reviewer": {
+        "consumes_view": "cleaning_review_view",
+        "required_contract_inputs": [
+            "scope",
+            "cleaning_gates",
+            "artifact_requirements.clean_dataset.output_path",
+            "artifact_requirements.clean_dataset.output_manifest_path|manifest_path",
+            "artifact_requirements.clean_dataset.required_columns",
+        ],
+    },
+    "ml_engineer": {
+        "consumes_view": "ml_view",
+        "required_contract_inputs": [
+            "scope",
+            "ml_engineer_runbook",
+            "validation_requirements",
+            "qa_gates",
+            "reviewer_gates",
+            "required_outputs",
+        ],
+        "objective_context_required": [
+            "objective_analysis.problem_type|evaluation_spec.objective_type",
+            "business_objective",
+            "strategy_title",
+        ],
+    },
+    "reviewer_board": {
+        "consumes_view": "review_board_view",
+        "required_contract_inputs": [
+            "qa_gates",
+            "reviewer_gates",
+            "validation_requirements",
+            "required_outputs",
+            "artifact_requirements",
+        ],
+    },
+    "business_translator": {
+        "consumes_view": "translator_view",
+        "required_contract_inputs": [
+            "strategy_title",
+            "business_objective",
+            "required_outputs",
+            "artifact_requirements",
+        ],
+    },
+}
+
+CONTRACT_EVIDENCE_POLICY_V1 = {
+    "priority_order": ["direct_evidence", "grounded_inference", "assumption_last_resort"],
+    "direct_evidence": "Field value is explicitly present in provided inputs.",
+    "grounded_inference": (
+        "Field value is deduced from strategy + business objective + column inventory + data profile; "
+        "no invented columns, paths, or unsupported claims."
+    ),
+    "assumption_last_resort": (
+        "Use only when required field cannot be left empty. Keep assumption conservative and record it under "
+        "planner_notes.assumptions (optional)."
+    ),
+    "if_evidence_missing_for_optional_field": "omit_field_or_leave_empty_object",
+    "if_evidence_missing_for_required_field": "use_minimal_safe_default_and_mark_assumption",
+    "forbidden": [
+        "invented_column_names",
+        "conceptual_items_in_required_outputs",
+        "requirements_without_downstream_consumer",
+    ],
+}
 
 
 def _normalize_text(*values: Any) -> str:
@@ -6153,12 +6242,13 @@ class ExecutionPlannerAgent:
                 "Return ONLY one valid JSON object (no markdown, no comments, no code fences).\n"
                 "scope MUST be one of: cleaning_only, ml_only, full_pipeline.\n"
                 "Do not invent columns outside column_inventory.\n"
+                "Use downstream_consumer_interface + evidence_policy from ORIGINAL INPUTS.\n"
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
                 "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "For ML scopes, include non-empty evaluation_spec and ensure objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
-                "Top-level required keys (all mandatory): "
+                "Top-level minimum keys (required interface for executable views): "
                 + json.dumps(required_top_level)
                 + "\n\nORIGINAL INPUTS (source of truth):\n"
                 + (original_inputs_text or "")
@@ -6422,6 +6512,7 @@ class ExecutionPlannerAgent:
                 "Return ONLY one JSON object.\n"
                 "Do not include markdown, comments, or explanations.\n"
                 "Use only data from ORIGINAL INPUTS; do not invent columns.\n"
+                "Use downstream_consumer_interface and evidence_policy from ORIGINAL INPUTS.\n"
                 "Keep semantics aligned with strategy/business objective.\n"
                 "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
@@ -6456,6 +6547,7 @@ class ExecutionPlannerAgent:
                 "No markdown, no comments.\n"
                 f"Required keys: {json.dumps(required_keys)}\n"
                 "Use ORIGINAL INPUTS as source of truth and keep compatibility with CURRENT CONTRACT DRAFT.\n"
+                "Use downstream_consumer_interface and evidence_policy from ORIGINAL INPUTS.\n"
                 "Do not invent columns not present in column_inventory.\n\n"
                 "Use artifact file paths for required_outputs.\n\n"
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
@@ -6890,6 +6982,15 @@ output_dialect:
 
 env_constraints:
 {json.dumps(env_constraints or {"forbid_inplace_column_creation": True})}
+
+contract_source_of_truth_policy:
+{json.dumps(CONTRACT_SOURCE_OF_TRUTH_POLICY_V1, indent=2)}
+
+downstream_consumer_interface:
+{json.dumps(DOWNSTREAM_CONSUMER_INTERFACE_V1, indent=2)}
+
+evidence_policy:
+{json.dumps(CONTRACT_EVIDENCE_POLICY_V1, indent=2)}
 
 domain_expert_critique:
 {critique_for_prompt or "None"}
