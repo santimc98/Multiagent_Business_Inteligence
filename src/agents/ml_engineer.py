@@ -278,6 +278,105 @@ class MLEngineerAgent:
             return ""
         return "\n\n".join(blocks[:max_blocks])
 
+    def _normalize_handoff_items(
+        self,
+        values: Any,
+        max_items: int = 8,
+        max_len: int = 200,
+    ) -> List[str]:
+        out: List[str] = []
+        if not isinstance(values, list):
+            return out
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            if len(text) > max_len:
+                text = text[: max_len - 3] + "..."
+            if text in out:
+                continue
+            out.append(text)
+            if len(out) >= max_items:
+                break
+        return out
+
+    def _normalize_iteration_handoff(
+        self,
+        iteration_handoff: Dict[str, Any] | None,
+        gate_context: Dict[str, Any] | None,
+        required_deliverables: List[str] | None,
+    ) -> Dict[str, Any]:
+        raw = iteration_handoff if isinstance(iteration_handoff, dict) else {}
+        gate_context = gate_context if isinstance(gate_context, dict) else {}
+        contract_focus = raw.get("contract_focus") if isinstance(raw.get("contract_focus"), dict) else {}
+        quality_focus = raw.get("quality_focus") if isinstance(raw.get("quality_focus"), dict) else {}
+        feedback = raw.get("feedback") if isinstance(raw.get("feedback"), dict) else {}
+
+        required_outputs = self._normalize_handoff_items(
+            contract_focus.get("required_outputs") or required_deliverables,
+            max_items=12,
+            max_len=140,
+        )
+        present_outputs = self._normalize_handoff_items(contract_focus.get("present_outputs"), max_items=12, max_len=140)
+        missing_outputs = self._normalize_handoff_items(contract_focus.get("missing_outputs"), max_items=12, max_len=140)
+        failed_gates = self._normalize_handoff_items(
+            quality_focus.get("failed_gates") or gate_context.get("failed_gates"),
+            max_items=12,
+            max_len=180,
+        )
+        required_fixes = self._normalize_handoff_items(
+            quality_focus.get("required_fixes") or gate_context.get("required_fixes"),
+            max_items=12,
+            max_len=240,
+        )
+        hard_failures = self._normalize_handoff_items(
+            quality_focus.get("hard_failures") or gate_context.get("hard_failures"),
+            max_items=8,
+            max_len=180,
+        )
+        must_preserve = self._normalize_handoff_items(raw.get("must_preserve"), max_items=8, max_len=220)
+        if not must_preserve and present_outputs:
+            must_preserve = [f"Preserve generation for {path}" for path in present_outputs[:6]]
+        patch_objectives = self._normalize_handoff_items(raw.get("patch_objectives"), max_items=8, max_len=260)
+        if missing_outputs and not any("missing contract outputs" in item.lower() for item in patch_objectives):
+            patch_objectives.insert(
+                0,
+                "Generate all missing contract outputs at exact paths: " + ", ".join(missing_outputs[:5]),
+            )
+        for fix in required_fixes:
+            if fix not in patch_objectives:
+                patch_objectives.append(fix)
+            if len(patch_objectives) >= 8:
+                break
+        if not patch_objectives:
+            patch_objectives = ["Apply reviewer feedback with minimal, targeted edits to the previous script."]
+
+        return {
+            "handoff_version": raw.get("handoff_version") or "v1",
+            "mode": str(raw.get("mode") or ("patch" if gate_context else "build")).lower(),
+            "source": raw.get("source") or "result_evaluator",
+            "from_iteration": raw.get("from_iteration"),
+            "next_iteration": raw.get("next_iteration"),
+            "contract_focus": {
+                "required_outputs": required_outputs,
+                "present_outputs": present_outputs,
+                "missing_outputs": missing_outputs,
+            },
+            "quality_focus": {
+                "status": raw.get("quality_focus", {}).get("status") if isinstance(raw.get("quality_focus"), dict) else None,
+                "failed_gates": failed_gates,
+                "required_fixes": required_fixes,
+                "hard_failures": hard_failures,
+            },
+            "feedback": {
+                "reviewer": str(feedback.get("reviewer") or gate_context.get("feedback") or "").strip(),
+                "qa": str(feedback.get("qa") or "").strip(),
+                "runtime_error_tail": str(feedback.get("runtime_error_tail") or "").strip(),
+            },
+            "must_preserve": must_preserve[:8],
+            "patch_objectives": patch_objectives[:8],
+        }
+
     def _extract_decisioning_context(
         self,
         ml_view: Dict[str, Any] | None,
@@ -347,6 +446,7 @@ class MLEngineerAgent:
         iteration_memory: List[Dict[str, Any]] | None,
         feedback_history: List[str] | None,
         gate_context: Dict[str, Any] | None,
+        iteration_handoff: Dict[str, Any] | None = None,
         ml_view: Dict[str, Any] | None = None,
     ) -> str:
         from src.utils.context_pack import compress_long_lists
@@ -362,6 +462,12 @@ class MLEngineerAgent:
             self._extract_decisioning_context(ml_view, execution_contract)
         )
         visual_requirements_json = self._extract_visual_requirements_context(ml_view)
+        normalized_handoff = self._normalize_iteration_handoff(
+            iteration_handoff=iteration_handoff,
+            gate_context=gate_context,
+            required_deliverables=required_outputs,
+        )
+        handoff_json = json.dumps(compress_long_lists(normalized_handoff)[0], indent=2)
         
         # STRUCTURED CRITICAL ERRORS SECTION
         critical_errors: List[str] = []
@@ -456,6 +562,8 @@ class MLEngineerAgent:
                 rules_block,
                 "ITERATION_MEMORY_CONTEXT:",
                 memory_block,
+                "ITERATION_HANDOFF_CONTEXT:",
+                handoff_json,
                 "LATEST_REVIEW_FEEDBACK:",
                 feedback_blocks or "None",
             ]
@@ -1689,6 +1797,7 @@ $strategy_json
         feedback_history: List[str] = None,
         previous_code: str = None,
         gate_context: Dict[str, Any] = None,
+        iteration_handoff: Dict[str, Any] | None = None,
         csv_encoding: str = 'utf-8',
         csv_sep: str = ',',
         csv_decimal: str = '.',
@@ -2367,6 +2476,15 @@ $strategy_json
         USER_PATCH_TEMPLATE = """
         *** PATCH MODE ACTIVATED ***
         Your previous code was REJECTED by the $gate_source.
+
+        *** ITERATION HANDOFF (AUTHORITATIVE PATCH CONTEXT) ***
+        $iteration_handoff_json
+
+        *** PRIORITY PATCH OBJECTIVES (APPLY IN ORDER) ***
+        $patch_objectives
+
+        *** MUST PRESERVE (DO NOT BREAK) ***
+        $must_preserve
         
         *** CRITICAL FEEDBACK ***
         $feedback_text
@@ -2378,42 +2496,57 @@ $strategy_json
         
         *** REQUIRED FIXES (CHECKLIST) ***
         $fixes_bullets
-        - [ ] VERIFY COLUMN MAPPING: Ensure fuzzy match + aliasing check found in Protocol v2. No case-sensitive filtering.
-        - [ ] VERIFY RENAMING: Ensure DataFrame columns are renamed to canonical required names.
         - [ ] DO NOT GENERATE SYNTHETIC DATA: Load the provided dataset from $data_path.
-        - [ ] DEFINE SEGMENT_FEATURES and MODEL_FEATURES lists and use them.
-        - [ ] IF USING CALIBRATEDCLASSIFIERCV: avoid feature_importances_ / base_estimator access.
-        - [ ] IF TARGET IS DERIVED: derive or guard it and log DERIVED_TARGET:<name>.
+        - [ ] IF RUNTIME ERROR EXISTS: patch root cause first, then re-run full flow.
+        - [ ] IF CONTRACT OUTPUTS ARE MISSING: write them at exact required paths.
+        - [ ] KEEP WORKING LOGIC/STEPS that already produced valid artifacts.
         
         *** PREVIOUS OUTPUT (TO PATCH) ***
         $previous_code
 
         INSTRUCTIONS:
-        1. APPLY A MINIMAL PATCH to the previous Python code. DO NOT REWRITE FROM SCRATCH unless necessary.
-        2. Address EVERY item in the Required Fixes checklist.
-        3. Ensure all MANDATORY UNIVERSAL QA INVARIANTS are met.
-        4. Return the FULL script (not a partial diff/snippet).
+        1. APPLY A MINIMAL PATCH to the previous Python code. DO NOT REWRITE FROM SCRATCH unless absolutely necessary.
+        2. Resolve patch objectives and required fixes while preserving stable/working blocks.
+        3. Return the FULL script (not a diff/snippet).
         """
 
         # Construct User Message with Patch Mode Logic
-        if previous_code and gate_context:
-            failed_gates = gate_context.get('failed_gates', [])
-            required_fixes = gate_context.get('required_fixes', [])
-            feedback_text = gate_context.get('feedback', '')
-            fixes_bullets = "\n".join(["- " + str(fix) for fix in required_fixes])
+        handoff_payload = self._normalize_iteration_handoff(
+            iteration_handoff=iteration_handoff,
+            gate_context=gate_context,
+            required_deliverables=required_deliverables,
+        )
+        handoff_payload_json = json.dumps(compress_long_lists(handoff_payload)[0], indent=2)
+        patch_mode_active = bool(previous_code and (gate_context or handoff_payload.get("mode") == "patch"))
+        if patch_mode_active:
+            gate_ctx = gate_context if isinstance(gate_context, dict) else {}
+            required_fixes = gate_ctx.get('required_fixes', [])
+            feedback_text = gate_ctx.get('feedback', '')
+            if not feedback_text and isinstance(handoff_payload.get("feedback"), dict):
+                feedback_text = str(handoff_payload.get("feedback", {}).get("reviewer") or "")
+            fixes_bullets = "\n".join(["- " + str(fix) for fix in required_fixes if str(fix).strip()])
+            if not fixes_bullets:
+                fixes_bullets = "- Follow patch objectives from iteration handoff."
             digest_prefixes = ("REVIEWER FEEDBACK", "QA TEAM FEEDBACK", "RESULT EVALUATION FEEDBACK", "OUTPUT_CONTRACT_MISSING")
             feedback_digest_items = [f for f in (feedback_history or []) if isinstance(f, str) and f.startswith(digest_prefixes)]
             feedback_digest = "\n".join(feedback_digest_items[-5:])
+            patch_objectives = handoff_payload.get("patch_objectives", [])
+            patch_objectives_block = "\n".join([f"- {item}" for item in patch_objectives]) if patch_objectives else "- Resolve reviewer findings."
+            must_preserve = handoff_payload.get("must_preserve", [])
+            must_preserve_block = "\n".join([f"- {item}" for item in must_preserve]) if must_preserve else "- Preserve valid artifact generation and data loading logic."
             previous_code_block = self._truncate_code_for_patch(previous_code)
             
             user_message = render_prompt(
                 USER_PATCH_TEMPLATE,
-                gate_source=str(gate_context.get('source', 'QA Reviewer')).upper(),
+                gate_source=str(gate_ctx.get('source', 'QA Reviewer')).upper(),
+                iteration_handoff_json=handoff_payload_json,
+                patch_objectives=patch_objectives_block,
+                must_preserve=must_preserve_block,
                 feedback_text=feedback_text,
                 fixes_bullets=fixes_bullets,
                 previous_code=previous_code_block,
                 feedback_digest=feedback_digest,
-                edit_instructions=str(gate_context.get("edit_instructions", "")),
+                edit_instructions=str(gate_ctx.get("edit_instructions", "")),
                 strategy_title=strategy.get('title', 'Unknown'),
                 data_path=data_path
             )
@@ -2438,7 +2571,7 @@ $strategy_json
 
         base_temp = _env_float("ML_ENGINEER_TEMPERATURE", 0.1)
         retry_temp = _env_float("ML_ENGINEER_TEMPERATURE_RETRY", 0.0)
-        if previous_code and gate_context:
+        if previous_code and (gate_context or handoff_payload.get("mode") == "patch"):
             current_temp = retry_temp
         else:
             current_temp = base_temp
@@ -2616,6 +2749,7 @@ $strategy_json
                     iteration_memory=iteration_memory,
                     feedback_history=feedback_history,
                     gate_context=gate_context,
+                    iteration_handoff=handoff_payload,
                     ml_view=ml_view,
                 )
                 completion_system = (

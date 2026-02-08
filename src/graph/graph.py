@@ -6795,6 +6795,214 @@ def _collect_outputs_state(required_outputs: List[str]) -> Dict[str, List[str]]:
             missing.append(path)
     return {"present": present, "missing": missing}
 
+def _truncate_handoff_text(text: Any, max_len: int = 360) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    compact = re.sub(r"\s+", " ", value)
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 3] + "..."
+
+def _normalize_handoff_items(values: Any, max_items: int = 10, max_len: int = 180) -> List[str]:
+    out: List[str] = []
+    if not isinstance(values, list):
+        return out
+    for value in values:
+        text = _truncate_handoff_text(value, max_len=max_len)
+        if not text or text in out:
+            continue
+        out.append(text)
+        if len(out) >= max_items:
+            break
+    return out
+
+def _extract_metric_target_hint(evaluation_spec: Dict[str, Any] | None, contract: Dict[str, Any] | None) -> tuple[float | None, str]:
+    sources: List[tuple[str, Dict[str, Any]]] = []
+    if isinstance(evaluation_spec, dict):
+        sources.append(("evaluation_spec", evaluation_spec))
+    if isinstance(contract, dict):
+        validation = contract.get("validation_requirements")
+        if isinstance(validation, dict):
+            sources.append(("validation_requirements", validation))
+    key_priority = [
+        "target_value",
+        "target",
+        "benchmark",
+        "minimum",
+        "min_value",
+        "threshold",
+        "kpi_target",
+    ]
+    for prefix, block in sources:
+        for key in key_priority:
+            value = block.get(key)
+            if _is_number(value):
+                return float(value), f"{prefix}.{key}"
+    for prefix, block in sources:
+        gates = block.get("qa_gates")
+        if not isinstance(gates, list):
+            continue
+        for gate in gates:
+            if not isinstance(gate, dict):
+                continue
+            params = gate.get("params")
+            if not isinstance(params, dict):
+                continue
+            for key in ("target", "target_value", "minimum", "threshold", "min_value"):
+                value = params.get(key)
+                if _is_number(value):
+                    gate_name = str(gate.get("name") or "qa_gate")
+                    return float(value), f"{prefix}.qa_gates[{gate_name}].params.{key}"
+    return None, ""
+
+def _build_iteration_handoff(
+    state: Dict[str, Any] | None,
+    status: str | None,
+    gate_context: Dict[str, Any] | None,
+    oc_report: Dict[str, Any] | None,
+    review_result: Dict[str, Any] | None,
+    qa_result: Dict[str, Any] | None,
+    evaluation_spec: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    gate_context = gate_context if isinstance(gate_context, dict) else {}
+    oc_report = oc_report if isinstance(oc_report, dict) else {}
+    review_result = review_result if isinstance(review_result, dict) else {}
+    qa_result = qa_result if isinstance(qa_result, dict) else {}
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    iteration_count = int(state.get("iteration_count", 0) or 0)
+    next_iteration = iteration_count + 1
+    normalized_status = str(status or state.get("review_verdict") or "UNKNOWN").upper()
+
+    required_outputs = [str(path) for path in (_resolve_required_outputs(contract, state) or []) if path]
+    present_outputs = _normalize_handoff_items(oc_report.get("present"), max_items=15, max_len=140)
+    missing_outputs = _normalize_handoff_items(oc_report.get("missing"), max_items=15, max_len=140)
+    if not present_outputs and required_outputs:
+        present_outputs = [path for path in required_outputs if path and os.path.exists(path)][:15]
+    if not missing_outputs and required_outputs:
+        for path in required_outputs:
+            if not path or _is_glob_pattern(path):
+                continue
+            if not os.path.exists(path) and path not in missing_outputs:
+                missing_outputs.append(path)
+            if len(missing_outputs) >= 15:
+                break
+
+    failed_gates = _normalize_handoff_items(gate_context.get("failed_gates"), max_items=15)
+    required_fixes = _normalize_handoff_items(gate_context.get("required_fixes"), max_items=15, max_len=240)
+    hard_failures = _normalize_handoff_items(
+        gate_context.get("hard_failures") or state.get("hard_failures"),
+        max_items=10,
+        max_len=200,
+    )
+
+    runtime_tail = _truncate_handoff_text(
+        state.get("last_runtime_error_tail") or state.get("execution_output"),
+        max_len=360,
+    )
+    reviewer_feedback = _truncate_handoff_text(
+        review_result.get("feedback") or gate_context.get("feedback") or state.get("review_feedback"),
+        max_len=520,
+    )
+    qa_feedback = _truncate_handoff_text(qa_result.get("feedback"), max_len=360)
+
+    metric_snapshot = state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {}
+    metric_name = str(metric_snapshot.get("primary_metric_name") or "")
+    metric_value = metric_snapshot.get("primary_metric_value")
+    baseline_value = metric_snapshot.get("baseline_value")
+    target_value, target_source = _extract_metric_target_hint(
+        evaluation_spec if isinstance(evaluation_spec, dict) else {},
+        contract,
+    )
+    higher_is_better = True
+    if metric_name:
+        higher_is_better = _metric_higher_is_better(metric_name)
+    metric_gap = None
+    if _is_number(metric_value) and _is_number(target_value):
+        metric_gap = (
+            float(target_value) - float(metric_value)
+            if higher_is_better
+            else float(metric_value) - float(target_value)
+        )
+
+    must_preserve: List[str] = []
+    for path in present_outputs:
+        item = f"Preserve artifact generation for {path}"
+        if item not in must_preserve:
+            must_preserve.append(item)
+    last_success = state.get("last_successful_output_contract_report")
+    if isinstance(last_success, dict):
+        for path in _normalize_handoff_items(last_success.get("present"), max_items=8, max_len=140):
+            item = f"Keep previously valid output path {path}"
+            if item not in must_preserve:
+                must_preserve.append(item)
+            if len(must_preserve) >= 8:
+                break
+
+    patch_objectives: List[str] = []
+    if runtime_tail and ("traceback" in runtime_tail.lower() or "error" in runtime_tail.lower()):
+        patch_objectives.append("Fix the runtime root cause first, then keep the rest of the pipeline stable.")
+    if missing_outputs:
+        patch_objectives.append(
+            "Produce all missing contract outputs exactly at the required paths: "
+            + ", ".join(missing_outputs[:5])
+        )
+    for fix in required_fixes:
+        if fix not in patch_objectives:
+            patch_objectives.append(fix)
+        if len(patch_objectives) >= 8:
+            break
+    if not patch_objectives and failed_gates:
+        patch_objectives.append("Resolve failed gates: " + ", ".join(failed_gates[:5]))
+    if (
+        normalized_status == "NEEDS_IMPROVEMENT"
+        and metric_name
+        and _is_number(metric_value)
+        and not hard_failures
+    ):
+        metric_msg = f"Improve primary metric {metric_name} from {float(metric_value):.6g}"
+        if _is_number(target_value):
+            metric_msg += f" toward target {float(target_value):.6g}"
+        patch_objectives.append(metric_msg)
+    if not patch_objectives:
+        patch_objectives.append("Apply reviewer and QA feedback with minimal, targeted code edits.")
+
+    return {
+        "handoff_version": "v1",
+        "mode": "patch" if next_iteration > 1 else "build",
+        "from_iteration": iteration_count,
+        "next_iteration": next_iteration,
+        "source": "result_evaluator",
+        "contract_focus": {
+            "required_outputs": required_outputs[:15],
+            "present_outputs": present_outputs,
+            "missing_outputs": missing_outputs,
+        },
+        "quality_focus": {
+            "status": normalized_status,
+            "failed_gates": failed_gates,
+            "required_fixes": required_fixes,
+            "hard_failures": hard_failures,
+        },
+        "metric_focus": {
+            "primary_metric": metric_name or None,
+            "current_value": metric_value if _is_number(metric_value) else None,
+            "baseline_value": baseline_value if _is_number(baseline_value) else None,
+            "target_value": target_value if _is_number(target_value) else None,
+            "target_source": target_source or None,
+            "gap_to_target": metric_gap,
+            "higher_is_better": higher_is_better,
+        },
+        "feedback": {
+            "reviewer": reviewer_feedback,
+            "qa": qa_feedback,
+            "runtime_error_tail": runtime_tail,
+        },
+        "must_preserve": must_preserve[:8],
+        "patch_objectives": patch_objectives[:8],
+    }
+
 def _suggest_next_actions(
     preflight_issues: List[str],
     outputs_missing: List[str],
@@ -7238,6 +7446,7 @@ class AgentState(TypedDict):
     # Patch Mode State
     last_generated_code: str
     last_gate_context: Dict[str, Any]
+    iteration_handoff: Dict[str, Any]
     review_reject_streak: int
     qa_reject_streak: int
     data_engineer_attempt: int
@@ -7589,6 +7798,7 @@ def run_steward(state: AgentState) -> AgentState:
         "plots_local": [],
         "last_generated_code": None,
         "last_gate_context": None,
+        "iteration_handoff": None,
         "review_reject_streak": 0,
         "qa_reject_streak": 0,
         "leakage_audit_summary": "",
@@ -12097,9 +12307,21 @@ def run_engineer(state: AgentState) -> AgentState:
     # Patch Mode Inputs
     previous_code = state.get('last_generated_code')
     gate_context = state.get('last_gate_context')
+    iteration_handoff = state.get("iteration_handoff")
+    if previous_code and gate_context and not isinstance(iteration_handoff, dict):
+        iteration_handoff = _build_iteration_handoff(
+            state=state if isinstance(state, dict) else {},
+            status=state.get("review_verdict"),
+            gate_context=gate_context,
+            oc_report=state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {},
+            review_result=state.get("reviewer_last_result") if isinstance(state.get("reviewer_last_result"), dict) else {},
+            qa_result=state.get("qa_last_result") if isinstance(state.get("qa_last_result"), dict) else {},
+            evaluation_spec=evaluation_spec if isinstance(evaluation_spec, dict) else {},
+        )
     if state.get("reset_ml_patch_context"):
         previous_code = None
         gate_context = None
+        iteration_handoff = None
 
     print(f"DEBUG: Generating code for strategy: {strategy['title']}")
 
@@ -12111,6 +12333,7 @@ def run_engineer(state: AgentState) -> AgentState:
             feedback_history=feedback_history,
             previous_code=previous_code,
             gate_context=gate_context,
+            iteration_handoff=iteration_handoff,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
@@ -12287,6 +12510,7 @@ def run_engineer(state: AgentState) -> AgentState:
                     "ml_view": kwargs.get("ml_view"),
                     "data_audit_context": data_audit_context,
                     "last_gate_context": gate_context,
+                    "iteration_handoff": iteration_handoff,
                     "iteration_memory_block": iteration_memory_block,
                 }
             else:
@@ -12304,6 +12528,7 @@ def run_engineer(state: AgentState) -> AgentState:
                     "execution_contract": execution_contract,
                     "ml_view": state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view"),
                     "data_audit_context": data_audit_context,
+                    "iteration_handoff": iteration_handoff,
                     "ml_engineer_audit_override": ml_audit_override,
                     "dataset_semantics_summary": dataset_semantics_summary,
                     "dataset_training_mask": state.get("dataset_training_mask"),
@@ -14539,12 +14764,31 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "Reviewer: Required visual artifacts are missing from the run. "
             "Please regenerate the plots defined in visual_requirements."
         )
+        gate_context = {
+            "source": "result_evaluator",
+            "status": "NEEDS_IMPROVEMENT",
+            "feedback": message,
+            "failed_gates": ["visual_requirements_missing"],
+            "required_fixes": ["Generate visual artifacts required by contract.visual_requirements."],
+        }
+        iteration_handoff = _build_iteration_handoff(
+            state=state if isinstance(state, dict) else {},
+            status="NEEDS_IMPROVEMENT",
+            gate_context=gate_context,
+            oc_report={},
+            review_result={"feedback": message},
+            qa_result={},
+            evaluation_spec=(state.get("evaluation_spec") or (contract or {}).get("evaluation_spec") or {}),
+        )
         if run_id:
             log_run_event(run_id, "visual_requirements_review", {"missing": len(visual_reqs.get("items", []))})
         return {
             "review_verdict": "NEEDS_IMPROVEMENT",
             "review_feedback": message,
             "failed_gates": ["visual_requirements_missing"],
+            "last_gate_context": gate_context,
+            "iteration_handoff": iteration_handoff,
+            "iteration_count": int(state.get("iteration_count", 0) or 0) + 1,
             "feedback_history": feedback_history,
         }
 
@@ -15277,6 +15521,16 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if fix_block:
         gate_context["edit_instructions"] = fix_block
 
+    iteration_handoff = _build_iteration_handoff(
+        state=state if isinstance(state, dict) else {},
+        status=status,
+        gate_context=gate_context,
+        oc_report=oc_report,
+        review_result=review_result,
+        qa_result=qa_result,
+        evaluation_spec=evaluation_spec_for_review if isinstance(evaluation_spec_for_review, dict) else {},
+    )
+
     print(f"Reviewer Verdict: {status}")
     if status == "NEEDS_IMPROVEMENT":
         print(f"Advice: {feedback}")
@@ -15348,6 +15602,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "metric_history": metric_history,
         "hard_qa_gate_reject": hard_qa_gate_reject,
         "hard_qa_retry_count": hard_qa_retry_count,
+        "iteration_handoff": iteration_handoff,
     }
     if merged_hard_failures:
         result_state["hard_failures"] = merged_hard_failures
@@ -15488,6 +15743,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "reviewer": reviewer_packet,
         "qa_reviewer": qa_packet,
         "results_advisor": results_packet,
+        "iteration_handoff": iteration_handoff,
         "deterministic_facts": review_board_facts,
         "final_pre_board": {
             "status": status,
@@ -15500,9 +15756,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     try:
         os.makedirs("data", exist_ok=True)
         dump_json("data/ml_review_stack.json", review_stack)
+        dump_json("data/iteration_handoff.json", iteration_handoff)
         existing_index = _load_json_any("data/produced_artifact_index.json")
         normalized_existing = existing_index if isinstance(existing_index, list) else []
-        additions = _build_artifact_index(["data/ml_review_stack.json"], None)
+        additions = _build_artifact_index(["data/ml_review_stack.json", "data/iteration_handoff.json"], None)
         merged_index = _merge_artifact_index_entries(normalized_existing, additions)
         dump_json("data/produced_artifact_index.json", merged_index)
         result_state["artifact_index"] = merged_index
@@ -15666,6 +15923,46 @@ def run_review_board(state: AgentState) -> AgentState:
         "confidence": confidence,
     }
 
+    iteration_handoff = state.get("iteration_handoff")
+    if not isinstance(iteration_handoff, dict):
+        iteration_handoff = {}
+    handoff_quality = (
+        dict(iteration_handoff.get("quality_focus"))
+        if isinstance(iteration_handoff.get("quality_focus"), dict)
+        else {}
+    )
+    handoff_quality["status"] = final_status
+    if failed_areas:
+        merged_failed = _normalize_handoff_items(handoff_quality.get("failed_gates"), max_items=15)
+        for area in _normalize_handoff_items(failed_areas, max_items=10):
+            if area not in merged_failed:
+                merged_failed.append(area)
+        handoff_quality["failed_gates"] = merged_failed[:15]
+    handoff_quality["required_fixes"] = _normalize_handoff_items(current_required, max_items=15, max_len=240)
+    handoff_quality["hard_failures"] = _normalize_handoff_items(
+        gate_context.get("hard_failures") or handoff_quality.get("hard_failures"),
+        max_items=10,
+        max_len=200,
+    )
+    patch_objectives = _normalize_handoff_items(iteration_handoff.get("patch_objectives"), max_items=8, max_len=260)
+    for action in _normalize_handoff_items(required_actions, max_items=8, max_len=240):
+        if action not in patch_objectives:
+            patch_objectives.append(action)
+        if len(patch_objectives) >= 8:
+            break
+    if final_status == "NEEDS_IMPROVEMENT" and not patch_objectives:
+        patch_objectives = ["Apply review_board required actions with minimal edits to the previous script."]
+    iteration_handoff["source"] = "review_board"
+    iteration_handoff["board_focus"] = {
+        "status": board_status,
+        "summary": board_summary,
+        "failed_areas": _normalize_handoff_items(failed_areas, max_items=12, max_len=200),
+        "required_actions": _normalize_handoff_items(required_actions, max_items=12, max_len=220),
+        "confidence": confidence,
+    }
+    iteration_handoff["quality_focus"] = handoff_quality
+    iteration_handoff["patch_objectives"] = patch_objectives
+
     board_payload = {
         "status": board_status,
         "final_review_verdict": final_status,
@@ -15715,6 +16012,7 @@ def run_review_board(state: AgentState) -> AgentState:
         "review_feedback": current_feedback,
         "feedback_history": history,
         "last_gate_context": gate_context,
+        "iteration_handoff": iteration_handoff,
     }
     # Iteration counter guard:
     # - run_result_evaluator already increments iteration_count when it returns NEEDS_IMPROVEMENT.
