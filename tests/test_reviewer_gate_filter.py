@@ -1,14 +1,37 @@
 from src.agents.reviewer import apply_reviewer_gate_filter
 
 
-def test_required_fixes_not_filtered():
+def test_reviewer_gate_filter_handles_dict_gate_specs() -> None:
     result = {
         "status": "REJECTED",
-        "failed_gates": ["gate_a"],
-        "required_fixes": ["fix_1", "fix_2"],
-        "feedback": "Needs fixes.",
+        "feedback": "gate failures",
+        "failed_gates": ["decision_policy_feasibility", "unknown_gate"],
+        "required_fixes": [],
     }
-    out = apply_reviewer_gate_filter(result, ["gate_b"])
-    assert out["failed_gates"] == []
-    assert out["required_fixes"] == ["fix_1", "fix_2"]
-    assert out["status"] == "APPROVE_WITH_WARNINGS"
+    reviewer_gates = [
+        {"gate": "decision_policy_feasibility", "condition": "policy thresholds defined"},
+        {"gate": "driver_transparency", "condition": "drivers documented"},
+    ]
+
+    filtered = apply_reviewer_gate_filter(result, reviewer_gates)
+
+    assert filtered["status"] == "REJECTED"
+    assert filtered["failed_gates"] == ["decision_policy_feasibility"]
+
+
+def test_reviewer_gate_filter_downgrades_when_no_allowed_gate_fails() -> None:
+    result = {
+        "status": "REJECTED",
+        "feedback": "only unknown gate",
+        "failed_gates": ["not_in_contract"],
+        "required_fixes": [],
+    }
+    reviewer_gates = [
+        {"gate": "decision_policy_feasibility"},
+    ]
+
+    filtered = apply_reviewer_gate_filter(result, reviewer_gates)
+
+    assert filtered["status"] == "APPROVE_WITH_WARNINGS"
+    assert filtered["failed_gates"] == []
+    assert "Spec-driven gating" in filtered["feedback"]

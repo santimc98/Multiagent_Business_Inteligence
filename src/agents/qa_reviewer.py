@@ -233,6 +233,7 @@ class QAReviewerAgent:
         - Evaluation Spec (JSON): $evaluation_spec_json
         - ML Dataset Path: $ml_data_path
         - QA Gates (contract-driven, with severity/params): $qa_gates
+        - Execution Diagnostics (JSON): $execution_diagnostics_json
         
         INSTRUCTIONS:
         - Analyze the code line-by-line.
@@ -257,6 +258,9 @@ class QAReviewerAgent:
         """
         
         ml_data_path = (evaluation_spec or {}).get("ml_data_path") or "data/cleaned_data.csv"
+        execution_diagnostics = (evaluation_spec or {}).get("execution_diagnostics")
+        if not isinstance(execution_diagnostics, dict):
+            execution_diagnostics = {}
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
             business_objective=business_objective,
@@ -264,6 +268,7 @@ class QAReviewerAgent:
             evaluation_spec_json=eval_spec_json,
             ml_data_path=ml_data_path,
             qa_gates=qa_gates_json,
+            execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2, ensure_ascii=True),
             output_format_instructions=output_format_instructions,
             senior_evidence_rule=SENIOR_EVIDENCE_RULE,
         )

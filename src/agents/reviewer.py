@@ -9,15 +9,32 @@ from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 
 load_dotenv()
 
+def _normalize_reviewer_gate_name(item: Any) -> str:
+    if isinstance(item, dict):
+        for key in ("name", "id", "gate"):
+            value = item.get(key)
+            if value:
+                return str(value).strip()
+        return ""
+    if item is None:
+        return ""
+    return str(item).strip()
+
+
 def apply_reviewer_gate_filter(result: Dict[str, Any], reviewer_gates: List[Any]) -> Dict[str, Any]:
     if not isinstance(result, dict):
         return {}
-    allowed = {str(g).lower() for g in (reviewer_gates or [])}
+    allowed = {
+        name.lower()
+        for name in (_normalize_reviewer_gate_name(g) for g in (reviewer_gates or []))
+        if name
+    }
     if allowed:
         filtered = []
         for g in result.get("failed_gates", []):
-            if str(g).lower() in allowed:
-                filtered.append(g)
+            gate_name = _normalize_reviewer_gate_name(g)
+            if gate_name.lower() in allowed:
+                filtered.append(gate_name)
         result["failed_gates"] = filtered
         if result.get("status") == "REJECTED" and not result.get("failed_gates"):
             result["status"] = "APPROVE_WITH_WARNINGS"
@@ -80,6 +97,19 @@ class ReviewerAgent:
         strategy_summary = reviewer_view.get("strategy_summary") or strategy_context
         objective_type = reviewer_view.get("objective_type") or analysis_type
         expected_metrics = reviewer_view.get("expected_metrics") or []
+        execution_diagnostics = (
+            reviewer_view.get("execution_diagnostics")
+            if isinstance(reviewer_view, dict)
+            else None
+        )
+        if not isinstance(execution_diagnostics, dict):
+            execution_diagnostics = (
+                evaluation_spec.get("execution_diagnostics")
+                if isinstance(evaluation_spec, dict)
+                else {}
+            )
+        if not isinstance(execution_diagnostics, dict):
+            execution_diagnostics = {}
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Technical Lead and Security Auditor.
@@ -95,6 +125,7 @@ class ReviewerAgent:
         - Reviewer Gates (only these can fail): $reviewer_gates
         - Allowed Columns (if provided): $allowed_columns_json
         - Expected Metrics (if provided): $expected_metrics_json
+        - Execution Diagnostics (JSON): $execution_diagnostics_json
         
         ### CRITERIA FOR APPROVAL (QUALITY FIRST PRINCIPLES)
 
@@ -157,6 +188,7 @@ class ReviewerAgent:
             reviewer_gates=reviewer_gates,
             allowed_columns_json=json.dumps(allowed_columns, indent=2),
             expected_metrics_json=json.dumps(expected_metrics, indent=2),
+            execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2),
             output_format_instructions=output_format_instructions,
             senior_evidence_rule=SENIOR_EVIDENCE_RULE,
         )
@@ -404,4 +436,3 @@ class ReviewerAgent:
                 "required_fixes": [],
                 "retry_worth_it": False
             }
-

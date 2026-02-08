@@ -601,6 +601,76 @@ def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _build_code_review_diagnostics(
+    *,
+    runtime_failure_detected: bool,
+    runtime_terminal: bool,
+    execution_output: str,
+    output_contract_report: Dict[str, Any] | None,
+    artifact_index: List[Dict[str, Any]] | None,
+) -> Dict[str, Any]:
+    oc_report = output_contract_report if isinstance(output_contract_report, dict) else {}
+    missing_outputs = [str(path) for path in (oc_report.get("missing") or []) if path]
+    blockers: List[str] = []
+    if runtime_failure_detected:
+        blockers.append("runtime_failure")
+    if str(oc_report.get("overall_status") or "").lower() == "error":
+        blockers.append("output_contract_error")
+    if missing_outputs:
+        blockers.append("contract_required_artifacts_missing")
+    return {
+        "runtime_status": "FAILED_RUNTIME" if runtime_failure_detected else "OK",
+        "runtime_fix_terminal": bool(runtime_terminal),
+        "execution_output_tail": str(execution_output or "")[-1200:],
+        "output_contract_overall_status": str(oc_report.get("overall_status") or "").lower(),
+        "output_contract_missing": missing_outputs,
+        "artifact_index": artifact_index if isinstance(artifact_index, list) else [],
+        "hard_blockers": blockers,
+    }
+
+
+def _apply_review_consistency_guard(
+    result: Dict[str, Any] | None,
+    diagnostics: Dict[str, Any] | None,
+    *,
+    actor: str,
+) -> Dict[str, Any]:
+    packet: Dict[str, Any] = dict(result or {})
+    blockers = [str(x) for x in ((diagnostics or {}).get("hard_blockers") or []) if x]
+    if not blockers:
+        return packet
+    status = str(packet.get("status") or "").upper()
+    if status and status != "APPROVED":
+        return packet
+
+    actor_name = str(actor or "reviewer").strip().lower() or "reviewer"
+    blocker_text = ", ".join(blockers)
+    note = (
+        f"{actor_name.upper()}_CONTEXT_GUARD: downgraded from APPROVED due to deterministic blockers "
+        f"({blocker_text})."
+    )
+    packet["status"] = "APPROVE_WITH_WARNINGS"
+    feedback = str(packet.get("feedback") or "").strip()
+    packet["feedback"] = f"{feedback}\n{note}".strip() if feedback else note
+
+    failed_gates = packet.get("failed_gates")
+    if not isinstance(failed_gates, list):
+        failed_gates = []
+    for blocker in blockers:
+        if blocker not in failed_gates:
+            failed_gates.append(blocker)
+    packet["failed_gates"] = failed_gates
+
+    required_fixes = packet.get("required_fixes")
+    if not isinstance(required_fixes, list):
+        required_fixes = []
+    generic_fix = "Resolve deterministic runtime/output failures before approving code quality."
+    if generic_fix not in required_fixes:
+        required_fixes.append(generic_fix)
+    packet["required_fixes"] = required_fixes
+    return packet
+
+
 def _append_run_facts_block(text: str, state: Dict[str, Any]) -> str:
     if not isinstance(state, dict):
         return text
@@ -14280,8 +14350,20 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         feedback = f"{feedback}\n{alias_msg}" if feedback else alias_msg
         new_history.append(alias_msg)
 
-    # Post-exec code audit (non-blocking warnings)
+    # Post-exec code audit (advisory; deterministic blockers remain canonical)
     code = state.get("generated_code") or state.get("last_generated_code") or ""
+    artifact_index_for_review = state.get("artifact_index")
+    if not isinstance(artifact_index_for_review, list):
+        artifact_index_for_review = _load_json_any("data/produced_artifact_index.json")
+    if not isinstance(artifact_index_for_review, list):
+        artifact_index_for_review = []
+    review_diagnostics = _build_code_review_diagnostics(
+        runtime_failure_detected=runtime_failure_detected,
+        runtime_terminal=runtime_terminal,
+        execution_output=execution_output,
+        output_contract_report=oc_report,
+        artifact_index=artifact_index_for_review,
+    )
     counters = dict(state.get("budget_counters") or {})
     review_counters = counters
     audit_rejected = False
@@ -14304,6 +14386,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     qa_context["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
     if state.get("ml_training_policy_warnings"):
         qa_context["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings")
+    qa_context["execution_diagnostics"] = review_diagnostics
     qa_context_prompt = compress_long_lists(qa_context)[0] if isinstance(qa_context, dict) else qa_context
 
     qa_gate_specs = _merge_qa_gate_specs(
@@ -14330,6 +14413,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     qa_result: Dict[str, Any] = {}
     if code:
         analysis_type = strategy.get("analysis_type", "predictive")
+        evaluation_spec_code_audit = dict(evaluation_spec_for_review or {})
+        evaluation_spec_code_audit["execution_diagnostics"] = review_diagnostics
         try:
             ok, counters, err_msg = _consume_budget(state, "reviewer_calls", "max_reviewer_calls", "Reviewer")
             review_counters = counters
@@ -14342,15 +14427,37 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     )
                     reviewer_view = projected_views.get("reviewer_view") or {}
                 if isinstance(reviewer_view, dict):
+                    reviewer_view = dict(reviewer_view)
+                    reviewer_view["execution_diagnostics"] = review_diagnostics
                     reviewer_view = compress_long_lists(reviewer_view)[0]
                 review_result = reviewer.review_code(
                     code,
                     analysis_type,
                     "",
                     reviewer_view.get("strategy_summary") if isinstance(reviewer_view, dict) else "",
-                    evaluation_spec,
+                    evaluation_spec_code_audit,
                     reviewer_view=reviewer_view,
                 )
+                review_result = _apply_review_consistency_guard(
+                    review_result,
+                    review_diagnostics,
+                    actor="reviewer",
+                )
+                if run_id:
+                    log_agent_snapshot(
+                        run_id,
+                        "reviewer",
+                        prompt=getattr(reviewer, "last_prompt", None),
+                        response=getattr(reviewer, "last_response", None) or review_result,
+                        context={
+                            "analysis_type": analysis_type,
+                            "evaluation_spec": evaluation_spec_code_audit,
+                            "reviewer_view": reviewer_view,
+                            "execution_diagnostics": review_diagnostics,
+                        },
+                        verdicts=review_result,
+                        attempt=iter_id,
+                    )
                 if review_result and review_result.get("status") != "APPROVED":
                     review_warnings.append(
                         f"REVIEWER_CODE_AUDIT[{review_result.get('status')}]: {review_result.get('feedback')}"
@@ -14364,6 +14471,21 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             review_counters = counters
             if ok:
                 qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context_prompt)
+                qa_result = _apply_review_consistency_guard(
+                    qa_result,
+                    review_diagnostics,
+                    actor="qa_reviewer",
+                )
+                if run_id:
+                    log_agent_snapshot(
+                        run_id,
+                        "qa_reviewer",
+                        prompt=getattr(qa_reviewer, "last_prompt", None),
+                        response=getattr(qa_reviewer, "last_response", None) or qa_result,
+                        context=qa_context_prompt if isinstance(qa_context_prompt, dict) else {"qa_context": qa_context_prompt},
+                        verdicts=qa_result,
+                        attempt=iter_id,
+                    )
                 if qa_result and qa_result.get("status") != "APPROVED":
                     review_warnings.append(
                         f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
