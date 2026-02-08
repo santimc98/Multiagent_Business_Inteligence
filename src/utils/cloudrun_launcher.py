@@ -182,7 +182,7 @@ def launch_heavy_runner_job(
     wait: bool = True,
     code_text: Optional[str] = None,
     support_files: Optional[list[Dict[str, str]]] = None,
-    data_path: str = "data/cleaned_data.csv",
+    data_path: Optional[str] = None,
     required_artifacts: Optional[list[str]] = None,
     attempt_id: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -214,6 +214,8 @@ def launch_heavy_runner_job(
     request["dataset_uri"] = dataset_uri
 
     if code_text is not None:
+        if not data_path:
+            raise CloudRunLaunchError("data_path is required when code_text is provided")
         code_uri = f"gs://{bucket}/{input_prefix}/{run_scope}/ml_script.py"
         _upload_text_to_gcs(code_text, code_uri, gsutil_bin)
         request["code_uri"] = code_uri

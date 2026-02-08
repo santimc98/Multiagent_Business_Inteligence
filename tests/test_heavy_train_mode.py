@@ -28,7 +28,12 @@ def _load_heavy_train_module():
 
 def test_resolve_execute_code_mode_for_data_engineer():
     heavy_train = _load_heavy_train_module()
-    mode, required, skip_paths = heavy_train._resolve_execute_code_mode({"mode": "data_engineer_cleaning"})
+    mode, required, skip_paths = heavy_train._resolve_execute_code_mode(
+        {
+            "mode": "data_engineer_cleaning",
+            "required_outputs": ["data/cleaned_data.csv", "data/cleaning_manifest.json"],
+        }
+    )
     assert mode == "data_engineer_cleaning"
     assert "data/cleaned_data.csv" in required
     assert "data/cleaning_manifest.json" in required
@@ -37,11 +42,23 @@ def test_resolve_execute_code_mode_for_data_engineer():
 
 def test_resolve_execute_code_mode_for_data_engineer_legacy_alias():
     heavy_train = _load_heavy_train_module()
-    mode, required, skip_paths = heavy_train._resolve_execute_code_mode({"mode": "data_engineer"})
+    mode, required, skip_paths = heavy_train._resolve_execute_code_mode(
+        {
+            "mode": "data_engineer",
+            "required_outputs": ["data/cleaned_data.csv", "data/cleaning_manifest.json"],
+        }
+    )
     assert mode == "data_engineer_cleaning"
     assert "data/cleaned_data.csv" in required
     assert "data/cleaning_manifest.json" in required
     assert "data/cleaned_data.csv" not in skip_paths
+
+
+def test_resolve_execute_code_mode_for_data_engineer_without_required_outputs():
+    heavy_train = _load_heavy_train_module()
+    mode, required, _ = heavy_train._resolve_execute_code_mode({"mode": "data_engineer_cleaning"})
+    assert mode == "data_engineer_cleaning"
+    assert required == []
 
 
 def test_resolve_execute_code_mode_for_ml_default():

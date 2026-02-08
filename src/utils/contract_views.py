@@ -294,7 +294,7 @@ def _resolve_output_path(
         lower = str(path).lower()
         if "cleaned" in lower and lower.endswith(".csv"):
             return str(path)
-    return "data/cleaned_data.csv"
+    return None
 
 
 def _resolve_manifest_path(
@@ -814,7 +814,7 @@ def build_de_view(
         "role": "data_engineer",
         "required_columns": required_columns,
         "optional_passthrough_columns": passthrough_columns,
-        "output_path": output_path or "data/cleaned_data.csv",
+        "output_path": output_path or "",
         "required_columns_path": "data/required_columns.json",
         "constraints": {
             "scope": "cleaning_only",
@@ -1406,10 +1406,20 @@ def build_contract_views_projection(
 
     output_path = clean_cfg.get("output_path") or clean_cfg.get("output")
     if not isinstance(output_path, str) or not output_path.strip():
-        output_path = "data/cleaned_data.csv"
+        output_path = ""
+        for path in required_outputs:
+            lower = str(path).lower()
+            if lower.endswith(".csv") and ("clean" in lower or "prepared" in lower):
+                output_path = str(path)
+                break
     manifest_path = clean_cfg.get("manifest_path") or clean_cfg.get("output_manifest_path")
     if not isinstance(manifest_path, str) or not manifest_path.strip():
-        manifest_path = "data/cleaning_manifest.json"
+        manifest_path = ""
+        for path in required_outputs:
+            lower = str(path).lower()
+            if lower.endswith(".json") and "manifest" in lower:
+                manifest_path = str(path)
+                break
 
     required_files: List[str] = []
     for entry in artifact_reqs.get("required_files", []) if isinstance(artifact_reqs.get("required_files"), list) else []:

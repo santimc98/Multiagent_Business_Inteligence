@@ -119,6 +119,25 @@ def resolve_qa_gates(evaluation_spec: Dict[str, Any] | None) -> tuple[List[Dict[
     warnings.append(_CONTRACT_FALLBACK_WARNING)
     return list(CONTRACT_BROKEN_FALLBACK_GATES), "fallback", warnings
 
+
+def _resolve_ml_data_path(evaluation_spec: Dict[str, Any] | None) -> str:
+    if not isinstance(evaluation_spec, dict):
+        return ""
+    explicit = evaluation_spec.get("ml_data_path")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    artifact_requirements = evaluation_spec.get("artifact_requirements")
+    if isinstance(artifact_requirements, dict):
+        for key in ("required_outputs", "required_files"):
+            values = artifact_requirements.get(key)
+            if not isinstance(values, list):
+                continue
+            for path in values:
+                if isinstance(path, str) and path.strip().lower().endswith(".csv"):
+                    return path.strip()
+    return ""
+
+
 class QAReviewerAgent:
     def __init__(self, api_key: str = None):
         """
@@ -257,7 +276,7 @@ class QAReviewerAgent:
         $output_format_instructions
         """
         
-        ml_data_path = (evaluation_spec or {}).get("ml_data_path") or "data/cleaned_data.csv"
+        ml_data_path = _resolve_ml_data_path(evaluation_spec)
         execution_diagnostics = (evaluation_spec or {}).get("execution_diagnostics")
         if not isinstance(execution_diagnostics, dict):
             execution_diagnostics = {}
@@ -999,7 +1018,7 @@ def run_static_qa_checks(
     require_dialect_guard = "dialect_mismatch_handling" in qa_gate_set
     require_group_split = "group_split_required" in qa_gate_set
     require_read_csv = "must_read_input_csv" in qa_gate_set
-    ml_data_path = (evaluation_spec or {}).get("ml_data_path") or "data/cleaned_data.csv"
+    ml_data_path = _resolve_ml_data_path(evaluation_spec)
     require_no_synth = "no_synthetic_data" in qa_gate_set
     require_contract_columns = "must_reference_contract_columns" in qa_gate_set
     train_eval_gate = None

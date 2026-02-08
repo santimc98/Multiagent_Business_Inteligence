@@ -1865,8 +1865,8 @@ def _resolve_allowed_columns_for_gate(
     evaluation_spec: Dict[str, Any] | None = None,
 ) -> List[str]:
     allowed: List[str] = []
-    csv_path = state.get("ml_data_path") or "data/cleaned_data.csv"
-    if os.path.exists(csv_path):
+    csv_path = state.get("ml_data_path")
+    if isinstance(csv_path, str) and csv_path and os.path.exists(csv_path):
         try:
             import pandas as pd
 
@@ -1969,15 +1969,10 @@ def _looks_like_filesystem_path(value: str) -> bool:
 
 
 def _normalize_output_path(path: str) -> str:
-    """Normalize output paths to data/ prefix for consistency."""
+    """Normalize separators while preserving contract-declared paths."""
     if not path:
         return path
-    # Known files that should be in data/
-    known_files = ["metrics.json", "alignment_check.json", "scored_rows.csv", "cleaned_data.csv"]
-    basename = os.path.basename(path)
-    if basename in known_files and not path.startswith("data/"):
-        return f"data/{basename}"
-    return path
+    return str(path).strip().replace("\\", "/").lstrip("/")
 
 
 def _merge_conceptual_outputs(
@@ -2023,7 +2018,6 @@ def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | 
       1. evaluation_spec.required_outputs
       2. contract.required_outputs
       3. artifact_requirements.required_files
-      4. Sensible fallback
     NO LONGER uses spec_extraction.deliverables (legacy).
     """
     if not isinstance(contract, dict):
@@ -2091,20 +2085,19 @@ def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | 
             else:
                 conceptual_outputs.append(text)
 
-    if resolved:
-        _merge_conceptual_outputs(state, contract, conceptual_outputs)
-        return resolved
-
-    # Fallback: minimal required outputs for a valid ML run
     _merge_conceptual_outputs(state, contract, conceptual_outputs)
-    return ["data/scored_rows.csv", "data/metrics.json", "data/alignment_check.json"]
+    return resolved
 
 def _resolve_expected_output_paths(contract: Dict[str, Any], state: Dict[str, Any] | None = None) -> List[str]:
     """V4.1-only: delegates to _resolve_required_outputs."""
     return _resolve_required_outputs(contract, state)
 
 
-def _purge_execution_outputs(required_outputs: List[str], keep_outputs: List[str] | None = None) -> None:
+def _purge_execution_outputs(
+    required_outputs: List[str],
+    keep_outputs: List[str] | None = None,
+    preserve_paths: List[str] | None = None,
+) -> None:
     protected = {
         "data/cleaned_data.csv",
         "data/cleaned_full.csv",
@@ -2118,6 +2111,10 @@ def _purge_execution_outputs(required_outputs: List[str], keep_outputs: List[str
         "data/evaluation_spec.json",
         "data/execution_contract.json",
     }
+    for path in preserve_paths or []:
+        norm = _normalize_output_path(str(path or ""))
+        if norm:
+            protected.add(norm)
     keep_exact = {
         _normalize_path_posix(path)
         for path in (keep_outputs or [])
@@ -2877,7 +2874,7 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "DATA_PATH_NOT_USED": [
             "CRITICAL: Use the EXACT path provided in context via $data_path variable (e.g., INPUT_FILE = '$data_path').",
             "DO NOT hardcode arbitrary paths like 'input.csv', 'data.csv', 'raw_data.csv', 'cleaned.csv', etc.",
-            "The system will substitute $data_path with the correct path (usually 'data/cleaned_data.csv').",
+            "The system will substitute $data_path with the contract-derived dataset path for this run.",
         ],
         "REQUIRED_OUTPUTS_MISSING": [
             "Write all required outputs to the exact contract paths before exiting.",
@@ -4893,8 +4890,10 @@ def _collect_iteration_diagnostics(state: Dict[str, Any]) -> Dict[str, Any]:
     seg_stats = _summarize_segmentation_stats(scored_path, csv_sep, csv_decimal, csv_encoding, contract)
     n_rows = seg_stats.get("n_rows")
     if n_rows is None:
-        fallback_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
-        if os.path.exists(fallback_path):
+        fallback_path = str(state.get("ml_data_path") or "").strip()
+        if not fallback_path or not os.path.exists(fallback_path):
+            fallback_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
+        if fallback_path and os.path.exists(fallback_path):
             try:
                 n_rows = _count_raw_rows(fallback_path, csv_encoding, csv_sep, csv_decimal)
                 seg_stats["n_rows"] = n_rows
@@ -5376,7 +5375,7 @@ def _artifact_alignment_gate(
 ) -> List[str]:
     issues: List[str] = []
     if not cleaned_path or not os.path.exists(cleaned_path):
-        issues.append(f"cleaned_data_missing:{cleaned_path or 'data/cleaned_data.csv'}")
+        issues.append(f"cleaned_data_missing:{cleaned_path or '<unset>'}")
         return issues
 
     try:
@@ -6104,10 +6103,8 @@ def _evaluate_baseline_sanity_check(
     target_col = _resolve_primary_target_column(evaluation_spec, contract, contract_min)
     if not target_col:
         return {}
-    csv_path = state.get("ml_data_path") or "data/cleaned_data.csv"
-    if not os.path.exists(csv_path) and os.path.exists("data/cleaned_full.csv"):
-        csv_path = "data/cleaned_full.csv"
-    if not os.path.exists(csv_path):
+    csv_path = state.get("ml_data_path")
+    if not isinstance(csv_path, str) or not csv_path or not os.path.exists(csv_path):
         return {}
     dialect = {
         "sep": state.get("csv_sep") or ",",
@@ -7639,10 +7636,8 @@ def _infer_column_count_from_state(state: Dict[str, Any], hints: Dict[str, Any])
         if isinstance(canonical, list) and canonical:
             candidates.append(len(canonical))
 
-    csv_path = state.get("ml_data_path") or "data/cleaned_data.csv"
-    if not os.path.exists(csv_path) and csv_path != "data/cleaned_data.csv":
-        csv_path = "data/cleaned_data.csv"
-    if os.path.exists(csv_path):
+    csv_path = state.get("ml_data_path")
+    if isinstance(csv_path, str) and csv_path and os.path.exists(csv_path):
         try:
             sep = state.get("csv_sep") or ","
             decimal = state.get("csv_decimal") or "."
@@ -8082,6 +8077,7 @@ def _detect_de_heavy_runner_protocol_mismatch(
     error_payload: Any,
     downloaded: Dict[str, Any],
     heavy_log_text: str,
+    expected_outputs: Optional[List[str]] = None,
 ) -> bool:
     """Detect stale heavy-runner behavior: DE mode requested but ML outputs enforced."""
     mode_text = str(request_mode or "").strip().lower()
@@ -8106,11 +8102,40 @@ def _detect_de_heavy_runner_protocol_mismatch(
     )
     if not missing_ml_outputs:
         return False
-    cleaned_success_logged = "cleaned data written to data/cleaned_data.csv" in str(heavy_log_text or "").lower()
+    cleaned_success_logged = "cleaned data written to" in str(heavy_log_text or "").lower()
     downloaded_keys = set(downloaded.keys()) if isinstance(downloaded, dict) else set()
-    cleaned_output_seen = "data/cleaned_data.csv" in downloaded_keys
-    manifest_output_seen = "data/cleaning_manifest.json" in downloaded_keys
-    return bool(cleaned_success_logged or cleaned_output_seen or manifest_output_seen)
+    expected = {
+        _normalize_output_path(path)
+        for path in (expected_outputs or [])
+        if isinstance(path, str) and path.strip()
+    }
+    expected_output_seen = any(path in downloaded_keys for path in expected)
+    return bool(cleaned_success_logged or expected_output_seen)
+
+
+def _resolve_de_output_artifacts(state: Dict[str, Any]) -> tuple[str, str, List[str]]:
+    """
+    Resolve DE output artifacts strictly from DE view (contract projection).
+    Returns (cleaned_output_path, manifest_output_path, required_artifacts).
+    """
+    de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+    if not isinstance(de_view, dict):
+        de_view = {}
+    output_path = _normalize_output_path(str(de_view.get("output_path") or ""))
+    manifest_path = _normalize_output_path(
+        str(
+            de_view.get("output_manifest_path")
+            or de_view.get("manifest_path")
+            or ""
+        )
+    )
+    required_artifacts: List[str] = []
+    if output_path:
+        required_artifacts.append(output_path)
+    if manifest_path:
+        required_artifacts.append(manifest_path)
+    required_artifacts = list(dict.fromkeys(required_artifacts))
+    return output_path, manifest_path, required_artifacts
 
 
 def _execute_data_engineer_via_heavy_runner(
@@ -8126,14 +8151,21 @@ def _execute_data_engineer_via_heavy_runner(
     attempt_id: int,
     reason: str,
 ) -> Dict[str, Any]:
-    required_artifacts = ["data/cleaned_data.csv", "data/cleaning_manifest.json"]
+    _, _, required_artifacts = _resolve_de_output_artifacts(state)
+    if not required_artifacts:
+        return {
+            "ok": False,
+            "unavailable": False,
+            "error_details": "DE_VIEW_OUTPUTS_MISSING: de_view.output_path and de_view.output_manifest_path are required.",
+            "heavy_result": None,
+        }
     download_map = {
-        "data/cleaned_data.csv": "data/cleaned_data.csv",
-        "data/cleaning_manifest.json": "data/cleaning_manifest.json",
         "error.json": os.path.join("artifacts", "heavy_error.json"),
         "status.json": os.path.join("artifacts", "heavy_status.json"),
         "artifacts/execution_log.txt": os.path.join("artifacts", "heavy_execution_log.txt"),
     }
+    for rel_path in required_artifacts:
+        download_map[rel_path] = rel_path
     support_files: List[Dict[str, str]] = []
     for rel_path in [
         "data/required_columns.json",
@@ -8158,6 +8190,7 @@ def _execute_data_engineer_via_heavy_runner(
             "step": "data_engineer",
         },
         "read": {"sep": csv_sep, "decimal": csv_decimal, "encoding": csv_encoding},
+        "required_outputs": required_artifacts,
     }
     if run_id:
         log_run_event(
@@ -8168,6 +8201,7 @@ def _execute_data_engineer_via_heavy_runner(
                 "reason": reason,
                 "attempt_id": attempt_id,
                 "download_keys": list(download_map.keys()),
+                "required_artifacts": required_artifacts,
                 "support_files": [item.get("path") for item in support_files],
             },
         )
@@ -8243,6 +8277,7 @@ def _execute_data_engineer_via_heavy_runner(
             heavy_result.get("error"),
             downloaded,
             heavy_log_text,
+            expected_outputs=required_artifacts,
         ):
             protocol_mismatch = True
             protocol_mismatch_hint = (
@@ -8361,9 +8396,12 @@ def _finalize_heavy_execution(
     required_outputs = _resolve_required_outputs(contract, state)
     deliverables = _resolve_contract_deliverables(contract)
     output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
+    cleaned_path = str(state.get("ml_data_path") or "").strip()
+    if not cleaned_path:
+        cleaned_path, _, _ = _resolve_de_output_artifacts(state)
 
     artifact_issues = _artifact_alignment_gate(
-        cleaned_path="data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv",
+        cleaned_path=cleaned_path,
         scored_path="data/scored_rows.csv",
         contract=contract,
         evaluation_spec=eval_spec,
@@ -9402,6 +9440,29 @@ def run_data_engineer(state: AgentState) -> AgentState:
     if not isinstance(de_view, dict) or not de_view:
         projected_views = build_contract_views_projection(execution_contract or {}, state.get("artifact_index") or [])
         de_view = projected_views.get("de_view") or {}
+    de_output_path = str(de_view.get("output_path") or "").strip()
+    de_manifest_path = str(
+        de_view.get("output_manifest_path")
+        or de_view.get("manifest_path")
+        or ""
+    ).strip()
+    if not de_output_path or not de_manifest_path:
+        msg = (
+            "DE_VIEW_OUTPUTS_MISSING: contract-derived de_view must define "
+            "output_path and output_manifest_path."
+        )
+        if run_id:
+            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "de_view_outputs_missing"})
+        oc_report = _persist_output_contract_report(state, reason="de_view_outputs_missing")
+        return {
+            "cleaning_code": "",
+            "cleaned_data_preview": "Error: Missing DE View Outputs",
+            "error_message": msg,
+            "output_contract_report": oc_report,
+            "pipeline_aborted_reason": "de_view_outputs_missing",
+            "data_engineer_failed": True,
+            "budget_counters": counters,
+        }
     de_objective = build_de_objective(execution_contract or {})
     try:
         de_view_len = len(json.dumps(de_view, ensure_ascii=True))
@@ -9880,9 +9941,27 @@ def run_data_engineer(state: AgentState) -> AgentState:
             }
 
     # Execute in E2B Sandbox
+    de_output_path, de_manifest_path, _ = _resolve_de_output_artifacts(state if isinstance(state, dict) else {})
+    if not de_output_path or not de_manifest_path:
+        msg = (
+            "DE_VIEW_OUTPUTS_MISSING: de_view.output_path and de_view.output_manifest_path "
+            "must be present in contract-derived views."
+        )
+        if run_id:
+            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "de_view_outputs_missing"})
+        oc_report = _persist_output_contract_report(state, reason="de_view_outputs_missing")
+        return {
+            "cleaning_code": code,
+            "cleaned_data_preview": "Error: Missing DE View Outputs",
+            "error_message": msg,
+            "output_contract_report": oc_report,
+            "pipeline_aborted_reason": "de_view_outputs_missing",
+            "data_engineer_failed": True,
+            "budget_counters": counters,
+        }
     try:
-        local_cleaned_path = "data/cleaned_data.csv"
-        local_manifest_path = "data/cleaning_manifest.json"
+        local_cleaned_path = de_output_path
+        local_manifest_path = de_manifest_path
         output_log = ""
         downloaded_cleaned_content = None
         downloaded_paths: List[str] = []
@@ -10378,10 +10457,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
                         # 4. Verification & Download
                         # Check if cleaned file exists
-                        ls_check = run_cmd_with_retry(sandbox, f"ls {run_root}/data/cleaned_data.csv", retries=2)
+                        remote_cleaned_rel = local_cleaned_path.lstrip("/").replace("\\", "/")
+                        ls_check = run_cmd_with_retry(sandbox, f"ls {run_root}/{remote_cleaned_rel}", retries=2)
                         ls_failed = bool(getattr(ls_check, "exit_code", 1) != 0)
                         if ls_failed:
-                            print("Warning: cleaned_data.csv not confirmed by ls; attempting download anyway.")
+                            print(f"Warning: cleaned artifact not confirmed by ls ({remote_cleaned_rel}); attempting download anyway.")
 
                         # Persist DE artifact
                         try:
@@ -10395,15 +10475,14 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
                         # Download Result (CSV) using centralized helper
                         print("Downloading cleaned data...")
-                        local_cleaned_path = "data/cleaned_data.csv"
-                        os.makedirs("data", exist_ok=True)
+                        os.makedirs(os.path.dirname(local_cleaned_path) or ".", exist_ok=True)
 
-                    csv_content = safe_download_bytes(sandbox, f"{run_root}/data/cleaned_data.csv")
+                    csv_content = safe_download_bytes(sandbox, f"{run_root}/{remote_cleaned_rel}")
                     if csv_content is None:
                         return {
                             "cleaning_code": code,
                             "cleaned_data_preview": "Error: Download Failed",
-                            "error_message": "Failed to download cleaned data from sandbox",
+                            "error_message": f"Failed to download cleaned data artifact from sandbox: {remote_cleaned_rel}",
                             "budget_counters": counters,
                         }
                     downloaded_cleaned_content = csv_content
@@ -10414,21 +10493,13 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
                         # Download Manifest (JSON) - Roundtrip Support using centralized helper
                         print("Downloading cleaning manifest...")
-                        local_manifest_path = "data/cleaning_manifest.json"
-                        manifest_content = safe_download_bytes(sandbox, f"{run_root}/data/cleaning_manifest.json")
+                        remote_manifest_rel = local_manifest_path.lstrip("/").replace("\\", "/")
+                        manifest_content = safe_download_bytes(sandbox, f"{run_root}/{remote_manifest_rel}")
                         if manifest_content is not None:
                             with open(local_manifest_path, "wb") as f_local:
                                 f_local.write(manifest_content)
                         else:
-                            print("Warning: Manifest download failed (not found?). Creating default.")
-                            # Create default manifest if missing
-                            default_manifest = {
-                                "input_dialect": {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal},
-                                "output_dialect": {"encoding": "utf-8", "sep": ",", "decimal": "."},
-                                "generated_by": "Host Fallback"
-                            }
-                            with open(local_manifest_path, "w", encoding="utf-8") as f_def:
-                                json.dump(default_manifest, f_def)
+                            print(f"Warning: Manifest download failed (not found?): {remote_manifest_rel}")
                         if os.path.exists(local_manifest_path):
                             downloaded_paths.append(local_manifest_path)
                         try:
@@ -10707,14 +10778,17 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if not os.path.exists(local_cleaned_path):
             print(f"Warning: cleaned data missing at {local_cleaned_path}; proceeding to reviewer checks.")
         if not os.path.exists(local_manifest_path):
-            default_manifest = {
-                "input_dialect": {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal},
-                "output_dialect": {"encoding": "utf-8", "sep": ",", "decimal": "."},
-                "generated_by": "Host Fallback",
+            msg = f"DE_REQUIRED_ARTIFACT_MISSING: manifest artifact not produced at '{local_manifest_path}'"
+            if run_id:
+                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "de_manifest_missing"})
+            return {
+                "cleaning_code": code,
+                "cleaned_data_preview": "Error: Missing Manifest Artifact",
+                "error_message": msg,
+                "pipeline_aborted_reason": "de_manifest_missing",
+                "data_engineer_failed": True,
+                "budget_counters": counters,
             }
-            os.makedirs(os.path.dirname(local_manifest_path) or ".", exist_ok=True)
-            with open(local_manifest_path, "w", encoding="utf-8") as f_def:
-                json.dump(default_manifest, f_def, indent=2)
         try:
             os.makedirs("artifacts", exist_ok=True)
             with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
@@ -11273,10 +11347,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     decimal=csv_decimal,
                     encoding=csv_encoding
                 )
-                print("Mapped data saved to 'data/cleaned_data.csv'")
+                print(f"Mapped data saved to '{local_cleaned_path}'")
             else:
                 df_final = df_mapped
-                print("Host mapping disabled; using DE cleaned_data.csv as-is.")
+                print(f"Host mapping disabled; using DE cleaned artifact as-is: {local_cleaned_path}")
 
             # Save Summary
             with open("data/column_mapping_summary.json", "w", encoding="utf-8") as f:
@@ -11299,7 +11373,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
         # P2.3: Calculate dataset scale hints after Data Engineer
         work_dir = state.get("work_dir", ".")
-        dataset_scale_hints = get_dataset_scale_hints(work_dir, "data/cleaned_data.csv")
+        dataset_scale_hints = get_dataset_scale_hints(work_dir, local_cleaned_path)
 
         if run_id:
             log_run_event(
@@ -11323,6 +11397,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "budget_counters": counters,
             "dataset_scale_hints": dataset_scale_hints,
             "dataset_scale": dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None,
+            "ml_data_path": local_cleaned_path,
+            "cleaning_manifest_path": local_manifest_path,
         }
         merged_state = dict(state or {})
         merged_state.update(result)
@@ -11344,16 +11420,19 @@ def check_data_success(state: AgentState):
         print(f"❌ Data Engineer Failed: {err}")
         return "failed"
 
-    if not os.path.exists("data/cleaned_data.csv"):
-        print("❌ Critical: cleaned_data.csv missing locally.")
+    cleaned_path, _, _ = _resolve_de_output_artifacts(state if isinstance(state, dict) else {})
+    if not cleaned_path:
+        cleaned_path = str(state.get("ml_data_path") or "").strip()
+    if not cleaned_path or not os.path.exists(cleaned_path):
+        print(f"❌ Critical: cleaned dataset missing locally ({cleaned_path or '<unset>'}).")
         return "failed"
 
     run_start_epoch = state.get("run_start_epoch")
     if run_start_epoch is not None:
         try:
-            cleaned_mtime = os.path.getmtime("data/cleaned_data.csv")
+            cleaned_mtime = os.path.getmtime(cleaned_path)
             if cleaned_mtime < float(run_start_epoch) - 1.0:
-                print("Data Engineer Failed: stale cleaned_data.csv detected.")
+                print(f"Data Engineer Failed: stale cleaned dataset detected at {cleaned_path}.")
                 return "failed"
         except Exception:
             pass
@@ -11458,18 +11537,19 @@ def run_engineer(state: AgentState) -> AgentState:
 
 
     # Pass input context
-    data_path = "data/cleaned_data.csv"
+    data_path = ""
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
     if isinstance(de_view, dict) and de_view.get("output_path"):
         data_path = str(de_view.get("output_path"))
+    elif state.get("ml_data_path"):
+        data_path = str(state.get("ml_data_path"))
     minimal_context_mode = _minimal_agent_context_enabled()
     data_audit_context = _build_agent_feedback_context(state if isinstance(state, dict) else {}, "ml_engineer")
-    if os.path.basename(data_path).lower() == "cleaned_full.csv":
+    if not data_path:
         data_audit_context = _merge_de_audit_override(
             data_audit_context,
-            "NOTICE: cleaned_full.csv is not a valid ML input; using cleaned_data.csv instead.",
+            "WARNING: ml_data_path missing from contract-derived context.",
         )
-        data_path = "data/cleaned_data.csv"
     feedback_history = state.get('feedback_history', [])
     leakage_summary = state.get("leakage_audit_summary", "")
     dataset_semantics_summary = state.get("dataset_semantics_summary")
@@ -11514,10 +11594,10 @@ def run_engineer(state: AgentState) -> AgentState:
                     print(f"ML dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
             except Exception:
                 pass
-    if not os.path.exists(data_path):
+    if not data_path or not os.path.exists(data_path):
         data_audit_context = _merge_de_audit_override(
             data_audit_context,
-            f"WARNING: cleaned_data.csv missing at '{data_path}'. ML execution cannot proceed without cleaned_data.csv.",
+            f"WARNING: ML input data missing at '{data_path or '<unset>'}'. ML execution cannot proceed.",
         )
     required_input_cols = _resolve_required_input_columns(execution_contract, strategy)
     header_cols = _read_csv_header(data_path, csv_encoding, csv_sep) if os.path.exists(data_path) else []
@@ -12191,7 +12271,8 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                         if isinstance(path, str) and path.endswith(".csv") and "clean" in path.lower():
                             ml_data_path = path
                             break
-        qa_context["ml_data_path"] = ml_data_path or "data/cleaned_data.csv"
+        if ml_data_path:
+            qa_context["ml_data_path"] = ml_data_path
         qa_context_prompt = compress_long_lists(qa_context)[0] if isinstance(qa_context, dict) else qa_context
         if contract_source == "qa_view":
             try:
@@ -12450,8 +12531,20 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     if not has_read_csv:
         issues.append("DATA_LOAD_MISSING")
     else:
-        allowed_paths = ("data/cleaned_data.csv", "data.csv")
-        path_hits = [p for p in read_csv_info.get("paths", []) if any(a in p for a in allowed_paths)]
+        allowed_paths = {"data.csv"}
+        ml_data_path = state.get("ml_data_path")
+        if isinstance(ml_data_path, str) and ml_data_path.strip():
+            allowed_paths.add(ml_data_path.strip())
+        de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+        if isinstance(de_view, dict):
+            de_output = de_view.get("output_path")
+            if isinstance(de_output, str) and de_output.strip():
+                allowed_paths.add(de_output.strip())
+        path_hits = [
+            p
+            for p in read_csv_info.get("paths", [])
+            if any(a and a in p for a in allowed_paths)
+        ]
         if not path_hits and "data_path" not in (code or "").lower():
             issues.append("DATA_PATH_NOT_USED")
     col_coverage = _required_columns_coverage(code, required_columns)
@@ -12703,10 +12796,24 @@ def execute_code(state: AgentState) -> AgentState:
             eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
             required_outputs = _resolve_required_outputs(contract, state)
             expected_outputs = _resolve_expected_output_paths(contract, state)
-            _purge_execution_outputs(required_outputs, expected_outputs)
-            local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
-            if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
-                local_csv = "data/cleaned_data.csv"
+            preserve_paths = []
+            ml_input_path = state.get("ml_data_path")
+            if ml_input_path:
+                preserve_paths.append(str(ml_input_path))
+            de_view_paths = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+            if isinstance(de_view_paths, dict):
+                for key in ("output_path", "output_manifest_path", "manifest_path"):
+                    value = de_view_paths.get(key)
+                    if value:
+                        preserve_paths.append(str(value))
+            _purge_execution_outputs(required_outputs, expected_outputs, preserve_paths=preserve_paths)
+            local_csv = str(state.get("ml_data_path") or "").strip()
+            if not local_csv:
+                return {
+                    "error_message": "HEAVY_RUNNER: ml_data_path missing from contract-derived context",
+                    "execution_output": "HEAVY_RUNNER_ERROR: ml_data_path missing",
+                    "budget_counters": counters,
+                }
             column_inventory = state.get("column_inventory")
             if not isinstance(column_inventory, list) or not column_inventory:
                 inv = _load_json_safe("data/column_inventory.json")
@@ -12828,7 +12935,11 @@ def execute_code(state: AgentState) -> AgentState:
             }
 
             if not os.path.exists(local_csv):
-                return {"error_message": "HEAVY_RUNNER: cleaned_data.csv missing", "execution_output": "HEAVY_RUNNER_ERROR: cleaned_data.csv missing", "budget_counters": counters}
+                return {
+                    "error_message": f"HEAVY_RUNNER: ml_data_path missing on disk ({local_csv})",
+                    "execution_output": "HEAVY_RUNNER_ERROR: ml_data_path missing",
+                    "budget_counters": counters,
+                }
 
             # Download map: GCS filename -> local path.
             # Contract-required artifacts are downloaded with 1:1 local paths.
@@ -12839,11 +12950,6 @@ def execute_code(state: AgentState) -> AgentState:
             }
             for rel_path in required_artifacts:
                 download_map.setdefault(rel_path, rel_path)
-            # Keep legacy artifacts as optional diagnostics (not required by runtime).
-            download_map.setdefault("data/metrics.json", "data/metrics.json")
-            download_map.setdefault("data/scored_rows.csv", "data/scored_rows.csv")
-            download_map.setdefault("data/alignment_check.json", "data/alignment_check.json")
-            download_map.setdefault("model.joblib", os.path.join("artifacts", "heavy_model.joblib"))
             support_files = []
             for rel_path in [
                 "data/cleaning_manifest.json",
@@ -12894,7 +13000,7 @@ def execute_code(state: AgentState) -> AgentState:
                     download_map=download_map,
                     code_text=code,
                     support_files=support_files,
-                    data_path="data/cleaned_data.csv",
+                    data_path=local_csv,
                     required_artifacts=required_artifacts,
                     attempt_id=attempt_id,
                 )
@@ -13038,7 +13144,17 @@ def execute_code(state: AgentState) -> AgentState:
 
     required_outputs = _resolve_required_outputs(contract, state)
     expected_outputs = _resolve_expected_output_paths(contract, state)
-    _purge_execution_outputs(required_outputs, expected_outputs)
+    preserve_paths = []
+    ml_input_path = state.get("ml_data_path")
+    if ml_input_path:
+        preserve_paths.append(str(ml_input_path))
+    de_view_paths = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+    if isinstance(de_view_paths, dict):
+        for key in ("output_path", "output_manifest_path", "manifest_path"):
+            value = de_view_paths.get(key)
+            if value:
+                preserve_paths.append(str(value))
+    _purge_execution_outputs(required_outputs, expected_outputs, preserve_paths=preserve_paths)
 
     eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
     allowed_columns = _resolve_allowed_columns_for_gate(state, contract, eval_spec)
@@ -13135,9 +13251,19 @@ def execute_code(state: AgentState) -> AgentState:
                 run_cmd_with_retry(sandbox, f"mkdir -p {run_root}/data", retries=2)
 
                 # P2.1: Use canonical cleaned path + aliases (P2.2: run_cmd_with_retry)
-                local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
-                if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
-                    local_csv = "data/cleaned_data.csv"
+                local_csv = str(state.get("ml_data_path") or "").strip()
+                if not local_csv:
+                    return {
+                        "error_message": "ML_EXECUTION_ABORTED: ml_data_path missing from contract-derived context",
+                        "execution_output": "ML_EXECUTION_ERROR: ml_data_path missing",
+                        "budget_counters": counters,
+                    }
+                if not os.path.exists(local_csv):
+                    return {
+                        "error_message": f"ML_EXECUTION_ABORTED: ml_data_path not found ({local_csv})",
+                        "execution_output": "ML_EXECUTION_ERROR: ml_data_path missing",
+                        "budget_counters": counters,
+                    }
 
                 # Upload cleaned data (P2.1: Canonical path)
                 remote_clean_abs = canonical_abs(run_root, CANONICAL_CLEANED_REL)
@@ -13526,9 +13652,12 @@ def execute_code(state: AgentState) -> AgentState:
     csv_sep = dialect["sep"]
     csv_decimal = dialect["decimal"]
     csv_encoding = dialect["encoding"]
+    cleaned_path = str(state.get("ml_data_path") or "").strip()
+    if not cleaned_path:
+        cleaned_path, _, _ = _resolve_de_output_artifacts(state)
 
     artifact_issues = _artifact_alignment_gate(
-        cleaned_path="data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv",
+        cleaned_path=cleaned_path,
         scored_path="data/scored_rows.csv",
         contract=contract,
         evaluation_spec=eval_spec,
@@ -14038,6 +14167,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         }
     elif case_alignment_required:
         data_paths = []
+        ml_data_path = state.get("ml_data_path")
+        if isinstance(ml_data_path, str) and ml_data_path and os.path.exists(ml_data_path):
+            data_paths.append(ml_data_path)
         if os.path.exists("data/cleaned_full.csv"):
             data_paths.append("data/cleaned_full.csv")
         if os.path.exists("data/cleaned_data.csv"):
@@ -14383,7 +14515,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         qa_context["_contract_source"] = "execution_contract"
     else:
         qa_context = {"_contract_source": "fallback"}
-    qa_context["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
+    ml_data_path = state.get("ml_data_path")
+    if ml_data_path:
+        qa_context["ml_data_path"] = ml_data_path
     if state.get("ml_training_policy_warnings"):
         qa_context["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings")
     qa_context["execution_diagnostics"] = review_diagnostics
@@ -15488,7 +15622,13 @@ def run_translator(state: AgentState) -> AgentState:
             or artifact_guard
             or stale_guard
         )
-        cleaned_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
+        cleaned_path = str(report_state.get("ml_data_path") or state.get("ml_data_path") or "").strip()
+        if not cleaned_path or not os.path.exists(cleaned_path):
+            de_cleaned_path, _, _ = _resolve_de_output_artifacts(report_state if isinstance(report_state, dict) else {})
+            if de_cleaned_path and os.path.exists(de_cleaned_path):
+                cleaned_path = de_cleaned_path
+        if not cleaned_path:
+            cleaned_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
         preview_root = None
         run_dir = get_run_dir(run_id) if run_id else None
         if run_id and not run_dir:

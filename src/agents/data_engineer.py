@@ -99,6 +99,12 @@ class DataEngineerAgent:
         contract_json = json.dumps(compress_long_lists(contract)[0], indent=2)
         de_view = de_view or {}
         de_view_json = json.dumps(compress_long_lists(de_view)[0], indent=2)
+        de_output_path = str(de_view.get("output_path") or "").strip()
+        de_manifest_path = str(
+            de_view.get("output_manifest_path")
+            or de_view.get("manifest_path")
+            or ""
+        ).strip()
         cleaning_gates = get_cleaning_gates(contract) or get_cleaning_gates(execution_contract or {}) or []
         cleaning_gates_json = json.dumps(compress_long_lists(cleaning_gates)[0], indent=2)
 
@@ -145,7 +151,7 @@ class DataEngineerAgent:
           # Risks & Checks:
 
         *** SCOPE OF WORK (NON-NEGOTIABLE) ***
-        - Output ONLY: data/cleaned_data.csv and data/cleaning_manifest.json.
+        - Output ONLY: $de_output_path and $de_manifest_path.
         - MUST NOT: compute scores, case assignment, weight fitting, regression/optimization, correlations, rank checks.
         - MUST: parse types, normalize numeric formats, preserve canonical column names.
         - Manifest MUST include: output_dialect, row_counts, conversions.
@@ -200,8 +206,8 @@ class DataEngineerAgent:
         
         *** CLEANING OUTPUT REQUIREMENTS ***
         - CRITICAL: Read input with pd.read_csv(..., sep='$csv_sep', decimal='$csv_decimal', encoding='$csv_encoding', dtype=str, low_memory=False). DO NOT rely on defaults.
-        - Save cleaned CSV to data/cleaned_data.csv.
-        - Save manifest to data/cleaning_manifest.json (use _safe_dump_json if present; otherwise json.dump(..., default=_json_default)).
+        - Save cleaned CSV to $de_output_path.
+        - Save manifest to $de_manifest_path (use _safe_dump_json if present; otherwise json.dump(..., default=_json_default)).
         - CRITICAL: Manifest MUST include "output_dialect": {"sep": "...", "decimal": "...", "encoding": "..."} matching the saved file.
         - Use standard CSV (sep=',', decimal='.', encoding='utf-8') for output unless forbidden.
         - Use canonical_name from the contract for all column references.
@@ -218,7 +224,7 @@ class DataEngineerAgent:
 
         *** GATE CHECKLIST (CONTRACT-DRIVEN) ***
         - Enumerate cleaning_gates by column and requirement (max_null_fraction, allow_nulls, required_columns, etc.).
-        - Before writing cleaned_data.csv, compute null_fraction for each gated column.
+        - Before writing the cleaned output CSV, compute null_fraction for each gated column.
         - If any HARD gate is violated, raise ValueError with a clear message: "CLEANING_GATE_FAILED: <gate_name> <details>".
         - If a gate references a column that is missing, raise ValueError (do not fabricate columns).
         """
@@ -250,6 +256,8 @@ class DataEngineerAgent:
             data_engineer_runbook=de_runbook_json,
             cleaning_gates_context=cleaning_gates_json,
             senior_engineering_protocol=SENIOR_ENGINEERING_PROTOCOL,
+            de_output_path=de_output_path,
+            de_manifest_path=de_manifest_path,
         )
         self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE
         print(f"DEBUG: DE System Prompt Len: {len(system_prompt)}")

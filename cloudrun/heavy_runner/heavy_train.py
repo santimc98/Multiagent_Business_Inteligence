@@ -6,7 +6,7 @@ ML Engineer or Data Engineer agents) in a sandboxed environment with more
 resources than E2B (32GB RAM vs 8GB).
 
 The execution model is identical to E2B:
-1. Download cleaned data to data/cleaned_data.csv
+1. Download dataset to payload data_path
 2. Download support files (manifests, configs)
 3. Execute the script from the working directory
 4. Collect and upload all generated outputs
@@ -30,12 +30,6 @@ from google.cloud import storage
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 
-
-# Required outputs for execute_code mode in DE execution.
-REQUIRED_OUTPUTS_EXECUTE_CODE_DE = [
-    "data/cleaned_data.csv",
-    "data/cleaning_manifest.json",
-]
 
 # Protocol marker for orchestrator/runner compatibility.
 HEAVY_RUNNER_PROTOCOL_VERSION = "de_mode_v1"
@@ -264,13 +258,6 @@ def _resolve_execute_code_mode(payload: Dict[str, Any]) -> Tuple[str, List[str],
         (mode, required_outputs, skip_paths_for_upload_scan)
     """
     mode = str(payload.get("mode") or "execute_code").strip().lower()
-    # Accept both legacy and explicit DE mode tags.
-    if mode in {"data_engineer_cleaning", "data_engineer"}:
-        mode = "data_engineer_cleaning"
-        # For DE, cleaned_data.csv is a required output and must be uploaded.
-        required = list(REQUIRED_OUTPUTS_EXECUTE_CODE_DE)
-        skip_paths = {os.path.join("data", "cleaned_full.csv")}
-        return mode, required, skip_paths
     required_payload = payload.get("required_outputs")
     required = []
     if isinstance(required_payload, list):
@@ -279,6 +266,12 @@ def _resolve_execute_code_mode(payload: Dict[str, Any]) -> Tuple[str, List[str],
             for path in required_payload
             if path
         ]
+    # Accept both legacy and explicit DE mode tags.
+    if mode in {"data_engineer_cleaning", "data_engineer"}:
+        mode = "data_engineer_cleaning"
+        # Contract-driven required outputs for DE are supplied by orchestrator.
+        skip_paths = {os.path.join("data", "cleaned_full.csv")}
+        return mode, required, skip_paths
     # For ML, treat cleaned datasets as input artifacts to avoid re-upload noise.
     skip_paths = {
         os.path.join("data", "cleaned_data.csv"),
@@ -292,7 +285,7 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     Execute user-provided Python script (same behavior as E2B sandbox).
 
     This mode:
-    1. Downloads dataset to payload data_path (e.g., data/raw.csv or data/cleaned_data.csv)
+    1. Downloads dataset to payload data_path (contract/orchestrator supplied)
     2. Downloads support files (manifests, column configs, etc.)
     3. Executes the ML script from the working directory
     4. Collects and uploads all generated outputs
@@ -326,7 +319,9 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     if not dataset_uri:
         raise ValueError("dataset_uri is required")
 
-    data_path = payload.get("data_path") or "data/cleaned_data.csv"
+    data_path = payload.get("data_path")
+    if not data_path:
+        raise ValueError("data_path is required for execute_code mode")
     data_full_path = os.path.join(work_dir, data_path)
     os.makedirs(os.path.dirname(data_full_path), exist_ok=True)
 

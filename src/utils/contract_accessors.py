@@ -758,17 +758,11 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     import re
     
     def _normalize_path(path: str) -> str:
-        """Normalize output path for consistency."""
+        """Normalize separators while preserving contract-declared relative paths."""
         if not path:
             return path
-        # Backslash to forward slash
-        path = path.replace("\\", "/")
-        # Known files that should be in data/
-        known_files = ["metrics.json", "alignment_check.json", "scored_rows.csv", "cleaned_data.csv", "cleaning_manifest.json"]
-        basename = os.path.basename(path)
-        if basename in known_files and not path.startswith("data/"):
-            return f"data/{basename}"
-        return path
+        path = path.replace("\\", "/").strip()
+        return path.lstrip("/")
 
     def _slug(value: Any, fallback: str) -> str:
         token = re.sub(r"[^0-9a-zA-Z]+", "_", str(value or "")).strip("_").lower()

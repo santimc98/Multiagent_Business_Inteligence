@@ -684,7 +684,7 @@ class MLEngineerAgent:
         inject the correct one. This is NOT hardcoding business logic - it's infrastructure.
 
         Common wrong paths: 'input.csv', 'data.csv', 'data/input_data.csv', 'data/data.csv', 'raw_data.csv'
-        Correct path: provided by system (usually 'data/cleaned_data.csv')
+        Correct path: provided by system through $data_path
 
         This catches common variable naming patterns that LLMs use for input paths.
         """
@@ -1868,12 +1868,12 @@ $strategy_json
            - CORRECT: INPUT_FILE = '$data_path' then df = pd.read_csv(INPUT_FILE, sep=sep, decimal=decimal, encoding=encoding, ...)
            - WRONG: Using hardcoded paths like 'data.csv', 'input.csv', 'raw_data.csv', 'data/input_data.csv', etc.
            - WRONG: pd.read_csv(INPUT_FILE) without dialect parameters
-           - The $data_path variable will be substituted with the actual path (e.g., 'data/cleaned_data.csv').
+           - The $data_path variable will be substituted with the contract-derived dataset path for this run.
            - ABSOLUTE PROHIBITION: Do NOT implement fallback logic like "if not os.path.exists(filepath): generate dummy data".
              The file WILL exist. If it doesn't, let pd.read_csv() raise FileNotFoundError. NO synthetic fallbacks.
         5) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
         6) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (contract.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
-        6b) Do NOT overwrite data/cleaned_data.csv. Treat it as immutable input; write derived datasets to data/model_input.csv or data/features.csv.
+        6b) Do NOT overwrite the input dataset at $data_path. Treat it as immutable input; write derived datasets to new output files.
         7) NEVER fabricate synthetic rows/features (pd.DataFrame({}) from literals, faker, sklearn.datasets.make_*, etc.).
            - Bootstrap/CV resampling of the OBSERVED rows is allowed (and expected when validation_requirements asks for bootstrap).
            - Randomness is permitted ONLY for resampling indices; do not generate new feature values from distributions.
