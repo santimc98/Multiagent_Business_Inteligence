@@ -74,6 +74,27 @@ def test_projection_ml_view_includes_contract_context_blocks():
     assert isinstance(ml_view.get("ml_engineer_runbook"), dict)
 
 
+def test_projection_ml_view_preserves_runbook_list_shape():
+    contract = {
+        "scope": "full_pipeline",
+        "canonical_columns": ["feature_a", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "outcome": ["target"],
+        },
+        "required_outputs": ["data/metrics.json"],
+        "ml_engineer_runbook": [
+            {"step": "train_baseline"},
+            {"step": "evaluate_cv"},
+        ],
+    }
+    projected = build_contract_views_projection(contract, artifact_index=[])
+    ml_view = projected.get("ml_view") or {}
+    runbook = ml_view.get("ml_engineer_runbook")
+    assert isinstance(runbook, list)
+    assert runbook and runbook[0].get("step") == "train_baseline"
+
+
 def test_ml_view_includes_scored_rows_schema():
     contract_min = {
         "canonical_columns": ["id", "feature_a"],

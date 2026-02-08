@@ -143,3 +143,63 @@ def test_execute_code_mode_fails_when_required_outputs_missing(monkeypatch):
     assert any(rel == "error.json" for rel, _ in captured_json)
     error_payload = next((item for rel, item in captured_json if rel == "error.json"), {})
     assert error_payload.get("error") == "missing_required_outputs"
+
+
+def test_execute_code_mode_uploads_required_outputs_outside_default_roots(monkeypatch):
+    heavy_train = _load_heavy_train_module()
+
+    def _fake_download(_uri, path):
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        if path_obj.name == "ml_script.py":
+            path_obj.write_text("print('ok')\n", encoding="utf-8")
+        else:
+            path_obj.write_text("a\n1\n", encoding="utf-8")
+
+    def _fake_run(_script, work_dir):
+        models_dir = Path(work_dir) / "models"
+        reports_dir = Path(work_dir) / "reports"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (models_dir / "best_model.joblib").write_text("binary", encoding="utf-8")
+        (reports_dir / "model_card.json").write_text("{}", encoding="utf-8")
+        return 0, "ok", ""
+
+    uploaded_files = []
+    status_payload = {}
+
+    monkeypatch.setattr(heavy_train, "_download_to_path", _fake_download)
+    monkeypatch.setattr(heavy_train, "_download_support_files", lambda _support, _work_dir: None)
+    monkeypatch.setattr(heavy_train, "_run_script", _fake_run)
+    monkeypatch.setattr(heavy_train, "_collect_output_files", lambda _work_dir, skip_paths=None: [])
+    monkeypatch.setattr(
+        heavy_train,
+        "_write_file_output",
+        lambda _local, _output, rel: uploaded_files.append(rel),
+    )
+
+    def _capture_json(payload, _output_uri, rel_path):
+        if rel_path == "status.json":
+            status_payload.update(payload)
+
+    monkeypatch.setattr(heavy_train, "_write_json_output", _capture_json)
+
+    payload = {
+        "mode": "execute_code",
+        "dataset_uri": "gs://bucket/input.csv",
+        "data_path": "data/raw.csv",
+        "code_uri": "gs://bucket/script.py",
+        "required_outputs": [
+            "models/best_model.joblib",
+            "reports/model_card.json",
+        ],
+    }
+
+    exit_code = heavy_train.execute_code_mode(payload, "gs://bucket/output/", "run-test")
+
+    assert exit_code == 0
+    assert "models/best_model.joblib" in uploaded_files
+    assert "reports/model_card.json" in uploaded_files
+    assert status_payload.get("required_outputs_missing") == []
+    assert "models/best_model.joblib" in (status_payload.get("uploaded_outputs") or [])
+    assert "reports/model_card.json" in (status_payload.get("uploaded_outputs") or [])

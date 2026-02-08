@@ -63,7 +63,7 @@ class MLView(TypedDict, total=False):
     objective_analysis: Dict[str, Any]
     qa_gates: List[Dict[str, Any]]
     reviewer_gates: List[Any]
-    ml_engineer_runbook: Dict[str, Any]
+    ml_engineer_runbook: Any
     case_rules: Any
     plot_spec: Dict[str, Any]
     artifact_requirements: Dict[str, Any]
@@ -1388,7 +1388,7 @@ def build_contract_views_projection(
     if not isinstance(objective_analysis, dict):
         objective_analysis = {}
     ml_engineer_runbook = contract_full.get("ml_engineer_runbook")
-    if not isinstance(ml_engineer_runbook, dict):
+    if not isinstance(ml_engineer_runbook, (dict, list)):
         ml_engineer_runbook = {}
     allowed_feature_sets = contract_full.get("allowed_feature_sets")
     if not isinstance(allowed_feature_sets, dict):

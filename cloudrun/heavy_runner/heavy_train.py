@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import joblib
 import numpy as np
@@ -48,6 +48,16 @@ def _ensure_text(value: Optional[Any]) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
+
+
+def _normalize_rel_path(path: Any) -> str:
+    """Normalize a relative artifact path to portable slash-separated form."""
+    if path is None:
+        return ""
+    normalized = str(path).strip().lstrip("/").replace("\\", "/")
+    while "//" in normalized:
+        normalized = normalized.replace("//", "/")
+    return normalized
 
 
 def _parse_gs_uri(uri: str) -> Tuple[str, str]:
@@ -213,9 +223,11 @@ def _collect_output_files(work_dir: str, skip_paths: Optional[set[str]] = None) 
         "data",
         os.path.join("static", "plots"),
         "report",
+        "reports",
         "artifacts",
+        "models",
     ]
-    skip = set(skip_paths or set())
+    skip = {_normalize_rel_path(path) for path in (skip_paths or set()) if path}
     collected = []
     for root in roots:
         base = os.path.join(work_dir, root)
@@ -225,11 +237,37 @@ def _collect_output_files(work_dir: str, skip_paths: Optional[set[str]] = None) 
             for name in filenames:
                 path = os.path.join(dirpath, name)
                 rel = os.path.relpath(path, work_dir)
-                rel_norm = rel.replace("\\", "/")
+                rel_norm = _normalize_rel_path(rel)
                 if rel_norm in skip:
                     continue
                 collected.append(rel_norm)
     return sorted(set(collected))
+
+
+def _collect_existing_required_outputs(
+    work_dir: str,
+    required: List[str],
+    skip_paths: Optional[Set[str]] = None,
+) -> List[str]:
+    """
+    Collect contract-required outputs that exist, even if produced outside scan roots.
+
+    This keeps upload behavior aligned to contract.required_outputs instead of
+    relying on static folder heuristics.
+    """
+    required_existing: List[str] = []
+    skip = {_normalize_rel_path(path) for path in (skip_paths or set()) if path}
+    work_dir_abs = os.path.abspath(work_dir)
+    for rel_path in required:
+        rel_norm = _normalize_rel_path(rel_path)
+        if not rel_norm or rel_norm in skip:
+            continue
+        full_path = os.path.abspath(os.path.join(work_dir, rel_norm))
+        if not (full_path == work_dir_abs or full_path.startswith(work_dir_abs + os.sep)):
+            continue
+        if os.path.isfile(full_path):
+            required_existing.append(rel_norm)
+    return sorted(set(required_existing))
 
 
 def _check_required_outputs(work_dir: str, required: List[str]) -> Tuple[List[str], List[str]]:
@@ -242,11 +280,14 @@ def _check_required_outputs(work_dir: str, required: List[str]) -> Tuple[List[st
     present = []
     missing = []
     for rel_path in required:
-        full_path = os.path.join(work_dir, rel_path)
+        rel_norm = _normalize_rel_path(rel_path)
+        if not rel_norm:
+            continue
+        full_path = os.path.join(work_dir, rel_norm)
         if os.path.exists(full_path):
-            present.append(rel_path)
+            present.append(rel_norm)
         else:
-            missing.append(rel_path)
+            missing.append(rel_norm)
     return present, missing
 
 
@@ -261,21 +302,19 @@ def _resolve_execute_code_mode(payload: Dict[str, Any]) -> Tuple[str, List[str],
     required_payload = payload.get("required_outputs")
     required = []
     if isinstance(required_payload, list):
-        required = [
-            str(path).strip().lstrip("/").replace("\\", "/")
-            for path in required_payload
-            if path
-        ]
+        required = [_normalize_rel_path(path) for path in required_payload if path]
+        required = [path for path in required if path]
+        required = list(dict.fromkeys(required))
     # Accept both legacy and explicit DE mode tags.
     if mode in {"data_engineer_cleaning", "data_engineer"}:
         mode = "data_engineer_cleaning"
         # Contract-driven required outputs for DE are supplied by orchestrator.
-        skip_paths = {os.path.join("data", "cleaned_full.csv")}
+        skip_paths = {"data/cleaned_full.csv"}
         return mode, required, skip_paths
     # For ML, treat cleaned datasets as input artifacts to avoid re-upload noise.
     skip_paths = {
-        os.path.join("data", "cleaned_data.csv"),
-        os.path.join("data", "cleaned_full.csv"),
+        "data/cleaned_data.csv",
+        "data/cleaned_full.csv",
     }
     return mode, required, skip_paths
 
@@ -400,6 +439,14 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     # Collect and upload outputs
     log("Collecting output files...")
     collected_outputs = _collect_output_files(work_dir, skip_paths=skip_paths)
+    collected_outputs.extend(
+        _collect_existing_required_outputs(
+            work_dir=work_dir,
+            required=required_outputs,
+            skip_paths=skip_paths,
+        )
+    )
+    collected_outputs = sorted(set(collected_outputs))
     log(f"Found {len(collected_outputs)} output files")
 
     uploaded = []
