@@ -2381,6 +2381,147 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                 )
             )
 
+    # Contract-to-view executability checks (fail-closed): if the contract is accepted,
+    # projected runtime views must be executable without additional deterministic repairs.
+    try:
+        from src.utils.contract_views import build_contract_views_projection
+
+        projected_views = build_contract_views_projection(contract, artifact_index=[])
+
+        if requires_cleaning:
+            de_view = projected_views.get("de_view") if isinstance(projected_views, dict) else None
+            if not isinstance(de_view, dict) or not de_view:
+                issues.append(
+                    _strict_issue(
+                        "contract.de_view_missing",
+                        "error",
+                        "de_view could not be projected from contract.",
+                        "de_view",
+                    )
+                )
+            else:
+                de_output_path = str(de_view.get("output_path") or "").strip()
+                de_manifest_path = str(
+                    de_view.get("output_manifest_path") or de_view.get("manifest_path") or ""
+                ).strip()
+                if not de_output_path or not is_file_path(de_output_path):
+                    issues.append(
+                        _strict_issue(
+                            "contract.de_view_output_path",
+                            "error",
+                            "de_view.output_path must be a valid artifact file path.",
+                            de_output_path or None,
+                        )
+                    )
+                if not de_manifest_path or not is_file_path(de_manifest_path):
+                    issues.append(
+                        _strict_issue(
+                            "contract.de_view_manifest_path",
+                            "error",
+                            "de_view.output_manifest_path must be a valid artifact file path.",
+                            de_manifest_path or None,
+                        )
+                    )
+                required_cols = de_view.get("required_columns")
+                if not isinstance(required_cols, list) or not any(
+                    isinstance(col, str) and col.strip() for col in required_cols
+                ):
+                    issues.append(
+                        _strict_issue(
+                            "contract.de_view_required_columns",
+                            "error",
+                            "de_view.required_columns must be a non-empty list.",
+                            required_cols,
+                        )
+                    )
+
+        if requires_ml:
+            ml_view = projected_views.get("ml_view") if isinstance(projected_views, dict) else None
+            reviewer_view = projected_views.get("reviewer_view") if isinstance(projected_views, dict) else None
+            qa_view = projected_views.get("qa_view") if isinstance(projected_views, dict) else None
+
+            if not isinstance(ml_view, dict) or not ml_view:
+                issues.append(
+                    _strict_issue(
+                        "contract.ml_view_missing",
+                        "error",
+                        "ml_view could not be projected from contract.",
+                        "ml_view",
+                    )
+                )
+            else:
+                objective_type = str(ml_view.get("objective_type") or "").strip().lower()
+                if not objective_type or objective_type == "unknown":
+                    issues.append(
+                        _strict_issue(
+                            "contract.ml_view_objective_type",
+                            "error",
+                            "ml_view.objective_type is unknown; set objective_analysis.problem_type or evaluation_spec.objective_type.",
+                            objective_type or None,
+                        )
+                    )
+                column_roles = ml_view.get("column_roles")
+                if not isinstance(column_roles, dict) or not column_roles:
+                    issues.append(
+                        _strict_issue(
+                            "contract.ml_view_column_roles",
+                            "error",
+                            "ml_view.column_roles must be a non-empty role mapping.",
+                            column_roles,
+                        )
+                    )
+
+            if not isinstance(reviewer_view, dict) or not reviewer_view:
+                issues.append(
+                    _strict_issue(
+                        "contract.reviewer_view_missing",
+                        "error",
+                        "reviewer_view could not be projected from contract.",
+                        "reviewer_view",
+                    )
+                )
+            else:
+                reviewer_gates = reviewer_view.get("reviewer_gates")
+                if not isinstance(reviewer_gates, list) or not reviewer_gates:
+                    issues.append(
+                        _strict_issue(
+                            "contract.reviewer_view_gates",
+                            "error",
+                            "reviewer_view.reviewer_gates is empty after projection.",
+                            reviewer_gates,
+                        )
+                    )
+
+            if not isinstance(qa_view, dict) or not qa_view:
+                issues.append(
+                    _strict_issue(
+                        "contract.qa_view_missing",
+                        "error",
+                        "qa_view could not be projected from contract.",
+                        "qa_view",
+                    )
+                )
+            else:
+                qa_gates = qa_view.get("qa_gates")
+                if not isinstance(qa_gates, list) or not qa_gates:
+                    issues.append(
+                        _strict_issue(
+                            "contract.qa_view_gates",
+                            "error",
+                            "qa_view.qa_gates is empty after projection.",
+                            qa_gates,
+                        )
+                    )
+    except Exception as projection_err:
+        issues.append(
+            _strict_issue(
+                "contract.view_projection_exception",
+                "error",
+                "Failed to validate projected contract views.",
+                str(projection_err),
+            )
+        )
+
     if "iteration_policy" not in contract:
         issues.append(
             _strict_issue(

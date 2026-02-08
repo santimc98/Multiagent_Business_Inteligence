@@ -180,20 +180,27 @@ Minimal contract interface:
 - output_dialect: object (csv sep/decimal/encoding when known)
 - canonical_columns: list[str]
 - required_outputs: list[str] file paths
+- column_roles: object mapping role -> list[str]
+- artifact_requirements: object
 
 Scope-dependent required fields:
 - If scope includes cleaning ("cleaning_only" or "full_pipeline"):
   - cleaning_gates: list (gate objects or labels)
   - data_engineer_runbook: object/list/string with actionable steps
+  - artifact_requirements.clean_dataset.required_columns: list[str]
+  - artifact_requirements.clean_dataset.output_path: file path for cleaned CSV
+  - artifact_requirements.clean_dataset.output_manifest_path (or manifest_path): file path for cleaning manifest JSON
 - If scope includes ML ("ml_only" or "full_pipeline"):
   - qa_gates: list
   - reviewer_gates: list
   - validation_requirements: object
   - ml_engineer_runbook: object/list/string with actionable steps
+  - objective_analysis.problem_type OR evaluation_spec.objective_type must be present
 
 Hard rules:
 - Do not invent columns not present in column_inventory.
 - required_outputs must be artifact paths, never conceptual labels.
+- Keep de_view executable from contract alone: include both cleaned output CSV and cleaning manifest JSON paths.
 - Keep contract coherent with strategy + business objective.
 - You may add extra fields if useful, but do not omit required minimum fields.
 """
@@ -6094,6 +6101,25 @@ class ExecutionPlannerAgent:
                 lines.append(f"- ... ({len(issues) - max_issues} more issues)")
             return "\n".join(lines) if lines else "No issues reported."
 
+        def _validate_contract_quality(contract_payload: Dict[str, Any] | None) -> Dict[str, Any]:
+            base_result: Dict[str, Any]
+            try:
+                base_result = validate_contract_minimal_readonly(copy.deepcopy(contract_payload or {}))
+            except Exception as val_err:
+                base_result = {
+                    "status": "error",
+                    "accepted": False,
+                    "issues": [
+                        {
+                            "severity": "error",
+                            "rule": "contract_validation_exception",
+                            "message": str(val_err),
+                        }
+                    ],
+                    "summary": {"error_count": 1, "warning_count": 0},
+                }
+            return base_result
+
         def _build_quality_repair_prompt(
             *,
             previous_contract: Dict[str, Any] | None,
@@ -6109,6 +6135,8 @@ class ExecutionPlannerAgent:
                 "output_dialect",
                 "canonical_columns",
                 "required_outputs",
+                "column_roles",
+                "artifact_requirements",
             ]
             validation_feedback = _compact_validation_feedback(previous_validation)
             parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
@@ -6124,6 +6152,8 @@ class ExecutionPlannerAgent:
                 "Do not invent columns outside column_inventory.\n"
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
+                "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
+                "For ML scopes, ensure objective_analysis.problem_type (or evaluation_spec.objective_type) and non-empty column_roles.\n"
                 "Top-level required keys (all mandatory): "
                 + json.dumps(required_top_level)
                 + "\n\nORIGINAL INPUTS (source of truth):\n"
@@ -6142,6 +6172,8 @@ class ExecutionPlannerAgent:
             "business_objective": str,
             "output_dialect": dict,
             "canonical_columns": list,
+            "column_roles": dict,
+            "artifact_requirements": dict,
             "required_outputs": list,
             "cleaning_gates": list,
             "qa_gates": list,
@@ -6149,6 +6181,8 @@ class ExecutionPlannerAgent:
             "validation_requirements": dict,
             "data_engineer_runbook": (dict, list, str),
             "ml_engineer_runbook": (dict, list, str),
+            "objective_analysis": dict,
+            "evaluation_spec": dict,
             "iteration_policy": dict,
         }
         _SCOPE_VALUES = {"cleaning_only", "ml_only", "full_pipeline"}
@@ -6245,11 +6279,45 @@ class ExecutionPlannerAgent:
                             f"{section_id}: required_outputs entries must be file paths; invalid={invalid_outputs[:5]}"
                         )
 
+                column_roles = payload.get("column_roles")
+                if not isinstance(column_roles, dict) or not column_roles:
+                    errors.append(f"{section_id}: column_roles must be a non-empty object")
+
+                artifact_requirements = payload.get("artifact_requirements")
+                if not isinstance(artifact_requirements, dict) or not artifact_requirements:
+                    errors.append(f"{section_id}: artifact_requirements must be a non-empty object")
+
             if section_id == "cleaning_contract" and _scope_requires_cleaning(candidate_scope):
                 if not _gate_list_valid(payload.get("cleaning_gates")):
                     errors.append(f"{section_id}: cleaning_gates must be a non-empty list")
                 if not _runbook_non_empty(payload.get("data_engineer_runbook")):
                     errors.append(f"{section_id}: data_engineer_runbook must be non-empty")
+
+                artifact_requirements = payload.get("artifact_requirements")
+                if isinstance(artifact_requirements, dict):
+                    clean_dataset = artifact_requirements.get("clean_dataset")
+                else:
+                    clean_dataset = None
+                if not isinstance(clean_dataset, dict):
+                    errors.append(
+                        f"{section_id}: artifact_requirements.clean_dataset must exist for cleaning scope"
+                    )
+                else:
+                    output_path = clean_dataset.get("output_path") or clean_dataset.get("output")
+                    manifest_path = clean_dataset.get("output_manifest_path") or clean_dataset.get("manifest_path")
+                    if not isinstance(output_path, str) or not is_file_path(output_path.strip()):
+                        errors.append(
+                            f"{section_id}: artifact_requirements.clean_dataset.output_path must be a file path"
+                        )
+                    if not isinstance(manifest_path, str) or not is_file_path(manifest_path.strip()):
+                        errors.append(
+                            f"{section_id}: artifact_requirements.clean_dataset.output_manifest_path must be a file path"
+                        )
+                    req_cols = clean_dataset.get("required_columns")
+                    if not isinstance(req_cols, list) or not any(isinstance(col, str) and col.strip() for col in req_cols):
+                        errors.append(
+                            f"{section_id}: artifact_requirements.clean_dataset.required_columns must be non-empty list"
+                        )
 
             if section_id == "ml_contract" and _scope_requires_ml(candidate_scope):
                 if not _gate_list_valid(payload.get("qa_gates")):
@@ -6261,6 +6329,19 @@ class ExecutionPlannerAgent:
                     errors.append(f"{section_id}: validation_requirements must be a non-empty object")
                 if not _runbook_non_empty(payload.get("ml_engineer_runbook")):
                     errors.append(f"{section_id}: ml_engineer_runbook must be non-empty")
+                objective_analysis = payload.get("objective_analysis")
+                eval_spec = payload.get("evaluation_spec")
+                objective_ok = False
+                if isinstance(objective_analysis, dict):
+                    problem_type = objective_analysis.get("problem_type")
+                    objective_ok = isinstance(problem_type, str) and bool(problem_type.strip())
+                if not objective_ok and isinstance(eval_spec, dict):
+                    objective_type = eval_spec.get("objective_type")
+                    objective_ok = isinstance(objective_type, str) and bool(objective_type.strip())
+                if not objective_ok:
+                    errors.append(
+                        f"{section_id}: objective_analysis.problem_type or evaluation_spec.objective_type must be present for ML scope"
+                    )
 
             return errors
 
@@ -6333,6 +6414,8 @@ class ExecutionPlannerAgent:
                 "Use only data from ORIGINAL INPUTS; do not invent columns.\n"
                 "Keep semantics aligned with strategy/business objective.\n"
                 "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
+                "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
+                "For ML scope, objective_analysis.problem_type and non-empty column_roles are required.\n"
                 f"Required keys for this section: {json.dumps(required_keys)}\n"
                 "If this section has no required keys for the selected scope, return {}.\n\n"
                 "ORIGINAL INPUTS:\n"
@@ -6364,6 +6447,8 @@ class ExecutionPlannerAgent:
                 "Use ORIGINAL INPUTS as source of truth and keep compatibility with CURRENT CONTRACT DRAFT.\n"
                 "Do not invent columns not present in column_inventory.\n\n"
                 "Use artifact file paths for required_outputs.\n\n"
+                "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
+                "For ML scope, include objective_analysis.problem_type and non-empty column_roles.\n\n"
                 "ORIGINAL INPUTS:\n"
                 + (original_inputs_text or "")
                 + "\n\nCURRENT CONTRACT DRAFT:\n"
@@ -6385,30 +6470,34 @@ class ExecutionPlannerAgent:
             section_specs: List[Dict[str, Any]] = [
                 {
                     "id": "core",
-                    "goal": "Define minimal contract identity, declared scope, columns, and required output artifacts.",
+                    "goal": "Define minimal contract identity, declared scope, columns, roles, and output artifact requirements.",
                     "required_keys": [
                         "scope",
                         "strategy_title",
                         "business_objective",
                         "output_dialect",
                         "canonical_columns",
+                        "column_roles",
+                        "artifact_requirements",
                         "required_outputs",
                     ],
                     "optional": False,
                 },
                 {
                     "id": "cleaning_contract",
-                    "goal": "Define cleaning gates and data engineer runbook when scope includes cleaning.",
+                    "goal": "Define cleaning gates, DE runbook, and clean_dataset artifact paths when scope includes cleaning.",
                     "required_keys": [
                         "cleaning_gates",
                         "data_engineer_runbook",
+                        "artifact_requirements",
                     ],
                     "optional": False,
                 },
                 {
                     "id": "ml_contract",
-                    "goal": "Define ML QA/reviewer gates, validation requirements, and ML runbook when scope includes ML.",
+                    "goal": "Define ML objective type, QA/reviewer gates, validation requirements, and ML runbook when scope includes ML.",
                     "required_keys": [
+                        "objective_analysis",
                         "qa_gates",
                         "reviewer_gates",
                         "validation_requirements",
@@ -6621,7 +6710,7 @@ class ExecutionPlannerAgent:
                 return diagnostics
 
             try:
-                validation_result = validate_contract_minimal_readonly(copy.deepcopy(contract))
+                validation_result = _validate_contract_quality(copy.deepcopy(contract))
             except Exception as err:
                 validation_result = {
                     "status": "error",
@@ -6653,6 +6742,26 @@ class ExecutionPlannerAgent:
                             print(f"  - [{issue.get('severity')}] {issue.get('rule')}: {issue.get('message')}")
 
             diagnostics["validation"] = validation_result if isinstance(validation_result, dict) else {}
+            error_rules: List[str] = []
+            warning_rules: List[str] = []
+            if isinstance(issues, list):
+                for issue in issues:
+                    if not isinstance(issue, dict):
+                        continue
+                    rule = str(issue.get("rule") or "").strip()
+                    if not rule:
+                        continue
+                    severity = str(issue.get("severity") or "").lower()
+                    if severity in {"error", "fail"}:
+                        if rule not in error_rules:
+                            error_rules.append(rule)
+                    elif severity == "warning":
+                        if rule not in warning_rules:
+                            warning_rules.append(rule)
+            diagnostics["quality_profile"] = {
+                "top_error_rules": error_rules[:8],
+                "top_warning_rules": warning_rules[:8],
+            }
             diagnostics["summary"] = {
                 "status": status,
                 "issue_count": len(issues) if isinstance(issues, list) else 0,
@@ -6783,6 +6892,7 @@ domain_expert_critique:
         best_response_text: str | None = None
         best_parse_feedback: str | None = None
         best_error_count: Optional[int] = None
+        best_warning_count: Optional[int] = None
 
         max_quality_rounds = 3
         try:
@@ -6846,7 +6956,7 @@ domain_expert_critique:
                 if parsed is not None and isinstance(parsed, dict):
                     round_has_candidate = True
                     try:
-                        validation_result = validate_contract_minimal_readonly(copy.deepcopy(parsed))
+                        validation_result = _validate_contract_quality(copy.deepcopy(parsed))
                     except Exception as val_err:
                         validation_result = {
                             "status": "error",
@@ -6862,18 +6972,42 @@ domain_expert_critique:
                         }
                     quality_accepted = _contract_is_accepted(validation_result)
                     if not quality_accepted:
-                        quality_error_message = "contract_quality_failed"
+                        primary_rule = None
+                        issues = validation_result.get("issues") if isinstance(validation_result, dict) else None
+                        if isinstance(issues, list):
+                            for issue in issues:
+                                if isinstance(issue, dict) and issue.get("rule"):
+                                    primary_rule = str(issue.get("rule"))
+                                    break
+                        quality_error_message = (
+                            f"contract_quality_failed:{primary_rule}"
+                            if primary_rule
+                            else "contract_quality_failed"
+                        )
                         summary = validation_result.get("summary") if isinstance(validation_result, dict) else {}
                         error_count = (
                             int(summary.get("error_count", 0))
                             if isinstance(summary, dict)
                             else 0
                         )
-                        if best_error_count is None or error_count < best_error_count:
+                        warning_count = (
+                            int(summary.get("warning_count", 0))
+                            if isinstance(summary, dict)
+                            else 0
+                        )
+                        if (
+                            best_error_count is None
+                            or error_count < best_error_count
+                            or (
+                                error_count == best_error_count
+                                and (best_warning_count is None or warning_count < best_warning_count)
+                            )
+                        ):
                             best_candidate = parsed
                             best_validation = validation_result
                             best_response_text = response_text
                             best_error_count = error_count
+                            best_warning_count = warning_count
                             best_parse_feedback = None
                 else:
                     parse_feedback = _build_parse_feedback(response_text, parse_error)
@@ -6895,6 +7029,25 @@ domain_expert_critique:
                         "parse_error_message": str(parse_error) if parse_error else None,
                         "quality_status": (
                             str(validation_result.get("status") or "").lower()
+                            if isinstance(validation_result, dict)
+                            else None
+                        ),
+                        "quality_issue_rules": (
+                            [
+                                str(issue.get("rule"))
+                                for issue in (validation_result.get("issues") or [])
+                                if isinstance(issue, dict) and issue.get("rule")
+                            ][:12]
+                            if isinstance(validation_result, dict)
+                            else []
+                        ),
+                        "quality_error_count": (
+                            int((validation_result.get("summary") or {}).get("error_count", 0))
+                            if isinstance(validation_result, dict)
+                            else None
+                        ),
+                        "quality_warning_count": (
+                            int((validation_result.get("summary") or {}).get("warning_count", 0))
                             if isinstance(validation_result, dict)
                             else None
                         ),
@@ -6976,7 +7129,7 @@ domain_expert_critique:
             sectional_accepted = False
             if isinstance(sectional_contract, dict) and sectional_contract:
                 try:
-                    sectional_validation = validate_contract_minimal_readonly(copy.deepcopy(sectional_contract))
+                    sectional_validation = _validate_contract_quality(copy.deepcopy(sectional_contract))
                 except Exception as section_val_err:
                     sectional_validation = {
                         "status": "error",

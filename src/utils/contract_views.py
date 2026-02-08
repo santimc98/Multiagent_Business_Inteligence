@@ -1306,7 +1306,9 @@ def _project_objective_type(contract_full: Dict[str, Any]) -> str:
     evaluation_spec = contract_full.get("evaluation_spec")
     if isinstance(evaluation_spec, dict) and evaluation_spec.get("objective_type"):
         return str(evaluation_spec.get("objective_type"))
-    return "unknown"
+    required_outputs = _project_required_outputs(contract_full)
+    inferred = _infer_objective_from_outputs(required_outputs)
+    return inferred or "unknown"
 
 
 def _project_required_outputs(contract_full: Dict[str, Any]) -> List[str]:
