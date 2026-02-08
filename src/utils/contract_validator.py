@@ -46,6 +46,31 @@ STRICT_ROLE_BUCKETS = {
 }
 
 CONTRACT_SCOPE_VALUES = {"cleaning_only", "ml_only", "full_pipeline"}
+SCOPE_ALIAS_VALUES = {
+    "cleaning",
+    "clean",
+    "clean_only",
+    "ml",
+    "training",
+    "modeling",
+    "model_only",
+}
+
+ITERATION_POLICY_LIMIT_KEYS = (
+    "max_iterations",
+    "metric_improvement_max",
+    "runtime_fix_max",
+    "compliance_bootstrap_max",
+)
+
+ITERATION_POLICY_LIMIT_ALIASES = (
+    "max_pipeline_iterations",
+    "max_model_iterations",
+    "max_iter",
+    "gate_retry_limit",
+    "runtime_retry_limit",
+    "max_runtime_retries",
+)
 
 # Role synonym mapping for normalization
 ROLE_SYNONYM_MAP = {
@@ -2240,14 +2265,25 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             )
         )
     elif str(scope_raw).strip().lower() not in CONTRACT_SCOPE_VALUES:
-        issues.append(
-            _strict_issue(
-                "contract.scope_unknown",
-                "error",
-                f"Unknown scope '{scope_raw}'. Normalized to '{scope}'.",
-                scope_raw,
+        token = str(scope_raw).strip().lower()
+        if token in SCOPE_ALIAS_VALUES:
+            issues.append(
+                _strict_issue(
+                    "contract.scope_alias_normalized",
+                    "warning",
+                    f"Scope alias '{scope_raw}' normalized to '{scope}'.",
+                    scope_raw,
+                )
             )
-        )
+        else:
+            issues.append(
+                _strict_issue(
+                    "contract.scope_unknown",
+                    "error",
+                    f"Unknown scope '{scope_raw}'. Normalized to '{scope}'.",
+                    scope_raw,
+                )
+            )
 
     strategy_title = contract.get("strategy_title")
     if not isinstance(strategy_title, str) or not strategy_title.strip():
@@ -2328,8 +2364,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.cleaning_gates",
-                    "error",
-                    "cleaning_gates must be a non-empty list of gate objects/labels for cleaning scope.",
+                    "warning",
+                    "cleaning_gates missing/empty for cleaning scope; execution can continue with reduced QA control.",
                     contract.get("cleaning_gates"),
                 )
             )
@@ -2337,8 +2373,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.data_engineer_runbook",
-                    "error",
-                    "data_engineer_runbook must be provided for cleaning scope.",
+                    "warning",
+                    "data_engineer_runbook missing for cleaning scope; execution may rely on generic behavior.",
                     contract.get("data_engineer_runbook"),
                 )
             )
@@ -2349,8 +2385,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.evaluation_spec",
-                    "error",
-                    "evaluation_spec must be a non-empty object for ML scope.",
+                    "warning",
+                    "evaluation_spec missing/empty for ML scope; reviewers may use reduced context.",
                     evaluation_spec,
                 )
             )
@@ -2358,8 +2394,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.qa_gates",
-                    "error",
-                    "qa_gates must be a non-empty list for ML scope.",
+                    "warning",
+                    "qa_gates missing/empty for ML scope; QA depth is reduced.",
                     contract.get("qa_gates"),
                 )
             )
@@ -2367,8 +2403,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.reviewer_gates",
-                    "error",
-                    "reviewer_gates must be a non-empty list for ML scope.",
+                    "warning",
+                    "reviewer_gates missing/empty for ML scope; review depth is reduced.",
                     contract.get("reviewer_gates"),
                 )
             )
@@ -2376,8 +2412,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.validation_requirements",
-                    "error",
-                    "validation_requirements must be a non-empty object for ML scope.",
+                    "warning",
+                    "validation_requirements missing/empty for ML scope; benchmark traceability may be reduced.",
                     contract.get("validation_requirements"),
                 )
             )
@@ -2385,8 +2421,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.ml_engineer_runbook",
-                    "error",
-                    "ml_engineer_runbook must be provided for ML scope.",
+                    "warning",
+                    "ml_engineer_runbook missing for ML scope; execution may rely on generic behavior.",
                     contract.get("ml_engineer_runbook"),
                 )
             )
@@ -2496,7 +2532,7 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                     issues.append(
                         _strict_issue(
                             "contract.reviewer_view_gates",
-                            "error",
+                            "warning",
                             "reviewer_view.reviewer_gates is empty after projection.",
                             reviewer_gates,
                         )
@@ -2517,7 +2553,7 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                     issues.append(
                         _strict_issue(
                             "contract.qa_view_gates",
-                            "error",
+                            "warning",
                             "qa_view.qa_gates is empty after projection.",
                             qa_gates,
                         )
@@ -2537,19 +2573,22 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
         issues.append(
             _strict_issue(
                 "contract.iteration_policy",
-                "error",
-                "iteration_policy must be a non-empty object.",
+                "warning",
+                "iteration_policy missing/empty; runtime will use default iteration behavior.",
                 iteration_policy,
             )
         )
     else:
+        limit_keys = list(ITERATION_POLICY_LIMIT_KEYS) + list(ITERATION_POLICY_LIMIT_ALIASES)
         policy_has_limit = False
-        for key in ("max_iterations", "metric_improvement_max", "runtime_fix_max", "compliance_bootstrap_max"):
+        canonical_present = any(key in iteration_policy for key in ITERATION_POLICY_LIMIT_KEYS)
+        alias_present = any(key in iteration_policy for key in ITERATION_POLICY_LIMIT_ALIASES)
+        for key in limit_keys:
             if key not in iteration_policy:
                 continue
             value = iteration_policy.get(key)
             try:
-                if int(value) >= 1:
+                if float(value) >= 1:
                     policy_has_limit = True
                     break
             except Exception:
@@ -2558,9 +2597,18 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.iteration_policy_limits",
-                    "error",
-                    "iteration_policy must declare at least one numeric iteration limit >= 1.",
+                    "warning",
+                    "iteration_policy has no numeric iteration limit >= 1; runtime will use defaults.",
                     iteration_policy,
+                )
+            )
+        elif alias_present and not canonical_present:
+            issues.append(
+                _strict_issue(
+                    "contract.iteration_policy_alias",
+                    "warning",
+                    "iteration_policy uses non-canonical limit keys; accepted with runtime alias mapping.",
+                    [key for key in ITERATION_POLICY_LIMIT_ALIASES if key in iteration_policy],
                 )
             )
 

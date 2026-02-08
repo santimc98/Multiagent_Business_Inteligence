@@ -3072,10 +3072,21 @@ def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
     compliance_max = policy.get("compliance_bootstrap_max")
     metric_max = policy.get("metric_improvement_max")
     runtime_max = policy.get("runtime_fix_max")
+    if compliance_max is None:
+        for alias in ("compliance_retry_limit",):
+            if policy.get(alias) is not None:
+                compliance_max = policy.get(alias)
+                break
     if metric_max is None:
-        legacy_max = policy.get("max_iterations")
-        if legacy_max is not None:
-            metric_max = legacy_max
+        for alias in ("max_iterations", "max_pipeline_iterations", "max_model_iterations", "max_iter"):
+            if policy.get(alias) is not None:
+                metric_max = policy.get(alias)
+                break
+    if runtime_max is None:
+        for alias in ("gate_retry_limit", "runtime_retry_limit", "max_runtime_retries"):
+            if policy.get(alias) is not None:
+                runtime_max = policy.get(alias)
+                break
     plateau_window = policy.get("plateau_window")
     plateau_epsilon = policy.get("plateau_epsilon")
     out: Dict[str, Any] = {}

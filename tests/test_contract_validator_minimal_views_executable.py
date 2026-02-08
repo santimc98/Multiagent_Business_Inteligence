@@ -96,23 +96,37 @@ def test_validate_contract_minimal_readonly_accepts_executable_views_contract():
     assert str(result.get("status")).lower() in {"ok", "warning"}
 
 
-def test_validate_contract_minimal_readonly_rejects_missing_iteration_policy():
+def test_validate_contract_minimal_readonly_allows_missing_iteration_policy_with_warning():
     contract = _base_full_pipeline_contract()
     contract.pop("iteration_policy", None)
 
     result = validate_contract_minimal_readonly(contract)
 
-    assert result.get("accepted") is False
+    assert result.get("accepted") is True
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.iteration_policy" in rules
 
 
-def test_validate_contract_minimal_readonly_rejects_missing_evaluation_spec_for_ml_scope():
+def test_validate_contract_minimal_readonly_allows_missing_evaluation_spec_for_ml_scope_with_warning():
     contract = _base_full_pipeline_contract()
     contract.pop("evaluation_spec", None)
 
     result = validate_contract_minimal_readonly(contract)
 
-    assert result.get("accepted") is False
+    assert result.get("accepted") is True
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.evaluation_spec" in rules
+
+
+def test_validate_contract_minimal_readonly_accepts_iteration_policy_alias_keys():
+    contract = _base_full_pipeline_contract()
+    contract["iteration_policy"] = {
+        "max_pipeline_iterations": 3,
+        "gate_retry_limit": 2,
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is True
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.iteration_policy_limits" not in rules

@@ -6187,7 +6187,7 @@ class ExecutionPlannerAgent:
             "ml_engineer_runbook": (dict, list, str),
             "objective_analysis": dict,
             "evaluation_spec": dict,
-            "iteration_policy": dict,
+            "iteration_policy": (dict, str),
         }
         _SCOPE_VALUES = {"cleaning_only", "ml_only", "full_pipeline"}
 
@@ -6292,21 +6292,8 @@ class ExecutionPlannerAgent:
                     errors.append(f"{section_id}: artifact_requirements must be a non-empty object")
 
                 iteration_policy = payload.get("iteration_policy")
-                if not isinstance(iteration_policy, dict) or not iteration_policy:
-                    errors.append(f"{section_id}: iteration_policy must be a non-empty object")
-                elif not any(
-                    key in iteration_policy
-                    for key in (
-                        "max_iterations",
-                        "metric_improvement_max",
-                        "runtime_fix_max",
-                        "compliance_bootstrap_max",
-                    )
-                ):
-                    errors.append(
-                        f"{section_id}: iteration_policy must declare at least one numeric iteration limit "
-                        "(e.g., max_iterations or runtime_fix_max)"
-                    )
+                if isinstance(iteration_policy, str) and not iteration_policy.strip():
+                    errors.append(f"{section_id}: iteration_policy string cannot be blank")
 
             if section_id == "cleaning_contract" and _scope_requires_cleaning(candidate_scope):
                 if not _gate_list_valid(payload.get("cleaning_gates")):
@@ -6342,8 +6329,8 @@ class ExecutionPlannerAgent:
 
             if section_id == "ml_contract" and _scope_requires_ml(candidate_scope):
                 eval_spec = payload.get("evaluation_spec")
-                if not isinstance(eval_spec, dict) or not eval_spec:
-                    errors.append(f"{section_id}: evaluation_spec must be a non-empty object for ML scope")
+                if eval_spec is not None and not isinstance(eval_spec, dict):
+                    errors.append(f"{section_id}: evaluation_spec must be an object when provided")
                 if not _gate_list_valid(payload.get("qa_gates")):
                     errors.append(f"{section_id}: qa_gates must be a non-empty list")
                 if not _gate_list_valid(payload.get("reviewer_gates")):
@@ -6524,7 +6511,6 @@ class ExecutionPlannerAgent:
                     "goal": "Define ML objective type, QA/reviewer gates, validation requirements, and ML runbook when scope includes ML.",
                     "required_keys": [
                         "objective_analysis",
-                        "evaluation_spec",
                         "qa_gates",
                         "reviewer_gates",
                         "validation_requirements",
