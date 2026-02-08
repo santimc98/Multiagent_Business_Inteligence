@@ -182,6 +182,7 @@ Minimal contract interface:
 - required_outputs: list[str] file paths
 - column_roles: object mapping role -> list[str]
 - artifact_requirements: object
+- iteration_policy: object with practical retry/iteration limits (small, numeric, and actionable)
 
 Scope-dependent required fields:
 - If scope includes cleaning ("cleaning_only" or "full_pipeline"):
@@ -195,6 +196,7 @@ Scope-dependent required fields:
   - reviewer_gates: list
   - validation_requirements: object
   - ml_engineer_runbook: object/list/string with actionable steps
+  - evaluation_spec: non-empty object for ML execution/review context
   - objective_analysis.problem_type OR evaluation_spec.objective_type must be present
 
 Hard rules:
@@ -6137,6 +6139,7 @@ class ExecutionPlannerAgent:
                 "required_outputs",
                 "column_roles",
                 "artifact_requirements",
+                "iteration_policy",
             ]
             validation_feedback = _compact_validation_feedback(previous_validation)
             parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
@@ -6153,7 +6156,8 @@ class ExecutionPlannerAgent:
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
                 "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
-                "For ML scopes, ensure objective_analysis.problem_type (or evaluation_spec.objective_type) and non-empty column_roles.\n"
+                "For ML scopes, include non-empty evaluation_spec and ensure objective_analysis.problem_type "
+                "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
                 "Top-level required keys (all mandatory): "
                 + json.dumps(required_top_level)
                 + "\n\nORIGINAL INPUTS (source of truth):\n"
@@ -6287,6 +6291,23 @@ class ExecutionPlannerAgent:
                 if not isinstance(artifact_requirements, dict) or not artifact_requirements:
                     errors.append(f"{section_id}: artifact_requirements must be a non-empty object")
 
+                iteration_policy = payload.get("iteration_policy")
+                if not isinstance(iteration_policy, dict) or not iteration_policy:
+                    errors.append(f"{section_id}: iteration_policy must be a non-empty object")
+                elif not any(
+                    key in iteration_policy
+                    for key in (
+                        "max_iterations",
+                        "metric_improvement_max",
+                        "runtime_fix_max",
+                        "compliance_bootstrap_max",
+                    )
+                ):
+                    errors.append(
+                        f"{section_id}: iteration_policy must declare at least one numeric iteration limit "
+                        "(e.g., max_iterations or runtime_fix_max)"
+                    )
+
             if section_id == "cleaning_contract" and _scope_requires_cleaning(candidate_scope):
                 if not _gate_list_valid(payload.get("cleaning_gates")):
                     errors.append(f"{section_id}: cleaning_gates must be a non-empty list")
@@ -6320,6 +6341,9 @@ class ExecutionPlannerAgent:
                         )
 
             if section_id == "ml_contract" and _scope_requires_ml(candidate_scope):
+                eval_spec = payload.get("evaluation_spec")
+                if not isinstance(eval_spec, dict) or not eval_spec:
+                    errors.append(f"{section_id}: evaluation_spec must be a non-empty object for ML scope")
                 if not _gate_list_valid(payload.get("qa_gates")):
                     errors.append(f"{section_id}: qa_gates must be a non-empty list")
                 if not _gate_list_valid(payload.get("reviewer_gates")):
@@ -6330,7 +6354,6 @@ class ExecutionPlannerAgent:
                 if not _runbook_non_empty(payload.get("ml_engineer_runbook")):
                     errors.append(f"{section_id}: ml_engineer_runbook must be non-empty")
                 objective_analysis = payload.get("objective_analysis")
-                eval_spec = payload.get("evaluation_spec")
                 objective_ok = False
                 if isinstance(objective_analysis, dict):
                     problem_type = objective_analysis.get("problem_type")
@@ -6415,7 +6438,8 @@ class ExecutionPlannerAgent:
                 "Keep semantics aligned with strategy/business objective.\n"
                 "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
-                "For ML scope, objective_analysis.problem_type and non-empty column_roles are required.\n"
+                "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
+                "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
                 f"Required keys for this section: {json.dumps(required_keys)}\n"
                 "If this section has no required keys for the selected scope, return {}.\n\n"
                 "ORIGINAL INPUTS:\n"
@@ -6448,7 +6472,8 @@ class ExecutionPlannerAgent:
                 "Do not invent columns not present in column_inventory.\n\n"
                 "Use artifact file paths for required_outputs.\n\n"
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
-                "For ML scope, include objective_analysis.problem_type and non-empty column_roles.\n\n"
+                "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
+                "(or evaluation_spec.objective_type) and non-empty column_roles.\n\n"
                 "ORIGINAL INPUTS:\n"
                 + (original_inputs_text or "")
                 + "\n\nCURRENT CONTRACT DRAFT:\n"
@@ -6480,6 +6505,7 @@ class ExecutionPlannerAgent:
                         "column_roles",
                         "artifact_requirements",
                         "required_outputs",
+                        "iteration_policy",
                     ],
                     "optional": False,
                 },
@@ -6498,6 +6524,7 @@ class ExecutionPlannerAgent:
                     "goal": "Define ML objective type, QA/reviewer gates, validation requirements, and ML runbook when scope includes ML.",
                     "required_keys": [
                         "objective_analysis",
+                        "evaluation_spec",
                         "qa_gates",
                         "reviewer_gates",
                         "validation_requirements",
@@ -6507,7 +6534,7 @@ class ExecutionPlannerAgent:
                 },
                 {
                     "id": "optional_context",
-                    "goal": "Optionally add useful context such as iteration_policy and additional execution hints.",
+                    "goal": "Optionally add useful execution context and supplemental hints.",
                     "required_keys": [],
                     "optional": True,
                 },

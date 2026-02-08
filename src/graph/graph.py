@@ -2818,14 +2818,10 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     # Ensure basic required structures exist (non-invasive)
     if not isinstance(normalized.get("business_alignment"), dict):
         normalized["business_alignment"] = {}
-    if not isinstance(normalized.get("iteration_policy"), dict):
-        normalized["iteration_policy"] = {}
     if not isinstance(normalized.get("compliance_checklist"), list):
         normalized["compliance_checklist"] = []
     if not isinstance(normalized.get("alignment_requirements"), list):
         normalized["alignment_requirements"] = []
-    if not isinstance(normalized.get("evaluation_spec"), dict):
-        normalized["evaluation_spec"] = {}
 
     # V4.1: Contract comes from Execution Planner with legacy keys already stripped
 
@@ -9022,7 +9018,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
         evaluation_spec = {}
     if not isinstance(contract, dict):
         contract = {}
-    if not evaluation_spec:
+    contract_scope = normalize_contract_scope(contract.get("scope")) if isinstance(contract, dict) else ""
+    if not evaluation_spec and contract_scope in {"ml_only", "full_pipeline"}:
         print("Warning: execution_contract has no evaluation_spec; reviewers will use contract-level gates only.")
     work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
     try:

@@ -39,6 +39,7 @@ def _base_full_pipeline_contract():
         "qa_gates": ["metric_threshold"],
         "reviewer_gates": ["artifact_completeness"],
         "validation_requirements": {"primary_metric": "normalized_gini", "method": "stratified_kfold"},
+        "evaluation_spec": {"objective_type": "classification", "primary_metric": "normalized_gini"},
         "ml_engineer_runbook": {"steps": ["train", "evaluate", "persist"]},
         "objective_analysis": {"problem_type": "prediction"},
         "iteration_policy": {"max_iterations": 2},
@@ -93,3 +94,25 @@ def test_validate_contract_minimal_readonly_accepts_executable_views_contract():
 
     assert result.get("accepted") is True
     assert str(result.get("status")).lower() in {"ok", "warning"}
+
+
+def test_validate_contract_minimal_readonly_rejects_missing_iteration_policy():
+    contract = _base_full_pipeline_contract()
+    contract.pop("iteration_policy", None)
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.iteration_policy" in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_missing_evaluation_spec_for_ml_scope():
+    contract = _base_full_pipeline_contract()
+    contract.pop("evaluation_spec", None)
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.evaluation_spec" in rules

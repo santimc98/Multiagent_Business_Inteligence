@@ -2344,6 +2344,16 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             )
 
     if requires_ml:
+        evaluation_spec = contract.get("evaluation_spec")
+        if not isinstance(evaluation_spec, dict) or not evaluation_spec:
+            issues.append(
+                _strict_issue(
+                    "contract.evaluation_spec",
+                    "error",
+                    "evaluation_spec must be a non-empty object for ML scope.",
+                    evaluation_spec,
+                )
+            )
         if not _gate_list_valid(contract.get("qa_gates")):
             issues.append(
                 _strict_issue(
@@ -2522,15 +2532,37 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             )
         )
 
-    if "iteration_policy" not in contract:
+    iteration_policy = contract.get("iteration_policy")
+    if not isinstance(iteration_policy, dict) or not iteration_policy:
         issues.append(
             _strict_issue(
-                "contract.iteration_policy_missing",
-                "warning",
-                "iteration_policy is missing; runtime will use defaults.",
-                "iteration_policy",
+                "contract.iteration_policy",
+                "error",
+                "iteration_policy must be a non-empty object.",
+                iteration_policy,
             )
         )
+    else:
+        policy_has_limit = False
+        for key in ("max_iterations", "metric_improvement_max", "runtime_fix_max", "compliance_bootstrap_max"):
+            if key not in iteration_policy:
+                continue
+            value = iteration_policy.get(key)
+            try:
+                if int(value) >= 1:
+                    policy_has_limit = True
+                    break
+            except Exception:
+                continue
+        if not policy_has_limit:
+            issues.append(
+                _strict_issue(
+                    "contract.iteration_policy_limits",
+                    "error",
+                    "iteration_policy must declare at least one numeric iteration limit >= 1.",
+                    iteration_policy,
+                )
+            )
 
     status = _status_from_issues(issues)
     error_count = sum(1 for issue in issues if str(issue.get("severity", "")).lower() in {"error", "fail"})
