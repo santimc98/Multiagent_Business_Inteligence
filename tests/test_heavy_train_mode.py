@@ -3,6 +3,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 def _load_heavy_train_module():
     # Provide a lightweight stub when google cloud client isn't installed.
@@ -101,3 +103,43 @@ def test_collect_output_files_respects_skip_paths(tmp_path):
 
     assert "data/cleaned_data.csv" not in collected_ml
     assert "data/cleaned_data.csv" in collected_de
+
+
+def test_execute_code_mode_fails_when_required_outputs_missing(monkeypatch):
+    heavy_train = _load_heavy_train_module()
+
+    def _fake_download(_uri, path):
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        if path_obj.name == "ml_script.py":
+            path_obj.write_text("print('ok')\n", encoding="utf-8")
+        else:
+            path_obj.write_text("a\n1\n", encoding="utf-8")
+
+    captured_json = []
+
+    monkeypatch.setattr(heavy_train, "_download_to_path", _fake_download)
+    monkeypatch.setattr(heavy_train, "_download_support_files", lambda _support, _work_dir: None)
+    monkeypatch.setattr(heavy_train, "_run_script", lambda _script, _work_dir: (0, "ok", ""))
+    monkeypatch.setattr(heavy_train, "_collect_output_files", lambda _work_dir, skip_paths=None: [])
+    monkeypatch.setattr(heavy_train, "_write_file_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        heavy_train,
+        "_write_json_output",
+        lambda payload, _output_uri, rel_path: captured_json.append((rel_path, payload)),
+    )
+
+    payload = {
+        "mode": "execute_code",
+        "dataset_uri": "gs://bucket/input.csv",
+        "data_path": "data/raw.csv",
+        "code_uri": "gs://bucket/script.py",
+        "required_outputs": ["data/metrics.json"],
+    }
+
+    with pytest.raises(RuntimeError, match="missing required outputs"):
+        heavy_train.execute_code_mode(payload, "gs://bucket/output/", "run-test")
+
+    assert any(rel == "error.json" for rel, _ in captured_json)
+    error_payload = next((item for rel, item in captured_json if rel == "error.json"), {})
+    assert error_payload.get("error") == "missing_required_outputs"

@@ -413,9 +413,8 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     # Verify required outputs for this execute_code mode
     present, missing = _check_required_outputs(work_dir, required_outputs)
 
-    if missing and mode == "data_engineer_cleaning":
-        log(f"WARNING: Missing required outputs: {missing}")
-        # Still upload what we have, but report the issue
+    if missing:
+        log(f"WARNING: Missing contract-required outputs: {missing}")
         _write_json_output(
             {
                 "ok": False,
@@ -434,8 +433,6 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
             "error.json",
         )
         raise RuntimeError(f"Script completed but missing required outputs: {missing}")
-    if missing:
-        log(f"WARNING: Missing contract-required outputs: {missing}")
 
     # Write success status
     status_payload = {

@@ -4,6 +4,7 @@ from pathlib import Path
 from src.utils.contract_views import (
     build_de_view,
     build_cleaning_view,
+    build_contract_views_projection,
     build_ml_view,
     build_qa_view,
     build_reviewer_view,
@@ -44,6 +45,33 @@ def test_ml_view_includes_required_fields():
     decisioning = ml_view.get("decisioning_requirements", {})
     assert isinstance(decisioning, dict)
     assert decisioning.get("enabled") is False
+
+
+def test_projection_ml_view_includes_contract_context_blocks():
+    contract = {
+        "scope": "full_pipeline",
+        "canonical_columns": ["feature_a", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "outcome": ["target"],
+        },
+        "required_outputs": ["data/metrics.json", "data/scored_rows.csv"],
+        "qa_gates": [{"name": "benchmark_kpi_report", "severity": "HARD"}],
+        "reviewer_gates": [{"name": "runtime_success", "severity": "HARD"}],
+        "evaluation_spec": {"objective_type": "predictive", "requires_target": True},
+        "objective_analysis": {"problem_type": "predictive"},
+        "ml_engineer_runbook": {"steps": ["train", "validate"]},
+        "validation_requirements": {"primary_metric": "accuracy"},
+        "artifact_requirements": {"clean_dataset": {"output_path": "data/cleaned_data.csv", "manifest_path": "data/cleaning_manifest.json"}},
+    }
+    projected = build_contract_views_projection(contract, artifact_index=[])
+    ml_view = projected.get("ml_view") or {}
+
+    assert isinstance(ml_view.get("evaluation_spec"), dict)
+    assert isinstance(ml_view.get("objective_analysis"), dict)
+    assert isinstance(ml_view.get("qa_gates"), list)
+    assert isinstance(ml_view.get("reviewer_gates"), list)
+    assert isinstance(ml_view.get("ml_engineer_runbook"), dict)
 
 
 def test_ml_view_includes_scored_rows_schema():

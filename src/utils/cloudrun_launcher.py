@@ -344,6 +344,19 @@ def launch_heavy_runner_job(
             rel_name = _normalize_rel_path(artifact)
             if rel_name and rel_name not in downloaded:
                 missing_artifacts.append(rel_name)
+    required_artifacts_missing = bool(missing_artifacts)
+
+    if required_artifacts_missing and not error_payload:
+        error_payload = {
+            "error": "required_artifacts_missing",
+            "missing": list(missing_artifacts),
+            "required": [
+                _normalize_rel_path(path)
+                for path in (required_artifacts or [])
+                if _normalize_rel_path(path)
+            ],
+            "downloaded": list(downloaded.keys()),
+        }
 
     # Build diagnostic info if job failed or artifacts are missing
     gcs_listing: list[str] = []
@@ -402,5 +415,6 @@ def launch_heavy_runner_job(
         "status_payload": status_payload,
         "status_ok": status_ok,
         "status_arbitration": status_arbitration,
+        "required_artifacts_missing": required_artifacts_missing,
         "attempt_id": attempt_num if attempt_num > 0 else None,
     }

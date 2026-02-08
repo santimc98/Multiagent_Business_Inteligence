@@ -171,6 +171,10 @@ class MLEngineerAgent:
             "business_objective",
             "canonical_columns",  # V4.1: replaces required_columns/data_requirements
             "required_outputs",
+            "objective_analysis",
+            "evaluation_spec",
+            "validation_requirements",
+            "decisioning_requirements",
             "alignment_requirements",
             "business_alignment",
             "feature_semantics",
@@ -189,6 +193,7 @@ class MLEngineerAgent:
             "data_limited_mode",
             "ml_engineer_runbook",
             "derived_columns",
+            "iteration_policy",
         ]
 
         compact: Dict[str, Any] = {}
@@ -2244,7 +2249,26 @@ $strategy_json
         from src.utils.context_pack import compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
 
         ml_view = ml_view or {}
-        required_outputs = ml_view.get("required_outputs") or (execution_contract or {}).get("required_outputs", []) or []
+        execution_contract_input = execution_contract if isinstance(execution_contract, dict) else {}
+        required_outputs = (
+            ml_view.get("required_outputs")
+            or execution_contract_input.get("required_outputs", [])
+            or []
+        )
+        if not execution_contract_input and ml_view:
+            execution_contract_input = {
+                "strategy_title": strategy.get("title", "Unknown"),
+                "business_objective": business_objective,
+                "canonical_columns": ml_view.get("canonical_columns") or [],
+                "required_outputs": required_outputs,
+                "column_roles": ml_view.get("column_roles") or {},
+                "validation_requirements": ml_view.get("validation_requirements") or {},
+                "evaluation_spec": ml_view.get("evaluation_spec") or {},
+                "objective_analysis": ml_view.get("objective_analysis") or {},
+                "qa_gates": ml_view.get("qa_gates") or [],
+                "reviewer_gates": ml_view.get("reviewer_gates") or [],
+                "ml_engineer_runbook": ml_view.get("ml_engineer_runbook") or {},
+            }
         # V4.1: Build deliverables from required_outputs, no spec_extraction
         deliverables: List[Dict[str, Any]] = []
         if required_outputs:
@@ -2253,19 +2277,31 @@ $strategy_json
         deliverables_json = json.dumps(compress_long_lists(deliverables)[0], indent=2)
         
         # V4.1: Use ml_engineer_runbook directly, no legacy role_runbooks
+        ml_runbook_source = execution_contract_input.get("ml_engineer_runbook")
+        if not isinstance(ml_runbook_source, dict):
+            ml_runbook_source = ml_view.get("ml_engineer_runbook") if isinstance(ml_view.get("ml_engineer_runbook"), dict) else {}
         ml_runbook_json = json.dumps(
-            compress_long_lists((execution_contract or {}).get("ml_engineer_runbook", {}))[0],
+            compress_long_lists(ml_runbook_source)[0],
             indent=2,
         )
         # V4.1: No spec_extraction - removed
-        execution_contract_compact = self._compact_execution_contract(execution_contract or {})
+        execution_contract_compact = self._compact_execution_contract(execution_contract_input)
         execution_contract_compact = compress_long_lists(execution_contract_compact)[0]
         ml_view_payload = compress_long_lists(ml_view)[0]
         ml_view_json = json.dumps(ml_view_payload, indent=2)
         plot_spec_json = json.dumps(compress_long_lists(ml_view.get("plot_spec", {}))[0], indent=2)
+        evaluation_spec_source = execution_contract_input.get("evaluation_spec")
+        if not isinstance(evaluation_spec_source, dict):
+            evaluation_spec_source = ml_view.get("evaluation_spec") if isinstance(ml_view.get("evaluation_spec"), dict) else {}
         evaluation_spec_json = json.dumps(
-            compress_long_lists((execution_contract or {}).get("evaluation_spec", {}))[0],
+            compress_long_lists(evaluation_spec_source)[0],
             indent=2,
+        )
+        canonical_columns_source = (
+            execution_contract_compact.get("canonical_columns")
+            or execution_contract_input.get("canonical_columns")
+            or ml_view.get("canonical_columns")
+            or []
         )
         required_columns_payload = strategy.get('required_columns', [])
         if isinstance(required_columns_payload, list) and len(required_columns_payload) > 80:
@@ -2279,23 +2315,21 @@ $strategy_json
             hypothesis=strategy.get('hypothesis', 'N/A'),
             required_columns=json.dumps(required_columns_payload),
             deliverables_json=deliverables_json,
-            canonical_columns=json.dumps(
-                execution_contract_compact.get("canonical_columns", (execution_contract or {}).get("canonical_columns", []))
-            ),
+            canonical_columns=json.dumps(canonical_columns_source),
             business_alignment_json=json.dumps(
-                compress_long_lists((execution_contract or {}).get("business_alignment", {}))[0],
+                compress_long_lists(execution_contract_input.get("business_alignment", {}))[0],
                 indent=2,
             ),
             alignment_requirements_json=json.dumps(
-                compress_long_lists((execution_contract or {}).get("alignment_requirements", []))[0],
+                compress_long_lists(execution_contract_input.get("alignment_requirements", []))[0],
                 indent=2,
             ),
             feature_semantics_json=json.dumps(
-                compress_long_lists((execution_contract or {}).get("feature_semantics", []))[0],
+                compress_long_lists(execution_contract_input.get("feature_semantics", []))[0],
                 indent=2,
             ),
             business_sanity_checks_json=json.dumps(
-                compress_long_lists((execution_contract or {}).get("business_sanity_checks", []))[0],
+                compress_long_lists(execution_contract_input.get("business_sanity_checks", []))[0],
                 indent=2,
             ),
             data_path=data_path,
@@ -2320,7 +2354,7 @@ $strategy_json
             SYSTEM_PROMPT_TEMPLATE,
             render_kwargs,
             ml_view=ml_view,
-            execution_contract=execution_contract or {},
+            execution_contract=execution_contract_input,
         )
         
         # USER TEMPLATES (Static)

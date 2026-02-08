@@ -640,16 +640,16 @@ def _apply_review_consistency_guard(
     if not blockers:
         return packet
     status = str(packet.get("status") or "").upper()
-    if status and status != "APPROVED":
+    if status and status not in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
         return packet
 
     actor_name = str(actor or "reviewer").strip().lower() or "reviewer"
     blocker_text = ", ".join(blockers)
     note = (
-        f"{actor_name.upper()}_CONTEXT_GUARD: downgraded from APPROVED due to deterministic blockers "
+        f"{actor_name.upper()}_CONTEXT_GUARD: forced REJECTED due to deterministic blockers "
         f"({blocker_text})."
     )
-    packet["status"] = "APPROVE_WITH_WARNINGS"
+    packet["status"] = "REJECTED"
     feedback = str(packet.get("feedback") or "").strip()
     packet["feedback"] = f"{feedback}\n{note}".strip() if feedback else note
 
@@ -661,10 +661,18 @@ def _apply_review_consistency_guard(
             failed_gates.append(blocker)
     packet["failed_gates"] = failed_gates
 
+    hard_failures = packet.get("hard_failures")
+    if not isinstance(hard_failures, list):
+        hard_failures = []
+    for blocker in blockers:
+        if blocker not in hard_failures:
+            hard_failures.append(blocker)
+    packet["hard_failures"] = hard_failures
+
     required_fixes = packet.get("required_fixes")
     if not isinstance(required_fixes, list):
         required_fixes = []
-    generic_fix = "Resolve deterministic runtime/output failures before approving code quality."
+    generic_fix = "Resolve deterministic runtime/output blockers before requesting approval again."
     if generic_fix not in required_fixes:
         required_fixes.append(generic_fix)
     packet["required_fixes"] = required_fixes
@@ -2493,6 +2501,73 @@ def _maybe_set_contract_min_policy(contract_min: Dict[str, Any] | None, policy: 
         contract_min["reporting_policy"] = compact
 
 
+def _is_artifact_path_like(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    path = value.strip().replace("\\", "/")
+    if not path:
+        return False
+    # Avoid logical labels and enforce file-like path shape.
+    if "/" not in path:
+        return False
+    base = os.path.basename(path)
+    if "." not in base:
+        return False
+    return True
+
+
+def _validate_projected_views_for_execution(
+    contract: Dict[str, Any],
+    views: Dict[str, Any],
+) -> List[str]:
+    errors: List[str] = []
+    scope = normalize_contract_scope((contract or {}).get("scope"))
+    requires_cleaning = scope in {"cleaning_only", "full_pipeline"}
+    requires_ml = scope in {"ml_only", "full_pipeline"}
+
+    de_view = views.get("de_view") if isinstance(views, dict) else None
+    if requires_cleaning:
+        if not isinstance(de_view, dict) or not de_view:
+            errors.append("de_view_missing")
+        else:
+            output_path = de_view.get("output_path")
+            manifest_path = de_view.get("output_manifest_path") or de_view.get("manifest_path")
+            req_cols = de_view.get("required_columns")
+            if not _is_artifact_path_like(output_path):
+                errors.append("de_view_output_path_invalid")
+            if not _is_artifact_path_like(manifest_path):
+                errors.append("de_view_manifest_path_invalid")
+            if not isinstance(req_cols, list) or not any(isinstance(col, str) and col.strip() for col in req_cols):
+                errors.append("de_view_required_columns_empty")
+
+    if requires_ml:
+        ml_view = views.get("ml_view") if isinstance(views, dict) else None
+        reviewer_view = views.get("reviewer_view") if isinstance(views, dict) else None
+        qa_view = views.get("qa_view") if isinstance(views, dict) else None
+
+        if not isinstance(ml_view, dict) or not ml_view:
+            errors.append("ml_view_missing")
+        else:
+            objective_type = str(ml_view.get("objective_type") or "").strip().lower()
+            column_roles = ml_view.get("column_roles")
+            required_outputs = ml_view.get("required_outputs")
+            if not objective_type or objective_type == "unknown":
+                errors.append("ml_view_objective_type_unknown")
+            if not isinstance(column_roles, dict) or not column_roles:
+                errors.append("ml_view_column_roles_missing")
+            if not isinstance(required_outputs, list) or not any(
+                isinstance(path, str) and _is_artifact_path_like(path) for path in required_outputs
+            ):
+                errors.append("ml_view_required_outputs_missing")
+
+        if not isinstance(reviewer_view, dict) or not reviewer_view:
+            errors.append("reviewer_view_missing")
+        if not isinstance(qa_view, dict) or not qa_view:
+            errors.append("qa_view_missing")
+
+    return errors
+
+
 def _build_contract_views(
     state: Dict[str, Any],
     contract: Dict[str, Any],
@@ -2521,6 +2596,7 @@ def _build_contract_views(
         "translator_view": translator_view,
         "results_advisor_view": results_advisor_view,
     }
+    view_errors = _validate_projected_views_for_execution(contract, views)
     view_paths = persist_views(
         views,
         base_dir="data",
@@ -2537,6 +2613,8 @@ def _build_contract_views(
         "reviewer_view": reviewer_view,
         "translator_view": translator_view,
         "results_advisor_view": results_advisor_view,
+        "contract_views_projection_ok": not view_errors,
+        "contract_views_projection_errors": view_errors,
     }
 
 def _deliverable_id_from_path(path: str) -> str:
@@ -9145,6 +9223,48 @@ def run_execution_planner(state: AgentState) -> AgentState:
         print(f"Warning: data_profile preflight failed: {dp_err}")
 
     view_payload = _build_contract_views(state if isinstance(state, dict) else {}, contract, {})
+    view_projection_ok = bool(view_payload.get("contract_views_projection_ok", True))
+    view_projection_errors = [
+        str(err) for err in (view_payload.get("contract_views_projection_errors") or []) if err
+    ]
+    if not view_projection_ok:
+        error_message = (
+            "Execution planner produced a contract that cannot generate executable agent views "
+            f"(fail-closed): {view_projection_errors}"
+        )
+        if run_id:
+            log_run_event(
+                run_id,
+                "pipeline_aborted_reason",
+                {
+                    "reason": "execution_contract_views_invalid",
+                    "view_projection_errors": view_projection_errors,
+                },
+            )
+            log_agent_snapshot(
+                run_id,
+                "execution_planner",
+                prompt=getattr(execution_planner, "last_prompt", None),
+                response=getattr(execution_planner, "last_response", None) or planner_contract_diagnostics,
+                context={
+                    "strategy": strategy,
+                    "business_objective": business_objective,
+                    "contract_diagnostics": planner_contract_diagnostics,
+                    "view_projection_errors": view_projection_errors,
+                    "fail_closed": True,
+                },
+                verdicts={"status": "REJECTED", "reason": "execution_contract_views_invalid"},
+            )
+        return {
+            "error_message": error_message,
+            "pipeline_aborted_reason": "execution_contract_views_invalid",
+            "execution_planner_failed": True,
+            "execution_contract": contract,
+            "execution_contract_diagnostics": planner_contract_diagnostics,
+            "execution_contract_diagnostics_path": "data/execution_contract_diagnostics.json",
+            "contract_views_projection_ok": False,
+            "contract_views_projection_errors": view_projection_errors,
+        }
     if view_payload.get("contract_views"):
         try:
             de_len = len(json.dumps(view_payload["contract_views"].get("de_view", {}), ensure_ascii=True))
@@ -9229,7 +9349,12 @@ def _planner_contract_invalid_for_execution(state: Dict[str, Any]) -> bool:
         return True
     if bool(state.get("execution_planner_failed")):
         return True
-    if state.get("pipeline_aborted_reason") == "execution_contract_invalid":
+    if state.get("pipeline_aborted_reason") in {
+        "execution_contract_invalid",
+        "execution_contract_views_invalid",
+    }:
+        return True
+    if state.get("contract_views_projection_ok") is False:
         return True
 
     diagnostics = state.get("execution_contract_diagnostics")
@@ -9260,15 +9385,18 @@ def run_data_engineer(state: AgentState) -> AgentState:
     if abort_state:
         return abort_state
     if _planner_contract_invalid_for_execution(state if isinstance(state, dict) else {}):
+        reason = str(state.get("pipeline_aborted_reason") or "execution_contract_invalid")
+        if reason not in {"execution_contract_invalid", "execution_contract_views_invalid"}:
+            reason = "execution_contract_invalid"
         msg = "Execution contract is invalid; Data Engineer halted by fail-closed planner policy."
         run_id = state.get("run_id")
         if run_id:
-            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "execution_contract_invalid"})
+            log_run_event(run_id, "pipeline_aborted_reason", {"reason": reason})
         return {
             "cleaning_code": "",
             "cleaned_data_preview": "Error: invalid execution contract",
             "error_message": msg,
-            "pipeline_aborted_reason": "execution_contract_invalid",
+            "pipeline_aborted_reason": reason,
             "data_engineer_failed": True,
             "budget_counters": state.get("budget_counters"),
         }
@@ -11748,7 +11876,7 @@ def run_engineer(state: AgentState) -> AgentState:
             iteration_memory_block=iteration_memory_block,
         )
         sig = inspect.signature(ml_engineer.generate_code)
-        if "execution_contract" in sig.parameters and not minimal_context_mode:
+        if "execution_contract" in sig.parameters:
             kwargs["execution_contract"] = execution_contract
         if "dataset_scale" in sig.parameters:
             dataset_scale_hints = state.get("dataset_scale_hints") or {}

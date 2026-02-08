@@ -3,14 +3,14 @@ Tests for cloudrun_launcher required artifacts validation.
 
 Ensures that:
 1. Missing artifacts are listed in the response
-2. Missing artifacts do not force launcher runtime error status
+2. Missing required artifacts fail launcher status
 3. Required artifacts can be fetched even if absent from download_map
 """
 from unittest.mock import patch
 
 
-def test_missing_required_artifacts_marks_missing_only():
-    """Missing required artifacts are non-blocking at launcher level."""
+def test_missing_required_artifacts_marks_error():
+    """Missing required artifacts are blocking at launcher level."""
     from src.utils.cloudrun_launcher import launch_heavy_runner_job
 
     # Mock all external dependencies
@@ -46,14 +46,16 @@ def test_missing_required_artifacts_marks_missing_only():
             required_artifacts=["metrics.json", "scored_rows.csv"],
         )
 
-        assert result["status"] == "success"
+        assert result["status"] == "error"
         assert "missing_artifacts" in result
         assert set(result["missing_artifacts"]) == {"metrics.json", "scored_rows.csv"}
-        assert result["error"] is None
+        assert result["required_artifacts_missing"] is True
+        assert isinstance(result["error"], dict)
+        assert result["error"].get("error") == "required_artifacts_missing"
 
 
-def test_partial_artifacts_still_success_with_missing_list():
-    """When only some required artifacts are downloaded, missing list is populated."""
+def test_partial_artifacts_marks_error_with_missing_list():
+    """When only some required artifacts are downloaded, status must be error."""
     from src.utils.cloudrun_launcher import launch_heavy_runner_job
 
     with patch("src.utils.cloudrun_launcher._ensure_cli"), \
@@ -88,10 +90,11 @@ def test_partial_artifacts_still_success_with_missing_list():
             required_artifacts=["metrics.json", "scored_rows.csv", "alignment_check.json"],
         )
 
-        assert result["status"] == "success"
+        assert result["status"] == "error"
         assert "scored_rows.csv" in result["missing_artifacts"]
         assert "alignment_check.json" in result["missing_artifacts"]
         assert "metrics.json" not in result["missing_artifacts"]
+        assert result["required_artifacts_missing"] is True
 
 
 def test_all_artifacts_present_marks_success():
@@ -166,6 +169,8 @@ def test_no_required_artifacts_legacy_behavior():
         # Without required_artifacts, no artifact check happens
         assert result["status"] == "success"
         assert result["missing_artifacts"] == []
+        assert result["required_artifacts_missing"] is False
+        assert result["required_artifacts_missing"] is False
 
 
 def test_required_artifacts_download_even_without_download_map_entry():
@@ -201,6 +206,7 @@ def test_required_artifacts_download_even_without_download_map_entry():
 
         assert result["status"] == "success"
         assert result["missing_artifacts"] == []
+        assert result["required_artifacts_missing"] is False
         assert "reports/summary.json" in result["downloaded"]
 
 

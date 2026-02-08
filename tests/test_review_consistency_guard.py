@@ -16,7 +16,7 @@ def test_build_code_review_diagnostics_marks_runtime_and_missing_outputs() -> No
     assert "contract_required_artifacts_missing" in blockers
 
 
-def test_apply_review_consistency_guard_downgrades_approved_with_blockers() -> None:
+def test_apply_review_consistency_guard_rejects_approved_with_blockers() -> None:
     result = {
         "status": "APPROVED",
         "feedback": "all good",
@@ -29,9 +29,10 @@ def test_apply_review_consistency_guard_downgrades_approved_with_blockers() -> N
 
     guarded = _apply_review_consistency_guard(result, diagnostics, actor="reviewer")
 
-    assert guarded["status"] == "APPROVE_WITH_WARNINGS"
+    assert guarded["status"] == "REJECTED"
     assert "runtime_failure" in guarded["failed_gates"]
     assert "contract_required_artifacts_missing" in guarded["failed_gates"]
+    assert "runtime_failure" in guarded.get("hard_failures", [])
     assert "CONTEXT_GUARD" in guarded["feedback"]
 
 

@@ -39,3 +39,22 @@ def test_run_data_engineer_halts_when_planner_diagnostics_reject_contract():
 
     assert result.get("pipeline_aborted_reason") == "execution_contract_invalid"
     assert result.get("data_engineer_failed") is True
+
+
+def test_run_data_engineer_halts_when_contract_views_are_invalid():
+    state = {
+        "run_id": None,
+        "execution_contract": {"contract_version": "4.1"},
+        "execution_contract_diagnostics": {
+            "validation": {"accepted": True, "status": "ok"},
+            "summary": {"accepted": True},
+        },
+        "contract_views_projection_ok": False,
+        "pipeline_aborted_reason": "execution_contract_views_invalid",
+        "budget_counters": {},
+    }
+
+    result = run_data_engineer(state)
+
+    assert result.get("pipeline_aborted_reason") == "execution_contract_views_invalid"
+    assert result.get("data_engineer_failed") is True

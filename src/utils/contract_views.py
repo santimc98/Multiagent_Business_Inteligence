@@ -59,6 +59,11 @@ class MLView(TypedDict, total=False):
     forbidden_features: List[str]
     required_outputs: List[str]
     validation_requirements: Dict[str, Any]
+    evaluation_spec: Dict[str, Any]
+    objective_analysis: Dict[str, Any]
+    qa_gates: List[Dict[str, Any]]
+    reviewer_gates: List[Any]
+    ml_engineer_runbook: Dict[str, Any]
     case_rules: Any
     plot_spec: Dict[str, Any]
     artifact_requirements: Dict[str, Any]
@@ -120,6 +125,9 @@ _PRESERVE_KEYS = {
     "reviewer_gates",
     "qa_gates",
     "cleaning_gates",
+    "evaluation_spec",
+    "objective_analysis",
+    "ml_engineer_runbook",
     "gates",
     "plot_spec",
     "plots",
@@ -1373,6 +1381,15 @@ def build_contract_views_projection(
     validation_requirements = contract_full.get("validation_requirements")
     if not isinstance(validation_requirements, dict):
         validation_requirements = {}
+    evaluation_spec = contract_full.get("evaluation_spec")
+    if not isinstance(evaluation_spec, dict):
+        evaluation_spec = {}
+    objective_analysis = contract_full.get("objective_analysis")
+    if not isinstance(objective_analysis, dict):
+        objective_analysis = {}
+    ml_engineer_runbook = contract_full.get("ml_engineer_runbook")
+    if not isinstance(ml_engineer_runbook, dict):
+        ml_engineer_runbook = {}
     allowed_feature_sets = contract_full.get("allowed_feature_sets")
     if not isinstance(allowed_feature_sets, dict):
         allowed_feature_sets = {
@@ -1500,6 +1517,11 @@ def build_contract_views_projection(
         "forbidden_features": forbidden_features,
         "required_outputs": required_outputs,
         "validation_requirements": validation_requirements,
+        "evaluation_spec": evaluation_spec,
+        "objective_analysis": objective_analysis,
+        "qa_gates": qa_gates if isinstance(qa_gates, list) else [],
+        "reviewer_gates": reviewer_gates if isinstance(reviewer_gates, list) else [],
+        "ml_engineer_runbook": ml_engineer_runbook,
         "artifact_requirements": artifact_payload,
         "decisioning_requirements": decisioning_requirements,
         "visual_requirements": visual_requirements,
