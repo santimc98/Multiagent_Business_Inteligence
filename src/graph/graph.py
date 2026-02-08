@@ -509,6 +509,211 @@ def _summarize_alignment_requirements(alignment_check: Dict[str, Any]) -> Dict[s
     }
 
 
+def _metrics_report_has_values(report: Dict[str, Any] | None) -> bool:
+    if not isinstance(report, dict):
+        return False
+    model_perf = report.get("model_performance")
+    return isinstance(model_perf, dict) and bool(model_perf)
+
+
+def _is_metrics_like_path(path: str) -> bool:
+    text = str(path or "").strip().lower()
+    if not text or not text.endswith(".json"):
+        return False
+    return any(
+        token in text
+        for token in (
+            "metric",
+            "evaluation",
+            "score",
+            "gini",
+            "auc",
+            "accuracy",
+            "precision",
+            "recall",
+            "f1",
+            "rmse",
+            "mae",
+            "r2",
+        )
+    )
+
+
+def _merge_model_performance_entry(model_perf: Dict[str, Any], metric_name: str, value: Any) -> None:
+    name = str(metric_name or "").strip()
+    if not name:
+        return
+    num = _coerce_float(value)
+    if num is not None:
+        model_perf[name] = float(num)
+        return
+    if not isinstance(value, dict):
+        return
+    mean = _coerce_float(value.get("mean"))
+    if mean is None:
+        mean = _coerce_float(value.get("value"))
+    if mean is None:
+        return
+    entry: Dict[str, Any] = {"mean": float(mean)}
+    for key in ("ci_lower", "ci_upper", "std", "stdev", "std_dev"):
+        if key in value:
+            coerced = _coerce_float(value.get(key))
+            if coerced is not None:
+                entry[key] = float(coerced)
+    model_perf[name] = entry
+
+
+def _normalize_metrics_report_payload(payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    if _metrics_report_has_values(payload):
+        return dict(payload)
+
+    model_perf: Dict[str, Any] = {}
+
+    primary_metric = payload.get("primary_metric")
+    if isinstance(primary_metric, dict):
+        metric_name = primary_metric.get("name") or primary_metric.get("metric")
+        _merge_model_performance_entry(model_perf, str(metric_name or ""), primary_metric.get("value"))
+
+    for block_name in ("cv_summary", "all_metrics", "metrics", "summary"):
+        block = payload.get(block_name)
+        if not isinstance(block, dict):
+            continue
+        for metric_name, metric_value in block.items():
+            _merge_model_performance_entry(model_perf, str(metric_name), metric_value)
+
+    for list_name in ("metrics_summary", "model_metrics"):
+        block = payload.get(list_name)
+        if not isinstance(block, list):
+            continue
+        for item in block:
+            if not isinstance(item, dict):
+                continue
+            metric_name = item.get("metric") or item.get("name")
+            if not metric_name:
+                continue
+            metric_name = str(metric_name)
+            if metric_name.lower().startswith("model_performance."):
+                metric_name = metric_name.split(".", 1)[1]
+            metric_value = item.get("value")
+            if metric_value is None:
+                metric_value = item.get("mean")
+            _merge_model_performance_entry(model_perf, metric_name, metric_value)
+
+    if not model_perf:
+        return {}
+    normalized = dict(payload)
+    normalized["model_performance"] = model_perf
+    return normalized
+
+
+def _resolve_output_contract_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
+    current = state.get("output_contract_report")
+    if not isinstance(current, dict):
+        current = _load_json_safe("data/output_contract_report.json")
+    if not isinstance(current, dict):
+        current = {}
+
+    best = state.get("best_attempt_output_contract_report")
+    if not isinstance(best, dict):
+        best = {}
+
+    last_success = state.get("last_successful_output_contract_report")
+    if not isinstance(last_success, dict):
+        last_success = {}
+
+    current_missing = [str(x) for x in (current.get("missing") or []) if x] if isinstance(current, dict) else []
+    current_status = str(current.get("overall_status") or "").lower() if isinstance(current, dict) else ""
+
+    def _is_clean(report: Dict[str, Any]) -> bool:
+        if not isinstance(report, dict) or not report:
+            return False
+        missing = [str(x) for x in (report.get("missing") or []) if x]
+        status = str(report.get("overall_status") or "").lower()
+        return not missing and status != "error"
+
+    if (current_missing or current_status == "error") and _is_clean(best):
+        return best
+    if (current_missing or current_status == "error") and _is_clean(last_success):
+        return last_success
+    if current:
+        return current
+    if best:
+        return best
+    if last_success:
+        return last_success
+    return {}
+
+
+def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
+    candidates: List[tuple[Dict[str, Any], str]] = []
+
+    state_metrics = state.get("metrics_report")
+    if isinstance(state_metrics, dict) and state_metrics:
+        candidates.append((state_metrics, "state.metrics_report"))
+
+    file_metrics = _load_json_safe("data/metrics.json")
+    if isinstance(file_metrics, dict) and file_metrics:
+        candidates.append((file_metrics, "data/metrics.json"))
+
+    insights = _load_json_safe("data/insights.json")
+    if isinstance(insights, dict) and insights:
+        candidates.append((insights, "data/insights.json"))
+
+    for payload, source in candidates:
+        normalized = _normalize_metrics_report_payload(payload)
+        if _metrics_report_has_values(normalized):
+            normalized.setdefault("source", source)
+            return normalized
+
+    artifact_paths: List[str] = []
+    seen_paths: set[str] = set()
+
+    def _add_path(path: Any) -> None:
+        if not isinstance(path, str):
+            return
+        rel = path.strip().replace("\\", "/")
+        if not rel or rel in seen_paths:
+            return
+        seen_paths.add(rel)
+        artifact_paths.append(rel)
+
+    oc_report = _resolve_output_contract_report_for_facts(state)
+    if isinstance(oc_report, dict):
+        for path in oc_report.get("present", []) or []:
+            _add_path(path)
+
+    artifact_index = state.get("artifact_index")
+    if not isinstance(artifact_index, list):
+        artifact_index = state.get("produced_artifact_index")
+    if not isinstance(artifact_index, list):
+        artifact_index = _load_json_safe("data/produced_artifact_index.json")
+    if isinstance(artifact_index, list):
+        for entry in artifact_index:
+            if isinstance(entry, dict):
+                path = entry.get("path")
+                if isinstance(path, str):
+                    _add_path(path)
+            elif isinstance(entry, str):
+                _add_path(entry)
+
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    for path in _resolve_required_outputs(contract, state):
+        _add_path(path)
+
+    for path in artifact_paths:
+        if not _is_metrics_like_path(path):
+            continue
+        payload = _load_json_safe(path)
+        normalized = _normalize_metrics_report_payload(payload if isinstance(payload, dict) else {})
+        if _metrics_report_has_values(normalized):
+            normalized.setdefault("source", f"artifact:{path}")
+            return normalized
+
+    return {}
+
+
 def _extract_primary_metric_for_board(
     state: Dict[str, Any],
     metrics_report: Dict[str, Any],
@@ -521,27 +726,50 @@ def _extract_primary_metric_for_board(
             "baseline_value": snapshot.get("baseline_value"),
             "source": "primary_metric_snapshot",
         }
+    weights_report = _load_json_safe("data/weights.json")
+    if not isinstance(weights_report, dict):
+        weights_report = {}
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    evaluation_spec = contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {}
+    objective_type = (
+        (evaluation_spec.get("objective_type") if isinstance(evaluation_spec, dict) else None)
+        or (state.get("selected_strategy") or {}).get("analysis_type")
+        or "unknown"
+    )
+    candidates = _collect_metric_candidates(metrics_report if isinstance(metrics_report, dict) else {}, weights_report)
+    primary = _pick_primary_metric_candidate(candidates, str(objective_type))
+    if isinstance(primary, dict):
+        value = _coerce_float(primary.get("value"))
+        if value is not None:
+            return {
+                "name": primary.get("name"),
+                "value": float(value),
+                "source": str((metrics_report or {}).get("source") or "metrics.normalized"),
+            }
+
     model_perf = metrics_report.get("model_performance") if isinstance(metrics_report.get("model_performance"), dict) else {}
     for key in ("normalized_gini", "auc", "accuracy", "f1", "rmse", "mae", "r2"):
         val = model_perf.get(key)
+        if isinstance(val, dict):
+            val = val.get("mean")
         if isinstance(val, (int, float)):
-            return {"name": key, "value": float(val), "source": "metrics.model_performance"}
+            return {
+                "name": key,
+                "value": float(val),
+                "source": str((metrics_report or {}).get("source") or "metrics.model_performance"),
+            }
     return {"name": None, "value": None, "source": "unavailable"}
 
 
 def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
-    metrics_report = _load_json_safe("data/metrics.json")
+    metrics_report = _resolve_metrics_report_for_facts(state if isinstance(state, dict) else {})
     if not isinstance(metrics_report, dict):
         metrics_report = {}
     alignment_check = _load_json_safe("data/alignment_check.json")
     if not isinstance(alignment_check, dict):
         alignment_check = {}
-    oc_report = state.get("output_contract_report")
-    if not isinstance(oc_report, dict):
-        oc_report = _load_json_safe("data/output_contract_report.json")
-    if not isinstance(oc_report, dict):
-        oc_report = {}
+    oc_report = _resolve_output_contract_report_for_facts(state if isinstance(state, dict) else {})
     artifact_issues = _extract_contract_artifact_issues(oc_report)
     visual_reqs = (
         contract.get("artifact_requirements", {}).get("visual_requirements")
@@ -8709,8 +8937,26 @@ def _finalize_heavy_execution(
     if not error_in_output:
         result["runtime_fix_count"] = 0
         result["last_successful_execution_output"] = output
-        result["last_successful_plots"] = []
+        result["last_successful_plots"] = plots_local
         result["last_successful_output_contract_report"] = oc_report
+    best_score = state.get("best_attempt_score")
+    if attempt_valid and (best_score is None or attempt_score > float(best_score)):
+        dest = _snapshot_best_attempt(
+            attempt_id=attempt_id,
+            artifact_paths=artifact_paths,
+            output_contract_report=oc_report,
+            artifact_index=artifact_index,
+            execution_output=output,
+            plots_local=plots_local,
+            diagnostics=content_diagnostics,
+        )
+        result["best_attempt_score"] = attempt_score
+        result["best_attempt_id"] = attempt_id
+        result["best_attempt_dir"] = dest
+        result["best_attempt_artifact_index"] = artifact_index
+        result["best_attempt_output_contract_report"] = oc_report
+        result["best_attempt_execution_output"] = output
+        result["best_attempt_plots"] = plots_local
     return result
 
 
@@ -14443,7 +14689,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         print(f"Warning: failed to persist case_alignment_report.json: {err}")
 
     # Detect stale metrics file across iterations (diagnostic for ML)
-    metrics_report = _load_json_safe("data/metrics.json")
+    metrics_report = _resolve_metrics_report_for_facts(state if isinstance(state, dict) else {})
     weights_report = _load_json_safe("data/weights.json")
     metrics_signature = _hash_json(metrics_report)
     weights_signature = _hash_json(weights_report)
