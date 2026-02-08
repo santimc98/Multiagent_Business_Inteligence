@@ -116,6 +116,66 @@ def _safe_load_csv(path: str) -> tuple[pd.DataFrame | None, str | None]:
     return df, None
 
 
+def _resolve_cleaned_data_path(state: Dict[str, Any], contract: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """
+    Resolve cleaned dataset path from contract/state with deterministic fallbacks.
+    Returns (best_path, ordered_candidates).
+    """
+    candidates: List[str] = []
+
+    ml_data_path = state.get("ml_data_path")
+    if isinstance(ml_data_path, str) and ml_data_path.strip():
+        candidates.append(ml_data_path.strip())
+
+    de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+    if isinstance(de_view, dict):
+        output_path = de_view.get("output_path")
+        if isinstance(output_path, str) and output_path.strip():
+            candidates.append(output_path.strip())
+
+    artifact_reqs = contract.get("artifact_requirements") if isinstance(contract, dict) else {}
+    if isinstance(artifact_reqs, dict):
+        clean_dataset = artifact_reqs.get("clean_dataset")
+        if isinstance(clean_dataset, dict):
+            output_path = clean_dataset.get("output_path")
+            if isinstance(output_path, str) and output_path.strip():
+                candidates.append(output_path.strip())
+
+    required_outputs = contract.get("required_outputs") if isinstance(contract, dict) else []
+    if isinstance(required_outputs, list):
+        for path in required_outputs:
+            if not isinstance(path, str):
+                continue
+            norm = path.replace("\\", "/").strip()
+            lower = norm.lower()
+            if lower.endswith(".csv") and "/clean" in lower:
+                candidates.append(norm)
+
+    candidates.extend(
+        [
+            "data/cleaned_dataset.csv",
+            "data/cleaned_data.csv",
+            "data/cleaned_full.csv",
+        ]
+    )
+
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        norm = path.replace("\\", "/").strip()
+        if not norm:
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        ordered.append(norm)
+
+    for path in ordered:
+        if os.path.exists(path):
+            return path, ordered
+    return (ordered[0] if ordered else ""), ordered
+
+
 def _is_number(value: Any) -> bool:
     try:
         float(value)
@@ -495,7 +555,8 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
     weights = _safe_load_json("data/weights.json")
     metrics_report = _safe_load_json("data/metrics.json")
-    cleaned, cleaned_err = _safe_load_csv("data/cleaned_data.csv")
+    cleaned_path, cleaned_candidates = _resolve_cleaned_data_path(state, contract if isinstance(contract, dict) else {})
+    cleaned, cleaned_err = _safe_load_csv(cleaned_path) if cleaned_path else (None, "file_missing")
     case_summary, _case_summary_err = _safe_load_csv("data/case_summary.csv")
     cleaned_read_failed = cleaned is None and cleaned_err not in (None, "file_missing")
     base_missing = (cleaned is None and not cleaned_read_failed) or (not metrics_report and not weights)
@@ -565,6 +626,8 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
                 "valid_row_fraction": valid_row_fraction,
                 "missing_outputs_count": len(missing_outputs) if isinstance(missing_outputs, list) else None,
                 "missingness_summary": missingness_summary,
+                "cleaned_data_path": cleaned_path or None,
+                "cleaned_data_candidates": cleaned_candidates[:5],
             },
             "quality_gates_alignment": {},
             "consecutive_data_limited": consecutive,
@@ -729,6 +792,8 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "ranking_metric_name": rank_metric_name,
         "ranking_metric": rank_metric,
         "available_metrics": sorted(metric_pool.keys()),
+        "cleaned_data_path": cleaned_path or None,
+        "cleaned_data_candidates": cleaned_candidates[:5],
     }
 
     if use_classification and not base_missing and cls_metric is None:

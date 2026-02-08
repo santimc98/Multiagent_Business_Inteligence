@@ -1125,7 +1125,9 @@ class BusinessTranslatorAgent:
         weights_payload = weights_payload or {}
         scored_rows = _safe_load_csv(predictions_path) if predictions_path else None
         case_summary = None
-        cleaned_path = _first_artifact_path(artifact_index, "dataset") or "data/cleaned_data.csv"
+        cleaned_path = _first_artifact_path(artifact_index, "dataset")
+        if not cleaned_path:
+            cleaned_path = "data/cleaned_dataset.csv" if _artifact_available("data/cleaned_dataset.csv") else "data/cleaned_data.csv"
         cleaned_rows = _safe_load_csv(cleaned_path, max_rows=100) if _artifact_available(cleaned_path) else None
         business_objective = state.get("business_objective") or contract.get("business_objective") or ""
         executive_decision_label = _derive_exec_decision(
@@ -1415,14 +1417,14 @@ class BusinessTranslatorAgent:
         model_metrics_context = _summarize_model_metrics()
         facts_context = _facts_from_insights(insights) or _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
         artifacts_context = view_inventory if view_inventory else []
-        evidence_paths = []
+        raw_evidence_paths = []
         for item in artifacts_context or []:
             if isinstance(item, dict) and item.get("path"):
-                evidence_paths.append(str(item.get("path")))
+                raw_evidence_paths.append(str(item.get("path")))
             elif isinstance(item, str):
-                evidence_paths.append(str(item))
-        evidence_paths = [p for idx, p in enumerate(evidence_paths) if p and p not in evidence_paths[:idx]]
-        evidence_paths = evidence_paths[:8]
+                raw_evidence_paths.append(str(item))
+        raw_evidence_paths = [p for idx, p in enumerate(raw_evidence_paths) if p and p not in raw_evidence_paths[:idx]]
+        raw_evidence_paths = raw_evidence_paths[:8]
         reporting_policy_context = view_policy if isinstance(view_policy, dict) else {}
         if not reporting_policy_context:
             reporting_policy_context = contract.get("reporting_policy", {}) if isinstance(contract, dict) else {}
@@ -1472,6 +1474,20 @@ class BusinessTranslatorAgent:
             run_summary=run_summary if isinstance(run_summary, dict) else {},
             run_id=str(run_id) if run_id else None,
         )
+        evidence_paths: List[str] = []
+        manifest_items = manifest.get("items", []) if isinstance(manifest, dict) else []
+        if isinstance(manifest_items, list):
+            for item in manifest_items:
+                if not isinstance(item, dict):
+                    continue
+                path = item.get("path")
+                if item.get("present") and _looks_like_path(path):
+                    evidence_paths.append(str(path))
+        if not evidence_paths:
+            evidence_paths = [path for path in raw_evidence_paths if _artifact_available(path)]
+        if not evidence_paths:
+            evidence_paths = list(raw_evidence_paths)
+        evidence_paths = [p for idx, p in enumerate(evidence_paths) if p and p not in evidence_paths[:idx]][:8]
         artifact_inventory_table_html = _build_artifact_inventory_table_html(manifest)
         artifact_compliance_table_html = _build_artifact_compliance_table_html(
             manifest,
@@ -1520,7 +1536,7 @@ class BusinessTranslatorAgent:
         header_rows = []
         if isinstance(cleaned_rows, dict) and isinstance(cleaned_rows.get("columns"), list):
             cols = cleaned_rows.get("columns") or []
-            header_rows.append(["data/cleaned_data.csv", str(len(cols)), _compact_header(cols)])
+            header_rows.append([cleaned_path, str(len(cols)), _compact_header(cols)])
         if isinstance(scored_rows, dict) and isinstance(scored_rows.get("columns"), list):
             cols = scored_rows.get("columns") or []
             header_rows.append(["data/scored_rows.csv", str(len(cols)), _compact_header(cols)])

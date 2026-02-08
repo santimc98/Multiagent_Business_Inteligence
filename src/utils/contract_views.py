@@ -10,6 +10,7 @@ from src.utils.contract_accessors import (
     get_column_roles,
     get_cleaning_gates,
     get_derived_column_names,
+    get_outcome_columns,
     get_qa_gates,
     get_reviewer_gates,
     get_required_outputs,
@@ -1356,9 +1357,7 @@ def build_contract_views_projection(
     canonical_columns = [str(c) for c in get_canonical_columns(contract_full) if c]
     column_roles = get_column_roles(contract_full)
     decision_columns = [str(c) for c in get_column_roles(contract_full).get("decision", []) if c]
-    outcome_columns = [str(c) for c in get_column_roles(contract_full).get("outcome", []) if c]
-    if not outcome_columns:
-        outcome_columns = [str(c) for c in contract_full.get("outcome_columns", []) if c]
+    outcome_columns = [str(c) for c in get_outcome_columns(contract_full) if c]
     audit_only_columns = [
         str(c)
         for c in (

@@ -8138,6 +8138,74 @@ def _resolve_de_output_artifacts(state: Dict[str, Any]) -> tuple[str, str, List[
     return output_path, manifest_path, required_artifacts
 
 
+def _candidate_ml_input_paths(state: Dict[str, Any]) -> List[str]:
+    """
+    Collect candidate local cleaned-dataset paths from state + contract views.
+    Order is deterministic and favors contract-derived sources.
+    """
+    if not isinstance(state, dict):
+        return []
+    candidates: List[str] = []
+
+    explicit = state.get("ml_data_path")
+    if isinstance(explicit, str) and explicit.strip():
+        candidates.append(explicit.strip())
+
+    de_output_path, _, _ = _resolve_de_output_artifacts(state)
+    if de_output_path:
+        candidates.append(de_output_path)
+
+    contract = state.get("execution_contract")
+    if isinstance(contract, dict):
+        artifact_reqs = contract.get("artifact_requirements")
+        if isinstance(artifact_reqs, dict):
+            clean_dataset = artifact_reqs.get("clean_dataset")
+            if isinstance(clean_dataset, dict):
+                output_path = clean_dataset.get("output_path")
+                if isinstance(output_path, str) and output_path.strip():
+                    candidates.append(output_path.strip())
+        required_outputs = contract.get("required_outputs")
+        if isinstance(required_outputs, list):
+            for path in required_outputs:
+                if not isinstance(path, str):
+                    continue
+                norm = _normalize_output_path(path)
+                if norm.endswith(".csv") and "/clean" in norm.lower():
+                    candidates.append(norm)
+
+    # Canonical/project aliases (universal fallbacks)
+    candidates.extend(
+        [
+            "data/cleaned_dataset.csv",
+            "data/cleaned_data.csv",
+            "data/cleaned_full.csv",
+        ]
+    )
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        norm = _normalize_output_path(str(path or ""))
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        normalized.append(norm)
+    return normalized
+
+
+def _resolve_ml_input_path(state: Dict[str, Any], *, require_exists: bool) -> str:
+    """
+    Resolve ML input data path from state/contract candidates.
+    """
+    for path in _candidate_ml_input_paths(state):
+        if not path:
+            continue
+        if require_exists and not os.path.exists(path):
+            continue
+        return path
+    return ""
+
+
 def _execute_data_engineer_via_heavy_runner(
     *,
     state: Dict[str, Any],
@@ -8396,7 +8464,7 @@ def _finalize_heavy_execution(
     required_outputs = _resolve_required_outputs(contract, state)
     deliverables = _resolve_contract_deliverables(contract)
     output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
-    cleaned_path = str(state.get("ml_data_path") or "").strip()
+    cleaned_path = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
     if not cleaned_path:
         cleaned_path, _, _ = _resolve_de_output_artifacts(state)
 
@@ -8551,6 +8619,7 @@ def _finalize_heavy_execution(
         "ml_call_refund_pending": False,
         "execution_call_refund_pending": False,
         "budget_counters": counters,
+        "ml_data_path": cleaned_path or state.get("ml_data_path"),
     }
     if not error_in_output:
         result["runtime_fix_count"] = 0
@@ -11458,7 +11527,10 @@ def check_execution_planner_success(state: AgentState):
     return "success"
 
 def run_engineer(state: AgentState) -> AgentState:
-    print(f"--- [4] ML Engineer: Generating Code (Iteration {state.get('iteration_count', 0) + 1}) ---")
+    print(
+        f"--- [4] ML Engineer: Generating Code "
+        f"(Iteration {state.get('iteration_count', 0) + 1}, Attempt {int(state.get('ml_engineer_attempt', 0) or 0) + 1}) ---"
+    )
     abort_state = _abort_if_requested(state, "ml_engineer")
     if abort_state:
         return abort_state
@@ -11509,8 +11581,17 @@ def run_engineer(state: AgentState) -> AgentState:
                 "review_abort_reason": "strategy_lock_failed",
             }
 
+    ml_attempt = int(state.get("ml_engineer_attempt", 0) or 0) + 1
     if run_id:
-        log_run_event(run_id, "ml_engineer_start", {"iteration": state.get("iteration_count", 0) + 1})
+        log_run_event(
+            run_id,
+            "ml_engineer_start",
+            {
+                "iteration": state.get("iteration_count", 0) + 1,
+                "ml_engineer_attempt": ml_attempt,
+                "runtime_fix_count": int(state.get("runtime_fix_count", 0) or 0),
+            },
+        )
 
     strategy = state.get('selected_strategy')
 
@@ -11537,12 +11618,7 @@ def run_engineer(state: AgentState) -> AgentState:
 
 
     # Pass input context
-    data_path = ""
-    de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
-    if isinstance(de_view, dict) and de_view.get("output_path"):
-        data_path = str(de_view.get("output_path"))
-    elif state.get("ml_data_path"):
-        data_path = str(state.get("ml_data_path"))
+    data_path = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
     minimal_context_mode = _minimal_agent_context_enabled()
     data_audit_context = _build_agent_feedback_context(state if isinstance(state, dict) else {}, "ml_engineer")
     if not data_path:
@@ -11951,16 +12027,16 @@ def run_engineer(state: AgentState) -> AgentState:
                 response=getattr(ml_engineer, "last_response", None) or code,
                 context=ctx_payload,
                 script=code,
-                attempt=int(state.get("iteration_count", 0)) + 1,
+                attempt=ml_attempt,
             )
         try:
-            iter_id = int(state.get("iteration_count", 0)) + 1
+            iter_id = ml_attempt
             os.makedirs(os.path.join("artifacts", "iterations"), exist_ok=True)
-            iter_path = os.path.join("artifacts", "iterations", f"ml_code_iter_{iter_id}.py")
+            iter_path = os.path.join("artifacts", "iterations", f"ml_code_attempt_{iter_id}.py")
             with open(iter_path, "w", encoding="utf-8") as f_iter:
                 f_iter.write(code)
         except Exception as iter_err:
-            print(f"Warning: failed to persist ml_code_iter_{iter_id}.py: {iter_err}")
+            print(f"Warning: failed to persist ml_code_attempt_{iter_id}.py: {iter_err}")
 
         policy_warnings = getattr(ml_engineer, "last_training_policy_warnings", None)
         if policy_warnings and run_id:
@@ -11983,6 +12059,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "generated_code": code,
                 "execution_output": msg,
                 "budget_counters": counters,
+                "ml_engineer_attempt": ml_attempt,
             }
         if str(code).strip().startswith("# Error:"):
             return {
@@ -11990,8 +12067,9 @@ def run_engineer(state: AgentState) -> AgentState:
                 "generated_code": code,
                 "execution_output": code,
                 "budget_counters": counters,
+                "ml_engineer_attempt": ml_attempt,
             }
-        return {
+        result = {
             "selected_strategy": strategy,
             "generated_code": code,
             "last_generated_code": code, # Update for next patch
@@ -12023,12 +12101,17 @@ def run_engineer(state: AgentState) -> AgentState:
             "data_profile_path": state.get("data_profile_path"),
             "ml_plan": ml_plan if 'ml_plan' in dir() else state.get("ml_plan"),
             "ml_plan_path": state.get("ml_plan_path"),
+            "ml_engineer_attempt": ml_attempt,
         }
+        merged_state = dict(state or {})
+        merged_state.update(result)
+        _refresh_run_facts_pack(merged_state)
+        return result
     except Exception as e:
         msg = f"CRITICAL: ML Engineer crashed in host: {str(e)}"
         print(msg)
         trace_text = traceback.format_exc()
-        iter_id = int(state.get("iteration_count", 0)) + 1
+        iter_id = ml_attempt
         if run_id:
             log_run_event(
                 run_id,
@@ -12038,6 +12121,7 @@ def run_engineer(state: AgentState) -> AgentState:
                     "exc_type": type(e).__name__,
                     "traceback": trace_text[:5000],
                     "iteration": iter_id,
+                    "ml_engineer_attempt": ml_attempt,
                 },
             )
         try:
@@ -12052,6 +12136,7 @@ def run_engineer(state: AgentState) -> AgentState:
             "generated_code": "# Generation Failed",
             "execution_output": msg,
             "budget_counters": counters,
+            "ml_engineer_attempt": ml_attempt,
         }
 
 def check_engineer_success(state: AgentState):
@@ -12797,9 +12882,8 @@ def execute_code(state: AgentState) -> AgentState:
             required_outputs = _resolve_required_outputs(contract, state)
             expected_outputs = _resolve_expected_output_paths(contract, state)
             preserve_paths = []
-            ml_input_path = state.get("ml_data_path")
-            if ml_input_path:
-                preserve_paths.append(str(ml_input_path))
+            ml_candidate_paths = _candidate_ml_input_paths(state if isinstance(state, dict) else {})
+            preserve_paths.extend(ml_candidate_paths)
             de_view_paths = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
             if isinstance(de_view_paths, dict):
                 for key in ("output_path", "output_manifest_path", "manifest_path"):
@@ -12807,13 +12891,21 @@ def execute_code(state: AgentState) -> AgentState:
                     if value:
                         preserve_paths.append(str(value))
             _purge_execution_outputs(required_outputs, expected_outputs, preserve_paths=preserve_paths)
-            local_csv = str(state.get("ml_data_path") or "").strip()
+            local_csv = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=True)
             if not local_csv:
+                local_csv_hint = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
+                if not local_csv_hint and ml_candidate_paths:
+                    local_csv_hint = str(ml_candidate_paths[0])
                 return {
-                    "error_message": "HEAVY_RUNNER: ml_data_path missing from contract-derived context",
+                    "error_message": (
+                        "HEAVY_RUNNER: ml_data_path missing from contract-derived context"
+                        + (f" (best_candidate={local_csv_hint})" if local_csv_hint else "")
+                    ),
                     "execution_output": "HEAVY_RUNNER_ERROR: ml_data_path missing",
+                    "ml_data_path": local_csv_hint or "",
                     "budget_counters": counters,
                 }
+            state["ml_data_path"] = local_csv
             column_inventory = state.get("column_inventory")
             if not isinstance(column_inventory, list) or not column_inventory:
                 inv = _load_json_safe("data/column_inventory.json")
@@ -12839,6 +12931,14 @@ def execute_code(state: AgentState) -> AgentState:
                             "label_present",
                         }:
                             target_cols = [tf_col.strip()]
+                if not target_cols:
+                    role_targets = roles.get("target") or roles.get("label") or []
+                    if isinstance(role_targets, str):
+                        target_cols = [role_targets]
+                    elif isinstance(role_targets, list):
+                        target_cols = [str(col) for col in role_targets if str(col).strip()]
+                    else:
+                        target_cols = []
                 if not target_cols:
                     target_cols = list(state.get("target_columns") or [])
                 target_col = target_cols[0] if target_cols else None
@@ -12938,6 +13038,7 @@ def execute_code(state: AgentState) -> AgentState:
                 return {
                     "error_message": f"HEAVY_RUNNER: ml_data_path missing on disk ({local_csv})",
                     "execution_output": "HEAVY_RUNNER_ERROR: ml_data_path missing",
+                    "ml_data_path": local_csv,
                     "budget_counters": counters,
                 }
 
@@ -12981,6 +13082,7 @@ def execute_code(state: AgentState) -> AgentState:
                         "required_artifacts": required_artifacts,
                         "support_files": [item.get("path") for item in support_files],
                         "attempt_id": attempt_id,
+                        "ml_data_path": local_csv,
                     },
                 )
             if run_id:
@@ -13145,9 +13247,8 @@ def execute_code(state: AgentState) -> AgentState:
     required_outputs = _resolve_required_outputs(contract, state)
     expected_outputs = _resolve_expected_output_paths(contract, state)
     preserve_paths = []
-    ml_input_path = state.get("ml_data_path")
-    if ml_input_path:
-        preserve_paths.append(str(ml_input_path))
+    ml_candidate_paths = _candidate_ml_input_paths(state if isinstance(state, dict) else {})
+    preserve_paths.extend(ml_candidate_paths)
     de_view_paths = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
     if isinstance(de_view_paths, dict):
         for key in ("output_path", "output_manifest_path", "manifest_path"):
@@ -13251,19 +13352,28 @@ def execute_code(state: AgentState) -> AgentState:
                 run_cmd_with_retry(sandbox, f"mkdir -p {run_root}/data", retries=2)
 
                 # P2.1: Use canonical cleaned path + aliases (P2.2: run_cmd_with_retry)
-                local_csv = str(state.get("ml_data_path") or "").strip()
+                local_csv = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=True)
                 if not local_csv:
+                    local_csv_hint = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
+                    if not local_csv_hint and ml_candidate_paths:
+                        local_csv_hint = str(ml_candidate_paths[0])
                     return {
-                        "error_message": "ML_EXECUTION_ABORTED: ml_data_path missing from contract-derived context",
+                        "error_message": (
+                            "ML_EXECUTION_ABORTED: ml_data_path missing from contract-derived context"
+                            + (f" (best_candidate={local_csv_hint})" if local_csv_hint else "")
+                        ),
                         "execution_output": "ML_EXECUTION_ERROR: ml_data_path missing",
+                        "ml_data_path": local_csv_hint or "",
                         "budget_counters": counters,
                     }
                 if not os.path.exists(local_csv):
                     return {
                         "error_message": f"ML_EXECUTION_ABORTED: ml_data_path not found ({local_csv})",
                         "execution_output": "ML_EXECUTION_ERROR: ml_data_path missing",
+                        "ml_data_path": local_csv,
                         "budget_counters": counters,
                     }
+                state["ml_data_path"] = local_csv
 
                 # Upload cleaned data (P2.1: Canonical path)
                 remote_clean_abs = canonical_abs(run_root, CANONICAL_CLEANED_REL)
@@ -14515,7 +14625,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         qa_context["_contract_source"] = "execution_contract"
     else:
         qa_context = {"_contract_source": "fallback"}
-    ml_data_path = state.get("ml_data_path")
+    ml_data_path = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
     if ml_data_path:
         qa_context["ml_data_path"] = ml_data_path
     if state.get("ml_training_policy_warnings"):
@@ -14545,13 +14655,23 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     review_warnings: List[str] = []
     review_result: Dict[str, Any] = {}
     qa_result: Dict[str, Any] = {}
+    budget_counter_state: Dict[str, Any] = {
+        "run_budget": state.get("run_budget"),
+        "budget_counters": review_counters,
+    }
     if code:
         analysis_type = strategy.get("analysis_type", "predictive")
         evaluation_spec_code_audit = dict(evaluation_spec_for_review or {})
         evaluation_spec_code_audit["execution_diagnostics"] = review_diagnostics
         try:
-            ok, counters, err_msg = _consume_budget(state, "reviewer_calls", "max_reviewer_calls", "Reviewer")
+            ok, counters, err_msg = _consume_budget(
+                budget_counter_state,
+                "reviewer_calls",
+                "max_reviewer_calls",
+                "Reviewer",
+            )
             review_counters = counters
+            budget_counter_state["budget_counters"] = review_counters
             if ok:
                 reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
                 if not isinstance(reviewer_view, dict) or not reviewer_view:
@@ -14601,8 +14721,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         except Exception as review_err:
             review_warnings.append(f"REVIEWER_CODE_AUDIT_ERROR: {review_err}")
         try:
-            ok, counters, err_msg = _consume_budget(state, "qa_calls", "max_qa_calls", "QA Reviewer")
+            ok, counters, err_msg = _consume_budget(
+                budget_counter_state,
+                "qa_calls",
+                "max_qa_calls",
+                "QA Reviewer",
+            )
             review_counters = counters
+            budget_counter_state["budget_counters"] = review_counters
             if ok:
                 qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context_prompt)
                 qa_result = _apply_review_consistency_guard(

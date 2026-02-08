@@ -334,9 +334,26 @@ def get_outcome_columns(contract: Dict[str, Any]) -> List[str]:
 
     # First: try column_roles["outcome"]
     roles = get_column_roles(contract)
-    outcome_cols = roles.get("outcome", [])
+    outcome_cols_raw = roles.get("outcome", [])
+    if isinstance(outcome_cols_raw, str):
+        outcome_cols = [outcome_cols_raw]
+    elif isinstance(outcome_cols_raw, list):
+        outcome_cols = outcome_cols_raw
+    else:
+        outcome_cols = []
     if outcome_cols:
-        return [c for c in outcome_cols if c and c.lower() != "unknown"]
+        return [str(c) for c in outcome_cols if c and str(c).lower() != "unknown"]
+    # Universal fallback: many contracts express supervised targets as `target` role.
+    for alias in ("target", "label", "response", "y"):
+        alias_cols_raw = roles.get(alias, [])
+        if isinstance(alias_cols_raw, str):
+            alias_cols = [alias_cols_raw]
+        elif isinstance(alias_cols_raw, list):
+            alias_cols = alias_cols_raw
+        else:
+            alias_cols = []
+        if alias_cols:
+            return [str(c) for c in alias_cols if c and str(c).lower() != "unknown"]
 
     # Fallback: validation_requirements.params
     val_req = contract.get("validation_requirements")
