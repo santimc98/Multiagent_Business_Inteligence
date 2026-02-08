@@ -35,6 +35,21 @@ class _StubBoardNeedsImprovement:
             "evidence": [],
         }
 
+class _StubBoardMetricOnlyNeedsImprovement:
+    def __init__(self):
+        self.last_prompt = None
+        self.last_response = None
+
+    def adjudicate(self, _context):
+        return {
+            "status": "NEEDS_IMPROVEMENT",
+            "summary": "Metric is below ideal benchmark.",
+            "failed_areas": ["metric_gap"],
+            "required_actions": ["Try additional model families to improve KPI."],
+            "confidence": "medium",
+            "evidence": [],
+        }
+
 
 class _RuntimePathReviewer:
     def evaluate_results(self, *_args, **_kwargs):
@@ -146,3 +161,29 @@ def test_run_review_board_does_not_double_increment_when_already_needs_improveme
     result = graph_mod.run_review_board(state)
     assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
     assert "iteration_count" not in result
+
+
+def test_run_review_board_metric_only_needs_improvement_is_downgraded(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardMetricOnlyNeedsImprovement())
+    state = {
+        "iteration_count": 0,
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "review_feedback": "Metric advisory only.",
+        "feedback_history": [],
+        "execution_output": "OK",
+        "last_gate_context": {"failed_gates": [], "required_fixes": []},
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False},
+            "result_evaluator": {"status": "APPROVE_WITH_WARNINGS"},
+            "reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "APPROVED"},
+            "results_advisor": {"status": "APPROVE_WITH_WARNINGS"},
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+    assert result["review_verdict"] == "APPROVE_WITH_WARNINGS"
+    assert "iteration_count" not in result
+    assert any("REVIEW_BOARD_POLICY" in item for item in (result.get("feedback_history") or []))

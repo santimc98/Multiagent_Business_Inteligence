@@ -3446,6 +3446,98 @@ def _classify_iteration_type(
         return "compliance"
     return "metric"
 
+def _looks_blocking_retry_signal(text: Any) -> bool:
+    value = str(text or "").strip().lower()
+    if not value:
+        return False
+    blocking_tokens = [
+        "runtime",
+        "traceback",
+        "exception",
+        "crash",
+        "sandbox",
+        "output_contract",
+        "contract_required",
+        "required_outputs_missing",
+        "artifact_missing",
+        "missing output",
+        "missing artifact",
+        "qa_",
+        "code_audit",
+        "hard_fail",
+        "leakage",
+        "security",
+        "decisioning",
+        "visual_requirements",
+        "schema_inconsistent",
+        "alignment_check",
+        "dependency",
+        "dialect",
+        "static_precheck",
+        "syntax",
+    ]
+    return any(token in value for token in blocking_tokens)
+
+def _is_blocking_retry_reason(
+    state: Dict[str, Any] | None,
+    gate_context: Dict[str, Any] | None = None,
+    board_failed_areas: List[str] | None = None,
+    board_required_actions: List[str] | None = None,
+) -> bool:
+    state = state if isinstance(state, dict) else {}
+    gate_context = gate_context if isinstance(gate_context, dict) else (
+        state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+    )
+    board_failed_areas = board_failed_areas if isinstance(board_failed_areas, list) else []
+    board_required_actions = board_required_actions if isinstance(board_required_actions, list) else []
+
+    if state.get("runtime_fix_terminal"):
+        return True
+    if state.get("sandbox_failed"):
+        return True
+    if _has_runtime_failure_marker(state.get("execution_output")):
+        return True
+
+    last_iter_type = str(state.get("last_iteration_type") or "").strip().lower()
+    gate_iter_type = str(gate_context.get("iteration_type") or "").strip().lower()
+    if last_iter_type == "compliance" or gate_iter_type == "compliance":
+        return True
+
+    hard_failures = [str(x) for x in (gate_context.get("hard_failures") or state.get("hard_failures") or []) if x]
+    if hard_failures:
+        return True
+
+    oc_report = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
+    if isinstance(oc_report, dict):
+        if str(oc_report.get("overall_status") or "").strip().lower() == "error":
+            return True
+        missing = [str(x) for x in (oc_report.get("missing") or []) if x]
+        if missing:
+            return True
+        artifact_report = oc_report.get("artifact_requirements_report")
+        if isinstance(artifact_report, dict):
+            if str(artifact_report.get("status") or "").strip().lower() == "error":
+                return True
+
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    artifact_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
+    visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
+    if visual_reqs.get("required") and bool(state.get("visuals_missing")):
+        return True
+
+    signals: List[str] = []
+    signals.extend([str(x) for x in (gate_context.get("failed_gates") or []) if x])
+    signals.extend([str(x) for x in (gate_context.get("required_fixes") or []) if x])
+    signals.extend([str(x) for x in hard_failures if x])
+    signals.extend([str(x) for x in (board_failed_areas or []) if x])
+    signals.extend([str(x) for x in (board_required_actions or []) if x])
+    for key in ("feedback", "source"):
+        value = gate_context.get(key)
+        if value:
+            signals.append(str(value))
+
+    return any(_looks_blocking_retry_signal(signal) for signal in signals)
+
 def _normalize_qa_gate_specs(raw_gates: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw_gates, list):
         return []
@@ -15542,14 +15634,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     # METRIC ITERATION DISABLED: Force downgrade to APPROVE_WITH_WARNINGS for metric-only issues.
     # This stops the metric retry loop while preserving compliance/runtime retries.
     metric_iteration_disabled = False
-    oc_error = oc_overall_status == "error"
-    has_hard_failures = bool(merged_hard_failures)
+    blocking_retry = _is_blocking_retry_reason(
+        state if isinstance(state, dict) else {},
+        gate_context=gate_context,
+    )
     if (
         status == "NEEDS_IMPROVEMENT"
         and iteration_type == "metric"
-        and not audit_rejected
-        and not has_hard_failures
-        and not oc_error
+        and not blocking_retry
     ):
         status = "APPROVE_WITH_WARNINGS"
         metric_disable_msg = "(Metric iteration disabled: reporting limitations & next steps only.)"
@@ -15922,6 +16014,29 @@ def run_review_board(state: AgentState) -> AgentState:
         "required_actions": required_actions,
         "confidence": confidence,
     }
+    if final_status == "NEEDS_IMPROVEMENT":
+        blocking_retry = _is_blocking_retry_reason(
+            state if isinstance(state, dict) else {},
+            gate_context=gate_context,
+            board_failed_areas=failed_areas,
+            board_required_actions=required_actions,
+        )
+        if not blocking_retry:
+            final_status = "APPROVE_WITH_WARNINGS"
+            board_note = (
+                "Review board marked NEEDS_IMPROVEMENT for non-blocking advisory issues "
+                "(metrics/optimization). Retry skipped by policy."
+            )
+            board_summary = f"{board_summary} {board_note}".strip() if board_summary else board_note
+            history.append("REVIEW_BOARD_POLICY: Non-blocking issues downgraded to APPROVE_WITH_WARNINGS.")
+            current_feedback = (
+                f"{current_feedback}\nREVIEW_BOARD_POLICY: advisory-only, no retry triggered."
+                if current_feedback
+                else "REVIEW_BOARD_POLICY: advisory-only, no retry triggered."
+            )
+            gate_context["iteration_type"] = "metric"
+        else:
+            gate_context["iteration_type"] = "compliance"
 
     iteration_handoff = state.get("iteration_handoff")
     if not isinstance(iteration_handoff, dict):
@@ -16312,9 +16427,12 @@ def check_evaluation(state: AgentState):
         return "approved"
 
     if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
-        # This branch should only be reached for compliance/runtime retries now
-        print(f"ITER_DECISION type=other action=retry reason=COMPLIANCE_OR_RUNTIME metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
-        return "retry"
+        if _is_blocking_retry_reason(state if isinstance(state, dict) else {}):
+            print(f"ITER_DECISION type=other action=retry reason=COMPLIANCE_OR_RUNTIME metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+            return "retry"
+        print(f"ITER_DECISION type=other action=stop reason=ADVISORY_ONLY metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+        state["stop_reason"] = "ADVISORY_ONLY"
+        return "approved"
     else:
         print(f"ITER_DECISION type=other action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         return "approved"

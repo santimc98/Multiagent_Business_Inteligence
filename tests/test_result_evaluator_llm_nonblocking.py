@@ -238,3 +238,17 @@ def test_result_evaluator_missing_contract_artifact_forces_retry(tmp_path, monke
 
     state.update(result)
     assert graph_mod.check_evaluation(state) == "retry"
+
+
+def test_check_evaluation_advisory_needs_improvement_stops_without_retry():
+    state = {
+        "review_verdict": "NEEDS_IMPROVEMENT",
+        "execution_output": "OK",
+        "last_iteration_type": None,
+        "last_gate_context": {
+            "failed_gates": ["metric_gap"],
+            "required_fixes": ["Improve KPI if possible."],
+        },
+    }
+    assert graph_mod.check_evaluation(state) == "approved"
+    assert state.get("stop_reason") == "ADVISORY_ONLY"
