@@ -606,6 +606,14 @@ def _normalize_gate_name(name: Any) -> str:
         "numeric_parsing_verification": "numeric_parsing_validation",
         "numericparsingverification": "numeric_parsing_validation",
         "numeric_parsing_check": "numeric_parsing_validation",
+        "numeric_type_casting": "numeric_type_casting_check",
+        "numeric_type_casting_check": "numeric_type_casting_check",
+        "numeric_type_casting_validation": "numeric_type_casting_check",
+        "target_null_alignment_with_split": "target_null_alignment_with_split",
+        "target_null_split_alignment": "target_null_alignment_with_split",
+        "target_split_null_alignment": "target_null_alignment_with_split",
+        "id_uniqueness_validation": "id_uniqueness_validation",
+        "id_uniqueness_check": "id_uniqueness_validation",
     }
     return alias_map.get(key, key)
 
@@ -786,6 +794,238 @@ def _check_numeric_parsing_validation(
         evidence["ratios"][col] = round(ratio, 4)
         if ratio < threshold:
             issues.append(f"{col} parseable_ratio={ratio:.2f} < {threshold:.2f}")
+    return issues, evidence
+
+
+def _pick_first_existing(candidates: List[str], cleaned_header: List[str]) -> str:
+    header_set = set(cleaned_header or [])
+    for col in candidates:
+        if col in header_set:
+            return col
+    return ""
+
+
+def _is_null_like_text(value: Any) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    return text in {"", "nan", "none", "null", "na"}
+
+
+def _build_null_mask(
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    column: str,
+) -> Optional[pd.Series]:
+    if sample_infer is not None and column in sample_infer.columns:
+        try:
+            return sample_infer[column].isna()
+        except Exception:
+            pass
+    if sample_str is not None and column in sample_str.columns:
+        try:
+            return sample_str[column].map(_is_null_like_text)
+        except Exception:
+            return None
+    return None
+
+
+def _resolve_numeric_cast_columns(
+    cleaned_header: List[str],
+    column_roles: Dict[str, List[str]],
+    params: Dict[str, Any],
+) -> List[str]:
+    columns = _list_str(params.get("columns"))
+    if columns:
+        return [col for col in columns if col in (cleaned_header or [])]
+
+    candidates: List[str] = []
+    candidates.extend(_columns_with_role_tokens(column_roles, {"feature", "predictor", "input"}))
+    # Common generic feature naming used in tabular datasets.
+    candidates.extend([col for col in (cleaned_header or []) if re.match(r"(?i)^var[_-]?\d+$", str(col))])
+    if not candidates:
+        candidates.extend(
+            [
+                col
+                for col in (cleaned_header or [])
+                if col
+                and col not in _columns_with_role_tokens(column_roles, {"id", "identifier", "split", "partition"})
+            ]
+        )
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for col in candidates:
+        if col in seen or col not in (cleaned_header or []):
+            continue
+        seen.add(col)
+        deduped.append(col)
+    return deduped
+
+
+def _check_numeric_type_casting(
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+) -> Tuple[List[str], Dict[str, Any]]:
+    columns = _resolve_numeric_cast_columns(cleaned_header, column_roles, params)
+    parse_params = dict(params or {})
+    parse_params["columns"] = columns
+    parse_params.setdefault("min_parse_ratio", 0.95)
+    issues, evidence = _check_numeric_parsing_validation(sample_str, sample_infer, parse_params)
+    evidence["columns_checked"] = len(columns)
+    evidence["columns_preview"] = columns[:20]
+    return issues, evidence
+
+
+def _check_target_null_alignment_with_split(
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+) -> Tuple[List[str], Dict[str, Any]]:
+    target_candidates = _list_str(params.get("target_column")) + _list_str(params.get("target_columns"))
+    split_candidates = _list_str(params.get("split_column")) + _list_str(params.get("split_columns"))
+    if not target_candidates:
+        target_candidates.extend(_columns_with_role_tokens(column_roles, {"target", "label", "outcome"}))
+        target_candidates.extend(["target", "label", "y"])
+    if not split_candidates:
+        split_candidates.extend(_columns_with_role_tokens(column_roles, {"split", "partition", "fold"}))
+        split_candidates.extend(["__split", "split", "partition", "fold"])
+
+    target_col = _pick_first_existing(target_candidates, cleaned_header)
+    split_col = _pick_first_existing(split_candidates, cleaned_header)
+
+    evidence: Dict[str, Any] = {
+        "target_column": target_col or None,
+        "split_column": split_col or None,
+    }
+    if not target_col or not split_col:
+        evidence["note"] = "target_or_split_column_missing"
+        return [], evidence
+
+    frame = sample_infer if sample_infer is not None else sample_str
+    if frame is None or target_col not in frame.columns or split_col not in frame.columns:
+        evidence["note"] = "sample_missing_required_columns"
+        return [], evidence
+
+    null_mask = _build_null_mask(sample_str, sample_infer, target_col)
+    if null_mask is None:
+        evidence["note"] = "target_null_mask_unavailable"
+        return [], evidence
+
+    total_rows = int(len(frame))
+    null_count = int(null_mask.sum())
+    evidence["total_rows_sampled"] = total_rows
+    evidence["target_null_count"] = null_count
+    if total_rows <= 0 or null_count <= 0:
+        evidence["note"] = "no_target_nulls_in_sample"
+        return [], evidence
+
+    split_series = frame[split_col].astype(str).fillna("").map(lambda x: x.strip())
+    null_split = split_series[null_mask]
+    nonnull_split = split_series[~null_mask]
+    if null_split.empty:
+        evidence["note"] = "no_null_rows_after_filter"
+        return [], evidence
+
+    null_distribution = null_split.value_counts(dropna=False).to_dict()
+    nonnull_distribution = nonnull_split.value_counts(dropna=False).to_dict()
+    evidence["null_split_distribution"] = {str(k): int(v) for k, v in null_distribution.items()}
+    evidence["nonnull_split_distribution"] = {str(k): int(v) for k, v in nonnull_distribution.items()}
+
+    dominant_split = str(null_split.mode().iloc[0]) if not null_split.mode().empty else ""
+    evidence["dominant_null_split_value"] = dominant_split or None
+    if not dominant_split:
+        return [], evidence
+
+    null_outside_ratio = float((null_split != dominant_split).mean()) if len(null_split) else 0.0
+    labeled_in_null_split_ratio = float((nonnull_split == dominant_split).mean()) if len(nonnull_split) else 0.0
+
+    max_null_outside = float(params.get("max_nulls_outside_dominant_split", 0.05))
+    max_labeled_in_null_split = float(params.get("max_labeled_in_null_split_ratio", 0.10))
+    evidence["null_outside_ratio"] = round(null_outside_ratio, 4)
+    evidence["labeled_in_null_split_ratio"] = round(labeled_in_null_split_ratio, 4)
+    evidence["thresholds"] = {
+        "max_nulls_outside_dominant_split": max_null_outside,
+        "max_labeled_in_null_split_ratio": max_labeled_in_null_split,
+    }
+
+    issues: List[str] = []
+    if null_outside_ratio > max_null_outside:
+        issues.append(
+            f"target null rows not aligned with split '{dominant_split}' "
+            f"(outside_ratio={null_outside_ratio:.4f} > {max_null_outside:.4f})"
+        )
+    if labeled_in_null_split_ratio > max_labeled_in_null_split:
+        issues.append(
+            f"labeled rows detected in null-dominant split '{dominant_split}' "
+            f"(ratio={labeled_in_null_split_ratio:.4f} > {max_labeled_in_null_split:.4f})"
+        )
+    return issues, evidence
+
+
+def _check_id_uniqueness_validation(
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+) -> Tuple[List[str], Dict[str, Any]]:
+    columns = _list_str(params.get("columns")) + _list_str(params.get("id_columns"))
+    if not columns:
+        columns.extend(_columns_with_role_tokens(column_roles, {"id", "identifier", "key"}))
+    if not columns:
+        regex = params.get("identifier_name_regex") or _DEFAULT_ID_REGEX
+        try:
+            pattern = re.compile(regex)
+        except re.error:
+            pattern = re.compile(_DEFAULT_ID_REGEX)
+        columns.extend([col for col in cleaned_header if pattern.search(str(col))])
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for col in columns:
+        if col in seen or col not in cleaned_header:
+            continue
+        seen.add(col)
+        deduped.append(col)
+    columns = deduped
+
+    evidence: Dict[str, Any] = {"id_columns": columns, "duplicate_ratio": {}}
+    if not columns:
+        evidence["note"] = "no_id_columns_detected"
+        return [], evidence
+
+    max_duplicate_ratio = float(params.get("max_duplicate_ratio", 0.0))
+    min_samples = int(params.get("min_samples", 20))
+    issues: List[str] = []
+
+    for col in columns:
+        series = None
+        if sample_str is not None and col in sample_str.columns:
+            series = sample_str[col]
+        elif sample_infer is not None and col in sample_infer.columns:
+            series = sample_infer[col]
+        if series is None:
+            evidence["duplicate_ratio"][col] = None
+            continue
+        cleaned = series.dropna().astype(str).map(lambda x: x.strip())
+        cleaned = cleaned[cleaned != ""]
+        total = int(len(cleaned))
+        unique = int(cleaned.nunique(dropna=True))
+        duplicate_ratio = float((total - unique) / total) if total else 0.0
+        evidence["duplicate_ratio"][col] = round(duplicate_ratio, 4)
+        evidence.setdefault("sample_counts", {})[col] = {"total": total, "unique": unique}
+        if total < min_samples:
+            continue
+        if duplicate_ratio > max_duplicate_ratio:
+            issues.append(
+                f"{col} duplicate_ratio={duplicate_ratio:.4f} > {max_duplicate_ratio:.4f}"
+            )
     return issues, evidence
 
 
@@ -989,6 +1229,30 @@ def _evaluate_gates_deterministic(
             evidence["row_counts"] = (manifest.get("row_counts") or {})
         elif gate_key == "numeric_parsing_validation":
             issues, evidence = _check_numeric_parsing_validation(sample_str, sample_infer, params)
+        elif gate_key == "numeric_type_casting_check":
+            issues, evidence = _check_numeric_type_casting(
+                sample_str=sample_str,
+                sample_infer=sample_infer,
+                cleaned_header=cleaned_header,
+                params=params,
+                column_roles=column_roles,
+            )
+        elif gate_key == "target_null_alignment_with_split":
+            issues, evidence = _check_target_null_alignment_with_split(
+                sample_str=sample_str,
+                sample_infer=sample_infer,
+                cleaned_header=cleaned_header,
+                params=params,
+                column_roles=column_roles,
+            )
+        elif gate_key == "id_uniqueness_validation":
+            issues, evidence = _check_id_uniqueness_validation(
+                sample_str=sample_str,
+                sample_infer=sample_infer,
+                cleaned_header=cleaned_header,
+                params=params,
+                column_roles=column_roles,
+            )
         elif gate_key == "null_handling_verification":
             columns = _list_str(params.get("columns"))
             allow_nulls = params.get("allow_nulls", True)
@@ -1035,7 +1299,7 @@ def _evaluate_gates_deterministic(
                 warnings.append(f"NULLS_OUTSIDE_GATE: {col} null_frac={null_frac:.4f}")
         else:
             evaluated = False
-            warnings.append(f"UNKNOWN_GATE_SKIPPED: {name}")
+            evidence["deterministic_support"] = "not_implemented"
 
         passed = None
         if evaluated:
