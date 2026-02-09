@@ -555,6 +555,12 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
     weights = _safe_load_json("data/weights.json")
     metrics_report = _safe_load_json("data/metrics.json")
+    if not isinstance(metrics_report, dict) or not metrics_report:
+        for candidate in ("reports/model_evaluation_metrics.json", "data/model_evaluation_metrics.json"):
+            payload = _safe_load_json(candidate)
+            if isinstance(payload, dict) and payload:
+                metrics_report = payload
+                break
     cleaned_path, cleaned_candidates = _resolve_cleaned_data_path(state, contract if isinstance(contract, dict) else {})
     cleaned, cleaned_err = _safe_load_csv(cleaned_path) if cleaned_path else (None, "file_missing")
     case_summary, _case_summary_err = _safe_load_csv("data/case_summary.csv")
@@ -570,9 +576,18 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     objective_map = {
         "classification": "classification",
         "classifier": "classification",
+        "binary": "classification",
+        "binary_classification": "classification",
+        "multiclass": "classification",
+        "multiclass_classification": "classification",
+        "multi_class_classification": "classification",
+        "propensity": "classification",
+        "propensity_scoring": "classification",
+        "risk_scoring": "classification",
         "regression": "regression",
         "forecasting": "forecasting",
         "forecast": "forecasting",
+        "time_series": "forecasting",
         "ranking": "ranking",
         "prioritization": "ranking",
         "calibration": "ranking",
@@ -587,17 +602,36 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         output_report = _safe_load_json("data/output_contract_report.json")
         missing_outputs = output_report.get("missing", []) if isinstance(output_report, dict) else []
         canonical_cols = contract.get("canonical_columns", []) if isinstance(contract, dict) else []
+        role_map = get_column_roles(contract) if isinstance(contract, dict) else {}
+        outcome_cols = set(get_outcome_columns(contract)) if isinstance(contract, dict) else set()
+        id_cols = set()
+        if isinstance(role_map, dict):
+            for key in ("id", "identifier", "identifiers"):
+                id_cols.update([str(c) for c in (role_map.get(key) or []) if c])
+        excluded_cols = set(["__split"]) | outcome_cols | id_cols
         row_count = int(cleaned.shape[0]) if cleaned is not None else None
         valid_row_fraction = None
         missingness_summary = {}
+        high_missing_columns: List[str] = []
         if cleaned is not None and canonical_cols:
-            cols = [c for c in canonical_cols if c in cleaned.columns]
+            cols = [c for c in canonical_cols if c in cleaned.columns and c not in excluded_cols]
             if cols:
                 subset = cleaned[cols]
                 valid_row_fraction = float(subset.notna().all(axis=1).mean()) if len(subset) else None
                 missingness_summary = {
                     col: float(subset[col].isna().mean()) for col in cols if col in subset.columns
                 }
+        if cleaned is not None and not missingness_summary:
+            fallback_cols = [c for c in cleaned.columns if c not in excluded_cols]
+            if fallback_cols:
+                subset = cleaned[fallback_cols]
+                valid_row_fraction = float(subset.notna().all(axis=1).mean()) if len(subset) else None
+                missingness_summary = {
+                    col: float(subset[col].isna().mean()) for col in fallback_cols if col in subset.columns
+                }
+        high_missing_columns = [
+            col for col, val in missingness_summary.items() if isinstance(val, float) and val > 0.5
+        ]
         reasons: List[str] = []
         if cleaned is None:
             if cleaned_read_failed:
@@ -608,7 +642,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
             reasons.append("required_outputs_missing")
         if valid_row_fraction is not None and valid_row_fraction < 0.8:
             reasons.append("low_valid_row_fraction")
-        if any(val > 0.5 for val in missingness_summary.values() if isinstance(val, float)):
+        if high_missing_columns:
             reasons.append("high_missingness")
         if any(reason.startswith("cleaned_data_read_failed") for reason in reasons):
             status = "unknown"
@@ -626,6 +660,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
                 "valid_row_fraction": valid_row_fraction,
                 "missing_outputs_count": len(missing_outputs) if isinstance(missing_outputs, list) else None,
                 "missingness_summary": missingness_summary,
+                "high_missing_columns": high_missing_columns[:20],
                 "cleaned_data_path": cleaned_path or None,
                 "cleaned_data_candidates": cleaned_candidates[:5],
             },
@@ -878,6 +913,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "status": status,
+        "objective_type": objective_family,
         "reasons": reasons,
         "recommendations": recommendations,
         "signals": signals,

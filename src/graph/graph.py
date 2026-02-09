@@ -6936,6 +6936,84 @@ def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
         return {"type": "execution_error", "message": line[:300]}
     return {"type": "error", "message": line[:300]}
 
+
+def _build_reviewer_evidence_packet(
+    state: Dict[str, Any] | None,
+    metrics_report: Dict[str, Any] | None,
+    oc_report: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    metrics_report = metrics_report if isinstance(metrics_report, dict) else {}
+    oc_report = oc_report if isinstance(oc_report, dict) else {}
+
+    missing_required = [str(x) for x in (oc_report.get("missing") or []) if x]
+    present_outputs = [str(x) for x in (oc_report.get("present") or []) if x]
+    perf = metrics_report.get("model_performance")
+    perf = perf if isinstance(perf, dict) else {}
+
+    metric_lines: List[str] = []
+    preferred_keys = [
+        "normalized_gini",
+        "roc_auc_mean",
+        "auc",
+        "accuracy",
+        "f1",
+        "lift_at_decile_1_mean",
+        "pr_auc_mean",
+        "brier_score_mean",
+        "rmse",
+        "mae",
+        "r2",
+    ]
+    for key in preferred_keys:
+        if key not in perf:
+            continue
+        value = perf.get(key)
+        if isinstance(value, dict):
+            value = value.get("mean")
+        if isinstance(value, (int, float)):
+            metric_lines.append(f"{key}={float(value):.6g}")
+    if not metric_lines:
+        primary = _extract_primary_metric_for_board(state, metrics_report)
+        primary_name = str(primary.get("name") or "").strip()
+        primary_value = primary.get("value")
+        if primary_name and isinstance(primary_value, (int, float)):
+            metric_lines.append(f"{primary_name}={float(primary_value):.6g}")
+
+    summary_lines = [
+        "=== DETERMINISTIC_EVIDENCE ===",
+        f"output_contract_missing_required={len(missing_required)}",
+    ]
+    if present_outputs:
+        preview = ", ".join(present_outputs[:5])
+        summary_lines.append(f"output_contract_present_preview={preview}")
+    if metric_lines:
+        summary_lines.append(f"metrics={'; '.join(metric_lines[:6])}")
+    summary_lines.append("=== END_DETERMINISTIC_EVIDENCE ===")
+    summary_text = "\n".join(summary_lines)
+    has_structured_evidence = (not missing_required) and bool(metric_lines)
+
+    return {
+        "has_structured_evidence": has_structured_evidence,
+        "summary_text": summary_text,
+        "metrics_preview": metric_lines[:6],
+        "missing_required": missing_required,
+    }
+
+
+def _feedback_claims_missing_evidence(feedback: str | None) -> bool:
+    text = str(feedback or "").lower()
+    if not text:
+        return False
+    tokens = (
+        "no_evidence_found",
+        "no verificable",
+        "no verifiable",
+        "not verifiable",
+        "insufficient evidence",
+    )
+    return any(token in text for token in tokens)
+
 def _collect_outputs_state(required_outputs: List[str]) -> Dict[str, List[str]]:
     present: List[str] = []
     missing: List[str] = []
@@ -8219,6 +8297,27 @@ def _infer_problem_type_for_heavy(
     data_profile: Dict[str, Any],
     target_col: str,
 ) -> str:
+    objective_hints: List[str] = []
+    if isinstance(evaluation_spec, dict):
+        objective = evaluation_spec.get("objective_type")
+        if objective:
+            objective_hints.append(str(objective))
+    if isinstance(contract, dict):
+        objective = contract.get("objective_type")
+        if objective:
+            objective_hints.append(str(objective))
+        contract_eval = contract.get("evaluation_spec")
+        if isinstance(contract_eval, dict):
+            objective = contract_eval.get("objective_type")
+            if objective:
+                objective_hints.append(str(objective))
+
+    objective_norm = " ".join(objective_hints).lower()
+    if any(token in objective_norm for token in ("classification", "classifier", "binary", "multiclass")):
+        return "classification"
+    if any(token in objective_norm for token in ("regression", "forecast", "timeseries")):
+        return "regression"
+
     metrics: List[str] = []
     validation = contract.get("validation_requirements") if isinstance(contract, dict) else {}
     if isinstance(validation, dict):
@@ -8230,21 +8329,27 @@ def _infer_problem_type_for_heavy(
         metrics.extend([str(m) for m in (evaluation_spec.get("metrics_to_report") or []) if m])
         if evaluation_spec.get("primary_metric"):
             metrics.append(str(evaluation_spec.get("primary_metric")))
-    metrics_norm = {str(m).lower() for m in metrics}
-    cls_metrics = {
+    metrics_norm = {_normalize_metric_key(m) for m in metrics if m}
+    cls_metric_tokens = (
         "accuracy",
-        "roc_auc",
+        "rocauc",
         "auc",
         "f1",
         "precision",
         "recall",
-        "balanced_accuracy",
-        "log_loss",
-    }
-    reg_metrics = {"rmse", "mse", "mae", "r2", "rmsle", "mape"}
-    if metrics_norm & cls_metrics:
+        "balancedaccuracy",
+        "logloss",
+        "averageprecision",
+        "prauc",
+        "brierscore",
+        "gini",
+        "normalizedgini",
+        "lift",
+    )
+    reg_metric_tokens = ("rmse", "mse", "mae", "r2", "rmsle", "mape", "smape")
+    if any(any(tok in metric for tok in cls_metric_tokens) for metric in metrics_norm):
         return "classification"
-    if metrics_norm & reg_metrics:
+    if any(any(tok in metric for tok in reg_metric_tokens) for metric in metrics_norm):
         return "regression"
     target_stats = (data_profile or {}).get("numeric_summary", {}).get(target_col) if target_col else None
     if isinstance(target_stats, dict):
@@ -15043,6 +15148,17 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         evaluation_spec_for_review = dict(evaluation_spec_for_review)
         evaluation_spec_for_review["governance_context"] = governance_context
 
+    metrics_report = _resolve_metrics_report_for_facts(state if isinstance(state, dict) else {})
+    oc_report_for_eval = _resolve_output_contract_report_for_facts(state if isinstance(state, dict) else {})
+    reviewer_evidence = _build_reviewer_evidence_packet(
+        state if isinstance(state, dict) else {},
+        metrics_report,
+        oc_report_for_eval,
+    )
+    execution_output_for_review = execution_output
+    if not runtime_failure_detected and reviewer_evidence.get("summary_text"):
+        execution_output_for_review = f"{execution_output}\n\n{reviewer_evidence['summary_text']}"
+
     if runtime_failure_detected:
         print("Reviewer: Runtime failure markers detected. Applying deterministic failure packet.")
         tail = execution_output[-1200:] if execution_output else "No execution output captured."
@@ -15055,8 +15171,32 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         }
     else:
         eval_result = reviewer.evaluate_results(
-            execution_output, business_objective, strategy_context, evaluation_spec_for_review
+            execution_output_for_review, business_objective, strategy_context, evaluation_spec_for_review
         )
+        if (
+            reviewer_evidence.get("has_structured_evidence")
+            and _feedback_claims_missing_evidence(eval_result.get("feedback"))
+        ):
+            metrics_preview = reviewer_evidence.get("metrics_preview") or []
+            metrics_text = ", ".join([str(item) for item in metrics_preview if item])
+            normalized_feedback = (
+                "Structured evidence is available and confirms required artifacts + metrics. "
+                "Treating missing-evidence warning as non-blocking context mismatch."
+            )
+            if metrics_text:
+                normalized_feedback = f"{normalized_feedback} EVIDENCE: {metrics_text}"
+            eval_result = dict(eval_result or {})
+            eval_result["feedback"] = normalized_feedback
+            prev_status = str(eval_result.get("status") or "").upper()
+            if prev_status == "NEEDS_IMPROVEMENT":
+                eval_result["status"] = "APPROVE_WITH_WARNINGS"
+                eval_result["retry_worth_it"] = False
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "result_evaluator_evidence_override",
+                    {"reason": "llm_missing_evidence_false_positive"},
+                )
 
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
@@ -15133,7 +15273,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         print(f"Warning: failed to persist case_alignment_report.json: {err}")
 
     # Detect stale metrics file across iterations (diagnostic for ML)
-    metrics_report = _resolve_metrics_report_for_facts(state if isinstance(state, dict) else {})
+    metrics_report = metrics_report if isinstance(metrics_report, dict) else {}
     weights_report = _load_json_safe("data/weights.json")
     metrics_signature = _hash_json(metrics_report)
     weights_signature = _hash_json(weights_report)
@@ -15635,7 +15775,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         evaluation_spec_final["governance_context"] = governance_context
         if evaluation_spec_final != evaluation_spec_for_review:
             re_eval = reviewer.evaluate_results(
-                execution_output, business_objective, strategy_context, evaluation_spec_final
+                execution_output_for_review, business_objective, strategy_context, evaluation_spec_final
             )
             if isinstance(re_eval, dict) and re_eval.get("status"):
                 status = re_eval.get("status", status)
