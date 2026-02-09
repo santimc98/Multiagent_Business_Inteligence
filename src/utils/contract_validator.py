@@ -2365,8 +2365,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.cleaning_gates",
-                    "warning",
-                    "cleaning_gates missing/empty for cleaning scope; execution can continue with reduced QA control.",
+                    "error",
+                    "cleaning_gates missing/empty for cleaning scope; fail-closed to protect reviewer alignment.",
                     contract.get("cleaning_gates"),
                 )
             )
@@ -2374,8 +2374,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.data_engineer_runbook",
-                    "warning",
-                    "data_engineer_runbook missing for cleaning scope; execution may rely on generic behavior.",
+                    "error",
+                    "data_engineer_runbook missing for cleaning scope; fail-closed (DE execution contract incomplete).",
                     contract.get("data_engineer_runbook"),
                 )
             )
@@ -2386,8 +2386,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.evaluation_spec",
-                    "warning",
-                    "evaluation_spec missing/empty for ML scope; reviewers may use reduced context.",
+                    "error",
+                    "evaluation_spec missing/empty for ML scope; fail-closed (ML objective context incomplete).",
                     evaluation_spec,
                 )
             )
@@ -2395,8 +2395,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.qa_gates",
-                    "warning",
-                    "qa_gates missing/empty for ML scope; QA depth is reduced.",
+                    "error",
+                    "qa_gates missing/empty for ML scope; fail-closed to protect QA review quality.",
                     contract.get("qa_gates"),
                 )
             )
@@ -2404,8 +2404,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.reviewer_gates",
-                    "warning",
-                    "reviewer_gates missing/empty for ML scope; review depth is reduced.",
+                    "error",
+                    "reviewer_gates missing/empty for ML scope; fail-closed to protect review-board alignment.",
                     contract.get("reviewer_gates"),
                 )
             )
@@ -2413,8 +2413,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.validation_requirements",
-                    "warning",
-                    "validation_requirements missing/empty for ML scope; benchmark traceability may be reduced.",
+                    "error",
+                    "validation_requirements missing/empty for ML scope; fail-closed (benchmark traceability required).",
                     contract.get("validation_requirements"),
                 )
             )
@@ -2422,8 +2422,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.ml_engineer_runbook",
-                    "warning",
-                    "ml_engineer_runbook missing for ML scope; execution may rely on generic behavior.",
+                    "error",
+                    "ml_engineer_runbook missing for ML scope; fail-closed (ML execution contract incomplete).",
                     contract.get("ml_engineer_runbook"),
                 )
             )
@@ -2533,8 +2533,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                     issues.append(
                         _strict_issue(
                             "contract.reviewer_view_gates",
-                            "warning",
-                            "reviewer_view.reviewer_gates is empty after projection.",
+                            "error",
+                            "reviewer_view.reviewer_gates is empty after projection (fail-closed).",
                             reviewer_gates,
                         )
                     )
@@ -2554,8 +2554,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                     issues.append(
                         _strict_issue(
                             "contract.qa_view_gates",
-                            "warning",
-                            "qa_view.qa_gates is empty after projection.",
+                            "error",
+                            "qa_view.qa_gates is empty after projection (fail-closed).",
                             qa_gates,
                         )
                     )

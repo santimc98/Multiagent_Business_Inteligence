@@ -107,13 +107,13 @@ def test_validate_contract_minimal_readonly_allows_missing_iteration_policy_with
     assert "contract.iteration_policy" in rules
 
 
-def test_validate_contract_minimal_readonly_allows_missing_evaluation_spec_for_ml_scope_with_warning():
+def test_validate_contract_minimal_readonly_rejects_missing_evaluation_spec_for_ml_scope():
     contract = _base_full_pipeline_contract()
     contract.pop("evaluation_spec", None)
 
     result = validate_contract_minimal_readonly(contract)
 
-    assert result.get("accepted") is True
+    assert result.get("accepted") is False
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.evaluation_spec" in rules
 

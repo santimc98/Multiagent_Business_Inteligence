@@ -3535,10 +3535,20 @@ class ExecutionPlannerAgent:
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        planner_max_output_tokens = 16384
+        try:
+            planner_max_output_tokens = int(
+                os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "16384")
+            )
+        except Exception:
+            planner_max_output_tokens = 16384
+        if planner_max_output_tokens < 1024:
+            planner_max_output_tokens = 1024
         self._generation_config = {
             "temperature": 0.0,
             "top_p": 0.9,
             "top_k": 40,
+            "max_output_tokens": planner_max_output_tokens,
             "response_mime_type": "application/json",
         }
         self._safety_settings = {
@@ -7014,210 +7024,35 @@ domain_expert_critique:
         except Exception:
             max_quality_rounds = 3
 
+        section_first_flag = str(os.getenv("EXECUTION_PLANNER_SECTION_FIRST", "1")).strip().lower()
+        section_first_enabled = section_first_flag not in {"0", "false", "no", "off"}
+        sectional_rounds = 2
+        try:
+            sectional_rounds = max(1, int(os.getenv("EXECUTION_PLANNER_SECTION_ROUNDS", "2")))
+        except Exception:
+            sectional_rounds = 2
+
+        sectional_attempted = False
+        sectional_contract_cached: Dict[str, Any] | None = None
+        sectional_payload_cached: Dict[str, Any] = {}
+        sectional_validation_cached: Dict[str, Any] | None = None
+        sectional_accepted_cached = False
+
         current_prompt = full_prompt
         current_prompt_name = "prompt_attempt_1.txt"
         attempt_counter = 0
 
-        for quality_round in range(1, max_quality_rounds + 1):
-            round_has_candidate = False
-            for model_idx, model_name in enumerate(model_chain, start=1):
-                attempt_counter += 1
-                self.last_prompt = current_prompt
-                response_text = ""
-                response = None
-                parse_error: Optional[Exception] = None
-                finish_reason = None
-                usage_metadata = None
-                validation_result: Dict[str, Any] | None = None
-                quality_accepted = False
-
-                if len(model_chain) > 1:
-                    response_name = f"response_attempt_{quality_round}_m{model_idx}.txt"
-                else:
-                    response_name = f"response_attempt_{quality_round}.txt"
-
-                try:
-                    model_client = self._build_model_client(model_name)
-                    if model_client is None:
-                        parse_error = ValueError(f"Planner client unavailable for model {model_name}")
-                    else:
-                        response = model_client.generate_content(current_prompt)
-                        response_text = getattr(response, "text", "") or ""
-                        self.last_response = response_text
-                except Exception as err:
-                    parse_error = err
-
-                if response is not None:
-                    try:
-                        candidates = getattr(response, "candidates", None)
-                        if candidates:
-                            finish_reason = getattr(candidates[0], "finish_reason", None)
-                    except Exception:
-                        finish_reason = None
-                    usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
-
-                _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
-
-                parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
-                if parse_exc:
-                    parse_error = parse_exc
-
-                had_json_parse_error = parsed is None or not isinstance(parsed, dict)
-                if parsed is not None and not isinstance(parsed, dict):
-                    parse_error = ValueError("Parsed JSON is not an object")
-
-                quality_error_message = None
-                if parsed is not None and isinstance(parsed, dict):
-                    round_has_candidate = True
-                    try:
-                        validation_result = _validate_contract_quality(copy.deepcopy(parsed))
-                    except Exception as val_err:
-                        validation_result = {
-                            "status": "error",
-                            "accepted": False,
-                            "issues": [
-                                {
-                                    "severity": "error",
-                                    "rule": "contract_validation_exception",
-                                    "message": str(val_err),
-                                }
-                            ],
-                            "summary": {"error_count": 1, "warning_count": 0},
-                        }
-                    quality_accepted = _contract_is_accepted(validation_result)
-                    if not quality_accepted:
-                        primary_rule = None
-                        issues = validation_result.get("issues") if isinstance(validation_result, dict) else None
-                        if isinstance(issues, list):
-                            for issue in issues:
-                                if isinstance(issue, dict) and issue.get("rule"):
-                                    primary_rule = str(issue.get("rule"))
-                                    break
-                        quality_error_message = (
-                            f"contract_quality_failed:{primary_rule}"
-                            if primary_rule
-                            else "contract_quality_failed"
-                        )
-                        summary = validation_result.get("summary") if isinstance(validation_result, dict) else {}
-                        error_count = (
-                            int(summary.get("error_count", 0))
-                            if isinstance(summary, dict)
-                            else 0
-                        )
-                        warning_count = (
-                            int(summary.get("warning_count", 0))
-                            if isinstance(summary, dict)
-                            else 0
-                        )
-                        if (
-                            best_error_count is None
-                            or error_count < best_error_count
-                            or (
-                                error_count == best_error_count
-                                and (best_warning_count is None or warning_count < best_warning_count)
-                            )
-                        ):
-                            best_candidate = parsed
-                            best_validation = validation_result
-                            best_response_text = response_text
-                            best_error_count = error_count
-                            best_warning_count = warning_count
-                            best_parse_feedback = None
-                else:
-                    parse_feedback = _build_parse_feedback(response_text, parse_error)
-                    if best_response_text is None:
-                        best_response_text = response_text
-                        best_parse_feedback = parse_feedback
-
-                planner_diag.append(
-                    {
-                        "model_name": model_name,
-                        "attempt_index": attempt_counter,
-                        "quality_round": quality_round,
-                        "prompt_char_len": len(current_prompt or ""),
-                        "response_char_len": len(response_text or ""),
-                        "finish_reason": str(finish_reason) if finish_reason is not None else None,
-                        "usage_metadata": usage_metadata,
-                        "had_json_parse_error": bool(had_json_parse_error),
-                        "parse_error_type": type(parse_error).__name__ if parse_error else None,
-                        "parse_error_message": str(parse_error) if parse_error else None,
-                        "quality_status": (
-                            str(validation_result.get("status") or "").lower()
-                            if isinstance(validation_result, dict)
-                            else None
-                        ),
-                        "quality_issue_rules": (
-                            [
-                                str(issue.get("rule"))
-                                for issue in (validation_result.get("issues") or [])
-                                if isinstance(issue, dict) and issue.get("rule")
-                            ][:12]
-                            if isinstance(validation_result, dict)
-                            else []
-                        ),
-                        "quality_error_count": (
-                            int((validation_result.get("summary") or {}).get("error_count", 0))
-                            if isinstance(validation_result, dict)
-                            else None
-                        ),
-                        "quality_warning_count": (
-                            int((validation_result.get("summary") or {}).get("warning_count", 0))
-                            if isinstance(validation_result, dict)
-                            else None
-                        ),
-                        "quality_accepted": quality_accepted,
-                        "quality_error": quality_error_message,
-                    }
-                )
-
-                if parsed is None or not isinstance(parsed, dict):
-                    print(f"WARNING: Planner parse failed on attempt {attempt_counter} (model={model_name}).")
-                    continue
-                if not quality_accepted:
-                    print(f"WARNING: Planner contract rejected by quality gate on attempt {attempt_counter} (model={model_name}).")
-                    continue
-
-                contract = parsed
-                llm_success = True
-                break
-
-            if contract is not None:
-                break
-            if quality_round >= max_quality_rounds:
-                break
-
-            current_prompt_name = f"prompt_attempt_{quality_round + 1}_repair.txt"
-            current_prompt = _build_quality_repair_prompt(
-                previous_contract=best_candidate,
-                previous_validation=best_validation,
-                previous_response_text=best_response_text,
-                previous_parse_feedback=best_parse_feedback,
-                original_inputs_text=user_input,
-            )
-            if not round_has_candidate:
-                current_prompt = (
-                    current_prompt
-                    + "\n\nPrevious attempts failed JSON parsing. Repair by returning syntactically valid JSON only."
-                )
-
-        if contract is None:
-            sectional_rounds = 2
+        if section_first_enabled:
+            sectional_attempted = True
             try:
-                sectional_rounds = max(1, int(os.getenv("EXECUTION_PLANNER_SECTION_ROUNDS", "2")))
-            except Exception:
-                sectional_rounds = 2
-
-            sectional_contract: Dict[str, Any] | None = None
-            sectional_payload: Dict[str, Any] = {}
-            try:
-                sectional_contract, sectional_payload = _compile_contract_by_sections(
+                sectional_contract_cached, sectional_payload_cached = _compile_contract_by_sections(
                     original_inputs_text=user_input,
                     model_names=model_chain,
                     max_rounds=sectional_rounds,
                 )
             except Exception as section_err:
-                sectional_contract = None
-                sectional_payload = {
+                sectional_contract_cached = None
+                sectional_payload_cached = {
                     "invalid_candidate": None,
                     "invalid_raw": None,
                     "invalid_meta": {
@@ -7227,7 +7062,7 @@ domain_expert_critique:
                     "section_diag": [],
                 }
 
-            section_diag = sectional_payload.get("section_diag")
+            section_diag = sectional_payload_cached.get("section_diag")
             if isinstance(section_diag, list) and section_diag:
                 base_attempt_index = len(planner_diag)
                 for idx, item in enumerate(section_diag, start=1):
@@ -7239,13 +7074,11 @@ domain_expert_critique:
                         row["attempt_index"] = base_attempt_index + idx
                     planner_diag.append(row)
 
-            sectional_validation: Dict[str, Any] | None = None
-            sectional_accepted = False
-            if isinstance(sectional_contract, dict) and sectional_contract:
+            if isinstance(sectional_contract_cached, dict) and sectional_contract_cached:
                 try:
-                    sectional_validation = _validate_contract_quality(copy.deepcopy(sectional_contract))
+                    sectional_validation_cached = _validate_contract_quality(copy.deepcopy(sectional_contract_cached))
                 except Exception as section_val_err:
-                    sectional_validation = {
+                    sectional_validation_cached = {
                         "status": "error",
                         "accepted": False,
                         "issues": [
@@ -7257,7 +7090,250 @@ domain_expert_critique:
                         ],
                         "summary": {"error_count": 1, "warning_count": 0},
                     }
-                sectional_accepted = _contract_is_accepted(sectional_validation)
+                sectional_accepted_cached = _contract_is_accepted(sectional_validation_cached)
+
+            if sectional_accepted_cached and isinstance(sectional_contract_cached, dict):
+                contract = sectional_contract_cached
+                llm_success = True
+                print("SUCCESS: Execution Planner succeeded via sectional compiler (primary path).")
+
+        if contract is None:
+            for quality_round in range(1, max_quality_rounds + 1):
+                round_has_candidate = False
+                for model_idx, model_name in enumerate(model_chain, start=1):
+                    attempt_counter += 1
+                    self.last_prompt = current_prompt
+                    response_text = ""
+                    response = None
+                    parse_error: Optional[Exception] = None
+                    finish_reason = None
+                    usage_metadata = None
+                    validation_result: Dict[str, Any] | None = None
+                    quality_accepted = False
+
+                    if len(model_chain) > 1:
+                        response_name = f"response_attempt_{quality_round}_m{model_idx}.txt"
+                    else:
+                        response_name = f"response_attempt_{quality_round}.txt"
+
+                    try:
+                        model_client = self._build_model_client(model_name)
+                        if model_client is None:
+                            parse_error = ValueError(f"Planner client unavailable for model {model_name}")
+                        else:
+                            response = model_client.generate_content(current_prompt)
+                            response_text = getattr(response, "text", "") or ""
+                            self.last_response = response_text
+                    except Exception as err:
+                        parse_error = err
+
+                    if response is not None:
+                        try:
+                            candidates = getattr(response, "candidates", None)
+                            if candidates:
+                                finish_reason = getattr(candidates[0], "finish_reason", None)
+                        except Exception:
+                            finish_reason = None
+                        usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
+
+                    _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
+
+                    parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
+                    if parse_exc:
+                        parse_error = parse_exc
+
+                    had_json_parse_error = parsed is None or not isinstance(parsed, dict)
+                    if parsed is not None and not isinstance(parsed, dict):
+                        parse_error = ValueError("Parsed JSON is not an object")
+
+                    quality_error_message = None
+                    if parsed is not None and isinstance(parsed, dict):
+                        round_has_candidate = True
+                        try:
+                            validation_result = _validate_contract_quality(copy.deepcopy(parsed))
+                        except Exception as val_err:
+                            validation_result = {
+                                "status": "error",
+                                "accepted": False,
+                                "issues": [
+                                    {
+                                        "severity": "error",
+                                        "rule": "contract_validation_exception",
+                                        "message": str(val_err),
+                                    }
+                                ],
+                                "summary": {"error_count": 1, "warning_count": 0},
+                            }
+                        quality_accepted = _contract_is_accepted(validation_result)
+                        if not quality_accepted:
+                            primary_rule = None
+                            issues = validation_result.get("issues") if isinstance(validation_result, dict) else None
+                            if isinstance(issues, list):
+                                for issue in issues:
+                                    if isinstance(issue, dict) and issue.get("rule"):
+                                        primary_rule = str(issue.get("rule"))
+                                        break
+                            quality_error_message = (
+                                f"contract_quality_failed:{primary_rule}"
+                                if primary_rule
+                                else "contract_quality_failed"
+                            )
+                            summary = validation_result.get("summary") if isinstance(validation_result, dict) else {}
+                            error_count = (
+                                int(summary.get("error_count", 0))
+                                if isinstance(summary, dict)
+                                else 0
+                            )
+                            warning_count = (
+                                int(summary.get("warning_count", 0))
+                                if isinstance(summary, dict)
+                                else 0
+                            )
+                            if (
+                                best_error_count is None
+                                or error_count < best_error_count
+                                or (
+                                    error_count == best_error_count
+                                    and (best_warning_count is None or warning_count < best_warning_count)
+                                )
+                            ):
+                                best_candidate = parsed
+                                best_validation = validation_result
+                                best_response_text = response_text
+                                best_error_count = error_count
+                                best_warning_count = warning_count
+                                best_parse_feedback = None
+                    else:
+                        parse_feedback = _build_parse_feedback(response_text, parse_error)
+                        if best_response_text is None:
+                            best_response_text = response_text
+                            best_parse_feedback = parse_feedback
+
+                    planner_diag.append(
+                        {
+                            "model_name": model_name,
+                            "attempt_index": attempt_counter,
+                            "quality_round": quality_round,
+                            "prompt_char_len": len(current_prompt or ""),
+                            "response_char_len": len(response_text or ""),
+                            "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                            "usage_metadata": usage_metadata,
+                            "had_json_parse_error": bool(had_json_parse_error),
+                            "parse_error_type": type(parse_error).__name__ if parse_error else None,
+                            "parse_error_message": str(parse_error) if parse_error else None,
+                            "quality_status": (
+                                str(validation_result.get("status") or "").lower()
+                                if isinstance(validation_result, dict)
+                                else None
+                            ),
+                            "quality_issue_rules": (
+                                [
+                                    str(issue.get("rule"))
+                                    for issue in (validation_result.get("issues") or [])
+                                    if isinstance(issue, dict) and issue.get("rule")
+                                ][:12]
+                                if isinstance(validation_result, dict)
+                                else []
+                            ),
+                            "quality_error_count": (
+                                int((validation_result.get("summary") or {}).get("error_count", 0))
+                                if isinstance(validation_result, dict)
+                                else None
+                            ),
+                            "quality_warning_count": (
+                                int((validation_result.get("summary") or {}).get("warning_count", 0))
+                                if isinstance(validation_result, dict)
+                                else None
+                            ),
+                            "quality_accepted": quality_accepted,
+                            "quality_error": quality_error_message,
+                        }
+                    )
+
+                    if parsed is None or not isinstance(parsed, dict):
+                        print(f"WARNING: Planner parse failed on attempt {attempt_counter} (model={model_name}).")
+                        continue
+                    if not quality_accepted:
+                        print(f"WARNING: Planner contract rejected by quality gate on attempt {attempt_counter} (model={model_name}).")
+                        continue
+
+                    contract = parsed
+                    llm_success = True
+                    break
+
+                if contract is not None:
+                    break
+                if quality_round >= max_quality_rounds:
+                    break
+
+                current_prompt_name = f"prompt_attempt_{quality_round + 1}_repair.txt"
+                current_prompt = _build_quality_repair_prompt(
+                    previous_contract=best_candidate,
+                    previous_validation=best_validation,
+                    previous_response_text=best_response_text,
+                    previous_parse_feedback=best_parse_feedback,
+                    original_inputs_text=user_input,
+                )
+                if not round_has_candidate:
+                    current_prompt = (
+                        current_prompt
+                        + "\n\nPrevious attempts failed JSON parsing. Repair by returning syntactically valid JSON only."
+                    )
+
+        if contract is None:
+            sectional_contract: Dict[str, Any] | None = sectional_contract_cached if sectional_attempted else None
+            sectional_payload: Dict[str, Any] = sectional_payload_cached if sectional_attempted else {}
+            sectional_validation: Dict[str, Any] | None = sectional_validation_cached if sectional_attempted else None
+            sectional_accepted = sectional_accepted_cached if sectional_attempted else False
+
+            if not sectional_attempted:
+                try:
+                    sectional_contract, sectional_payload = _compile_contract_by_sections(
+                        original_inputs_text=user_input,
+                        model_names=model_chain,
+                        max_rounds=sectional_rounds,
+                    )
+                except Exception as section_err:
+                    sectional_contract = None
+                    sectional_payload = {
+                        "invalid_candidate": None,
+                        "invalid_raw": None,
+                        "invalid_meta": {
+                            "mode": "sectional",
+                            "section_compiler_exception": str(section_err),
+                        },
+                        "section_diag": [],
+                    }
+
+                section_diag = sectional_payload.get("section_diag")
+                if isinstance(section_diag, list) and section_diag:
+                    base_attempt_index = len(planner_diag)
+                    for idx, item in enumerate(section_diag, start=1):
+                        if isinstance(item, dict):
+                            row = dict(item)
+                        else:
+                            row = {"compiler_mode": "sectional", "detail": str(item)}
+                        if "attempt_index" not in row:
+                            row["attempt_index"] = base_attempt_index + idx
+                        planner_diag.append(row)
+
+                if isinstance(sectional_contract, dict) and sectional_contract:
+                    try:
+                        sectional_validation = _validate_contract_quality(copy.deepcopy(sectional_contract))
+                    except Exception as section_val_err:
+                        sectional_validation = {
+                            "status": "error",
+                            "accepted": False,
+                            "issues": [
+                                {
+                                    "severity": "error",
+                                    "rule": "sectional_contract_validation_exception",
+                                    "message": str(section_val_err),
+                                }
+                            ],
+                            "summary": {"error_count": 1, "warning_count": 0},
+                        }
+                    sectional_accepted = _contract_is_accepted(sectional_validation)
 
             if sectional_accepted and isinstance(sectional_contract, dict):
                 contract = sectional_contract

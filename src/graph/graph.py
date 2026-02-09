@@ -2829,6 +2829,21 @@ def _validate_projected_views_for_execution(
             if not isinstance(req_cols, list) or not any(isinstance(col, str) and col.strip() for col in req_cols):
                 errors.append("de_view_required_columns_empty")
 
+        cleaning_view = views.get("cleaning_view") if isinstance(views, dict) else None
+        if not isinstance(cleaning_view, dict) or not cleaning_view:
+            errors.append("cleaning_view_missing")
+        else:
+            cleaning_gates = cleaning_view.get("cleaning_gates")
+            gates_ok = (
+                isinstance(cleaning_gates, list)
+                and any(
+                    (isinstance(g, str) and g.strip()) or (isinstance(g, dict) and bool(g))
+                    for g in cleaning_gates
+                )
+            )
+            if not gates_ok:
+                errors.append("cleaning_view_cleaning_gates_empty")
+
     if requires_ml:
         ml_view = views.get("ml_view") if isinstance(views, dict) else None
         reviewer_view = views.get("reviewer_view") if isinstance(views, dict) else None
