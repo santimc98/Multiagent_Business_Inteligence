@@ -714,29 +714,90 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _resolve_contract_primary_metric_name(state: Dict[str, Any], contract: Dict[str, Any]) -> str | None:
+    candidates: List[Any] = []
+    if isinstance(contract, dict):
+        candidates.append(contract.get("evaluation_spec"))
+        candidates.append(contract.get("validation_requirements"))
+    if isinstance(state, dict):
+        candidates.append(state.get("evaluation_spec"))
+    for entry in candidates:
+        if not isinstance(entry, dict):
+            continue
+        validation = entry.get("validation_requirements")
+        if isinstance(validation, dict):
+            metric = validation.get("primary_metric")
+            if isinstance(metric, str) and metric.strip():
+                return metric.strip()
+        metric = entry.get("primary_metric")
+        if isinstance(metric, str) and metric.strip():
+            return metric.strip()
+    return None
+
+
+def _metric_name_matches(expected: str, candidate: str) -> bool:
+    expected_norm = _normalize_metric_key(expected)
+    candidate_norm = _normalize_metric_key(candidate)
+    if not expected_norm or not candidate_norm:
+        return False
+    return (
+        expected_norm == candidate_norm
+        or expected_norm in candidate_norm
+        or candidate_norm in expected_norm
+    )
+
+
 def _extract_primary_metric_for_board(
     state: Dict[str, Any],
     metrics_report: Dict[str, Any],
 ) -> Dict[str, Any]:
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    contract_metric = _resolve_contract_primary_metric_name(state, contract)
+
     snapshot = state.get("primary_metric_snapshot")
-    if isinstance(snapshot, dict) and snapshot:
+    if isinstance(snapshot, dict) and snapshot and (
+        not contract_metric
+        or _metric_name_matches(str(contract_metric), str(snapshot.get("primary_metric_name") or ""))
+    ):
         return {
-            "name": snapshot.get("primary_metric_name"),
+            "name": snapshot.get("primary_metric_name") or contract_metric,
             "value": snapshot.get("primary_metric_value"),
             "baseline_value": snapshot.get("baseline_value"),
             "source": "primary_metric_snapshot",
         }
+
     weights_report = _load_json_safe("data/weights.json")
     if not isinstance(weights_report, dict):
         weights_report = {}
-    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+
+    candidates = _collect_metric_candidates(metrics_report if isinstance(metrics_report, dict) else {}, weights_report)
+    if contract_metric:
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            cand_name = str(cand.get("name") or "")
+            if not _metric_name_matches(contract_metric, cand_name):
+                continue
+            value = _coerce_float(cand.get("value"))
+            if value is None:
+                continue
+            return {
+                "name": cand_name or contract_metric,
+                "value": float(value),
+                "source": str((metrics_report or {}).get("source") or "metrics.normalized"),
+            }
+        return {
+            "name": contract_metric,
+            "value": None,
+            "source": "contract.primary_metric_missing",
+        }
+
     evaluation_spec = contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {}
     objective_type = (
         (evaluation_spec.get("objective_type") if isinstance(evaluation_spec, dict) else None)
         or (state.get("selected_strategy") or {}).get("analysis_type")
         or "unknown"
     )
-    candidates = _collect_metric_candidates(metrics_report if isinstance(metrics_report, dict) else {}, weights_report)
     primary = _pick_primary_metric_candidate(candidates, str(objective_type))
     if isinstance(primary, dict):
         value = _coerce_float(primary.get("value"))
@@ -3384,12 +3445,12 @@ def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
                 compliance_max = policy.get(alias)
                 break
     if metric_max is None:
-        for alias in ("max_iterations", "max_pipeline_iterations", "max_model_iterations", "max_iter"):
+        for alias in ("max_iterations", "max_pipeline_iterations", "max_model_iterations", "max_iter", "max_retries"):
             if policy.get(alias) is not None:
                 metric_max = policy.get(alias)
                 break
     if runtime_max is None:
-        for alias in ("gate_retry_limit", "runtime_retry_limit", "max_runtime_retries"):
+        for alias in ("gate_retry_limit", "runtime_retry_limit", "max_runtime_retries", "max_retries"):
             if policy.get(alias) is not None:
                 runtime_max = policy.get(alias)
                 break

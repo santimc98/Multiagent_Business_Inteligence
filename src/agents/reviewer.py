@@ -9,6 +9,41 @@ from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 
 load_dotenv()
 
+
+def _extract_json_object(text: str) -> str | None:
+    if not text:
+        return None
+    start = None
+    depth = 0
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text):
+        if start is None:
+            if ch == "{":
+                start = i
+                depth = 1
+                in_str = False
+                escape = False
+            continue
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "\"":
+                in_str = False
+            continue
+        if ch == "\"":
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 def _normalize_reviewer_gate_name(item: Any) -> str:
     if isinstance(item, dict):
         for key in ("name", "id", "gate"):
@@ -225,8 +260,7 @@ class ReviewerAgent:
                 )
                 content = response.choices[0].message.content
             self.last_response = content
-            cleaned_content = self._clean_json(content)
-            result = json.loads(cleaned_content)
+            result = self._parse_json_payload(content)
             
             # Normalize lists
             for field in ['failed_gates', 'required_fixes']:
@@ -258,6 +292,29 @@ class ReviewerAgent:
         text = re.sub(r'```json', '', text)
         text = re.sub(r'```', '', text)
         return text.strip()
+
+    def _parse_json_payload(self, text: str) -> Dict[str, Any]:
+        parse_error: Exception | None = None
+        cleaned = self._clean_json(text or "")
+        candidates = [cleaned, _extract_json_object(cleaned), _extract_json_object(text or "")]
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            blob = candidate.strip()
+            if not blob or blob in seen:
+                continue
+            seen.add(blob)
+            try:
+                parsed = json.loads(blob)
+                if isinstance(parsed, dict):
+                    return parsed
+                parse_error = ValueError("Reviewer JSON payload is not an object")
+            except Exception as err:
+                parse_error = err
+        if parse_error:
+            raise parse_error
+        raise ValueError("Empty reviewer JSON payload")
 
     def evaluate_results(
         self,
@@ -414,8 +471,7 @@ class ReviewerAgent:
                 )
                 content = response.choices[0].message.content
             self.last_response = content
-            cleaned_content = self._clean_json(content)
-            result = json.loads(cleaned_content)
+            result = self._parse_json_payload(content)
             
             # Defaults for backward compatibility
             if "failed_gates" not in result: result["failed_gates"] = []

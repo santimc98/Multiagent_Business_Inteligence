@@ -25,3 +25,29 @@ def test_results_advisor_deployment_recommendation_with_ci(tmp_path, monkeypatch
     )
     assert insights.get("deployment_recommendation") == "PILOT"
     assert insights.get("confidence") in {"LOW", "MEDIUM"}
+
+
+def test_results_advisor_does_not_flag_leakage_on_preventive_feedback(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    advisor = ResultsAdvisorAgent(api_key="")
+    insights = advisor.generate_insights(
+        {
+            "artifact_index": [],
+            "review_feedback": "Leakage guard prevents leakage and reports no leakage detected.",
+        }
+    )
+    risks = insights.get("risks") or []
+    assert all("leakage" not in str(item).lower() for item in risks)
+
+
+def test_results_advisor_flags_leakage_on_explicit_risk_feedback(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    advisor = ResultsAdvisorAgent(api_key="")
+    insights = advisor.generate_insights(
+        {
+            "artifact_index": [],
+            "review_feedback": "Potential leakage detected from post-outcome fields in features.",
+        }
+    )
+    risks = [str(item).lower() for item in (insights.get("risks") or [])]
+    assert any("leakage" in item for item in risks)

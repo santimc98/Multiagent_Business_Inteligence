@@ -130,3 +130,16 @@ def test_validate_contract_minimal_readonly_accepts_iteration_policy_alias_keys(
     assert result.get("accepted") is True
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.iteration_policy_limits" not in rules
+
+
+def test_validate_contract_minimal_readonly_accepts_max_retries_alias():
+    contract = _base_full_pipeline_contract()
+    contract["iteration_policy"] = {
+        "max_retries": 4,
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is True
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.iteration_policy_limits" not in rules

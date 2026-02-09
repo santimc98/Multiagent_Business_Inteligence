@@ -157,8 +157,9 @@ class ResultsAdvisorAgent:
             recommendations.append("Ensure required artifacts are written before pipeline completion.")
 
         review_feedback = str(context.get("review_feedback") or "")
-        if "leakage" in review_feedback.lower():
-            risks.append("Leakage risk flagged in reviewer feedback.")
+        leakage_risk_flagged = self._feedback_indicates_leakage_risk(review_feedback) or self._alignment_indicates_leakage_risk(alignment_payload)
+        if leakage_risk_flagged:
+            risks.append("Leakage risk signal detected in reviewer/alignment evidence.")
             recommendations.append("Audit feature availability timing and exclude post-outcome fields.")
 
         if objective_type == "classification":
@@ -541,7 +542,7 @@ class ResultsAdvisorAgent:
             suggestions.append("Add baseline metrics to quantify lift over trivial models.")
         if "validation" in text or "cross_validation" in text or "split" in text:
             suggestions.append("Align validation strategy with contract (CV/holdout/time split).")
-        if "leakage" in text:
+        if self._feedback_indicates_leakage_risk(text):
             suggestions.append("Remove post-outcome features and rerun leakage checks.")
         if "imputer" in text or "missing" in text:
             suggestions.append("Add preprocessing with imputation for missing values.")
@@ -552,6 +553,83 @@ class ResultsAdvisorAgent:
         if not suggestions:
             suggestions.append("Simplify the model, validate splits, and report metrics with confidence intervals.")
         return suggestions[:4]
+
+    def _feedback_indicates_leakage_risk(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        if "leak" not in lowered:
+            return False
+        sentences = re.split(r"[\n\r.!?]+", lowered)
+        if not sentences:
+            sentences = [lowered]
+        negative_tokens = (
+            "no leakage",
+            "without leakage",
+            "leakage-free",
+            "leakage free",
+            "prevents leakage",
+            "prevent leakage",
+            "prevents target leakage",
+            "mitigate leakage",
+            "mitigated leakage",
+            "no deterministic target leakage",
+            "leakage check passed",
+            "no leakage detected",
+        )
+        positive_tokens = (
+            "leakage risk",
+            "risk of leakage",
+            "leakage detected",
+            "target leakage detected",
+            "possible leakage",
+            "potential leakage",
+            "leakage found",
+            "leaky feature",
+            "post-outcome",
+            "post outcome",
+        )
+        for sentence in sentences:
+            fragment = sentence.strip()
+            if "leak" not in fragment:
+                continue
+            if any(token in fragment for token in negative_tokens):
+                continue
+            if any(token in fragment for token in positive_tokens):
+                return True
+            if "risk" in fragment or "detected" in fragment or "found" in fragment:
+                return True
+        return False
+
+    def _alignment_indicates_leakage_risk(self, alignment_payload: Any) -> bool:
+        if not isinstance(alignment_payload, dict) or not alignment_payload:
+            return False
+        failure_mode = str(alignment_payload.get("failure_mode") or "").lower()
+        if "leak" in failure_mode:
+            return True
+
+        requirements = alignment_payload.get("requirements")
+        if isinstance(requirements, list):
+            for req in requirements:
+                if not isinstance(req, dict):
+                    continue
+                name = str(req.get("name") or req.get("id") or "").lower()
+                if "leak" not in name:
+                    continue
+                status = str(req.get("status") or req.get("state") or "").upper()
+                if status in {"FAIL", "FAILED", "ERROR", "REJECTED", "WARN", "WARNING"}:
+                    return True
+                if bool(req.get("detected")) or bool(req.get("is_leakage")):
+                    return True
+
+        leak_payload = self._extract_leakage_audit(alignment_payload)
+        if isinstance(leak_payload, dict):
+            action = str(leak_payload.get("action_taken") or "").lower()
+            corr = self._coerce_number(leak_payload.get("correlation"), ".")
+            threshold = self._coerce_number(leak_payload.get("threshold"), ".")
+            if "remove" in action or "exclude" in action or "drop" in action:
+                return True
+            if corr is not None and threshold is not None and abs(corr) >= abs(threshold):
+                return True
+        return False
 
     def _detect_plateau(self, metric_history: List[Dict[str, Any]], window: int, epsilon: float) -> bool:
         if not metric_history or len(metric_history) < window:
@@ -876,7 +954,7 @@ class ResultsAdvisorAgent:
             lines.append(
                 "ISSUE: required outputs missing; WHY: outputs not saved; FIX: ensure all required artifacts are written."
             )
-        if "leakage" in review_feedback.lower():
+        if self._feedback_indicates_leakage_risk(review_feedback):
             lines.append(
                 "ISSUE: leakage risk flagged; WHY: post-outcome fields may be in features; FIX: audit feature timing and remove leaks."
             )

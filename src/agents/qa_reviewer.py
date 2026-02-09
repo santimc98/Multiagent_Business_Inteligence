@@ -220,9 +220,9 @@ class QAReviewerAgent:
         
         QUALITY GATES (SPEC-DRIVEN):
         
-        1. MAPPING SUMMARY (only if gate enabled):
-           - The code MUST print a "Mapping Summary" or similar dict showing which features map to which columns.
-           - Example: print(f"Mapping: Target={{target_col}}, Features={{features}}")
+        1. CONTRACT TRACEABILITY (only if gate enabled):
+           - Feature/target selection must remain traceable to contract columns and roles.
+           - Ask for explicit traceability evidence only when a dedicated gate requires it.
            
         2. CONSISTENCY CHECKS (only if gate enabled):
            - Check for column aliasing (two features mapping to same column).
@@ -598,21 +598,6 @@ def _call_name(call_node: ast.Call) -> str:
     return ""
 
 
-def _node_mentions_mapping(node: ast.AST) -> bool:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return "mapping" in node.value.lower()
-    if isinstance(node, ast.Name):
-        return "mapping" in node.id.lower()
-    if isinstance(node, ast.Attribute):
-        return "mapping" in node.attr.lower()
-    if isinstance(node, ast.JoinedStr):
-        for value in node.values:
-            if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                if "mapping" in value.value.lower():
-                    return True
-    return False
-
-
 _REGRESSOR_KEYWORDS = {
     "LinearRegression",
     "ElasticNet",
@@ -762,7 +747,6 @@ class _StaticQAScanner(ast.NodeVisitor):
         self.has_group_split_usage = False
         self.has_security_violation = False
         self.has_train_eval_split = False
-        self.has_mapping_summary_print = False
         self.has_mkdirs = False
         self.forbidden_imports_found = False
         self.has_read_csv = False
@@ -788,9 +772,6 @@ class _StaticQAScanner(ast.NodeVisitor):
         name = _call_name(node)
         if _is_synthetic_data_call(node):
             self.has_synthetic_data = True
-        if isinstance(node.func, ast.Name) and node.func.id == "print":
-            if any(_node_mentions_mapping(arg) for arg in node.args):
-                self.has_mapping_summary_print = True
         if "read_csv" in name:
             self.has_read_csv = True
         if "assert_no_deterministic_target_leakage" in name:
@@ -1241,7 +1222,6 @@ def collect_static_qa_facts(code: str) -> Dict[str, bool]:
         "has_split_fabrication": False,
         "has_security_violation": False,
         "has_train_eval_split": False,
-        "has_mapping_summary_print": False,
         "has_mkdirs": False,
         "forbidden_imports_found": False,
         "has_read_csv": False,
@@ -1262,7 +1242,6 @@ def collect_static_qa_facts(code: str) -> Dict[str, bool]:
     facts["has_split_fabrication"] = scanner.has_split_fabrication
     facts["has_security_violation"] = scanner.has_security_violation
     facts["has_train_eval_split"] = scanner.has_train_eval_split
-    facts["has_mapping_summary_print"] = scanner.has_mapping_summary_print
     facts["has_mkdirs"] = scanner.has_mkdirs
     facts["forbidden_imports_found"] = scanner.forbidden_imports_found
     facts["has_read_csv"] = scanner.has_read_csv

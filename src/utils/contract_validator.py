@@ -67,6 +67,7 @@ ITERATION_POLICY_LIMIT_ALIASES = (
     "max_pipeline_iterations",
     "max_model_iterations",
     "max_iter",
+    "max_retries",
     "gate_retry_limit",
     "runtime_retry_limit",
     "max_runtime_retries",
