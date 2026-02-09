@@ -396,38 +396,114 @@ class DataEngineerAgent:
     def _clean_code(self, code: str) -> str:
         """
         Extracts code from markdown blocks, validates syntax, and applies auto-fixes.
-        Raises ValueError if code is empty or has unfixable syntax errors (CAUSA RAÍZ 2 & 3).
+        Raises ValueError if code is empty or has unfixable syntax errors (CAUSA RAIZ 2 & 3).
         """
-        # Step 1: Extract code from markdown
         cleaned = (extract_code_block(code) or "").strip()
-
-        if not cleaned:
+        if not cleaned and not (code or "").strip():
             print("ERROR: EMPTY_CODE_AFTER_EXTRACTION")
             raise ValueError("EMPTY_CODE_AFTER_EXTRACTION")
 
-        # Step 2: Validate syntax
-        try:
-            ast.parse(cleaned)
-            return cleaned
-        except SyntaxError as e:
-            print(f"DEBUG: SyntaxError detected: {e}. Attempting auto-fix...")
+        def _autofix_assign_digit_identifier(src: str) -> str:
+            # .assign(1stYearAmount=...) -> .assign(**{'1stYearAmount': ...})
+            pattern = r'\.assign\(\s*([0-9][a-zA-Z0-9_]*)\s*=\s*([^)]+)\)'
 
-        # Step 3: Auto-fix common pattern: .assign(1stYearAmount=...) -> .assign(**{'1stYearAmount': ...})
-        # Pattern: .assign(DIGIT_START_IDENT=VALUE)
-        pattern = r'\.assign\(\s*([0-9][a-zA-Z0-9_]*)\s*=\s*([^)]+)\)'
-        
-        def fix_assign(match):
-            col_name = match.group(1)
-            value = match.group(2)
-            return f".assign(**{{'{col_name}': {value}}})"
+            def fix_assign(match):
+                col_name = match.group(1)
+                value = match.group(2)
+                return f".assign(**{{'{col_name}': {value}}})"
 
-        fixed = re.sub(pattern, fix_assign, cleaned)
+            return re.sub(pattern, fix_assign, src or "")
 
-        # Step 4: Validate fixed code
-        try:
-            ast.parse(fixed)
-            print("DEBUG: Auto-fix successful.")
-            return fixed
-        except SyntaxError as e2:
-            print(f"ERROR: Auto-fix failed. Syntax still invalid: {e2}")
-            raise ValueError(f"UNFIXABLE_SYNTAX_ERROR: {e2}")
+        def _trim_to_code_start(src: str) -> str:
+            if not isinstance(src, str):
+                return ""
+            normalized = re.sub(r"</?think>", "\n", src, flags=re.IGNORECASE).strip()
+            if not normalized:
+                return ""
+            lines = normalized.splitlines()
+            start_pattern = re.compile(
+                r"^(#|from\s+\w+|import\s+\w+|def\s+\w+|class\s+\w+|if\s+__name__|if\s+|for\s+|while\s+|try:|with\s+|@|[A-Za-z_]\w*\s*=|print\()"
+            )
+            for idx, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if start_pattern.match(stripped):
+                    return "\n".join(lines[idx:]).strip()
+            return normalized
+
+        def _looks_like_script(src: str) -> bool:
+            if not isinstance(src, str):
+                return False
+            text = src.strip()
+            if not text:
+                return False
+            markers = (
+                "import ",
+                "from ",
+                "def ",
+                "class ",
+                "if __name__",
+                "\n",
+                "=",
+                "print(",
+                "raise ",
+                "try:",
+                "# ",
+            )
+            lowered = text.lower()
+            return any(marker in lowered for marker in markers)
+
+        candidates: List[str] = []
+
+        def _push_candidate(value: str) -> None:
+            if not isinstance(value, str):
+                return
+            stripped = value.strip()
+            if not stripped or stripped in candidates:
+                return
+            candidates.append(stripped)
+
+        _push_candidate(cleaned)
+        _push_candidate(code or "")
+
+        raw = code or ""
+        if "```" in raw:
+            parts = [p.strip() for p in re.split(r"```(?:python)?", raw, flags=re.IGNORECASE) if isinstance(p, str)]
+            for part in parts:
+                _push_candidate(part)
+            first_fence = re.search(r"```(?:python)?", raw, re.IGNORECASE)
+            if first_fence:
+                _push_candidate(raw[: first_fence.start()])
+                _push_candidate(raw[first_fence.end() :])
+
+        think_tail = re.split(r"</think>", raw, flags=re.IGNORECASE)
+        if len(think_tail) > 1:
+            _push_candidate(think_tail[-1])
+
+        recovery_candidates: List[str] = []
+        for candidate in candidates:
+            recovery_candidates.append(candidate)
+            trimmed = _trim_to_code_start(candidate)
+            if trimmed and trimmed != candidate:
+                recovery_candidates.append(trimmed)
+
+        last_syntax_error: Optional[SyntaxError] = None
+        for candidate in recovery_candidates:
+            for variant in (candidate, _autofix_assign_digit_identifier(candidate)):
+                variant = (variant or "").strip()
+                if not variant or not _looks_like_script(variant):
+                    continue
+                try:
+                    ast.parse(variant)
+                    if variant != candidate:
+                        print("DEBUG: Auto-fix successful.")
+                    return variant
+                except SyntaxError as e:
+                    last_syntax_error = e
+
+        if last_syntax_error:
+            print(f"ERROR: Auto-fix failed. Syntax still invalid: {last_syntax_error}")
+            raise ValueError(f"UNFIXABLE_SYNTAX_ERROR: {last_syntax_error}")
+        print("ERROR: EMPTY_CODE_AFTER_EXTRACTION")
+        raise ValueError("EMPTY_CODE_AFTER_EXTRACTION")
