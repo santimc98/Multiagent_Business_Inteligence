@@ -4,6 +4,7 @@
 # Usage:
 #   ./deploy.sh                    # Uses defaults from .env or prompts
 #   ./deploy.sh --project my-proj  # Override project
+#   ./deploy.sh --timeout 120m     # Override Cloud Run task timeout
 #   ./deploy.sh --create           # Create new job (instead of update)
 
 set -e
@@ -17,7 +18,7 @@ REPO="heavy-runner"
 IMAGE="heavy-train"
 MEMORY="32Gi"
 CPU="8"
-TIMEOUT="30m"
+TIMEOUT="${HEAVY_RUNNER_TASK_TIMEOUT:-120m}"
 CREATE_MODE=false
 
 # Parse arguments
@@ -33,6 +34,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --job)
             JOB_NAME="$2"
+            shift 2
+            ;;
+        --timeout)
+            TIMEOUT="$2"
             shift 2
             ;;
         --create)

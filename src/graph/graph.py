@@ -8400,6 +8400,183 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _clamp_int(value: int, lower: int, upper: int) -> int:
+    if value < lower:
+        return lower
+    if value > upper:
+        return upper
+    return value
+
+
+def _detect_max_int_assignment(code: str, key: str) -> int:
+    if not code or not key:
+        return 0
+    pattern = rf"{re.escape(key)}\s*=\s*(\d+)"
+    matches = re.findall(pattern, code, flags=re.IGNORECASE)
+    values: List[int] = []
+    for item in matches:
+        try:
+            values.append(int(item))
+        except Exception:
+            continue
+    return max(values) if values else 0
+
+
+def _contains_any_pattern(code: str, patterns: List[str]) -> bool:
+    if not code:
+        return False
+    lower = code.lower()
+    return any(str(pattern).lower() in lower for pattern in patterns if pattern)
+
+
+def _infer_cv_folds_for_timeout(code: str, ml_plan: Dict[str, Any] | None = None) -> int:
+    if isinstance(ml_plan, dict):
+        cv_policy = ml_plan.get("cv_policy")
+        if isinstance(cv_policy, dict):
+            folds = _safe_int(cv_policy.get("n_splits"), 0)
+            if folds > 0:
+                return _clamp_int(folds, 1, 20)
+    folds_detected = _detect_max_int_assignment(code or "", "n_splits")
+    if folds_detected > 0:
+        return _clamp_int(folds_detected, 1, 20)
+    return 1
+
+
+def _estimate_heavy_script_timeout(
+    *,
+    stage: str,
+    code: str,
+    state: Dict[str, Any],
+    ml_plan: Dict[str, Any] | None = None,
+    configured_timeout_seconds: int | None = None,
+) -> Dict[str, Any]:
+    """
+    Estimate script timeout with generous headroom from script + dataset context.
+
+    The model keeps full reasoning freedom; timeout is adapted post-generation.
+    """
+    stage_norm = str(stage or "ml_engineer").strip().lower()
+    hints = state.get("dataset_scale_hints") or {}
+    dataset_scale = str(hints.get("scale") or state.get("dataset_scale") or "unknown").strip().lower()
+    est_rows = _safe_int(hints.get("est_rows"), 0)
+    n_cols = _safe_int(hints.get("cols") or hints.get("n_cols"), 0)
+    file_mb = _safe_float(hints.get("file_mb"), 0.0)
+
+    # Stage-aware baseline (seconds): intentionally conservative.
+    if stage_norm == "data_engineer":
+        base_seconds = 1500
+        if dataset_scale == "medium":
+            base_seconds = 2100
+        elif dataset_scale == "large":
+            base_seconds = 3000
+    else:
+        base_seconds = 1800
+        if dataset_scale == "medium":
+            base_seconds = 3000
+        elif dataset_scale == "large":
+            base_seconds = 4200
+
+    complexity_bonus = 0
+    tags: List[str] = []
+
+    if est_rows >= 300_000:
+        complexity_bonus += 600
+        tags.append("rows_ge_300k")
+    if est_rows >= 800_000:
+        complexity_bonus += 900
+        tags.append("rows_ge_800k")
+    if n_cols >= 200:
+        complexity_bonus += 240
+        tags.append("cols_ge_200")
+    if n_cols >= 500:
+        complexity_bonus += 360
+        tags.append("cols_ge_500")
+    if file_mb >= 250:
+        complexity_bonus += 420
+        tags.append("file_mb_ge_250")
+    if file_mb >= 700:
+        complexity_bonus += 600
+        tags.append("file_mb_ge_700")
+
+    folds = _infer_cv_folds_for_timeout(code, ml_plan=ml_plan)
+    if folds > 1:
+        complexity_bonus += (folds - 1) * 240
+        tags.append(f"cv_folds_{folds}")
+
+    if _contains_any_pattern(code, ["gridsearchcv", "randomizedsearchcv", "optuna", "hyperopt"]):
+        complexity_bonus += 1500
+        tags.append("hpo_detected")
+    if _contains_any_pattern(code, ["cross_val_score(", "cross_validate("]):
+        complexity_bonus += 360
+        tags.append("cross_validation_api_detected")
+    if _contains_any_pattern(code, ["isotonicregression", "calibratedclassifiercv"]):
+        complexity_bonus += 300
+        tags.append("calibration_detected")
+    if _contains_any_pattern(code, ["import shap", "shap."]):
+        complexity_bonus += 1500
+        tags.append("shap_detected")
+    if _contains_any_pattern(code, ["shap_values(", "explainer.shap_values("]):
+        complexity_bonus += 720
+        tags.append("shap_value_compute_detected")
+
+    max_estimators = _detect_max_int_assignment(code, "n_estimators")
+    if max_estimators >= 500:
+        complexity_bonus += 300
+        tags.append("n_estimators_ge_500")
+    if max_estimators >= 1000:
+        complexity_bonus += 600
+        tags.append("n_estimators_ge_1000")
+    if max_estimators >= 2000:
+        complexity_bonus += 900
+        tags.append("n_estimators_ge_2000")
+
+    if _contains_any_pattern(code, ["lightgbm", "xgboost", "catboost"]):
+        complexity_bonus += 240
+        tags.append("boosting_detected")
+
+    raw_estimate = base_seconds + complexity_bonus
+    margin_multiplier = _safe_float(os.getenv("HEAVY_RUNNER_TIMEOUT_MARGIN_MULTIPLIER"), 1.45)
+    margin_multiplier = max(1.0, margin_multiplier)
+    margin_seconds = _safe_int(os.getenv("HEAVY_RUNNER_TIMEOUT_MARGIN_SECONDS"), 900)
+    estimated = int(round(raw_estimate * margin_multiplier)) + max(0, margin_seconds)
+
+    default_min = 1200 if stage_norm == "data_engineer" else 2400
+    min_timeout = _safe_int(os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MIN_SECONDS"), default_min)
+    max_timeout = _safe_int(os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MAX_SECONDS"), 7200)
+    if max_timeout <= 0:
+        max_timeout = 7200
+    if min_timeout <= 0:
+        min_timeout = default_min
+    if max_timeout < min_timeout:
+        max_timeout = min_timeout
+
+    timeout = _clamp_int(estimated, min_timeout, max_timeout)
+    configured = _safe_int(configured_timeout_seconds, 0)
+    if configured > 0:
+        timeout = _clamp_int(max(timeout, configured), min_timeout, max_timeout)
+        tags.append("configured_timeout_floor")
+
+    return {
+        "timeout_seconds": int(timeout),
+        "estimated_seconds_before_clamp": int(estimated),
+        "raw_estimate_seconds": int(raw_estimate),
+        "base_seconds": int(base_seconds),
+        "complexity_bonus_seconds": int(complexity_bonus),
+        "min_timeout_seconds": int(min_timeout),
+        "max_timeout_seconds": int(max_timeout),
+        "margin_multiplier": float(margin_multiplier),
+        "margin_seconds": int(max(0, margin_seconds)),
+        "dataset_scale": dataset_scale,
+        "est_rows": int(est_rows),
+        "n_cols": int(n_cols),
+        "file_mb": float(file_mb),
+        "cv_folds": int(folds),
+        "max_detected_n_estimators": int(max_estimators),
+        "stage": stage_norm,
+        "tags": tags,
+    }
+
+
 def _dtype_bytes_estimate(dtype_name: str) -> float:
     dtype = str(dtype_name or "").strip().lower()
     if not dtype:
@@ -9080,8 +9257,14 @@ def _execute_data_engineer_via_heavy_runner(
         "read": {"sep": csv_sep, "decimal": csv_decimal, "encoding": csv_encoding},
         "required_outputs": required_artifacts,
     }
-    if heavy_cfg.get("script_timeout_seconds"):
-        request["script_timeout_seconds"] = int(heavy_cfg["script_timeout_seconds"])
+    timeout_decision = _estimate_heavy_script_timeout(
+        stage="data_engineer",
+        code=code,
+        state=state,
+        ml_plan=None,
+        configured_timeout_seconds=heavy_cfg.get("script_timeout_seconds"),
+    )
+    request["script_timeout_seconds"] = int(timeout_decision["timeout_seconds"])
     if run_id:
         log_run_event(
             run_id,
@@ -9094,6 +9277,7 @@ def _execute_data_engineer_via_heavy_runner(
                 "required_artifacts": required_artifacts,
                 "support_files": [item.get("path") for item in support_files],
                 "script_timeout_seconds": request.get("script_timeout_seconds"),
+                "script_timeout_decision": timeout_decision,
             },
         )
         log_run_event(run_id, "heavy_runner_start", {"step": "data_engineer", "reason": reason})
@@ -13925,6 +14109,13 @@ def execute_code(state: AgentState) -> AgentState:
                 for path in required_artifacts
                 if path
             ]
+            timeout_decision = _estimate_heavy_script_timeout(
+                stage="ml_engineer",
+                code=code,
+                state=state,
+                ml_plan=ml_plan if isinstance(ml_plan, dict) else None,
+                configured_timeout_seconds=heavy_cfg.get("script_timeout_seconds"),
+            )
 
             request = {
                 "run_id": run_id,
@@ -13940,9 +14131,8 @@ def execute_code(state: AgentState) -> AgentState:
                 "cv": cv_cfg,
                 "decisioning_required_names": decisioning_names,
                 "required_outputs": required_artifacts,
+                "script_timeout_seconds": int(timeout_decision["timeout_seconds"]),
             }
-            if heavy_cfg.get("script_timeout_seconds"):
-                request["script_timeout_seconds"] = int(heavy_cfg["script_timeout_seconds"])
 
             if not os.path.exists(local_csv):
                 return {
@@ -13992,6 +14182,7 @@ def execute_code(state: AgentState) -> AgentState:
                         "required_artifacts": required_artifacts,
                         "support_files": [item.get("path") for item in support_files],
                         "script_timeout_seconds": request.get("script_timeout_seconds"),
+                        "script_timeout_decision": timeout_decision,
                         "attempt_id": attempt_id,
                         "ml_data_path": local_csv,
                     },
