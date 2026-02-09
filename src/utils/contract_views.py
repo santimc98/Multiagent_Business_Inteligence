@@ -457,9 +457,15 @@ def _resolve_qa_gates(contract_min: Dict[str, Any], contract_full: Dict[str, Any
             return []
         normalized: List[Dict[str, Any]] = []
         seen: set[str] = set()
+        alias_keys = ("name", "id", "gate", "metric", "check", "rule", "title", "label")
         for gate in raw:
             if isinstance(gate, dict):
-                name = gate.get("name") or gate.get("id") or gate.get("gate")
+                name = ""
+                for key in alias_keys:
+                    value = gate.get(key)
+                    if isinstance(value, str) and value.strip():
+                        name = value.strip()
+                        break
                 if not name:
                     continue
                 severity = str(gate.get("severity") or "HARD").upper()
@@ -468,11 +474,18 @@ def _resolve_qa_gates(contract_min: Dict[str, Any], contract_full: Dict[str, Any
                 params = gate.get("params")
                 if not isinstance(params, dict):
                     params = {}
+                for param_key in ("metric", "check", "rule", "threshold", "target", "min", "max", "operator", "direction", "condition"):
+                    if param_key in gate and param_key not in params:
+                        params[param_key] = gate.get(param_key)
                 key = str(name).lower()
                 if key in seen:
                     continue
                 seen.add(key)
-                normalized.append({"name": str(name), "severity": severity, "params": params})
+                entry: Dict[str, Any] = {"name": str(name), "severity": severity, "params": params}
+                for extra_key in ("condition", "evidence_required", "action_if_fail"):
+                    if extra_key in gate:
+                        entry[extra_key] = gate.get(extra_key)
+                normalized.append(entry)
             elif isinstance(gate, str) and gate.strip():
                 key = gate.strip().lower()
                 if key in seen:
@@ -554,18 +567,22 @@ def _resolve_case_rules(contract_full: Dict[str, Any]) -> Any:
 
 
 def _resolve_reviewer_gates(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[Any]:
-    gates = contract_min.get("reviewer_gates")
-    if isinstance(gates, list) and gates:
+    gates = get_reviewer_gates(contract_full)
+    if gates:
+        return gates
+    gates = get_reviewer_gates(contract_min)
+    if gates:
         return gates
     eval_spec = contract_min.get("evaluation_spec")
     if isinstance(eval_spec, dict) and isinstance(eval_spec.get("reviewer_gates"), list):
-        return eval_spec.get("reviewer_gates") or []
+        normalized = get_reviewer_gates({"reviewer_gates": eval_spec.get("reviewer_gates")})
+        if normalized:
+            return normalized
     eval_spec = contract_full.get("evaluation_spec") if isinstance(contract_full, dict) else None
     if isinstance(eval_spec, dict) and isinstance(eval_spec.get("reviewer_gates"), list):
-        return eval_spec.get("reviewer_gates") or []
-    gates = contract_full.get("reviewer_gates")
-    if isinstance(gates, list):
-        return gates
+        normalized = get_reviewer_gates({"reviewer_gates": eval_spec.get("reviewer_gates")})
+        if normalized:
+            return normalized
     return []
 
 

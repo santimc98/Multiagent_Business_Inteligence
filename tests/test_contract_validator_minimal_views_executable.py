@@ -143,3 +143,21 @@ def test_validate_contract_minimal_readonly_accepts_max_retries_alias():
     assert result.get("accepted") is True
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.iteration_policy_limits" not in rules
+
+
+def test_validate_contract_minimal_readonly_accepts_alias_gate_objects():
+    contract = _base_full_pipeline_contract()
+    contract["qa_gates"] = [
+        {"metric": "roc_auc", "severity": "HARD", "threshold": 0.8},
+        {"name": "stability_check", "severity": "SOFT"},
+    ]
+    contract["reviewer_gates"] = [
+        {"check": "artifact_completeness", "severity": "HARD"},
+    ]
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is True
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.qa_view_gates" not in rules
+    assert "contract.reviewer_view_gates" not in rules

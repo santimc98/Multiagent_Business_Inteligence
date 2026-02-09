@@ -235,7 +235,16 @@ def _extract_qa_gate_names(raw_gates: Any) -> List[str]:
     if isinstance(raw_gates, list):
         for gate in raw_gates:
             if isinstance(gate, dict):
-                name = gate.get("name") or gate.get("id") or gate.get("gate")
+                name = (
+                    gate.get("name")
+                    or gate.get("id")
+                    or gate.get("gate")
+                    or gate.get("metric")
+                    or gate.get("check")
+                    or gate.get("rule")
+                    or gate.get("title")
+                    or gate.get("label")
+                )
                 if name:
                     names.append(str(name))
             elif isinstance(gate, str) and gate.strip():

@@ -2205,13 +2205,23 @@ def normalize_contract_scope(scope_value: Any) -> str:
     return "full_pipeline"
 
 
+def _gate_has_consumable_name(gate: Dict[str, Any]) -> bool:
+    if not isinstance(gate, dict):
+        return False
+    for key in ("name", "id", "gate", "metric", "check", "rule", "title", "label"):
+        value = gate.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
 def _gate_list_valid(gates: Any) -> bool:
     if not isinstance(gates, list) or not gates:
         return False
     for gate in gates:
         if isinstance(gate, str) and gate.strip():
             continue
-        if isinstance(gate, dict) and gate:
+        if isinstance(gate, dict) and _gate_has_consumable_name(gate):
             continue
         return False
     return True

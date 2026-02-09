@@ -16,9 +16,12 @@ from src.utils.contract_validation import (
 )
 from src.utils.contract_accessors import (
     get_canonical_columns,
+    get_cleaning_gates,
     get_column_roles,
     get_derived_column_names,
+    get_qa_gates,
     get_required_outputs,
+    get_reviewer_gates,
     CONTRACT_VERSION_V41,
     normalize_contract_version,
 )
@@ -186,18 +189,24 @@ Minimal contract interface:
 
 Scope-dependent required fields:
 - If scope includes cleaning ("cleaning_only" or "full_pipeline"):
-  - cleaning_gates: list (gate objects or labels)
+  - cleaning_gates: list of gate objects
   - data_engineer_runbook: object/list/string with actionable steps
   - artifact_requirements.clean_dataset.required_columns: list[str]
   - artifact_requirements.clean_dataset.output_path: file path for cleaned CSV
   - artifact_requirements.clean_dataset.output_manifest_path (or manifest_path): file path for cleaning manifest JSON
 - If scope includes ML ("ml_only" or "full_pipeline"):
-  - qa_gates: list
-  - reviewer_gates: list
+  - qa_gates: list of gate objects
+  - reviewer_gates: list of gate objects
   - validation_requirements: object
   - ml_engineer_runbook: object/list/string with actionable steps
   - evaluation_spec: non-empty object for ML execution/review context
   - objective_analysis.problem_type OR evaluation_spec.objective_type must be present
+
+Gate object contract (for cleaning_gates / qa_gates / reviewer_gates):
+- preferred shape: {"name": string, "severity": "HARD"|"SOFT", "params": object}
+- optional semantic keys: "condition", "evidence_required", "action_if_fail"
+- avoid anonymous dicts: each gate must have a consumable identifier.
+- if you start from semantic wording like metric/check/rule, map it into "name" and keep the original key inside params.
 
 Hard rules:
 - Do not invent columns not present in column_inventory.
@@ -631,7 +640,16 @@ def _build_decision_column_entry(
 
 def _normalize_qa_gate_spec(item: Any) -> Dict[str, Any] | None:
     if isinstance(item, dict):
-        name = item.get("name") or item.get("id") or item.get("gate")
+        name = (
+            item.get("name")
+            or item.get("id")
+            or item.get("gate")
+            or item.get("metric")
+            or item.get("check")
+            or item.get("rule")
+            or item.get("title")
+            or item.get("label")
+        )
         if not name:
             return None
         severity = item.get("severity")
@@ -644,7 +662,14 @@ def _normalize_qa_gate_spec(item: Any) -> Dict[str, Any] | None:
         params = item.get("params")
         if not isinstance(params, dict):
             params = {}
-        return {"name": str(name), "severity": severity, "params": params}
+        for param_key in ("metric", "check", "rule", "threshold", "target", "min", "max", "operator", "direction", "condition"):
+            if param_key in item and param_key not in params:
+                params[param_key] = item.get(param_key)
+        gate_spec: Dict[str, Any] = {"name": str(name), "severity": severity, "params": params}
+        for extra_key in ("condition", "evidence_required", "action_if_fail"):
+            if extra_key in item:
+                gate_spec[extra_key] = item.get(extra_key)
+        return gate_spec
     if isinstance(item, str):
         name = item.strip()
         if not name:
@@ -672,7 +697,16 @@ def _normalize_qa_gates(raw_gates: Any) -> List[Dict[str, Any]]:
 
 def _normalize_cleaning_gate_spec(item: Any) -> Dict[str, Any] | None:
     if isinstance(item, dict):
-        name = item.get("name") or item.get("id") or item.get("gate")
+        name = (
+            item.get("name")
+            or item.get("id")
+            or item.get("gate")
+            or item.get("metric")
+            or item.get("check")
+            or item.get("rule")
+            or item.get("title")
+            or item.get("label")
+        )
         if not name:
             return None
         severity = item.get("severity")
@@ -685,7 +719,14 @@ def _normalize_cleaning_gate_spec(item: Any) -> Dict[str, Any] | None:
         params = item.get("params")
         if not isinstance(params, dict):
             params = {}
-        return {"name": str(name), "severity": severity, "params": params}
+        for param_key in ("metric", "check", "rule", "threshold", "target", "min", "max", "operator", "direction", "condition"):
+            if param_key in item and param_key not in params:
+                params[param_key] = item.get(param_key)
+        gate_spec: Dict[str, Any] = {"name": str(name), "severity": severity, "params": params}
+        for extra_key in ("condition", "evidence_required", "action_if_fail"):
+            if extra_key in item:
+                gate_spec[extra_key] = item.get(extra_key)
+        return gate_spec
     if isinstance(item, str):
         name = item.strip()
         if not name:
@@ -6248,6 +6289,9 @@ class ExecutionPlannerAgent:
                 "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "For ML scopes, include non-empty evaluation_spec and ensure objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
+                "Gate lists must be executable by downstream views: use gate objects with "
+                "{name, severity, params} (severity in HARD|SOFT). If using metric/check/rule language, "
+                "map it to name and keep semantic details in params.\n"
                 "Top-level minimum keys (required interface for executable views): "
                 + json.dumps(required_top_level)
                 + "\n\nORIGINAL INPUTS (source of truth):\n"
@@ -6304,13 +6348,25 @@ class ExecutionPlannerAgent:
                 return bool(value)
             return False
 
-        def _gate_list_valid(value: Any) -> bool:
+        def _gate_list_valid(value: Any, gate_key: str) -> bool:
             if not isinstance(value, list) or not value:
                 return False
+            if gate_key == "qa_gates":
+                return bool(get_qa_gates({"qa_gates": value}))
+            if gate_key == "reviewer_gates":
+                return bool(get_reviewer_gates({"reviewer_gates": value}))
+            if gate_key == "cleaning_gates":
+                return bool(get_cleaning_gates({"cleaning_gates": value}))
             for gate in value:
                 if isinstance(gate, str) and gate.strip():
                     continue
-                if isinstance(gate, dict) and gate:
+                if isinstance(gate, dict):
+                    for key in ("name", "id", "gate", "metric", "check", "rule", "title", "label"):
+                        field_value = gate.get(key)
+                        if isinstance(field_value, str) and field_value.strip():
+                            break
+                    else:
+                        return False
                     continue
                 return False
             return True
@@ -6386,8 +6442,11 @@ class ExecutionPlannerAgent:
                     errors.append(f"{section_id}: iteration_policy string cannot be blank")
 
             if section_id == "cleaning_contract" and _scope_requires_cleaning(candidate_scope):
-                if not _gate_list_valid(payload.get("cleaning_gates")):
-                    errors.append(f"{section_id}: cleaning_gates must be a non-empty list")
+                if not _gate_list_valid(payload.get("cleaning_gates"), "cleaning_gates"):
+                    errors.append(
+                        f"{section_id}: cleaning_gates must be a non-empty list of consumable gate objects "
+                        "(prefer name/severity/params)"
+                    )
                 if not _runbook_non_empty(payload.get("data_engineer_runbook")):
                     errors.append(f"{section_id}: data_engineer_runbook must be non-empty")
 
@@ -6421,10 +6480,16 @@ class ExecutionPlannerAgent:
                 eval_spec = payload.get("evaluation_spec")
                 if eval_spec is not None and not isinstance(eval_spec, dict):
                     errors.append(f"{section_id}: evaluation_spec must be an object when provided")
-                if not _gate_list_valid(payload.get("qa_gates")):
-                    errors.append(f"{section_id}: qa_gates must be a non-empty list")
-                if not _gate_list_valid(payload.get("reviewer_gates")):
-                    errors.append(f"{section_id}: reviewer_gates must be a non-empty list")
+                if not _gate_list_valid(payload.get("qa_gates"), "qa_gates"):
+                    errors.append(
+                        f"{section_id}: qa_gates must be a non-empty list of consumable gate objects "
+                        "(prefer name/severity/params)"
+                    )
+                if not _gate_list_valid(payload.get("reviewer_gates"), "reviewer_gates"):
+                    errors.append(
+                        f"{section_id}: reviewer_gates must be a non-empty list of consumable gate objects "
+                        "(prefer name/severity/params)"
+                    )
                 validation_reqs = payload.get("validation_requirements")
                 if not isinstance(validation_reqs, dict) or not validation_reqs:
                     errors.append(f"{section_id}: validation_requirements must be a non-empty object")
@@ -6518,6 +6583,8 @@ class ExecutionPlannerAgent:
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
+                "Gate lists must be executable by downstream views: each gate should expose a consumable identifier "
+                "(prefer name) and include severity + params.\n"
                 f"Required keys for this section: {json.dumps(required_keys)}\n"
                 "If this section has no required keys for the selected scope, return {}.\n\n"
                 "ORIGINAL INPUTS:\n"
@@ -6553,6 +6620,8 @@ class ExecutionPlannerAgent:
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n\n"
+                "Gate lists must be executable by downstream views: each gate should expose a consumable identifier "
+                "(prefer name) and include severity + params.\n\n"
                 "ORIGINAL INPUTS:\n"
                 + (original_inputs_text or "")
                 + "\n\nCURRENT CONTRACT DRAFT:\n"

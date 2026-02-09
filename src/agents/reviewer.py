@@ -46,7 +46,7 @@ def _extract_json_object(text: str) -> str | None:
 
 def _normalize_reviewer_gate_name(item: Any) -> str:
     if isinstance(item, dict):
-        for key in ("name", "id", "gate"):
+        for key in ("name", "id", "gate", "check", "metric", "rule", "title", "label"):
             value = item.get(key)
             if value:
                 return str(value).strip()

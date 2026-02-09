@@ -55,7 +55,16 @@ CONTRACT_BROKEN_FALLBACK_GATES = [
 
 def _normalize_qa_gate_spec(item: Any) -> Optional[Dict[str, Any]]:
     if isinstance(item, dict):
-        name = item.get("name") or item.get("id") or item.get("gate")
+        name = (
+            item.get("name")
+            or item.get("id")
+            or item.get("gate")
+            or item.get("metric")
+            or item.get("check")
+            or item.get("rule")
+            or item.get("title")
+            or item.get("label")
+        )
         if not name:
             return None
         severity = item.get("severity")
@@ -68,7 +77,14 @@ def _normalize_qa_gate_spec(item: Any) -> Optional[Dict[str, Any]]:
         params = item.get("params")
         if not isinstance(params, dict):
             params = {}
-        return {"name": str(name), "severity": severity, "params": params}
+        for param_key in ("metric", "check", "rule", "threshold", "target", "min", "max", "operator", "direction", "condition"):
+            if param_key in item and param_key not in params:
+                params[param_key] = item.get(param_key)
+        gate_spec: Dict[str, Any] = {"name": str(name), "severity": severity, "params": params}
+        for extra_key in ("condition", "evidence_required", "action_if_fail"):
+            if extra_key in item:
+                gate_spec[extra_key] = item.get(extra_key)
+        return gate_spec
     if isinstance(item, str):
         name = item.strip()
         if not name:
