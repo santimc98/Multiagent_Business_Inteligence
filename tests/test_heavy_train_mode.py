@@ -120,7 +120,11 @@ def test_execute_code_mode_fails_when_required_outputs_missing(monkeypatch):
 
     monkeypatch.setattr(heavy_train, "_download_to_path", _fake_download)
     monkeypatch.setattr(heavy_train, "_download_support_files", lambda _support, _work_dir: None)
-    monkeypatch.setattr(heavy_train, "_run_script", lambda _script, _work_dir: (0, "ok", ""))
+    monkeypatch.setattr(
+        heavy_train,
+        "_run_script",
+        lambda _script, _work_dir, timeout_seconds=None: (0, "ok", ""),
+    )
     monkeypatch.setattr(heavy_train, "_collect_output_files", lambda _work_dir, skip_paths=None: [])
     monkeypatch.setattr(heavy_train, "_write_file_output", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -156,7 +160,7 @@ def test_execute_code_mode_uploads_required_outputs_outside_default_roots(monkey
         else:
             path_obj.write_text("a\n1\n", encoding="utf-8")
 
-    def _fake_run(_script, work_dir):
+    def _fake_run(_script, work_dir, timeout_seconds=None):
         models_dir = Path(work_dir) / "models"
         reports_dir = Path(work_dir) / "reports"
         models_dir.mkdir(parents=True, exist_ok=True)
@@ -203,3 +207,17 @@ def test_execute_code_mode_uploads_required_outputs_outside_default_roots(monkey
     assert status_payload.get("required_outputs_missing") == []
     assert "models/best_model.joblib" in (status_payload.get("uploaded_outputs") or [])
     assert "reports/model_card.json" in (status_payload.get("uploaded_outputs") or [])
+
+
+def test_resolve_script_timeout_seconds_prefers_payload(monkeypatch):
+    heavy_train = _load_heavy_train_module()
+    monkeypatch.setenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS", "1200")
+    timeout = heavy_train._resolve_script_timeout_seconds({"script_timeout_seconds": 1500})
+    assert timeout == 1500
+
+
+def test_resolve_script_timeout_seconds_uses_env_when_payload_missing(monkeypatch):
+    heavy_train = _load_heavy_train_module()
+    monkeypatch.setenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS", "1650")
+    timeout = heavy_train._resolve_script_timeout_seconds({})
+    assert timeout == 1650

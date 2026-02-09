@@ -33,6 +33,9 @@ from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 
 # Protocol marker for orchestrator/runner compatibility.
 HEAVY_RUNNER_PROTOCOL_VERSION = "de_mode_v1"
+DEFAULT_SCRIPT_TIMEOUT_SECONDS = 1740
+MIN_SCRIPT_TIMEOUT_SECONDS = 60
+MAX_SCRIPT_TIMEOUT_SECONDS = 7200
 
 
 def log(message: str) -> None:
@@ -58,6 +61,44 @@ def _normalize_rel_path(path: Any) -> str:
     while "//" in normalized:
         normalized = normalized.replace("//", "/")
     return normalized
+
+
+def _coerce_timeout_seconds(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        parsed = int(str(value).strip())
+    except Exception:
+        return None
+    if parsed <= 0:
+        return None
+    if parsed < MIN_SCRIPT_TIMEOUT_SECONDS:
+        return MIN_SCRIPT_TIMEOUT_SECONDS
+    if parsed > MAX_SCRIPT_TIMEOUT_SECONDS:
+        return MAX_SCRIPT_TIMEOUT_SECONDS
+    return parsed
+
+
+def _resolve_script_timeout_seconds(payload: Optional[Dict[str, Any]] = None) -> int:
+    """
+    Resolve execution timeout for user scripts.
+
+    Precedence:
+    1) payload.script_timeout_seconds
+    2) env HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS
+    3) DEFAULT_SCRIPT_TIMEOUT_SECONDS
+    """
+    payload_timeout = None
+    if isinstance(payload, dict):
+        payload_timeout = _coerce_timeout_seconds(payload.get("script_timeout_seconds"))
+    if payload_timeout is not None:
+        return payload_timeout
+
+    env_timeout = _coerce_timeout_seconds(os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS"))
+    if env_timeout is not None:
+        return env_timeout
+
+    return DEFAULT_SCRIPT_TIMEOUT_SECONDS
 
 
 def _parse_gs_uri(uri: str) -> Tuple[str, str]:
@@ -181,18 +222,23 @@ def _download_support_files(items: Any, base_dir: str) -> List[str]:
     return downloaded
 
 
-def _run_script(script_path: str, work_dir: str, timeout_seconds: int = 1200) -> Tuple[int, str, str]:
+def _run_script(
+    script_path: str,
+    work_dir: str,
+    timeout_seconds: Optional[int] = None,
+) -> Tuple[int, str, str]:
     """
     Execute Python script in working directory.
 
     Args:
         script_path: Path to the Python script
         work_dir: Working directory for execution (cwd)
-        timeout_seconds: Execution timeout (default 20 minutes)
+        timeout_seconds: Execution timeout in seconds
 
     Returns:
         Tuple of (exit_code, stdout, stderr)
     """
+    effective_timeout = _coerce_timeout_seconds(timeout_seconds) or DEFAULT_SCRIPT_TIMEOUT_SECONDS
     try:
         proc = subprocess.run(
             [sys.executable, script_path],
@@ -200,11 +246,11 @@ def _run_script(script_path: str, work_dir: str, timeout_seconds: int = 1200) ->
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
+            timeout=effective_timeout,
         )
         return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as e:
-        return -1, e.stdout or "", f"TIMEOUT: Script exceeded {timeout_seconds}s limit\n{e.stderr or ''}"
+        return -1, e.stdout or "", f"TIMEOUT: Script exceeded {effective_timeout}s limit\n{e.stderr or ''}"
 
 
 def _collect_output_files(work_dir: str, skip_paths: Optional[set[str]] = None) -> List[str]:
@@ -348,6 +394,8 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
         + str(mode)
         + f"; requested_mode={requested_mode}; required_outputs={required_outputs}"
     )
+    script_timeout_seconds = _resolve_script_timeout_seconds(payload)
+    log(f"execute_code.script_timeout_seconds={script_timeout_seconds}")
 
     # Setup data directories (same structure as E2B)
     for subdir in ["data", "static/plots", "report", "artifacts"]:
@@ -389,7 +437,11 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     log("=" * 60)
 
     exec_start = time.perf_counter()
-    exit_code, stdout, stderr = _run_script(script_path, work_dir)
+    exit_code, stdout, stderr = _run_script(
+        script_path,
+        work_dir,
+        timeout_seconds=script_timeout_seconds,
+    )
     exec_time = time.perf_counter() - exec_start
     stdout = _ensure_text(stdout)
     stderr = _ensure_text(stderr)

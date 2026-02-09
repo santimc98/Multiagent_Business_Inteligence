@@ -8192,6 +8192,15 @@ def _get_heavy_runner_config() -> Dict[str, Any] | None:
     bucket = os.getenv("HEAVY_RUNNER_BUCKET")
     if not job or not region or not bucket:
         return None
+    timeout_raw = os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS")
+    script_timeout_seconds = None
+    if timeout_raw is not None:
+        try:
+            parsed = int(str(timeout_raw).strip())
+            if parsed > 0:
+                script_timeout_seconds = parsed
+        except Exception:
+            script_timeout_seconds = None
     return {
         "job": job,
         "region": region,
@@ -8200,6 +8209,7 @@ def _get_heavy_runner_config() -> Dict[str, Any] | None:
         "input_prefix": os.getenv("HEAVY_RUNNER_INPUT_PREFIX", "inputs"),
         "output_prefix": os.getenv("HEAVY_RUNNER_OUTPUT_PREFIX", "outputs"),
         "dataset_prefix": os.getenv("HEAVY_RUNNER_DATASET_PREFIX", "datasets"),
+        "script_timeout_seconds": script_timeout_seconds,
     }
 
 
@@ -8965,6 +8975,8 @@ def _execute_data_engineer_via_heavy_runner(
         "read": {"sep": csv_sep, "decimal": csv_decimal, "encoding": csv_encoding},
         "required_outputs": required_artifacts,
     }
+    if heavy_cfg.get("script_timeout_seconds"):
+        request["script_timeout_seconds"] = int(heavy_cfg["script_timeout_seconds"])
     if run_id:
         log_run_event(
             run_id,
@@ -8976,6 +8988,7 @@ def _execute_data_engineer_via_heavy_runner(
                 "download_keys": list(download_map.keys()),
                 "required_artifacts": required_artifacts,
                 "support_files": [item.get("path") for item in support_files],
+                "script_timeout_seconds": request.get("script_timeout_seconds"),
             },
         )
         log_run_event(run_id, "heavy_runner_start", {"step": "data_engineer", "reason": reason})
@@ -8998,6 +9011,7 @@ def _execute_data_engineer_via_heavy_runner(
             data_path="data/raw.csv",
             required_artifacts=required_artifacts,
             attempt_id=attempt_id,
+            stage_namespace="data_engineer",
         )
     except CloudRunLaunchError as exc:
         msg = str(exc)
@@ -13822,6 +13836,8 @@ def execute_code(state: AgentState) -> AgentState:
                 "decisioning_required_names": decisioning_names,
                 "required_outputs": required_artifacts,
             }
+            if heavy_cfg.get("script_timeout_seconds"):
+                request["script_timeout_seconds"] = int(heavy_cfg["script_timeout_seconds"])
 
             if not os.path.exists(local_csv):
                 return {
@@ -13870,6 +13886,7 @@ def execute_code(state: AgentState) -> AgentState:
                         "download_keys": list(download_map.keys()),
                         "required_artifacts": required_artifacts,
                         "support_files": [item.get("path") for item in support_files],
+                        "script_timeout_seconds": request.get("script_timeout_seconds"),
                         "attempt_id": attempt_id,
                         "ml_data_path": local_csv,
                     },
@@ -13894,6 +13911,7 @@ def execute_code(state: AgentState) -> AgentState:
                     data_path=local_csv,
                     required_artifacts=required_artifacts,
                     attempt_id=attempt_id,
+                    stage_namespace="ml_engineer",
                 )
             except CloudRunLaunchError as exc:
                 if run_id:

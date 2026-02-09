@@ -83,6 +83,9 @@ HEAVY_RUNNER_JOB=heavy-runner
 HEAVY_RUNNER_REGION=us-central1
 HEAVY_RUNNER_BUCKET=your-bucket-name
 HEAVY_RUNNER_PROJECT=your-project-id
+# Optional: max seconds for user script execution inside the runner
+# (default: 1740 seconds, i.e. 29 minutes)
+HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS=1740
 ```
 
 ## Request Payload (inputs/{run_id}.json)

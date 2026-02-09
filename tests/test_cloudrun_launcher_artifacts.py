@@ -296,6 +296,40 @@ def test_attempt_scopes_output_uri():
         assert result["attempt_id"] == 3
 
 
+def test_stage_and_attempt_scope_output_uri():
+    """Stage namespace must isolate DE/ML outputs within the same run attempt id."""
+    from src.utils.cloudrun_launcher import launch_heavy_runner_job
+
+    with patch("src.utils.cloudrun_launcher._ensure_cli"), \
+         patch("src.utils.cloudrun_launcher._gsutil_cp"), \
+         patch("src.utils.cloudrun_launcher._gsutil_exists") as mock_exists, \
+         patch("src.utils.cloudrun_launcher._gsutil_ls") as mock_ls, \
+         patch("src.utils.cloudrun_launcher._run_gcloud_job_execute") as mock_execute, \
+         patch("os.path.exists") as mock_path_exists, \
+         patch("os.makedirs"):
+
+        mock_execute.return_value = ("stdout", "stderr", "update-env-vars")
+        mock_path_exists.return_value = True
+        mock_exists.return_value = False
+        mock_ls.return_value = []
+
+        result = launch_heavy_runner_job(
+            run_id="test_run",
+            request={"dataset_uri": "gs://bucket/test.csv"},
+            dataset_path="data/test.csv",
+            bucket="test-bucket",
+            job="test-job",
+            region="us-central1",
+            download_map={},
+            attempt_id=1,
+            stage_namespace="ml_engineer",
+        )
+
+        assert result["output_uri"].endswith("/outputs/test_run/ml_engineer/attempt_1/")
+        assert result["input_uri"].endswith("/inputs/test_run/ml_engineer/attempt_1/request.json")
+        assert result["stage_namespace"] == "ml_engineer"
+
+
 def test_job_failure_is_overridden_when_status_ok_and_artifacts_present():
     """A launcher transport failure should be downgraded if output contract proves success."""
     from src.utils.cloudrun_launcher import launch_heavy_runner_job, CloudRunLaunchError

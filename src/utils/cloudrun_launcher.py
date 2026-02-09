@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -166,6 +167,15 @@ def _normalize_rel_path(path: Any) -> str:
     return value.lstrip("/").replace("\\", "/")
 
 
+def _normalize_scope_segment(value: Any) -> str:
+    raw = str(value or "").strip().strip("/")
+    if not raw:
+        return ""
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", raw)
+    slug = slug.strip("._-")
+    return slug.lower()
+
+
 def launch_heavy_runner_job(
     *,
     run_id: str,
@@ -185,6 +195,7 @@ def launch_heavy_runner_job(
     data_path: Optional[str] = None,
     required_artifacts: Optional[list[str]] = None,
     attempt_id: Optional[int] = None,
+    stage_namespace: Optional[str] = None,
 ) -> Dict[str, Any]:
     gcloud_bin = _resolve_cli_override("gcloud", "HEAVY_RUNNER_GCLOUD_BIN")
     gsutil_bin = _resolve_cli_override("gsutil", "HEAVY_RUNNER_GSUTIL_BIN")
@@ -195,6 +206,9 @@ def launch_heavy_runner_job(
     output_prefix = _normalize_prefix(output_prefix)
     dataset_prefix = _normalize_prefix(dataset_prefix)
     run_scope = str(run_id or "unknown").strip().strip("/")
+    stage_scope = _normalize_scope_segment(stage_namespace)
+    if stage_scope:
+        run_scope = f"{run_scope}/{stage_scope}"
     attempt_num = 0
     try:
         if attempt_id is not None:
@@ -417,4 +431,5 @@ def launch_heavy_runner_job(
         "status_arbitration": status_arbitration,
         "required_artifacts_missing": required_artifacts_missing,
         "attempt_id": attempt_num if attempt_num > 0 else None,
+        "stage_namespace": stage_scope or None,
     }
