@@ -1,9 +1,16 @@
-
+import json
 import pytest
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 from src.agents.strategist import StrategistAgent
 from src.graph.graph import run_strategist
+
+
+def _mock_llm_response(payload: Dict[str, Any]) -> MagicMock:
+    response = MagicMock()
+    response.text = json.dumps(payload)
+    return response
+
 
 class TestStrategistNormalization:
     
@@ -49,6 +56,53 @@ class TestStrategistNormalization:
         assert self.agent._normalize_strategist_output("garbage")["strategies"] == []
         assert self.agent._normalize_strategist_output(None)["strategies"] == []
         assert self.agent._normalize_strategist_output(123)["strategies"] == []
+
+    def test_validate_required_columns_detects_invalid_names(self):
+        payload = {
+            "strategies": [
+                {"title": "s1", "required_columns": ["valid_a", "invalid_x"]},
+                {"title": "s2", "required_columns": [{"name": "valid_b"}, {"column": "invalid_y"}]},
+            ]
+        }
+        validation = self.agent._validate_required_columns(payload, ["valid_a", "valid_b"])
+        assert validation["status"] == "invalid_required_columns"
+        assert validation["invalid_count"] == 2
+        assert len(validation["invalid_details"]) == 2
+
+    @patch.dict("os.environ", {"STRATEGIST_COLUMN_REPAIR_ATTEMPTS": "1"})
+    def test_generate_strategies_repairs_required_columns_with_inventory(self):
+        initial = {
+            "strategies": [
+                {
+                    "title": "risk",
+                    "objective_type": "predictive",
+                    "required_columns": ["ps_car_01", "target"],
+                    "recommended_evaluation_metrics": ["auc"],
+                }
+            ]
+        }
+        repaired = {
+            "strategies": [
+                {
+                    "title": "risk",
+                    "objective_type": "predictive",
+                    "required_columns": ["ps_car_01_cat", "target"],
+                    "recommended_evaluation_metrics": ["auc"],
+                }
+            ]
+        }
+        self.agent.model.generate_content = MagicMock(
+            side_effect=[_mock_llm_response(initial), _mock_llm_response(repaired)]
+        )
+        output = self.agent.generate_strategies(
+            data_summary="summary",
+            user_request="goal",
+            column_inventory=["ps_car_01_cat", "target"],
+            column_sets={"all_features": ["ps_*"]},
+        )
+        assert output["column_validation"]["status"] == "ok"
+        assert output["column_validation"]["invalid_count"] == 0
+        assert output["strategies"][0]["required_columns"] == ["ps_car_01_cat", "target"]
 
 
 class TestGraphStrategistIntegration:
@@ -102,3 +156,17 @@ class TestGraphStrategistIntegration:
         
         assert result["strategies"]["strategies"][0]["title"] == "Modern Strategy"
         assert result["strategy_spec"]["spec"] == "details"
+
+    @patch("src.graph.graph.strategist")
+    def test_run_strategist_passes_inventory_and_column_sets(self, mock_strategist):
+        mock_strategist.generate_strategies.return_value = {"strategies": [{"title": "s"}]}
+        state = {
+            "business_objective": "Test",
+            "run_id": "test_run",
+            "column_inventory_columns": ["a", "b", "target"],
+            "column_sets": {"pre_decision": ["a", "b"]},
+        }
+        run_strategist(state)
+        _, kwargs = mock_strategist.generate_strategies.call_args
+        assert kwargs["column_inventory"] == ["a", "b", "target"]
+        assert kwargs["column_sets"] == {"pre_decision": ["a", "b"]}

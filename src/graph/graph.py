@@ -7932,7 +7932,31 @@ def run_strategist(state: AgentState) -> AgentState:
         data_summary = _prepend_dataset_semantics_summary(data_summary, state)
         if context_pack:
             data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
-    result = strategist.generate_strategies(data_summary, user_context)
+    column_inventory: List[str] = []
+    inventory_cols = state.get("column_inventory_columns")
+    if isinstance(inventory_cols, list):
+        column_inventory = [str(c) for c in inventory_cols if isinstance(c, str) and c.strip()]
+    if not column_inventory:
+        inv_state = state.get("column_inventory")
+        if isinstance(inv_state, dict):
+            inv_cols = inv_state.get("columns") or inv_state.get("column_inventory")
+            if isinstance(inv_cols, list):
+                column_inventory = [str(c) for c in inv_cols if isinstance(c, str) and c.strip()]
+    if not column_inventory:
+        inv_file = _load_json_safe("data/column_inventory.json")
+        if isinstance(inv_file, dict):
+            inv_cols = inv_file.get("columns") or inv_file.get("column_inventory")
+            if isinstance(inv_cols, list):
+                column_inventory = [str(c) for c in inv_cols if isinstance(c, str) and c.strip()]
+    column_sets = state.get("column_sets")
+    if not isinstance(column_sets, dict):
+        column_sets = {}
+    result = strategist.generate_strategies(
+        data_summary,
+        user_context,
+        column_inventory=column_inventory,
+        column_sets=column_sets,
+    )
     run_id = state.get("run_id")
     if run_id:
         log_agent_snapshot(
@@ -7940,7 +7964,12 @@ def run_strategist(state: AgentState) -> AgentState:
             "strategist",
             prompt=getattr(strategist, "last_prompt", None),
             response=getattr(strategist, "last_response", None) or result,
-            context={"data_summary": data_summary, "user_context": user_context},
+            context={
+                "data_summary": data_summary,
+                "user_context": user_context,
+                "column_inventory_count": len(column_inventory),
+                "column_sets_keys": sorted(list(column_sets.keys()))[:30] if isinstance(column_sets, dict) else [],
+            },
         )
     # Defensive handling of strategist result types (Fix for potential crashes)
     strategies_list = []

@@ -1,7 +1,7 @@
 import os
 import json
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
@@ -39,13 +39,23 @@ class StrategistAgent:
         )
         self.last_prompt = None
         self.last_response = None
+        self.last_repair_prompt = None
+        self.last_repair_response = None
 
-    def generate_strategies(self, data_summary: str, user_request: str) -> Dict[str, Any]:
+    def generate_strategies(
+        self,
+        data_summary: str,
+        user_request: str,
+        column_inventory: Optional[List[str]] = None,
+        column_sets: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Generates a single strategy based on the data summary and user request.
         """
         
         from src.utils.prompting import render_prompt
+        allowed_columns = self._normalize_column_inventory(column_inventory)
+        column_sets_payload = column_sets if isinstance(column_sets, dict) else {}
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Chief Data Strategist inside a multi-agent system. Your goal is to craft ONE optimal strategy
@@ -56,6 +66,12 @@ class StrategistAgent:
 
         *** DATASET SUMMARY ***
         $data_summary
+
+        *** AUTHORIZED COLUMN INVENTORY (SOURCE OF TRUTH FOR COLUMN NAMES) ***
+        $authorized_column_inventory
+
+        *** COLUMN SETS (OPTIONAL, MAY BE EMPTY) ***
+        $column_sets
 
         *** USER REQUEST ***
         "$user_request"
@@ -224,7 +240,9 @@ class StrategistAgent:
             "estimated_difficulty": "Low | Medium | High (with data-driven justification)",
             "reasoning": "Why this strategy is optimal for the data and objective"
           }
-        - "required_columns": Use EXACT column names from the dataset summary.
+        - "required_columns": Use EXACT column names from AUTHORIZED COLUMN INVENTORY only.
+        - NEVER invent, rename, abbreviate, or infer columns not present in AUTHORIZED COLUMN INVENTORY.
+        - If uncertain about a column, omit it (do not hallucinate).
         - "objective_reasoning" is MANDATORY and must connect business goal → objective_type.
         - "feasibility_analysis" is MANDATORY - no technique without data-driven justification.
         - "fallback_chain" is MANDATORY - every strategy needs a Plan B.
@@ -234,6 +252,8 @@ class StrategistAgent:
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
             data_summary=data_summary,
+            authorized_column_inventory=json.dumps(allowed_columns, ensure_ascii=False),
+            column_sets=json.dumps(column_sets_payload, ensure_ascii=False),
             user_request=user_request,
             senior_strategy_protocol=SENIOR_STRATEGY_PROTOCOL,
         )
@@ -248,6 +268,23 @@ class StrategistAgent:
 
             # Normalization (Fix for crash 'list' object has no attribute 'get')
             payload = self._normalize_strategist_output(parsed)
+            column_validation = self._validate_required_columns(payload, allowed_columns)
+            max_repairs = self._get_column_repair_attempts()
+            if (
+                allowed_columns
+                and column_validation.get("invalid_count", 0) > 0
+                and max_repairs > 0
+            ):
+                payload, column_validation = self._repair_required_columns_with_llm(
+                    payload=payload,
+                    data_summary=data_summary,
+                    user_request=user_request,
+                    allowed_columns=allowed_columns,
+                    column_sets=column_sets_payload,
+                    validation_report=column_validation,
+                    max_attempts=max_repairs,
+                )
+            payload["column_validation"] = column_validation
 
             # Build strategy_spec from LLM reasoning (not hardcoded inference)
             strategy_spec = self._build_strategy_spec_from_llm(payload, data_summary, user_request)
@@ -271,6 +308,7 @@ class StrategistAgent:
                 "estimated_difficulty": "Low",
                 "reasoning": f"Gemini API Failed: {e}"
             }]}
+            fallback["column_validation"] = self._validate_required_columns(fallback, allowed_columns)
             strategy_spec = self._build_strategy_spec_from_llm(fallback, data_summary, user_request)
             fallback["strategy_spec"] = strategy_spec
             return fallback
@@ -314,6 +352,186 @@ class StrategistAgent:
         text = re.sub(r'```json', '', text)
         text = re.sub(r'```', '', text)
         return text.strip()
+
+    def _normalize_column_inventory(self, column_inventory: Any) -> List[str]:
+        if not isinstance(column_inventory, list):
+            return []
+        normalized: List[str] = []
+        seen = set()
+        for col in column_inventory:
+            if not isinstance(col, str):
+                continue
+            name = col.strip()
+            if not name:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            normalized.append(name)
+        return normalized
+
+    def _extract_required_column_names(self, strategy: Dict[str, Any]) -> List[str]:
+        required_raw = strategy.get("required_columns") if isinstance(strategy, dict) else None
+        if not isinstance(required_raw, list):
+            return []
+        names: List[str] = []
+        for item in required_raw:
+            name = None
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                maybe_name = item.get("name") or item.get("column")
+                if isinstance(maybe_name, str):
+                    name = maybe_name.strip()
+            if name:
+                names.append(name)
+        return list(dict.fromkeys(names))
+
+    def _validate_required_columns(self, payload: Dict[str, Any], allowed_columns: List[str]) -> Dict[str, Any]:
+        strategies = payload.get("strategies") if isinstance(payload, dict) else []
+        if not isinstance(strategies, list):
+            strategies = []
+        if not allowed_columns:
+            return {
+                "status": "skipped_no_inventory",
+                "allowed_column_count": 0,
+                "checked_strategy_count": len(strategies),
+                "invalid_count": 0,
+                "invalid_details": [],
+            }
+        allowed = set(allowed_columns)
+        invalid_details: List[Dict[str, Any]] = []
+        invalid_count = 0
+        for idx, strategy in enumerate(strategies):
+            if not isinstance(strategy, dict):
+                continue
+            names = self._extract_required_column_names(strategy)
+            invalid = [name for name in names if name not in allowed]
+            if invalid:
+                invalid_count += len(invalid)
+                invalid_details.append(
+                    {
+                        "strategy_index": idx,
+                        "strategy_title": strategy.get("title", f"strategy_{idx}"),
+                        "required_count": len(names),
+                        "invalid_columns": invalid,
+                    }
+                )
+        status = "ok" if invalid_count == 0 else "invalid_required_columns"
+        return {
+            "status": status,
+            "allowed_column_count": len(allowed_columns),
+            "checked_strategy_count": len(strategies),
+            "invalid_count": invalid_count,
+            "invalid_details": invalid_details,
+        }
+
+    def _get_column_repair_attempts(self) -> int:
+        raw = os.getenv("STRATEGIST_COLUMN_REPAIR_ATTEMPTS", "1")
+        try:
+            val = int(raw)
+        except Exception:
+            val = 1
+        return max(0, min(val, 3))
+
+    def _build_required_columns_repair_prompt(
+        self,
+        payload: Dict[str, Any],
+        data_summary: str,
+        user_request: str,
+        allowed_columns: List[str],
+        column_sets: Dict[str, Any],
+        validation_report: Dict[str, Any],
+    ) -> str:
+        from src.utils.prompting import render_prompt
+
+        REPAIR_PROMPT_TEMPLATE = """
+        You are repairing strategist JSON after validation found invalid required_columns.
+
+        Return ONLY raw JSON. No markdown, no comments.
+        Keep the same top-level structure: {"strategies":[...]}.
+        Preserve strategy meaning, but fix required_columns so every entry is in AUTHORIZED COLUMN INVENTORY.
+        Never invent or rename columns.
+        If a strategy cannot justify a column from inventory, return [] for required_columns.
+
+        *** USER REQUEST ***
+        "$user_request"
+
+        *** DATASET SUMMARY ***
+        $data_summary
+
+        *** AUTHORIZED COLUMN INVENTORY ***
+        $authorized_column_inventory
+
+        *** COLUMN SETS ***
+        $column_sets
+
+        *** CURRENT STRATEGY JSON ***
+        $current_payload
+
+        *** VALIDATION FAILURES ***
+        $validation_report
+        """
+        return render_prompt(
+            REPAIR_PROMPT_TEMPLATE,
+            user_request=user_request,
+            data_summary=data_summary,
+            authorized_column_inventory=json.dumps(allowed_columns, ensure_ascii=False),
+            column_sets=json.dumps(column_sets or {}, ensure_ascii=False),
+            current_payload=json.dumps(payload, ensure_ascii=False),
+            validation_report=json.dumps(validation_report, ensure_ascii=False),
+        )
+
+    def _repair_required_columns_with_llm(
+        self,
+        payload: Dict[str, Any],
+        data_summary: str,
+        user_request: str,
+        allowed_columns: List[str],
+        column_sets: Dict[str, Any],
+        validation_report: Dict[str, Any],
+        max_attempts: int,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        best_payload = payload
+        best_validation = validation_report
+        best_invalid = int(validation_report.get("invalid_count", 0))
+        attempts_used = 0
+        repaired = False
+        for _ in range(max_attempts):
+            if best_invalid <= 0:
+                break
+            attempts_used += 1
+            repair_prompt = self._build_required_columns_repair_prompt(
+                payload=best_payload,
+                data_summary=data_summary,
+                user_request=user_request,
+                allowed_columns=allowed_columns,
+                column_sets=column_sets,
+                validation_report=best_validation,
+            )
+            self.last_repair_prompt = repair_prompt
+            try:
+                repair_response = self.model.generate_content(repair_prompt)
+                self.last_repair_response = repair_response.text
+                repaired_raw = self._clean_json(repair_response.text)
+                repaired_parsed = json.loads(repaired_raw)
+                candidate = self._normalize_strategist_output(repaired_parsed)
+                candidate_validation = self._validate_required_columns(candidate, allowed_columns)
+                candidate_invalid = int(candidate_validation.get("invalid_count", 0))
+                if candidate_invalid < best_invalid:
+                    best_payload = candidate
+                    best_validation = candidate_validation
+                    best_invalid = candidate_invalid
+                    repaired = True
+                if candidate_invalid == 0:
+                    break
+            except Exception as repair_err:
+                print(f"Strategist required_columns repair error: {repair_err}")
+                continue
+        best_validation = dict(best_validation or {})
+        best_validation["repair_attempts_used"] = attempts_used
+        best_validation["repair_applied"] = repaired
+        return best_payload, best_validation
 
     def _build_strategy_spec_from_llm(self, strategy_payload: Dict[str, Any], data_summary: str, user_request: str) -> Dict[str, Any]:
         """
