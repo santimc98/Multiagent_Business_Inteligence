@@ -1,15 +1,17 @@
 from src.agents.execution_planner import ExecutionPlannerAgent
 
 
-def test_execution_planner_sets_explicit_max_output_tokens(monkeypatch):
-    monkeypatch.setenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "20000")
+def test_execution_planner_does_not_set_explicit_max_output_tokens(monkeypatch):
+    monkeypatch.delenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", raising=False)
     agent = ExecutionPlannerAgent(api_key=None)
 
-    assert int(agent._generation_config.get("max_output_tokens", 0)) == 20000
+    assert "max_output_tokens" not in agent._generation_config
 
 
-def test_execution_planner_max_output_tokens_has_safe_floor(monkeypatch):
-    monkeypatch.setenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "10")
+def test_execution_planner_generation_config_keeps_stable_defaults(monkeypatch):
+    monkeypatch.delenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", raising=False)
     agent = ExecutionPlannerAgent(api_key=None)
 
-    assert int(agent._generation_config.get("max_output_tokens", 0)) >= 1024
+    assert agent._generation_config["temperature"] == 0.0
+    assert agent._generation_config["top_p"] == 0.9
+    assert agent._generation_config["top_k"] == 40

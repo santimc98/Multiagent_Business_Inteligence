@@ -3535,20 +3535,10 @@ class ExecutionPlannerAgent:
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
-        planner_max_output_tokens = 16384
-        try:
-            planner_max_output_tokens = int(
-                os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "16384")
-            )
-        except Exception:
-            planner_max_output_tokens = 16384
-        if planner_max_output_tokens < 1024:
-            planner_max_output_tokens = 1024
         self._generation_config = {
             "temperature": 0.0,
             "top_p": 0.9,
             "top_k": 40,
-            "max_output_tokens": planner_max_output_tokens,
             "response_mime_type": "application/json",
         }
         self._safety_settings = {
