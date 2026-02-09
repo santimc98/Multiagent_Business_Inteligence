@@ -17066,4 +17066,58 @@ workflow.add_edge("translator", "generate_pdf")
 workflow.add_edge("generate_pdf", END)
 
 # 4. Compile
-app_graph = workflow.compile()
+_compiled_app_graph = workflow.compile()
+
+
+class _WorkspaceSafeGraph:
+    """
+    Thin wrapper that guarantees workspace cleanup on graph termination,
+    including exception/interruption paths.
+    """
+
+    def __init__(self, graph: Any):
+        self._graph = graph
+
+    @staticmethod
+    def _merge_state(latest_state: Dict[str, Any], event: Any) -> Dict[str, Any]:
+        if not isinstance(latest_state, dict):
+            latest_state = {}
+        if not isinstance(event, dict):
+            return latest_state
+        for node_payload in event.values():
+            if isinstance(node_payload, dict):
+                latest_state.update(node_payload)
+        return latest_state
+
+    @staticmethod
+    def _cleanup_workspace(latest_state: Dict[str, Any]) -> None:
+        try:
+            exit_run_workspace(latest_state if isinstance(latest_state, dict) else {})
+        except Exception as cleanup_err:
+            print(f"WORKSPACE_EXIT_WARNING: {cleanup_err}")
+
+    def stream(self, initial_state: Any, *args: Any, **kwargs: Any):
+        latest_state = dict(initial_state) if isinstance(initial_state, dict) else {}
+        iterator = self._graph.stream(initial_state, *args, **kwargs)
+        try:
+            for event in iterator:
+                latest_state = self._merge_state(latest_state, event)
+                yield event
+        finally:
+            self._cleanup_workspace(latest_state)
+
+    def invoke(self, initial_state: Any, *args: Any, **kwargs: Any):
+        latest_state = dict(initial_state) if isinstance(initial_state, dict) else {}
+        try:
+            result = self._graph.invoke(initial_state, *args, **kwargs)
+            if isinstance(result, dict):
+                latest_state.update(result)
+            return result
+        finally:
+            self._cleanup_workspace(latest_state)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._graph, name)
+
+
+app_graph = _WorkspaceSafeGraph(_compiled_app_graph)

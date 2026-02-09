@@ -12,9 +12,18 @@ import zipfile
 from datetime import datetime
 
 # Ensure src is in path
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+APP_ROOT = os.path.abspath(os.path.dirname(__file__))
+sys.path.append(APP_ROOT)
 
 from src.graph.graph import app_graph, request_abort, clear_abort
+from src.utils.run_workspace import recover_orphaned_workspace_cwd
+
+# Auto-heal cwd when prior run crashed inside runs/<run_id>/work.
+recover_orphaned_workspace_cwd(project_root=APP_ROOT)
+try:
+    os.chdir(APP_ROOT)
+except Exception as cwd_err:
+    print(f"APP_CWD_WARNING: {cwd_err}")
 
 _SIGNAL_HANDLER_INSTALLED = False
 

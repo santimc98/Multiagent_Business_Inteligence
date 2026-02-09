@@ -5,7 +5,55 @@ Ensures each run operates in an isolated workspace directory to prevent
 cross-run contamination from leftover artifacts.
 """
 import os
+import re
 from typing import Dict, Any, Optional
+
+
+_RUN_WORKSPACE_RE = re.compile(
+    r"^(?P<root>.+?)[\\/]+runs[\\/]+[^\\/]+[\\/]+work(?:[\\/].*)?$",
+    re.IGNORECASE,
+)
+
+
+def _infer_project_root_from_workspace_path(path: Optional[str]) -> Optional[str]:
+    """
+    Infer project root when current cwd is inside runs/<run_id>/work.
+    """
+    if not path:
+        return None
+    normalized = os.path.normpath(os.path.abspath(path))
+    match = _RUN_WORKSPACE_RE.match(normalized)
+    if not match:
+        return None
+    root = match.group("root")
+    if root and os.path.isdir(root):
+        return os.path.normpath(root)
+    return None
+
+
+def recover_orphaned_workspace_cwd(project_root: Optional[str] = None) -> Optional[str]:
+    """
+    Recover cwd if process got stranded inside runs/<run_id>/work.
+
+    Returns restored path when recovery happens, else None.
+    """
+    cwd = os.getcwd()
+    inferred_root = _infer_project_root_from_workspace_path(cwd)
+    if not inferred_root:
+        return None
+
+    candidate = None
+    if project_root:
+        normalized_root = os.path.normpath(os.path.abspath(project_root))
+        if os.path.isdir(normalized_root):
+            candidate = normalized_root
+    if not candidate:
+        candidate = inferred_root
+
+    if os.path.normcase(os.path.normpath(cwd)) != os.path.normcase(candidate):
+        os.chdir(candidate)
+        print(f"WORKSPACE_RECOVER: Restored cwd to {candidate}")
+    return candidate
 
 
 def init_run_workspace(run_dir: str) -> str:
@@ -94,12 +142,20 @@ def exit_run_workspace(state: Dict[str, Any]) -> None:
     Args:
         state: Agent state dict with orig_cwd
     """
-    orig_cwd = state.get("orig_cwd")
+    orig_cwd = state.get("orig_cwd") if isinstance(state, dict) else None
+    restored = False
     if orig_cwd and os.path.isdir(orig_cwd):
         os.chdir(orig_cwd)
         print(f"WORKSPACE_EXIT: Restored cwd to {orig_cwd}")
+        restored = True
 
-    state["workspace_active"] = False
+    if not restored:
+        recovered = recover_orphaned_workspace_cwd()
+        if recovered:
+            print(f"WORKSPACE_EXIT_FALLBACK: Restored cwd to {recovered}")
+
+    if isinstance(state, dict):
+        state["workspace_active"] = False
 
     # Note: We don't delete work_dir by default (useful for debug).
     # Set env CLEANUP_RUN_WORKSPACE=1 to enable cleanup in future.
