@@ -23,7 +23,6 @@ class StrategistAgent:
             "temperature": 0.3,
             "top_p": 0.9,
             "top_k": 40,
-            "max_output_tokens": 8192,
             "response_mime_type": "application/json",
         }
         self.safety_settings = {
