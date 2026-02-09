@@ -10383,7 +10383,7 @@ def _planner_contract_invalid_for_execution(state: Dict[str, Any]) -> bool:
 
 
 def run_data_engineer(state: AgentState) -> AgentState:
-    print("--- [3] Data Engineer: Cleaning Data (E2B Sandbox) ---")
+    print("--- [3] Data Engineer: Cleaning Data (Sandbox Execution) ---")
     abort_state = _abort_if_requested(state, "data_engineer")
     if abort_state:
         return abort_state
@@ -11358,6 +11358,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     except Exception as log_err:
                         print(f"Warning: failed to persist data_engineer_sandbox_last.log: {log_err}")
 
+                    remote_cleaned_rel = local_cleaned_path.lstrip("/").replace("\\", "/")
+                    remote_manifest_rel = local_manifest_path.lstrip("/").replace("\\", "/")
+
                     if execution.error:
                         error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
                         print(f"Cleaning Failed in Sandbox: {error_details}")
@@ -11663,27 +11666,26 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "budget_counters": counters,
                         }
 
-                        # 4. Verification & Download
-                        # Check if cleaned file exists
-                        remote_cleaned_rel = local_cleaned_path.lstrip("/").replace("\\", "/")
-                        ls_check = run_cmd_with_retry(sandbox, f"ls {run_root}/{remote_cleaned_rel}", retries=2)
-                        ls_failed = bool(getattr(ls_check, "exit_code", 1) != 0)
-                        if ls_failed:
-                            print(f"Warning: cleaned artifact not confirmed by ls ({remote_cleaned_rel}); attempting download anyway.")
+                    # 4. Verification & Download
+                    # Check if cleaned file exists
+                    ls_check = run_cmd_with_retry(sandbox, f"ls {run_root}/{remote_cleaned_rel}", retries=2)
+                    ls_failed = bool(getattr(ls_check, "exit_code", 1) != 0)
+                    if ls_failed:
+                        print(f"Warning: cleaned artifact not confirmed by ls ({remote_cleaned_rel}); attempting download anyway.")
 
-                        # Persist DE artifact
-                        try:
-                            os.makedirs("artifacts", exist_ok=True)
-                            with open(os.path.join("artifacts", "data_engineer_last.py"), "w", encoding="utf-8") as f_art:
-                                f_art.write(code)
-                        except Exception as art_err:
-                            print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
+                    # Persist DE artifact
+                    try:
+                        os.makedirs("artifacts", exist_ok=True)
+                        with open(os.path.join("artifacts", "data_engineer_last.py"), "w", encoding="utf-8") as f_art:
+                            f_art.write(code)
+                    except Exception as art_err:
+                        print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
 
-                        downloaded_paths = []
+                    downloaded_paths = []
 
-                        # Download Result (CSV) using centralized helper
-                        print("Downloading cleaned data...")
-                        os.makedirs(os.path.dirname(local_cleaned_path) or ".", exist_ok=True)
+                    # Download Result (CSV) using centralized helper
+                    print("Downloading cleaned data...")
+                    os.makedirs(os.path.dirname(local_cleaned_path) or ".", exist_ok=True)
 
                     csv_content = safe_download_bytes(sandbox, f"{run_root}/{remote_cleaned_rel}")
                     if csv_content is None:
@@ -11699,163 +11701,162 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     if os.path.exists(local_cleaned_path):
                         downloaded_paths.append(local_cleaned_path)
 
-                        # Download Manifest (JSON) - Roundtrip Support using centralized helper
-                        print("Downloading cleaning manifest...")
-                        remote_manifest_rel = local_manifest_path.lstrip("/").replace("\\", "/")
-                        manifest_content = safe_download_bytes(sandbox, f"{run_root}/{remote_manifest_rel}")
-                        if manifest_content is not None:
-                            with open(local_manifest_path, "wb") as f_local:
-                                f_local.write(manifest_content)
-                        else:
-                            print(f"Warning: Manifest download failed (not found?): {remote_manifest_rel}")
-                        if os.path.exists(local_manifest_path):
-                            downloaded_paths.append(local_manifest_path)
-                        try:
-                            os.makedirs("artifacts", exist_ok=True)
-                            with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
-                                with open(local_manifest_path, "rb") as f_src:
-                                    f_copy.write(f_src.read())
-                        except Exception as copy_err:
-                            print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
+                    # Download Manifest (JSON) - Roundtrip Support using centralized helper
+                    print("Downloading cleaning manifest...")
+                    manifest_content = safe_download_bytes(sandbox, f"{run_root}/{remote_manifest_rel}")
+                    if manifest_content is not None:
+                        with open(local_manifest_path, "wb") as f_local:
+                            f_local.write(manifest_content)
+                    else:
+                        print(f"Warning: Manifest download failed (not found?): {remote_manifest_rel}")
+                    if os.path.exists(local_manifest_path):
+                        downloaded_paths.append(local_manifest_path)
+                    try:
+                        os.makedirs("artifacts", exist_ok=True)
+                        with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
+                            with open(local_manifest_path, "rb") as f_src:
+                                f_copy.write(f_src.read())
+                    except Exception as copy_err:
+                        print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
 
+                    manifest_data = {}
+                    try:
+                        with open(local_manifest_path, "r", encoding="utf-8") as f_manifest:
+                            manifest_data = json.load(f_manifest)
+                    except Exception:
                         manifest_data = {}
-                        try:
-                            with open(local_manifest_path, "r", encoding="utf-8") as f_manifest:
-                                manifest_data = json.load(f_manifest)
-                        except Exception:
-                            manifest_data = {}
-                        manifest_alerts = _extract_manifest_alerts(
-                            manifest_data,
-                            _resolve_contract_columns(state.get("execution_contract", {}), sources={"derived", "output"})
+                    manifest_alerts = _extract_manifest_alerts(
+                        manifest_data,
+                        _resolve_contract_columns(state.get("execution_contract", {}), sources={"derived", "output"})
+                    )
+                    if manifest_alerts and not state.get("de_manifest_guard_retry_done"):
+                        new_state = dict(state)
+                        new_state["de_manifest_guard_retry_done"] = True
+                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                        payload = "MANIFEST_ALERTS:\n" + "\n".join(f"- {alert}" for alert in manifest_alerts)
+                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                        print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
+                        return run_data_engineer(new_state)
+
+                    outputs_listing = []
+                    try:
+                        listing_proc = sandbox.commands.run(
+                            f"sh -c 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
                         )
-                        if manifest_alerts and not state.get("de_manifest_guard_retry_done"):
-                            new_state = dict(state)
-                            new_state["de_manifest_guard_retry_done"] = True
-                            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                            payload = "MANIFEST_ALERTS:\n" + "\n".join(f"- {alert}" for alert in manifest_alerts)
-                            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-                            print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
-                            return run_data_engineer(new_state)
-
+                        if listing_proc.exit_code == 0:
+                            outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
+                    except Exception:
                         outputs_listing = []
-                        try:
-                            listing_proc = sandbox.commands.run(
-                                f"sh -c 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
-                            )
-                            if listing_proc.exit_code == 0:
-                                outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
-                        except Exception:
-                            outputs_listing = []
-                        if run_id:
-                            log_sandbox_attempt(
-                                run_id,
-                                step_name,
-                                attempt_id,
-                                code=code,
-                                stdout=stdout_text,
-                                stderr=stderr_text,
-                                outputs_listing=outputs_listing,
-                                downloaded_paths=downloaded_paths,
-                                exit_code=getattr(execution, "exit_code", None),
-                                error_tail=(execution.error.traceback if execution.error else None),
-                                success=True,
-                                stage="completed",
-                            )
+                    if run_id:
+                        log_sandbox_attempt(
+                            run_id,
+                            step_name,
+                            attempt_id,
+                            code=code,
+                            stdout=stdout_text,
+                            stderr=stderr_text,
+                            outputs_listing=outputs_listing,
+                            downloaded_paths=downloaded_paths,
+                            exit_code=getattr(execution, "exit_code", None),
+                            error_tail=(execution.error.traceback if execution.error else None),
+                            success=True,
+                            stage="completed",
+                        )
 
-                        required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
-                        raw_rows = _count_raw_rows(csv_path, csv_encoding, csv_sep, csv_decimal)
+                    required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+                    raw_rows = _count_raw_rows(csv_path, csv_encoding, csv_sep, csv_decimal)
+                    cleaned_encoding = None
+                    try:
+                        cleaned_encoding = (
+                            manifest_data.get("output_dialect", {}).get("encoding")
+                            if isinstance(manifest_data.get("output_dialect"), dict)
+                            else None
+                        )
+                    except Exception:
                         cleaned_encoding = None
-                        try:
-                            cleaned_encoding = (
-                                manifest_data.get("output_dialect", {}).get("encoding")
-                                if isinstance(manifest_data.get("output_dialect"), dict)
-                                else None
-                            )
-                        except Exception:
-                            cleaned_encoding = None
-                        cleaned_encoding = cleaned_encoding or "utf-8"
+                    cleaned_encoding = cleaned_encoding or "utf-8"
+                    cleaned_sep = None
+                    cleaned_decimal = None
+                    try:
+                        if isinstance(manifest_data.get("output_dialect"), dict):
+                            cleaned_sep = manifest_data["output_dialect"].get("sep")
+                            cleaned_decimal = manifest_data["output_dialect"].get("decimal")
+                    except Exception:
                         cleaned_sep = None
                         cleaned_decimal = None
-                        try:
-                            if isinstance(manifest_data.get("output_dialect"), dict):
-                                cleaned_sep = manifest_data["output_dialect"].get("sep")
-                                cleaned_decimal = manifest_data["output_dialect"].get("decimal")
-                        except Exception:
-                            cleaned_sep = None
-                            cleaned_decimal = None
-                        cleaned_rows = _count_raw_rows(local_cleaned_path, cleaned_encoding, cleaned_sep, cleaned_decimal)
-                        row_drop_summary = _summarize_row_drop(
-                            manifest_data,
-                            required_input,
-                            initial_override=raw_rows,
-                            after_override=cleaned_rows,
+                    cleaned_rows = _count_raw_rows(local_cleaned_path, cleaned_encoding, cleaned_sep, cleaned_decimal)
+                    row_drop_summary = _summarize_row_drop(
+                        manifest_data,
+                        required_input,
+                        initial_override=raw_rows,
+                        after_override=cleaned_rows,
+                    )
+                    if row_drop_summary and not state.get("de_row_drop_retry_done"):
+                        new_state = dict(state)
+                        new_state["de_row_drop_retry_done"] = True
+                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                        payload = (
+                            "CLEANING_RECOVERY_ALERT:\n"
+                            f"- rows_initial={row_drop_summary.get('initial')}\n"
+                            f"- rows_after={row_drop_summary.get('after')}\n"
+                            f"- drop_frac={row_drop_summary.get('drop_frac')}\n"
                         )
-                        if row_drop_summary and not state.get("de_row_drop_retry_done"):
-                            new_state = dict(state)
-                            new_state["de_row_drop_retry_done"] = True
-                            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                            payload = (
-                                "CLEANING_RECOVERY_ALERT:\n"
-                                f"- rows_initial={row_drop_summary.get('initial')}\n"
-                                f"- rows_after={row_drop_summary.get('after')}\n"
-                                f"- drop_frac={row_drop_summary.get('drop_frac')}\n"
-                            )
-                            suspects = row_drop_summary.get("suspects") or []
-                            if suspects:
-                                payload += "SUSPECT_CONVERSIONS:\n" + json.dumps(suspects, ensure_ascii=True)
-                                try:
-                                    header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
-                                    norm_map = {}
-                                    for col in header_cols:
-                                        normed = _norm_name(col)
-                                        if normed and normed not in norm_map:
-                                            norm_map[normed] = col
-                                    suspect_cols = [item.get("column") for item in suspects if item.get("column")]
-                                    sample_context = _build_required_sample_context(
-                                        csv_path, input_dialect, suspect_cols, norm_map, max_rows=200
-                                    )
-                                    if sample_context:
-                                        payload = f"{payload}\n\n{sample_context}"
-                                except Exception:
-                                    pass
+                        suspects = row_drop_summary.get("suspects") or []
+                        if suspects:
+                            payload += "SUSPECT_CONVERSIONS:\n" + json.dumps(suspects, ensure_ascii=True)
                             try:
-                                explainer_text = failure_explainer.explain_data_engineer_failure(
-                                    code=code,
-                                    error_details=payload,
-                                    context={
-                                        "strategy_title": selected.get("title", "") if selected else "",
-                                        "csv_dialect": input_dialect,
-                                        "required_input_columns": required_input,
-                                        "row_drop_summary": row_drop_summary,
-                                    },
+                                header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+                                norm_map = {}
+                                for col in header_cols:
+                                    normed = _norm_name(col)
+                                    if normed and normed not in norm_map:
+                                        norm_map[normed] = col
+                                suspect_cols = [item.get("column") for item in suspects if item.get("column")]
+                                sample_context = _build_required_sample_context(
+                                    csv_path, input_dialect, suspect_cols, norm_map, max_rows=200
                                 )
-                            except Exception as explainer_err:
-                                print(f"Warning: failure explainer failed: {explainer_err}")
-                                explainer_text = ""
-                            if explainer_text:
-                                payload = payload + "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
-                                try:
-                                    os.makedirs("artifacts", exist_ok=True)
-                                    with open(
-                                        os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
-                                        "w",
-                                        encoding="utf-8",
-                                    ) as f_exp:
-                                        f_exp.write(explainer_text.strip())
-                                except Exception as exp_err:
-                                    print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
-                            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-                            print("ROW_DROP_GUARD: retrying Data Engineer with recovery context.")
-                            return run_data_engineer(new_state)
+                                if sample_context:
+                                    payload = f"{payload}\n\n{sample_context}"
+                            except Exception:
+                                pass
+                        try:
+                            explainer_text = failure_explainer.explain_data_engineer_failure(
+                                code=code,
+                                error_details=payload,
+                                context={
+                                    "strategy_title": selected.get("title", "") if selected else "",
+                                    "csv_dialect": input_dialect,
+                                    "required_input_columns": required_input,
+                                    "row_drop_summary": row_drop_summary,
+                                },
+                            )
+                        except Exception as explainer_err:
+                            print(f"Warning: failure explainer failed: {explainer_err}")
+                            explainer_text = ""
+                        if explainer_text:
+                            payload = payload + "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                            try:
+                                os.makedirs("artifacts", exist_ok=True)
+                                with open(
+                                    os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
+                                    "w",
+                                    encoding="utf-8",
+                                ) as f_exp:
+                                    f_exp.write(explainer_text.strip())
+                            except Exception as exp_err:
+                                print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
+                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                        print("ROW_DROP_GUARD: retrying Data Engineer with recovery context.")
+                        return run_data_engineer(new_state)
 
-                        print("Cleaning Success (Artifacts Downloaded).")
+                    print("Cleaning Success (Artifacts Downloaded).")
 
-                        # Apply output_dialect for downstream reads
-                        csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
-                            local_manifest_path, csv_sep, csv_decimal, csv_encoding
-                        )
-                        if dialect_updated:
-                            print(f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
+                    # Apply output_dialect for downstream reads
+                    csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
+                        local_manifest_path, csv_sep, csv_decimal, csv_encoding
+                    )
+                    if dialect_updated:
+                        print(f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
 
                     break  # Sandbox execution successful, exit retry loop
               except Exception as e:
