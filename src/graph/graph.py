@@ -976,6 +976,67 @@ def _apply_review_consistency_guard(
     return packet
 
 
+def _harmonize_review_packets_with_final_eval(
+    reviewer_packet: Dict[str, Any] | None,
+    qa_packet: Dict[str, Any] | None,
+    *,
+    eval_raw_status: str,
+    eval_feedback: str,
+    eval_failed_gates: List[str] | None,
+    eval_required_fixes: List[str] | None,
+) -> tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+    """
+    Keep reviewer/QA packets semantically aligned with the final evaluator signal.
+    This does not force deterministic rejection; it only downgrades to warnings
+    when evaluator reports unresolved issues but packets are clean approvals.
+    """
+    trigger_statuses = {"NEEDS_IMPROVEMENT", "REJECTED", "FAIL", "FAILED", "ERROR", "CRASH"}
+    status_norm = str(eval_raw_status or "").strip().upper()
+    if status_norm not in trigger_statuses:
+        return dict(reviewer_packet or {}), dict(qa_packet or {}), []
+
+    advisory_fixes = [str(item) for item in (eval_required_fixes or []) if item][:5]
+    advisory_gates = [str(item) for item in (eval_failed_gates or []) if item][:5]
+    eval_feedback_trimmed = str(eval_feedback or "").strip()
+    notes: List[str] = []
+
+    def _patch_packet(packet: Dict[str, Any], label: str) -> Dict[str, Any]:
+        patched = dict(packet or {})
+        status = str(patched.get("status") or "").strip().upper()
+        failed = [str(item) for item in (patched.get("failed_gates") or []) if item]
+        hard = [str(item) for item in (patched.get("hard_failures") or []) if item]
+        if status != "APPROVED" or failed or hard:
+            return patched
+
+        patched["status"] = "APPROVE_WITH_WARNINGS"
+        message = (
+            f"{label.upper()}_CROSS_REVIEW_ALIGNMENT: result_evaluator reported unresolved "
+            "contract/business coverage issues; approval downgraded to warning-only context."
+        )
+        feedback = str(patched.get("feedback") or "").strip()
+        if eval_feedback_trimmed:
+            message = f"{message} evaluator_feedback={eval_feedback_trimmed[:320]}"
+        patched["feedback"] = f"{feedback}\n{message}".strip() if feedback else message
+
+        if "cross_review_alignment_gap" not in failed:
+            failed.append("cross_review_alignment_gap")
+        for gate in advisory_gates:
+            if gate not in failed:
+                failed.append(gate)
+        patched["failed_gates"] = failed
+
+        required = [str(item) for item in (patched.get("required_fixes") or []) if item]
+        for fix in advisory_fixes:
+            if fix not in required:
+                required.append(fix)
+        if required:
+            patched["required_fixes"] = required
+        notes.append(f"{label}: downgraded APPROVED -> APPROVE_WITH_WARNINGS due to evaluator status {status_norm}")
+        return patched
+
+    return _patch_packet(dict(reviewer_packet or {}), "reviewer"), _patch_packet(dict(qa_packet or {}), "qa_reviewer"), notes
+
+
 def _append_run_facts_block(text: str, state: Dict[str, Any]) -> str:
     if not isinstance(state, dict):
         return text
@@ -16686,6 +16747,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "metric_history": metric_history,
             "primary_metric_snapshot": primary_metric_snapshot,
             "evaluation_spec": evaluation_spec if isinstance(evaluation_spec, dict) else None,
+            "execution_contract": contract if isinstance(contract, dict) else None,
             "data_adequacy_report": data_adequacy_report,
             "iteration_policy": (contract or {}).get("iteration_policy", {}) if isinstance(contract, dict) else {},
             "strategy_spec": strategy_spec,
@@ -16749,6 +16811,19 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "required_fixes": [str(fx) for fx in (qa_result.get("required_fixes") or []) if fx],
         "hard_failures": [str(h) for h in (qa_result.get("hard_failures") or []) if h],
     }
+    reviewer_packet, qa_packet, cross_review_notes = _harmonize_review_packets_with_final_eval(
+        reviewer_packet,
+        qa_packet,
+        eval_raw_status=raw_eval_status or status,
+        eval_feedback=str(eval_packet.get("feedback") or ""),
+        eval_failed_gates=eval_packet.get("failed_gates") if isinstance(eval_packet.get("failed_gates"), list) else [],
+        eval_required_fixes=eval_packet.get("required_fixes") if isinstance(eval_packet.get("required_fixes"), list) else [],
+    )
+    if cross_review_notes:
+        try:
+            new_history.extend([f"CROSS_REVIEW_ALIGNMENT: {note}" for note in cross_review_notes])
+        except Exception:
+            pass
     results_packet: Dict[str, Any] = {
         "status": "APPROVED" if status == "APPROVED" else "APPROVE_WITH_WARNINGS",
         "insights_available": bool(results_insights),
@@ -16780,6 +16855,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "results_advisor": results_packet,
         "iteration_handoff": iteration_handoff,
         "deterministic_facts": review_board_facts,
+        "cross_review_alignment": {"notes": cross_review_notes},
         "final_pre_board": {
             "status": status,
             "feedback": feedback,

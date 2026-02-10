@@ -35,3 +35,29 @@ def test_data_adequacy_infers_objective_family_from_metrics(tmp_path, monkeypatc
     report = build_data_adequacy_report({})
 
     assert report.get("signals", {}).get("objective_type") in {"regression", "forecasting"}
+
+
+def test_data_adequacy_reads_evaluation_metrics_artifact(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    os.makedirs("reports", exist_ok=True)
+    with open(os.path.join("data", "cleaned_data.csv"), "w", encoding="utf-8") as handle:
+        handle.write("feature,target\n1,2\n2,3\n")
+    with open(os.path.join("reports", "evaluation_metrics.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "model_performance": {
+                    "primary_metric": "RMSLE",
+                    "primary_metric_value": 0.42,
+                    "cv_rmsle_mean": 0.42,
+                }
+            },
+            handle,
+        )
+
+    report = build_data_adequacy_report(
+        {"execution_contract": {"evaluation_spec": {"objective_type": "regression"}}}
+    )
+
+    reasons = [str(item) for item in (report.get("reasons") or [])]
+    assert "pipeline_aborted_before_metrics" not in reasons

@@ -21,6 +21,22 @@ def _safe_load_json(path: str) -> Dict[str, Any]:
         return {}
 
 
+def _load_metrics_report() -> Dict[str, Any]:
+    """Load metrics from the first available canonical metrics artifact path."""
+    candidates = [
+        "data/metrics.json",
+        "reports/evaluation_metrics.json",
+        "data/evaluation_metrics.json",
+        "reports/model_evaluation_metrics.json",
+        "data/model_evaluation_metrics.json",
+    ]
+    for path in candidates:
+        payload = _safe_load_json(path)
+        if isinstance(payload, dict) and payload:
+            return payload
+    return {}
+
+
 def _load_output_dialect(manifest_path: str = "data/cleaning_manifest.json") -> Dict[str, Any] | None:
     if not os.path.exists(manifest_path):
         return None
@@ -554,18 +570,13 @@ def _segment_coverage(case_summary: pd.DataFrame | None, min_size: int | None) -
 def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
     weights = _safe_load_json("data/weights.json")
-    metrics_report = _safe_load_json("data/metrics.json")
-    if not isinstance(metrics_report, dict) or not metrics_report:
-        for candidate in ("reports/model_evaluation_metrics.json", "data/model_evaluation_metrics.json"):
-            payload = _safe_load_json(candidate)
-            if isinstance(payload, dict) and payload:
-                metrics_report = payload
-                break
+    metrics_report = _load_metrics_report()
     cleaned_path, cleaned_candidates = _resolve_cleaned_data_path(state, contract if isinstance(contract, dict) else {})
     cleaned, cleaned_err = _safe_load_csv(cleaned_path) if cleaned_path else (None, "file_missing")
     case_summary, _case_summary_err = _safe_load_csv("data/case_summary.csv")
     cleaned_read_failed = cleaned is None and cleaned_err not in (None, "file_missing")
-    base_missing = (cleaned is None and not cleaned_read_failed) or (not metrics_report and not weights)
+    metric_pool_probe = _extract_metric_pool(weights, metrics_report)
+    base_missing = (cleaned is None and not cleaned_read_failed) or (not metric_pool_probe)
     objective_type = (
         state.get("objective_type")
         or (contract.get("evaluation_spec") or {}).get("objective_type")

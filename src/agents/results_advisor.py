@@ -365,12 +365,22 @@ class ResultsAdvisorAgent:
         model_perf = metrics.get("model_performance") if isinstance(metrics.get("model_performance"), dict) else {}
         seg_stats = metrics.get("segmentation_stats") if isinstance(metrics.get("segmentation_stats"), dict) else {}
         priority_keys = [
+            "primary_metric_value",
             "accuracy",
             "roc_auc",
+            "auc",
+            "pr_auc",
+            "average_precision",
+            "normalized_gini",
+            "gini",
             "precision",
             "f1",
+            "recall",
+            "rmsle",
+            "logloss",
             "rmse",
             "mae",
+            "mape",
             "r2",
             "silhouette_score",
             "training_samples",
@@ -437,6 +447,33 @@ class ResultsAdvisorAgent:
             name = snapshot.get("primary_metric_name")
             if isinstance(name, str) and name.strip():
                 return name.strip()
+        if isinstance(metrics_payload, dict):
+            payload_primary = metrics_payload.get("primary_metric")
+            if isinstance(payload_primary, str) and payload_primary.strip():
+                return payload_primary.strip()
+            model_perf = (
+                metrics_payload.get("model_performance")
+                if isinstance(metrics_payload.get("model_performance"), dict)
+                else {}
+            )
+            perf_primary = model_perf.get("primary_metric")
+            if isinstance(perf_primary, str) and perf_primary.strip():
+                return perf_primary.strip()
+            perf_primary_name = model_perf.get("primary_metric_name")
+            if isinstance(perf_primary_name, str) and perf_primary_name.strip():
+                return perf_primary_name.strip()
+        execution_contract = context.get("execution_contract")
+        if isinstance(execution_contract, dict):
+            validation = execution_contract.get("validation_requirements")
+            if isinstance(validation, dict):
+                primary = validation.get("primary_metric")
+                if isinstance(primary, str) and primary.strip():
+                    return primary.strip()
+            evaluation = execution_contract.get("evaluation_spec")
+            if isinstance(evaluation, dict):
+                primary = evaluation.get("primary_metric")
+                if isinstance(primary, str) and primary.strip():
+                    return primary.strip()
         evaluation_spec = context.get("evaluation_spec")
         if isinstance(evaluation_spec, dict):
             validation = evaluation_spec.get("validation_requirements")

@@ -18,6 +18,22 @@ def _safe_load_json(path: str) -> Dict[str, Any]:
         return {}
 
 
+def _load_metrics_report() -> Dict[str, Any]:
+    """Load metrics from the first available canonical metrics artifact path."""
+    candidates = [
+        "data/metrics.json",
+        "reports/evaluation_metrics.json",
+        "data/evaluation_metrics.json",
+        "reports/model_evaluation_metrics.json",
+        "data/model_evaluation_metrics.json",
+    ]
+    for path in candidates:
+        payload = _safe_load_json(path)
+        if isinstance(payload, dict) and payload:
+            return payload
+    return {}
+
+
 def _is_number(value: Any) -> bool:
     try:
         float(value)
@@ -84,6 +100,7 @@ def _detect_metric_ceiling(
     ceiling_detected = False
     reason = None
     pairs = baseline_vs_model.get("pairs", []) if isinstance(baseline_vs_model, dict) else []
+    metric_pool = baseline_vs_model.get("metric_pool", {}) if isinstance(baseline_vs_model, dict) else {}
     for pair in pairs:
         metric = str(pair.get("metric", "")).lower()
         delta = pair.get("delta")
@@ -106,14 +123,15 @@ def _detect_metric_ceiling(
                 ceiling_detected = True
                 reason = "low_signal"
     if isinstance(data_adequacy, dict):
-        if data_adequacy.get("status") in {"data_limited", "insufficient_signal"}:
+        reasons = data_adequacy.get("reasons", []) or []
+        reason_tags = {str(item).split(":", 1)[0] for item in reasons if item}
+        stale_pipeline_abort = bool(metric_pool) and reason_tags == {"pipeline_aborted_before_metrics"}
+        if data_adequacy.get("status") in {"data_limited", "insufficient_signal"} and not stale_pipeline_abort:
             ceiling_detected = True
             reason = reason or "low_signal"
-        reasons = data_adequacy.get("reasons", []) or []
         if any("high_dimensionality_low_sample" in r for r in reasons):
             ceiling_detected = True
             reason = "small_n"
-    metric_pool = baseline_vs_model.get("metric_pool", {}) if isinstance(baseline_vs_model, dict) else {}
     for key, value in metric_pool.items():
         if "cv_std" in str(key).lower() and _is_number(value) and value >= thresholds["cv_std"]:
             ceiling_detected = True
@@ -307,7 +325,7 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Contract and metrics for ceiling detection (preserved)
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
-    metrics_report = _safe_load_json("data/metrics.json")
+    metrics_report = _load_metrics_report()
     weights_report = _safe_load_json("data/weights.json")
     metric_pool: Dict[str, float] = {}
     metric_pool.update(_flatten_metrics(metrics_report))

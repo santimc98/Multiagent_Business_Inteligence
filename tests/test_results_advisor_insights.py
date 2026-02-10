@@ -51,3 +51,21 @@ def test_results_advisor_flags_leakage_on_explicit_risk_feedback(tmp_path, monke
     )
     risks = [str(item).lower() for item in (insights.get("risks") or [])]
     assert any("leakage" in item for item in risks)
+
+
+def test_results_advisor_primary_metric_prefers_explicit_metric_field(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "metrics.json"), "w", encoding="utf-8") as handle:
+        handle.write(
+            '{"model_performance": {"primary_metric": "RMSLE", "primary_metric_value": 0.4249, "cv_mae_mean": 318.4, "cv_rmsle_mean": 0.4249}}'
+        )
+
+    advisor = ResultsAdvisorAgent(api_key="")
+    insights = advisor.generate_insights(
+        {
+            "artifact_index": [{"path": "data/metrics.json", "artifact_type": "metrics"}],
+            "evaluation_spec": {"objective_type": "regression"},
+        }
+    )
+    assert str(insights.get("primary_metric") or "").lower() == "rmsle"

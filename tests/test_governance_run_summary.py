@@ -91,3 +91,36 @@ def test_run_summary_drops_broad_qa_gate_when_qa_packet_has_no_findings(tmp_path
     }
     summary = build_run_summary(state)
     assert "qa_gates" not in (summary.get("failed_gates") or [])
+
+
+def test_run_summary_ignores_stale_pipeline_aborted_reason_when_metrics_exist(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    os.makedirs("reports", exist_ok=True)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"missing": []}, f)
+    with open("reports/evaluation_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model_performance": {
+                    "primary_metric": "RMSLE",
+                    "primary_metric_value": 0.4249,
+                    "cv_rmsle_mean": 0.4249,
+                }
+            },
+            f,
+        )
+    with open("data/data_adequacy_report.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "status": "insufficient_signal",
+                "reasons": ["pipeline_aborted_before_metrics"],
+                "recommendations": [],
+                "quality_gates_alignment": {"status": "partial", "mapped_gates": {}, "unmapped_gates": {}},
+            },
+            f,
+        )
+
+    summary = build_run_summary({"review_verdict": "APPROVED"})
+    assert summary.get("metrics", {}).get("metric_pool_size", 0) > 0
+    assert summary.get("metric_ceiling_detected") is False
