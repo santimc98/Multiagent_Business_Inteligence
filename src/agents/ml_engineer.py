@@ -212,14 +212,23 @@ class MLEngineerAgent:
         return compact
 
     def _resolve_allowed_columns_for_prompt(self, contract: Dict[str, Any] | None) -> List[str]:
-        """V4.1: Use canonical_columns only, no legacy required_columns."""
+        """Build prompt-safe column universe from executable input columns first, then canonical/derived."""
         if not isinstance(contract, dict):
             return []
         cols: List[str] = []
-        # V4.1: Only use canonical_columns (no legacy required_columns)
+
+        artifact_reqs = contract.get("artifact_requirements")
+        if isinstance(artifact_reqs, dict):
+            clean_cfg = artifact_reqs.get("clean_dataset")
+            if isinstance(clean_cfg, dict):
+                required_input = clean_cfg.get("required_columns")
+                if isinstance(required_input, list):
+                    cols.extend([str(v) for v in required_input if v])
+
         canonical = contract.get("canonical_columns")
         if isinstance(canonical, list):
             cols.extend([str(v) for v in canonical if v])
+
         # Also include derived_columns
         derived = contract.get("derived_columns")
         if isinstance(derived, list):
@@ -532,7 +541,7 @@ class MLEngineerAgent:
                 "- Include SimpleImputer in preprocessing when NaNs may exist.",
                 "- Write all required outputs to exact paths.",
                 "- scored_rows may include canonical + contract-approved derived outputs only.",
-                "- Define CONTRACT_COLUMNS from the contract and print a MAPPING SUMMARY.",
+                "- Define CONTRACT_INPUT_COLUMNS from clean_dataset.required_columns (fallback canonical) and print a MAPPING SUMMARY.",
             ]
         )
         return "\n".join(
@@ -1833,6 +1842,7 @@ $strategy_json
          - Before any training/model code, construct a CONTRACT_EXECUTION_MAP dictionary and print it.
          - CONTRACT_EXECUTION_MAP must include at least:
            * target_columns
+           * input_required_columns
            * training_rows_policy
            * train_filter
            * primary_metric
@@ -1843,7 +1853,7 @@ $strategy_json
          - Do not silently continue on ambiguous contract interpretation.
 
          UNIVERSAL PREFLIGHT GATES (RUN BEFORE model.fit)
-         - Gate A: Required columns exist in the loaded dataframe.
+         - Gate A: input_required_columns exist in the loaded dataframe.
          - Gate B: Target is resolved and has at least 2 classes/values for supervised tasks.
          - Gate C: Training mask/filter is explicitly applied and logged.
          - Gate D: Forbidden/audit-only columns are excluded from modeling features.
@@ -1985,7 +1995,7 @@ $strategy_json
            - The $data_path variable will be substituted with the contract-derived dataset path for this run.
            - ABSOLUTE PROHIBITION: Do NOT implement fallback logic like "if not os.path.exists(filepath): generate dummy data".
              The file WILL exist. If it doesn't, let pd.read_csv() raise FileNotFoundError. NO synthetic fallbacks.
-        5) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
+        5) Do NOT invent column names. Use only columns from the contract input schema/canonical list and the loaded dataset.
         6) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (contract.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
         6b) Do NOT overwrite the input dataset at $data_path. Treat it as immutable input; write derived datasets to new output files.
         7) NEVER fabricate synthetic rows/features (pd.DataFrame({}) from literals, faker, sklearn.datasets.make_*, etc.).
@@ -1995,7 +2005,7 @@ $strategy_json
            Acceptable sources: artifact_requirements.scored_rows_schema (derived_columns/required_columns/allowed_extra_columns/allowed_name_patterns) or execution_contract.derived_columns.
            Any other derived columns must go to a separate artifact file.
         9) Start the script with a short comment block labeled PLAN describing: (1) dialect loading from cleaning_manifest.json, (2) detected columns, (3) row_id construction, (4) scored_rows columns, and (5) where extra derived artifacts go.
-        10) Define CONTRACT_COLUMNS from the Execution Contract (use canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
+        10) Define CONTRACT_INPUT_COLUMNS from execution_contract.artifact_requirements.clean_dataset.required_columns (fallback: canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
         11) LEAKAGE ZERO-TOLERANCE: Check 'allowed_feature_sets' in the contract. Any column listed as 'audit_only_features' or 'forbidden_for_modeling' MUST be excluded from X (features). Use them ONLY for audit/metrics calculation. Violation = REJECTION.
         12) PIPELINE ISOLATION: If you define multiple models/pipelines, do NOT reuse the same preprocessor/transformer across pipelines.
             - Create separate preprocessors or clone them.
@@ -2389,7 +2399,28 @@ $strategy_json
             or ml_view.get("canonical_columns")
             or []
         )
-        required_columns_payload = strategy.get('required_columns', [])
+        required_columns_payload: Any = []
+        artifact_reqs = execution_contract_input.get("artifact_requirements")
+        if isinstance(artifact_reqs, dict):
+            clean_cfg = artifact_reqs.get("clean_dataset")
+            if isinstance(clean_cfg, dict):
+                required_candidate = clean_cfg.get("required_columns")
+                if isinstance(required_candidate, list) and required_candidate:
+                    required_columns_payload = required_candidate
+        if not required_columns_payload:
+            view_artifacts = ml_view.get("artifact_requirements")
+            if isinstance(view_artifacts, dict):
+                clean_cfg = view_artifacts.get("clean_dataset")
+                if isinstance(clean_cfg, dict):
+                    required_candidate = clean_cfg.get("required_columns")
+                    if isinstance(required_candidate, list) and required_candidate:
+                        required_columns_payload = required_candidate
+        if not required_columns_payload:
+            strategy_required = strategy.get("required_columns", [])
+            if isinstance(strategy_required, list) and strategy_required:
+                required_columns_payload = strategy_required
+        if not required_columns_payload:
+            required_columns_payload = canonical_columns_source
         if isinstance(required_columns_payload, list) and len(required_columns_payload) > 80:
             required_columns_payload = summarize_long_list(required_columns_payload)
             required_columns_payload["note"] = COLUMN_LIST_POINTER

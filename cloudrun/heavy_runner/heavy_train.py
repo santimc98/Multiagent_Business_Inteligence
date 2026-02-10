@@ -46,6 +46,8 @@ _DYNAMIC_DEPENDENCY_MAP: Dict[str, Tuple[str, str]] = {
     "datasets": ("datasets", "datasets"),
     "accelerate": ("accelerate", "accelerate"),
     "sentence_transformers": ("sentence-transformers", "sentence_transformers"),
+    "sentencepiece": ("sentencepiece", "sentencepiece"),
+    "huggingface_hub": ("huggingface-hub", "huggingface_hub"),
     "shap": ("shap", "shap"),
     "xgboost": ("xgboost", "xgboost"),
     "lightgbm": ("lightgbm", "lightgbm"),
@@ -54,11 +56,17 @@ _DYNAMIC_DEPENDENCY_MAP: Dict[str, Tuple[str, str]] = {
     "imblearn": ("imbalanced-learn", "imblearn"),
     "category_encoders": ("category_encoders", "category_encoders"),
     "plotly": ("plotly", "plotly"),
+    "rapidfuzz": ("rapidfuzz", "rapidfuzz"),
+    "pydantic": ("pydantic", "pydantic"),
+    "pandera": ("pandera", "pandera"),
+    "networkx": ("networkx", "networkx"),
 }
 
 _DYNAMIC_DEP_ALIASES: Dict[str, str] = {
     "sentence-transformers": "sentence_transformers",
     "sentence_transformers": "sentence_transformers",
+    "huggingface-hub": "huggingface_hub",
+    "huggingface_hub": "huggingface_hub",
     "imbalanced-learn": "imblearn",
     "imblearn": "imblearn",
 }

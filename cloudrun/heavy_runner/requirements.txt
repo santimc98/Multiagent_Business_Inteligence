@@ -28,6 +28,12 @@ shap
 # --- Deep Learning / NLP (Cloud Run heavy profile only) ---
 torch
 transformers
+tokenizers
+datasets
+accelerate
+sentence-transformers
+sentencepiece
+huggingface-hub
 
 # --- Visualization ---
 matplotlib
@@ -39,3 +45,7 @@ python-dateutil
 pytz
 tqdm
 pyyaml
+rapidfuzz
+pydantic
+pandera
+networkx

@@ -8,6 +8,7 @@ BASE_ALLOWLIST = [
     "pandas",
     "scipy",
     "sklearn",
+    "joblib",
     "statsmodels",
     "matplotlib",
     "seaborn",
@@ -29,6 +30,22 @@ CLOUDRUN_NATIVE_ALLOWLIST = [
     "accelerate",
     "sentence_transformers",
 ]
+CLOUDRUN_OPTIONAL_ALLOWLIST = [
+    "xgboost",
+    "lightgbm",
+    "catboost",
+    "shap",
+    "optuna",
+    "imblearn",
+    "category_encoders",
+    "plotly",
+    "rapidfuzz",
+    "pydantic",
+    "pandera",
+    "networkx",
+    "sentencepiece",
+    "huggingface_hub",
+]
 # Unsupported regardless of backend (either incompatible or out-of-scope for this product runtime)
 BANNED_ALWAYS_ALLOWLIST = ["tensorflow", "keras", "pyspark", "spacy", "prophet", "cvxpy", "pulp", "fuzzywuzzy"]
 # Imports explicitly blocked on E2B due to runtime constraints (8GB RAM / lightweight profile)
@@ -39,6 +56,7 @@ PIP_BASE = [
     "pandas",
     "scipy",
     "scikit-learn",
+    "joblib",
     "statsmodels",
     "matplotlib",
     "seaborn",
@@ -65,6 +83,22 @@ PIP_CLOUDRUN_NATIVE = {
     "datasets": "datasets",
     "accelerate": "accelerate",
     "sentence_transformers": "sentence-transformers",
+}
+PIP_CLOUDRUN_OPTIONAL = {
+    "xgboost": "xgboost",
+    "lightgbm": "lightgbm",
+    "catboost": "catboost",
+    "shap": "shap",
+    "optuna": "optuna",
+    "imblearn": "imbalanced-learn",
+    "category_encoders": "category_encoders",
+    "plotly": "plotly",
+    "rapidfuzz": "rapidfuzz",
+    "pydantic": "pydantic",
+    "pandera": "pandera",
+    "networkx": "networkx",
+    "sentencepiece": "sentencepiece",
+    "huggingface_hub": "huggingface-hub",
 }
 
 _BACKEND_ALIASES = {
@@ -145,6 +179,7 @@ def _allowed_import_roots(required: Set[str], backend_profile: str) -> Set[str]:
     allowed = set(BASE_ALLOWLIST) | (set(EXTENDED_ALLOWLIST) & required) | stdlib
     if backend_profile == "cloudrun":
         allowed |= set(CLOUDRUN_NATIVE_ALLOWLIST)
+        allowed |= set(CLOUDRUN_OPTIONAL_ALLOWLIST)
     return allowed
 
 
@@ -175,7 +210,28 @@ def check_dependency_precheck(
             suggestions[imp] = "Use difflib or rapidfuzz (only if contract allows)."
         elif imp in {"rapidfuzz"}:
             suggestions[imp] = "Request rapidfuzz in execution_contract.required_dependencies, or use difflib."
-        elif imp in {"torch", "transformers", "datasets", "tokenizers", "accelerate", "sentence_transformers"}:
+        elif imp in {
+            "torch",
+            "transformers",
+            "datasets",
+            "tokenizers",
+            "accelerate",
+            "sentence_transformers",
+            "xgboost",
+            "lightgbm",
+            "catboost",
+            "shap",
+            "optuna",
+            "imblearn",
+            "category_encoders",
+            "plotly",
+            "rapidfuzz",
+            "pydantic",
+            "pandera",
+            "networkx",
+            "sentencepiece",
+            "huggingface_hub",
+        }:
             if backend == "cloudrun":
                 suggestions[imp] = (
                     "Use Cloud Run heavy runtime and declare dependency in execution_contract.required_dependencies."
@@ -208,5 +264,26 @@ def get_sandbox_install_packages(
     extra = [PIP_EXTENDED[d] for d in EXTENDED_ALLOWLIST if d in required]
     heavy = []
     if backend == "cloudrun":
-        heavy = [PIP_CLOUDRUN_NATIVE[d] for d in CLOUDRUN_NATIVE_ALLOWLIST if d in required and d in PIP_CLOUDRUN_NATIVE]
+        heavy = [
+            PIP_CLOUDRUN_NATIVE[d]
+            for d in CLOUDRUN_NATIVE_ALLOWLIST
+            if d in required and d in PIP_CLOUDRUN_NATIVE
+        ]
+        heavy += [
+            PIP_CLOUDRUN_OPTIONAL[d]
+            for d in CLOUDRUN_OPTIONAL_ALLOWLIST
+            if d in required and d in PIP_CLOUDRUN_OPTIONAL
+        ]
+        # Allow explicit request for joblib even though it is part of base dependencies.
+        if "joblib" in required:
+            heavy.append("joblib")
+        # Deduplicate while preserving order.
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for pkg in heavy:
+            if pkg in seen:
+                continue
+            seen.add(pkg)
+            deduped.append(pkg)
+        heavy = deduped
     return {"base": list(PIP_BASE), "extra": extra, "heavy": heavy}

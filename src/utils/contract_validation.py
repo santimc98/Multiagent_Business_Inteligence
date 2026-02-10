@@ -81,7 +81,7 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
     ],
     "must": [
         "Use dialect/output_dialect from manifest when loading data.",
-        "Honor allowlist dependencies; do not import banned packages (pulp/cvxpy/fuzzywuzzy/torch/tensorflow/etc.).",
+        "Honor allowlist dependencies; do not import banned packages (pulp/cvxpy/fuzzywuzzy/tensorflow/keras/pyspark/etc.).",
         "If contract contains column_roles/artifact_requirements, treat them as source-of-truth for outputs.",
         "Include variance guard: if y.nunique() <= 1 raise ValueError.",
         "Print Mapping Summary and build X only from contract feature columns.",

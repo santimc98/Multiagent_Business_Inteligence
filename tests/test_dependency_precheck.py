@@ -41,6 +41,20 @@ def test_dependency_precheck_allows_torch_on_cloudrun():
     assert "torch" not in result["blocked"]
 
 
+def test_dependency_precheck_allows_lightgbm_on_cloudrun_without_contract_hint():
+    code = "import lightgbm\n"
+    result = check_dependency_precheck(code, required_dependencies=[], backend_profile="cloudrun")
+    assert "lightgbm" not in result["banned"]
+    assert "lightgbm" not in result["blocked"]
+
+
+def test_dependency_precheck_allows_joblib_on_cloudrun():
+    code = "import joblib\n"
+    result = check_dependency_precheck(code, required_dependencies=[], backend_profile="cloudrun")
+    assert "joblib" not in result["banned"]
+    assert "joblib" not in result["blocked"]
+
+
 def test_cloudrun_import_detection_handles_markdown_fences():
     code = "```python\nfrom transformers import AutoModel\nimport torch\n```"
     imports = cloudrun_imports_from_code(code)
