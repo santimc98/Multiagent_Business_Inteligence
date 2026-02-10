@@ -759,7 +759,11 @@ def _build_default_cleaning_gates() -> List[Dict[str, Any]]:
             "name": "id_integrity",
             "severity": "HARD",
             "params": {
-                "identifier_name_regex": r"(?i)(^id$|id$|entity|cod|code|key|partida|invoice|account)",
+                "identifier_name_regex": (
+                    r"(?i)(^id$|"
+                    r"(?:^|[_\W])(?:id|entity|cod|code|key|partida|invoice|account)(?:[_\W]|$)|"
+                    r"(?:_id$)|(?:^id_))"
+                ),
                 "detect_scientific_notation": True,
             },
         },

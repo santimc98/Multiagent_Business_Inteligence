@@ -24,7 +24,11 @@ _LLM_CALL_WARNING = "LLM_CALL_FAILED"
 _UNEVALUATED_HARD_GATES_WARNING = "UNEVALUATED_HARD_GATES"
 _LLM_FAIL_CLOSED_REASON = "LLM_UNAVAILABLE_WITH_UNEVALUATED_HARD_GATES"
 
-_DEFAULT_ID_REGEX = r"(?i)(^id$|id$|entity|cod|code|key|partida|invoice|account)"
+_DEFAULT_ID_REGEX = (
+    r"(?i)(^id$|"
+    r"(?:^|[_\W])(?:id|entity|cod|code|key|partida|invoice|account)(?:[_\W]|$)|"
+    r"(?:_id$)|(?:^id_))"
+)
 _DEFAULT_PERCENT_REGEX = r"(?i)%|pct|percent|plazo"
 
 _FALLBACK_CLEANING_GATES = [
@@ -1207,13 +1211,17 @@ def _evaluate_gates_deterministic(
             issues = _check_required_columns(required_columns, cleaned_header, cleaned_csv_path)
             evidence["missing"] = [c for c in required_columns if c not in cleaned_header]
         elif gate_key == "id_integrity":
-            issues = _check_id_integrity(
+            issues, id_evidence = _check_id_integrity(
                 cleaned_header,
                 sample_str,
                 sample_infer,
                 params,
                 column_roles,
             )
+            if isinstance(id_evidence, dict):
+                evidence.update(id_evidence)
+                if not bool(id_evidence.get("applies_if", True)):
+                    warnings.append(f"id_integrity skipped: {id_evidence.get('skip_reason', 'not_applicable')}")
         elif gate_key == "no_semantic_rescale":
             # DELEGATED TO LLM: Semantic rescale detection requires contextual reasoning
             # about code + data profile, not brittle threshold-based heuristics.
@@ -1225,7 +1233,16 @@ def _evaluate_gates_deterministic(
         elif gate_key == "no_synthetic_data":
             issues = _check_no_synthetic_data(manifest, cleaning_code=cleaning_code)
         elif gate_key == "row_count_sanity":
-            issues = _check_row_count_sanity(manifest, params)
+            skip_row_count, skip_reason, skip_evidence = _should_skip_row_count_sanity(manifest, params, column_roles)
+            if isinstance(skip_evidence, dict):
+                evidence.update(skip_evidence)
+            if skip_row_count:
+                issues = []
+                evidence["applies_if"] = False
+                evidence["skip_reason"] = skip_reason
+                warnings.append(f"row_count_sanity skipped: {skip_reason}")
+            else:
+                issues = _check_row_count_sanity(manifest, params)
             evidence["row_counts"] = (manifest.get("row_counts") or {})
         elif gate_key == "numeric_parsing_validation":
             issues, evidence = _check_numeric_parsing_validation(sample_str, sample_infer, params)
@@ -1825,22 +1842,10 @@ def _check_id_integrity(
     sample_infer: Optional[pd.DataFrame],
     params: Dict[str, Any],
     column_roles: Dict[str, List[str]],
-) -> List[str]:
-    if not cleaned_header:
-        return []
-    regex = params.get("identifier_name_regex") or _DEFAULT_ID_REGEX
-    try:
-        pattern = re.compile(regex)
-    except re.error:
-        pattern = re.compile(_DEFAULT_ID_REGEX)
-
-    candidates = [col for col in cleaned_header if pattern.search(col)]
-    role_candidates = _columns_with_role_tokens(column_roles, {"id", "identifier"})
-    for col in role_candidates:
-        if col in cleaned_header and col not in candidates:
-            candidates.append(col)
+) -> Tuple[List[str], Dict[str, Any]]:
+    candidates, evidence = _resolve_id_integrity_candidates(cleaned_header, params, column_roles)
     if not candidates:
-        return []
+        return [], evidence
 
     detect_sci = bool(params.get("detect_scientific_notation", True))
     sci_threshold = float(params.get("scientific_notation_ratio_threshold", 0.02))
@@ -1848,9 +1853,11 @@ def _check_id_integrity(
     min_samples = int(params.get("min_samples", 20))
 
     issues: List[str] = []
+    column_evidence: Dict[str, Any] = {}
     for col in candidates:
         values = _string_values(sample_str, col)
         if len(values) < min_samples:
+            column_evidence[col] = {"samples": len(values), "skipped": "insufficient_samples"}
             continue
         sci_count = 0
         dot0_count = 0
@@ -1861,6 +1868,14 @@ def _check_id_integrity(
             if re.search(r"\.0+$", val):
                 dot0_count += 1
         total = len(values)
+        col_evidence: Dict[str, Any] = {
+            "samples": total,
+            "scientific_notation_count": sci_count,
+            "dot_zero_count": dot0_count,
+            "detect_scientific_notation": detect_sci,
+            "scientific_notation_ratio_threshold": sci_threshold,
+            "dot_zero_ratio_threshold": dot0_threshold,
+        }
         if detect_sci and sci_count / total >= sci_threshold:
             issues.append(f"{col} contains scientific notation ({sci_count}/{total})")
         if dot0_count / total >= dot0_threshold:
@@ -1868,7 +1883,12 @@ def _check_id_integrity(
         if sample_infer is not None and col in sample_infer.columns:
             if pd.api.types.is_float_dtype(sample_infer[col]):
                 issues.append(f"{col} inferred as float dtype in cleaned data")
-    return issues
+                col_evidence["inferred_dtype"] = str(sample_infer[col].dtype)
+        column_evidence[col] = col_evidence
+
+    evidence["columns_checked"] = candidates
+    evidence["column_evidence"] = column_evidence
+    return issues, evidence
 
 
 # =============================================================================
@@ -2042,6 +2062,187 @@ def _columns_with_role_tokens(column_roles: Dict[str, List[str]], tokens: set[st
         if any(token in role.lower() for token in tokens):
             cols.extend(names)
     return cols
+
+
+def _resolve_id_role_context(
+    cleaned_header: List[str],
+    column_roles: Dict[str, List[str]],
+) -> Dict[str, Any]:
+    header_set = set(cleaned_header or [])
+    id_like = {col for col in _columns_with_role_tokens(column_roles, {"id", "identifier", "key"}) if col in header_set}
+    target_like = {
+        col for col in _columns_with_role_tokens(column_roles, {"target", "label", "outcome"}) if col in header_set
+    }
+    split_like = {
+        col for col in _columns_with_role_tokens(column_roles, {"split", "partition", "fold"}) if col in header_set
+    }
+    excluded = target_like | split_like
+    id_like -= excluded
+    return {
+        "id_like": sorted(id_like),
+        "target_like": sorted(target_like),
+        "split_like": sorted(split_like),
+        "excluded": sorted(excluded),
+    }
+
+
+def _resolve_id_integrity_candidates(
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+) -> Tuple[List[str], Dict[str, Any]]:
+    evidence: Dict[str, Any] = {"applies_if": True}
+    if not cleaned_header:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "cleaned_header_missing"
+        evidence["candidate_columns"] = []
+        return [], evidence
+
+    role_ctx = _resolve_id_role_context(cleaned_header, column_roles)
+    excluded = set(role_ctx.get("excluded") or [])
+
+    explicit = _list_str(params.get("columns")) + _list_str(params.get("id_columns"))
+    explicit_candidates = [col for col in explicit if col in cleaned_header and col not in excluded]
+
+    role_candidates = [col for col in (role_ctx.get("id_like") or []) if col in cleaned_header]
+
+    regex = params.get("identifier_name_regex") or _DEFAULT_ID_REGEX
+    try:
+        pattern = re.compile(regex)
+    except re.error:
+        pattern = re.compile(_DEFAULT_ID_REGEX)
+    regex_candidates = [col for col in cleaned_header if col not in excluded and pattern.search(str(col))]
+
+    candidates: List[str] = []
+    candidate_source = "none"
+    if explicit_candidates:
+        candidates = explicit_candidates
+        candidate_source = "params"
+    elif role_candidates:
+        candidates = role_candidates
+        candidate_source = "column_roles"
+    else:
+        candidates = regex_candidates
+        candidate_source = "regex_fallback"
+
+    # Deduplicate while preserving order
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for col in candidates:
+        if col in seen:
+            continue
+        seen.add(col)
+        deduped.append(col)
+    candidates = deduped
+
+    evidence["candidate_source"] = candidate_source
+    evidence["candidate_columns"] = candidates
+    evidence["excluded_columns"] = role_ctx.get("excluded") or []
+    evidence["target_role_columns"] = role_ctx.get("target_like") or []
+    evidence["split_role_columns"] = role_ctx.get("split_like") or []
+
+    if not candidates:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "no_identifier_columns_detected"
+    return candidates, evidence
+
+
+def _extract_manifest_row_counts(manifest: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
+    if not isinstance(manifest, dict):
+        return None, None, {}
+    rows_before = manifest.get("rows_before")
+    rows_after = manifest.get("rows_after")
+    row_counts = manifest.get("row_counts") or {}
+    if rows_before is None:
+        for key in ("initial", "original", "input", "rows_before", "total"):
+            if rows_before is None:
+                rows_before = row_counts.get(key)
+    if rows_after is None:
+        for key in ("final", "after_cleaning", "output", "rows_after"):
+            if rows_after is None:
+                rows_after = row_counts.get(key)
+    if not isinstance(rows_before, (int, float)):
+        rows_before = None
+    if not isinstance(rows_after, (int, float)):
+        rows_after = None
+    return rows_before, rows_after, row_counts
+
+
+def _should_skip_row_count_sanity(
+    manifest: Dict[str, Any],
+    params: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+) -> Tuple[bool, str, Dict[str, Any]]:
+    evidence: Dict[str, Any] = {"adaptive_policy": "none"}
+    if not bool(params.get("allow_label_null_listwise_skip", True)):
+        return False, "", evidence
+    if bool(params.get("enforce_on_listwise_label_drop", False)):
+        return False, "", evidence
+    if not isinstance(manifest, dict):
+        return False, "", evidence
+
+    rows_before, rows_after, row_counts = _extract_manifest_row_counts(manifest)
+    if rows_before is None or rows_after is None or rows_before <= 0 or rows_after > rows_before:
+        return False, "", evidence
+
+    dropped = float(rows_before - rows_after)
+    if dropped <= 0:
+        return False, "", evidence
+
+    drop_reason = str((row_counts or {}).get("dropped_reason") or "").strip().lower()
+    gate_results = manifest.get("gate_results") if isinstance(manifest.get("gate_results"), dict) else {}
+    null_gate = gate_results.get("null_label_removal") if isinstance(gate_results, dict) else None
+    rows_removed = None
+    if isinstance(null_gate, dict):
+        rows_removed = null_gate.get("rows_removed")
+    if not isinstance(rows_removed, (int, float)):
+        rows_removed = None
+
+    role_ctx = _resolve_id_role_context(list((manifest.get("null_stats", {}).get("before", {}) or {}).keys()), column_roles)
+    target_cols = role_ctx.get("target_like") or []
+    null_stats = manifest.get("null_stats") if isinstance(manifest.get("null_stats"), dict) else {}
+    before = null_stats.get("before") if isinstance(null_stats.get("before"), dict) else {}
+    after = null_stats.get("after") if isinstance(null_stats.get("after"), dict) else {}
+    if not target_cols and isinstance(before, dict):
+        # Fallback: infer likely supervised targets from null stats (positive nulls cleaned to zero),
+        # excluding role-tagged identifier/split columns.
+        excluded_cols = set(role_ctx.get("id_like") or []) | set(role_ctx.get("split_like") or [])
+        inferred_targets: List[str] = []
+        for col, before_val in before.items():
+            after_val = after.get(col) if isinstance(after, dict) else None
+            if col in excluded_cols:
+                continue
+            if not isinstance(before_val, (int, float)) or not isinstance(after_val, (int, float)):
+                continue
+            if float(before_val) > 0 and float(after_val) == 0.0:
+                inferred_targets.append(col)
+        target_cols = inferred_targets
+
+    if not target_cols:
+        return False, "", evidence
+
+    aligned_targets = True
+    for col in target_cols:
+        before_val = before.get(col)
+        after_val = after.get(col)
+        if not isinstance(before_val, (int, float)) or not isinstance(after_val, (int, float)):
+            aligned_targets = False
+            break
+        if abs(float(before_val) - dropped) > 1.0 or float(after_val) != 0.0:
+            aligned_targets = False
+            break
+
+    rows_removed_aligned = rows_removed is not None and abs(float(rows_removed) - dropped) <= 1.0
+    if aligned_targets and (rows_removed_aligned or "listwise" in drop_reason):
+        evidence["adaptive_policy"] = "label_null_listwise_drop"
+        evidence["target_columns"] = target_cols
+        evidence["rows_before"] = int(rows_before)
+        evidence["rows_after"] = int(rows_after)
+        evidence["rows_dropped"] = int(dropped)
+        evidence["rows_removed_gate"] = int(rows_removed) if isinstance(rows_removed, (int, float)) else None
+        return True, "drop_explained_by_label_null_listwise_removal", evidence
+
+    return False, "", evidence
 
 
 def _map_status_value(status: Any) -> str | None:
