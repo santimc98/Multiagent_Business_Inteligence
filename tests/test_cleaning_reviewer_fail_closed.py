@@ -1,6 +1,5 @@
 import json
 import os
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -16,39 +15,42 @@ def tmp_workdir(tmp_path, monkeypatch):
     os.chdir(old_cwd)
 
 
-def _mock_command_ok(stdout=""):
-    return SimpleNamespace(exit_code=0, stdout=stdout)
-
-
 class _ExplodingReviewer:
     def review_cleaning(self, *args, **kwargs):
         raise RuntimeError("boom")
+
+
+def _mock_de_heavy_success(*args, **kwargs):
+    os.makedirs("data", exist_ok=True)
+    with open("data/cleaned_data.csv", "wb") as f:
+        f.write(b"a,b,target\n1,2,3\n4,5,9\n")
+    with open("data/cleaning_manifest.json", "wb") as f:
+        f.write(
+            json.dumps(
+                {"output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"}}
+            ).encode("utf-8")
+        )
+    return {
+        "ok": True,
+        "downloaded": {
+            "data/cleaned_data.csv": "data/cleaned_data.csv",
+            "data/cleaning_manifest.json": "data/cleaning_manifest.json",
+        },
+    }
 
 
 def test_cleaning_reviewer_failure_fail_closed(tmp_workdir, monkeypatch):
     raw_path = tmp_workdir / "raw.csv"
     raw_path.write_text("col1,col2,target\n1,2,3\n4,5,9\n", encoding="utf-8")
 
-    cleaned_bytes = b"a,b,target\n1,2,3\n4,5,9\n"
-    manifest_bytes = json.dumps(
-        {"output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"}}
-    ).encode("utf-8")
-
     monkeypatch.setattr("src.graph.graph.cleaning_reviewer", _ExplodingReviewer())
 
-    with patch("src.graph.graph.Sandbox") as MockSandbox, \
+    with patch("src.graph.graph._get_heavy_runner_config", return_value={"job": "j", "bucket": "b", "region": "r"}), \
+         patch("src.graph.graph._execute_data_engineer_via_heavy_runner", side_effect=_mock_de_heavy_success), \
          patch("src.graph.graph.scan_code_safety", return_value=(True, [])), \
          patch("src.graph.graph.data_engineer.generate_cleaning_script", return_value="print('clean')"), \
          patch("src.graph.graph.data_engineer_preflight", return_value=[]), \
-         patch.dict(os.environ, {"E2B_API_KEY": "dummy", "DEEPSEEK_API_KEY": "dummy", "GOOGLE_API_KEY": "dummy"}):
-
-        mock_instance = MockSandbox.create.return_value.__enter__.return_value
-        mock_instance.commands.run.return_value = _mock_command_ok()
-        mock_instance.run_code.return_value = SimpleNamespace(
-            logs=SimpleNamespace(stdout=["ok"], stderr=[]),
-            error=None,
-        )
-        mock_instance.files.read.side_effect = [cleaned_bytes, manifest_bytes]
+         patch.dict(os.environ, {"DEEPSEEK_API_KEY": "dummy", "GOOGLE_API_KEY": "dummy"}):
 
         state = {
             "selected_strategy": {"title": "t", "analysis_type": "regression", "required_columns": ["a", "b", "target"]},

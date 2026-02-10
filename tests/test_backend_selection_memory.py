@@ -185,7 +185,7 @@ def test_ml_backend_selection_forces_cloudrun_when_contract_requires_heavy_deps(
 
     assert decision.get("use_heavy") is True
     assert decision.get("backend_profile") == "cloudrun"
-    assert decision.get("reason") == "heavy_dependencies_required"
+    assert decision.get("reason") == "cloudrun_only_mode"
     assert decision.get("heavy_deps_required") is True
 
 
@@ -197,8 +197,8 @@ def test_ml_backend_selection_heavy_deps_without_cloudrun_stays_e2b():
         decision = graph_mod._resolve_ml_backend_selection(state)
 
     assert decision.get("use_heavy") is False
-    assert decision.get("backend_profile") == "e2b"
-    assert decision.get("reason") == "heavy_dependencies_required_but_cloudrun_unavailable"
+    assert decision.get("backend_profile") == "cloudrun"
+    assert decision.get("reason") == "cloudrun_required_by_dependencies_but_unavailable"
     assert decision.get("heavy_deps_required") is True
 
 
@@ -215,7 +215,7 @@ def test_ml_backend_selection_forces_cloudrun_when_script_imports_heavy_libs():
 
     assert decision.get("use_heavy") is True
     assert decision.get("backend_profile") == "cloudrun"
-    assert decision.get("reason") == "heavy_imports_in_code"
+    assert decision.get("reason") == "cloudrun_only_mode"
     assert decision.get("heavy_deps_from_code") is True
     assert "torch" in (decision.get("heavy_imports_in_code") or [])
 
@@ -229,6 +229,6 @@ def test_ml_backend_selection_marks_unavailable_when_script_imports_heavy_libs()
         decision = graph_mod._resolve_ml_backend_selection(state)
 
     assert decision.get("use_heavy") is False
-    assert decision.get("backend_profile") == "e2b"
-    assert decision.get("reason") == "heavy_imports_in_code_but_cloudrun_unavailable"
+    assert decision.get("backend_profile") == "cloudrun"
+    assert decision.get("reason") == "cloudrun_required_by_script_imports_but_unavailable"
     assert decision.get("heavy_deps_from_code") is True

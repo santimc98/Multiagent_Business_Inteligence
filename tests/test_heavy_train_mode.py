@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -221,3 +222,42 @@ def test_resolve_script_timeout_seconds_uses_env_when_payload_missing(monkeypatc
     monkeypatch.setenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS", "1650")
     timeout = heavy_train._resolve_script_timeout_seconds({})
     assert timeout == 1650
+
+
+def test_resolve_dynamic_dependency_plan_detects_missing_torch(tmp_path, monkeypatch):
+    heavy_train = _load_heavy_train_module()
+    script_path = tmp_path / "ml_script.py"
+    script_path.write_text("import torch\nfrom transformers import AutoModel\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        heavy_train,
+        "_module_available",
+        lambda name: name not in {"torch", "transformers", "sentence_transformers"},
+    )
+    plan = heavy_train._resolve_dynamic_dependency_plan(
+        {"required_dependencies": ["sentence-transformers"]},
+        str(script_path),
+    )
+
+    assert "torch" in (plan.get("missing_roots") or [])
+    assert "transformers" in (plan.get("missing_roots") or [])
+    assert "sentence-transformers" in (plan.get("pip_packages") or [])
+    assert "torch" in (plan.get("pip_packages") or [])
+    assert "transformers" in (plan.get("pip_packages") or [])
+
+
+def test_install_dynamic_dependencies_invokes_pip(monkeypatch):
+    heavy_train = _load_heavy_train_module()
+    captured = {}
+
+    def _fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(heavy_train.subprocess, "run", _fake_run)
+    heavy_train._install_dynamic_dependencies(["torch", "transformers"])
+
+    cmd = captured.get("cmd") or []
+    assert cmd[:4] == [heavy_train.sys.executable, "-m", "pip", "install"]
+    assert "torch" in cmd
+    assert "transformers" in cmd

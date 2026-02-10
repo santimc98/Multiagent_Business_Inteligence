@@ -9046,29 +9046,16 @@ def _resolve_ml_backend_selection(state: Dict[str, Any]) -> Dict[str, Any]:
     data_profile = state.get("data_profile")
     if not isinstance(data_profile, dict):
         data_profile = {}
-    use_heavy = False
-    reason = "no_heavy_config"
-    heavy_unavailable = bool(state.get("heavy_runner_unavailable"))
+    use_heavy = bool(heavy_cfg)
     if heavy_cfg:
-        if heavy_deps_from_code and not heavy_unavailable:
-            use_heavy = True
-            reason = "heavy_imports_in_code"
-        elif heavy_deps_required and not heavy_unavailable:
-            use_heavy = True
-            reason = "heavy_dependencies_required"
-        elif heavy_deps_from_code and heavy_unavailable:
-            use_heavy = False
-            reason = "heavy_imports_in_code_but_cloudrun_unavailable"
-        elif heavy_deps_required and heavy_unavailable:
-            use_heavy = False
-            reason = "heavy_dependencies_required_but_cloudrun_unavailable"
-        else:
-            use_heavy, reason = _should_use_heavy_runner(state, data_profile, ml_plan)
+        reason = "cloudrun_only_mode"
     elif heavy_deps_from_code:
-        reason = "heavy_imports_in_code_but_cloudrun_unavailable"
+        reason = "cloudrun_required_by_script_imports_but_unavailable"
     elif heavy_deps_required:
-        reason = "heavy_dependencies_required_but_cloudrun_unavailable"
-    backend_profile = "cloudrun" if heavy_cfg and use_heavy else "e2b"
+        reason = "cloudrun_required_by_dependencies_but_unavailable"
+    else:
+        reason = "cloudrun_config_missing"
+    backend_profile = "cloudrun"
     return {
         "heavy_cfg": heavy_cfg,
         "use_heavy": bool(use_heavy),
@@ -10637,22 +10624,17 @@ def run_data_engineer(state: AgentState) -> AgentState:
             memory_guard_active = True
     state["de_memory_guard_active"] = memory_guard_active
     de_heavy_cfg = _get_heavy_runner_config()
-    de_use_heavy_runner = False
-    de_heavy_reason = "disabled"
-    if de_heavy_cfg:
-        de_use_heavy_runner, de_heavy_reason = _should_use_heavy_runner_for_data_engineer(
-            state if isinstance(state, dict) else {},
-            required_cols_count=len(required_cols or []),
-            total_cols_count=n_cols,
-        )
+    de_use_heavy_runner = bool(de_heavy_cfg)
+    de_heavy_reason = "cloudrun_only_mode" if de_heavy_cfg else "cloudrun_config_missing"
     if run_id:
         try:
             log_run_event(
                 run_id,
                 "data_engineer_backend_selection",
                 {
-                    "backend": "heavy_runner" if de_use_heavy_runner else "e2b",
+                    "backend": "heavy_runner",
                     "reason": de_heavy_reason,
+                    "cloudrun_available": bool(de_heavy_cfg),
                     "dataset_scale": {
                         "scale": dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None,
                         "file_mb": dataset_scale_hints.get("file_mb") if isinstance(dataset_scale_hints, dict) else None,
@@ -11282,42 +11264,87 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 msg = f"Host Cleaning Plan Failed: {plan_err}"
                 return {"cleaning_code": code, "cleaned_data_preview": "Error: Plan Failed", "error_message": msg, "budget_counters": counters}
         else:
-            de_heavy_result = None
-            if de_use_heavy_runner and de_heavy_cfg:
-                print(f"    Backend: Cloud Run Heavy Runner (DE, reason={de_heavy_reason})")
-                de_heavy_result = _execute_data_engineer_via_heavy_runner(
-                    state=state,
-                    code=code,
-                    csv_path=csv_path,
-                    csv_sep=csv_sep,
-                    csv_decimal=csv_decimal,
-                    csv_encoding=csv_encoding,
-                    heavy_cfg=de_heavy_cfg,
-                    run_id=run_id,
-                    attempt_id=attempt_id,
-                    reason=de_heavy_reason,
+            if not de_heavy_cfg:
+                msg = (
+                    "CLOUDRUN_REQUIRED: Data Engineer execution is configured for Cloud Run only, "
+                    "but heavy runner configuration is missing."
                 )
-                if de_heavy_result.get("unavailable"):
-                    state["heavy_runner_unavailable"] = True
-                    print("HEAVY_RUNNER_UNAVAILABLE for Data Engineer: falling back to E2B.")
-                elif de_heavy_result.get("ok"):
-                    if os.path.exists(local_cleaned_path):
-                        try:
-                            with open(local_cleaned_path, "rb") as f_local:
-                                downloaded_cleaned_content = f_local.read()
-                        except Exception:
-                            downloaded_cleaned_content = None
-                        downloaded_paths.append(local_cleaned_path)
-                    if os.path.exists(local_manifest_path):
-                        downloaded_paths.append(local_manifest_path)
-                    csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
-                        local_manifest_path, csv_sep, csv_decimal, csv_encoding
+                if run_id:
+                    log_run_event(
+                        run_id,
+                        "pipeline_aborted_reason",
+                        {"reason": "data_engineer_cloudrun_config_missing"},
                     )
-                    if dialect_updated:
-                        print(
-                            f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}"
-                        )
-            run_e2b_after_heavy = _should_run_e2b_after_de_heavy_result(de_heavy_result)
+                return {
+                    "cleaning_code": code,
+                    "cleaned_data_preview": "Error: Cloud Run Required",
+                    "error_message": msg,
+                    "pipeline_aborted_reason": "data_engineer_cloudrun_config_missing",
+                    "data_engineer_failed": True,
+                    "budget_counters": counters,
+                }
+
+            print(f"    Backend: Cloud Run Heavy Runner (DE, reason={de_heavy_reason})")
+            de_heavy_result = _execute_data_engineer_via_heavy_runner(
+                state=state,
+                code=code,
+                csv_path=csv_path,
+                csv_sep=csv_sep,
+                csv_decimal=csv_decimal,
+                csv_encoding=csv_encoding,
+                heavy_cfg=de_heavy_cfg,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                reason=de_heavy_reason,
+            )
+            if de_heavy_result.get("unavailable"):
+                heavy_error = str(
+                    de_heavy_result.get("error_details")
+                    or "HEAVY_RUNNER_UNAVAILABLE: cloudrun execution unavailable."
+                )
+                if run_id:
+                    log_run_event(
+                        run_id,
+                        "pipeline_aborted_reason",
+                        {"reason": "data_engineer_cloudrun_unavailable"},
+                    )
+                return {
+                    "cleaning_code": code,
+                    "cleaned_data_preview": "Error: Cloud Run Unavailable",
+                    "error_message": heavy_error,
+                    "pipeline_aborted_reason": "data_engineer_cloudrun_unavailable",
+                    "data_engineer_failed": True,
+                    "budget_counters": counters,
+                }
+            if not de_heavy_result.get("ok"):
+                heavy_error = str(
+                    de_heavy_result.get("error_details")
+                    or "HEAVY_RUNNER_ERROR: data engineer execution failed."
+                )
+                return {
+                    "cleaning_code": code,
+                    "cleaned_data_preview": "Error: Cleaning Failed",
+                    "error_message": heavy_error,
+                    "budget_counters": counters,
+                }
+
+            if os.path.exists(local_cleaned_path):
+                try:
+                    with open(local_cleaned_path, "rb") as f_local:
+                        downloaded_cleaned_content = f_local.read()
+                except Exception:
+                    downloaded_cleaned_content = None
+                downloaded_paths.append(local_cleaned_path)
+            if os.path.exists(local_manifest_path):
+                downloaded_paths.append(local_manifest_path)
+            csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
+                local_manifest_path, csv_sep, csv_decimal, csv_encoding
+            )
+            if dialect_updated:
+                print(
+                    f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}"
+                )
+            run_e2b_after_heavy = False
             if not run_e2b_after_heavy and isinstance(de_heavy_result, dict) and not de_heavy_result.get("ok"):
                 heavy_error = str(
                     de_heavy_result.get("error_details")
@@ -14088,13 +14115,30 @@ def execute_code(state: AgentState) -> AgentState:
     heavy_cfg = backend_selection.get("heavy_cfg")
     use_heavy = bool(backend_selection.get("use_heavy"))
     heavy_reason = str(backend_selection.get("reason") or "unknown")
-    dependency_backend = str(backend_selection.get("backend_profile") or "e2b")
+    heavy_imports_in_code = (
+        backend_selection.get("heavy_imports_in_code")
+        if isinstance(backend_selection.get("heavy_imports_in_code"), list)
+        else []
+    )
+    dependency_backend = "cloudrun"
     ml_plan = backend_selection.get("ml_plan") if isinstance(backend_selection.get("ml_plan"), dict) else {}
     data_profile = (
         backend_selection.get("data_profile")
         if isinstance(backend_selection.get("data_profile"), dict)
         else {}
     )
+    if not heavy_cfg or not use_heavy:
+        msg = (
+            "CLOUDRUN_REQUIRED: ML execution is configured for Cloud Run only, "
+            "but heavy runner configuration is missing/unavailable."
+        )
+        if run_id:
+            log_run_event(
+                run_id,
+                "execution_backend_unavailable",
+                {"backend": "heavy_runner", "reason": heavy_reason},
+            )
+        return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
 
     # Shared prechecks for both backends (Cloud Run + E2B) to keep behavior aligned.
     is_safe, violations = scan_code_safety(code)
@@ -14140,7 +14184,7 @@ def execute_code(state: AgentState) -> AgentState:
                 run_id,
                 "execution_backend_selection",
                 {
-                    "backend": "heavy_runner" if use_heavy else "e2b",
+                    "backend": "heavy_runner",
                     "reason": heavy_reason,
                     "dataset_scale": {
                         "scale": hints.get("scale"),
@@ -14314,6 +14358,12 @@ def execute_code(state: AgentState) -> AgentState:
                 configured_timeout_seconds=heavy_cfg.get("script_timeout_seconds"),
             )
 
+            runtime_required_deps: List[str] = []
+            for dep in list(required_deps or []) + list(heavy_imports_in_code or []):
+                dep_name = str(dep or "").strip()
+                if dep_name and dep_name not in runtime_required_deps:
+                    runtime_required_deps.append(dep_name)
+
             request = {
                 "run_id": run_id,
                 "dataset_uri": None,
@@ -14328,6 +14378,7 @@ def execute_code(state: AgentState) -> AgentState:
                 "cv": cv_cfg,
                 "decisioning_required_names": decisioning_names,
                 "required_outputs": required_artifacts,
+                "required_dependencies": runtime_required_deps,
                 "script_timeout_seconds": int(timeout_decision["timeout_seconds"]),
             }
 
@@ -14412,87 +14463,7 @@ def execute_code(state: AgentState) -> AgentState:
             except CloudRunLaunchError as exc:
                 if run_id:
                     log_run_event(run_id, "heavy_runner_failed", {"error": str(exc)})
-                if "Required CLI not found" in str(exc):
-                    if run_id:
-                        log_run_event(run_id, "heavy_runner_unavailable", {"error": str(exc)})
-                    state["heavy_runner_unavailable"] = True
-                    print(f"HEAVY_RUNNER_UNAVAILABLE: {exc} -- falling back to E2B.")
-                else:
-                    output = f"HEAVY_RUNNER_ERROR: {exc}"
-                    return _finalize_heavy_execution(
-                        state=state,
-                        output=output,
-                        exec_start_ts=exec_start_ts,
-                        contract=contract,
-                        eval_spec=eval_spec or {},
-                        csv_sep=csv_sep,
-                        csv_decimal=csv_decimal,
-                        csv_encoding=csv_encoding,
-                        counters=counters,
-                        run_id=run_id,
-                        attempt_id=attempt_id,
-                        visuals_missing=False,
-                    )
-
-            if not state.get("heavy_runner_unavailable"):
-                if run_id:
-                    log_run_event(
-                        run_id,
-                        "heavy_runner_complete",
-                        {
-                            "status": heavy_result.get("status"),
-                            "output_uri": heavy_result.get("output_uri"),
-                            "dataset_uri": heavy_result.get("dataset_uri"),
-                            "downloaded": list((heavy_result.get("downloaded") or {}).keys()),
-                            "missing_artifacts": heavy_result.get("missing_artifacts") or [],
-                            "gcs_listing": heavy_result.get("gcs_listing") or [],
-                            "error_present": bool(heavy_result.get("error")),
-                            "error_raw_present": bool(heavy_result.get("error_raw")),
-                            "status_ok": bool(heavy_result.get("status_ok")),
-                            "status_arbitration": heavy_result.get("status_arbitration"),
-                            "job_failed_raw": bool(heavy_result.get("job_failed_raw")),
-                            "gcloud_flag": heavy_result.get("gcloud_flag"),
-                        },
-                    )
-
-                heavy_error_kind = None
-                heavy_error_context = None
-                if heavy_result.get("error"):
-                    heavy_error_kind = "code"
-                    heavy_error_context = heavy_result.get("error")
-                elif heavy_result.get("job_failed"):
-                    heavy_error_kind = "infra"
-                    heavy_error_context = heavy_result.get("job_error")
-                state["heavy_runner_error_kind"] = heavy_error_kind
-                state["heavy_runner_error_context"] = heavy_error_context
-
-                output = f"HEAVY_RUNNER: status={heavy_result.get('status')} reason={heavy_reason}"
-                if heavy_result.get("job_failed"):
-                    output += f"\nHEAVY_RUNNER_ERROR: Job execution failed"
-                    job_err = heavy_result.get("job_error")
-                    if job_err:
-                        output += f"\nJOB_ERROR_DETAIL: {str(job_err)[:2000]}"
-                    output += "\nHEAVY_RUNNER_INFRA_ERROR"
-                if heavy_result.get("error"):
-                    err_payload = heavy_result.get("error")
-                    err_text = ""
-                    if isinstance(err_payload, dict):
-                        err_summary = err_payload.get("error") or ""
-                        err_stack = err_payload.get("stacktrace") or ""
-                        err_text = "\n".join([item for item in [err_summary, err_stack] if item])
-                    else:
-                        err_text = str(err_payload)
-                    if err_text:
-                        output += f"\nHEAVY_RUNNER_ERROR: {err_text[:4000]}"
-                    output += "\nHEAVY_RUNNER_CODE_ERROR"
-
-                visual_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
-                visual_cfg = visual_reqs.get("visual_requirements") if isinstance(visual_reqs.get("visual_requirements"), dict) else {}
-                visual_items = visual_cfg.get("items") if isinstance(visual_cfg.get("items"), list) else []
-                visual_required = bool(visual_cfg.get("required")) and bool(visual_items)
-                visuals_missing = bool(visual_required)
-                state["ml_skipped_reason"] = "HEAVY_RUNNER"
-
+                output = f"HEAVY_RUNNER_ERROR: {exc}"
                 return _finalize_heavy_execution(
                     state=state,
                     output=output,
@@ -14505,8 +14476,81 @@ def execute_code(state: AgentState) -> AgentState:
                     counters=counters,
                     run_id=run_id,
                     attempt_id=attempt_id,
-                    visuals_missing=visuals_missing,
+                    visuals_missing=False,
                 )
+
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "heavy_runner_complete",
+                    {
+                        "status": heavy_result.get("status"),
+                        "output_uri": heavy_result.get("output_uri"),
+                        "dataset_uri": heavy_result.get("dataset_uri"),
+                        "downloaded": list((heavy_result.get("downloaded") or {}).keys()),
+                        "missing_artifacts": heavy_result.get("missing_artifacts") or [],
+                        "gcs_listing": heavy_result.get("gcs_listing") or [],
+                        "error_present": bool(heavy_result.get("error")),
+                        "error_raw_present": bool(heavy_result.get("error_raw")),
+                        "status_ok": bool(heavy_result.get("status_ok")),
+                        "status_arbitration": heavy_result.get("status_arbitration"),
+                        "job_failed_raw": bool(heavy_result.get("job_failed_raw")),
+                        "gcloud_flag": heavy_result.get("gcloud_flag"),
+                    },
+                )
+
+            heavy_error_kind = None
+            heavy_error_context = None
+            if heavy_result.get("error"):
+                heavy_error_kind = "code"
+                heavy_error_context = heavy_result.get("error")
+            elif heavy_result.get("job_failed"):
+                heavy_error_kind = "infra"
+                heavy_error_context = heavy_result.get("job_error")
+            state["heavy_runner_error_kind"] = heavy_error_kind
+            state["heavy_runner_error_context"] = heavy_error_context
+
+            output = f"HEAVY_RUNNER: status={heavy_result.get('status')} reason={heavy_reason}"
+            if heavy_result.get("job_failed"):
+                output += f"\nHEAVY_RUNNER_ERROR: Job execution failed"
+                job_err = heavy_result.get("job_error")
+                if job_err:
+                    output += f"\nJOB_ERROR_DETAIL: {str(job_err)[:2000]}"
+                output += "\nHEAVY_RUNNER_INFRA_ERROR"
+            if heavy_result.get("error"):
+                err_payload = heavy_result.get("error")
+                err_text = ""
+                if isinstance(err_payload, dict):
+                    err_summary = err_payload.get("error") or ""
+                    err_stack = err_payload.get("stacktrace") or ""
+                    err_text = "\n".join([item for item in [err_summary, err_stack] if item])
+                else:
+                    err_text = str(err_payload)
+                if err_text:
+                    output += f"\nHEAVY_RUNNER_ERROR: {err_text[:4000]}"
+                output += "\nHEAVY_RUNNER_CODE_ERROR"
+
+            visual_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
+            visual_cfg = visual_reqs.get("visual_requirements") if isinstance(visual_reqs.get("visual_requirements"), dict) else {}
+            visual_items = visual_cfg.get("items") if isinstance(visual_cfg.get("items"), list) else []
+            visual_required = bool(visual_cfg.get("required")) and bool(visual_items)
+            visuals_missing = bool(visual_required)
+            state["ml_skipped_reason"] = "HEAVY_RUNNER"
+
+            return _finalize_heavy_execution(
+                state=state,
+                output=output,
+                exec_start_ts=exec_start_ts,
+                contract=contract,
+                eval_spec=eval_spec or {},
+                csv_sep=csv_sep,
+                csv_decimal=csv_decimal,
+                csv_encoding=csv_encoding,
+                counters=counters,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                visuals_missing=visuals_missing,
+            )
 
     # E2B Sandbox execution path
     print("    Backend: E2B Sandbox")

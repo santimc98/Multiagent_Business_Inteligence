@@ -15,6 +15,8 @@ Environment Variables:
     INPUT_URI: GCS URI to request.json with execution config
     OUTPUT_URI: GCS URI prefix for outputs
 """
+import ast
+import importlib.util
 import json
 import os
 import subprocess
@@ -36,6 +38,30 @@ HEAVY_RUNNER_PROTOCOL_VERSION = "de_mode_v1"
 DEFAULT_SCRIPT_TIMEOUT_SECONDS = 1740
 MIN_SCRIPT_TIMEOUT_SECONDS = 60
 MAX_SCRIPT_TIMEOUT_SECONDS = 7200
+
+_DYNAMIC_DEPENDENCY_MAP: Dict[str, Tuple[str, str]] = {
+    "torch": ("torch", "torch"),
+    "transformers": ("transformers", "transformers"),
+    "tokenizers": ("tokenizers", "tokenizers"),
+    "datasets": ("datasets", "datasets"),
+    "accelerate": ("accelerate", "accelerate"),
+    "sentence_transformers": ("sentence-transformers", "sentence_transformers"),
+    "shap": ("shap", "shap"),
+    "xgboost": ("xgboost", "xgboost"),
+    "lightgbm": ("lightgbm", "lightgbm"),
+    "catboost": ("catboost", "catboost"),
+    "optuna": ("optuna", "optuna"),
+    "imblearn": ("imbalanced-learn", "imblearn"),
+    "category_encoders": ("category_encoders", "category_encoders"),
+    "plotly": ("plotly", "plotly"),
+}
+
+_DYNAMIC_DEP_ALIASES: Dict[str, str] = {
+    "sentence-transformers": "sentence_transformers",
+    "sentence_transformers": "sentence_transformers",
+    "imbalanced-learn": "imblearn",
+    "imblearn": "imblearn",
+}
 
 
 def log(message: str) -> None:
@@ -99,6 +125,121 @@ def _resolve_script_timeout_seconds(payload: Optional[Dict[str, Any]] = None) ->
         return env_timeout
 
     return DEFAULT_SCRIPT_TIMEOUT_SECONDS
+
+
+def _extract_import_roots(code_text: str) -> Set[str]:
+    text = str(code_text or "")
+    try:
+        tree = ast.parse(text)
+    except Exception:
+        return set()
+    roots: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name:
+                    roots.add(alias.name.split(".")[0].strip().lower())
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                roots.add(node.module.split(".")[0].strip().lower())
+    return {root for root in roots if root}
+
+
+def _normalize_dependency_root(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    raw = raw.replace("-", "_")
+    raw = raw.split(".", 1)[0]
+    return _DYNAMIC_DEP_ALIASES.get(raw, raw)
+
+
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for item in items:
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _resolve_dynamic_dependency_plan(payload: Dict[str, Any], script_path: str) -> Dict[str, Any]:
+    required_raw = payload.get("required_dependencies")
+    required_roots: Set[str] = set()
+    if isinstance(required_raw, list):
+        required_roots = {
+            root
+            for root in (_normalize_dependency_root(dep) for dep in required_raw)
+            if root
+        }
+
+    script_import_roots: Set[str] = set()
+    if script_path and os.path.exists(script_path):
+        try:
+            with open(script_path, "r", encoding="utf-8") as f:
+                script_import_roots = {
+                    root
+                    for root in (_normalize_dependency_root(dep) for dep in _extract_import_roots(f.read()))
+                    if root
+                }
+        except Exception:
+            script_import_roots = set()
+
+    requested_roots = required_roots | script_import_roots
+    known_roots = set(_DYNAMIC_DEPENDENCY_MAP.keys())
+    install_roots = sorted(root for root in requested_roots if root in known_roots)
+    unknown_roots = sorted(root for root in requested_roots if root not in known_roots)
+
+    pip_packages: List[str] = []
+    missing_roots: List[str] = []
+    for root in install_roots:
+        pip_pkg, module_probe = _DYNAMIC_DEPENDENCY_MAP[root]
+        if _module_available(module_probe):
+            continue
+        missing_roots.append(root)
+        pip_packages.append(pip_pkg)
+
+    return {
+        "required_roots": sorted(required_roots),
+        "script_import_roots": sorted(script_import_roots),
+        "missing_roots": missing_roots,
+        "unknown_roots": unknown_roots,
+        "pip_packages": _dedupe_preserve_order(pip_packages),
+    }
+
+
+def _install_dynamic_dependencies(packages: List[str]) -> None:
+    packages = _dedupe_preserve_order(packages or [])
+    if not packages:
+        return
+    cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir", *packages]
+    log(f"Installing runtime dependencies: {packages}")
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stdout_tail = _ensure_text(proc.stdout)[-2000:]
+        stderr_tail = _ensure_text(proc.stderr)[-4000:]
+        raise RuntimeError(
+            "runtime_dependency_install_failed: "
+            + f"packages={packages}; exit_code={proc.returncode}; "
+            + f"stdout_tail={stdout_tail}; stderr_tail={stderr_tail}"
+        )
 
 
 def _parse_gs_uri(uri: str) -> Tuple[str, str]:
@@ -430,6 +571,21 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
     script_path = os.path.join(work_dir, "ml_script.py")
     log(f"Downloading ML script from {code_uri}")
     _download_to_path(code_uri, script_path)
+
+    dynamic_dep_install_enabled = str(os.getenv("HEAVY_RUNNER_DYNAMIC_DEP_INSTALL", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if dynamic_dep_install_enabled:
+        dep_plan = _resolve_dynamic_dependency_plan(payload, script_path)
+        unknown_roots = dep_plan.get("unknown_roots") or []
+        if unknown_roots:
+            log(f"Dependency roots ignored (not in dynamic allowlist): {unknown_roots}")
+        pip_packages = dep_plan.get("pip_packages") or []
+        if pip_packages:
+            _install_dynamic_dependencies([str(pkg) for pkg in pip_packages if str(pkg).strip()])
 
     # Execute script
     log("=" * 60)
