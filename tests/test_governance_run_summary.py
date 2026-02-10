@@ -54,3 +54,40 @@ def test_run_summary_integrity_warning_does_not_force_no_go(tmp_path, monkeypatc
     assert summary.get("integrity_critical_count") == 0
     assert "integrity_critical" not in summary.get("failed_gates", [])
     assert summary.get("run_outcome") in {"GO", "GO_WITH_LIMITATIONS"}
+
+
+def test_run_summary_reports_all_contract_views(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    views_dir = os.path.join("data", "contracts", "views")
+    os.makedirs(views_dir, exist_ok=True)
+    for name in [
+        "de_view",
+        "ml_view",
+        "cleaning_view",
+        "qa_view",
+        "reviewer_view",
+        "translator_view",
+        "results_advisor_view",
+    ]:
+        with open(os.path.join(views_dir, f"{name}.json"), "w", encoding="utf-8") as f:
+            json.dump({"role": name}, f)
+
+    summary = build_run_summary({"review_verdict": "APPROVED"})
+    present = set((summary.get("contract_views") or {}).get("present") or [])
+    assert "cleaning_view" in present
+    assert "qa_view" in present
+
+
+def test_run_summary_drops_broad_qa_gate_when_qa_packet_has_no_findings(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"missing": []}, f)
+
+    state = {
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "last_gate_context": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": ["qa_gates"]},
+        "qa_last_result": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": [], "hard_failures": []},
+    }
+    summary = build_run_summary(state)
+    assert "qa_gates" not in (summary.get("failed_gates") or [])

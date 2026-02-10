@@ -1,5 +1,6 @@
 import json
 import os
+import csv
 
 from src.agents.business_translator import BusinessTranslatorAgent
 
@@ -96,3 +97,31 @@ def test_translator_manifest_profiles_csv_dimensions(tmp_path, monkeypatch):
     assert scored["present"] is True
     assert scored["row_count"] == 2
     assert scored["column_count"] == 3
+
+
+def test_translator_manifest_csv_row_count_handles_multiline_cells(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+
+    with open(os.path.join("data", "scored_rows.csv"), "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "comment_text", "score"])
+        writer.writerow([1, "line one\nline two", 0.93])
+        writer.writerow([2, "single line", 0.11])
+
+    with open(os.path.join("data", "execution_contract.json"), "w", encoding="utf-8") as f:
+        json.dump({"required_outputs": ["data/scored_rows.csv"]}, f)
+
+    with open(os.path.join("data", "produced_artifact_index.json"), "w", encoding="utf-8") as f:
+        json.dump([{"path": "data/scored_rows.csv", "artifact_type": "predictions"}], f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    _ = agent.generate_report({"execution_output": "ok", "business_objective": "Objetivo"})
+
+    with open(os.path.join("data", "report_artifact_manifest.json"), "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    scored = next(item for item in manifest["items"] if item["path"] == "data/scored_rows.csv")
+    assert scored["present"] is True
+    assert scored["row_count"] == 2

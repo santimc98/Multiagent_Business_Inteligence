@@ -51,6 +51,22 @@ class _StubBoardMetricOnlyNeedsImprovement:
         }
 
 
+class _StubBoardSpuriousAreas:
+    def __init__(self):
+        self.last_prompt = None
+        self.last_response = None
+
+    def adjudicate(self, _context):
+        return {
+            "status": "APPROVE_WITH_WARNINGS",
+            "summary": "Minor caveats only.",
+            "failed_areas": ["qa_gates", "reviewer_alignment"],
+            "required_actions": [],
+            "confidence": "high",
+            "evidence": [],
+        }
+
+
 class _RuntimePathReviewer:
     def evaluate_results(self, *_args, **_kwargs):
         raise AssertionError("evaluate_results must be skipped when runtime markers are present.")
@@ -129,7 +145,7 @@ def test_run_review_board_increments_iteration_on_escalation_to_needs_improvemen
             "runtime": {"status": "OK", "runtime_fix_terminal": False},
             "result_evaluator": {"status": "APPROVE_WITH_WARNINGS"},
             "reviewer": {"status": "APPROVED"},
-            "qa_reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "REJECTED", "failed_gates": ["gate_x"]},
             "results_advisor": {"status": "APPROVE_WITH_WARNINGS"},
         },
     }
@@ -187,3 +203,31 @@ def test_run_review_board_metric_only_needs_improvement_is_downgraded(tmp_path, 
     assert result["review_verdict"] == "APPROVE_WITH_WARNINGS"
     assert "iteration_count" not in result
     assert any("REVIEW_BOARD_POLICY" in item for item in (result.get("feedback_history") or []))
+
+
+def test_run_review_board_drops_spurious_failed_areas_when_packets_are_clean(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardSpuriousAreas())
+    state = {
+        "review_verdict": "APPROVED",
+        "review_feedback": "All checks passed.",
+        "feedback_history": [],
+        "last_gate_context": {"failed_gates": [], "required_fixes": []},
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False},
+            "result_evaluator": {"status": "APPROVED"},
+            "reviewer": {"status": "APPROVED", "failed_gates": [], "hard_failures": []},
+            "qa_reviewer": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": [], "hard_failures": []},
+            "results_advisor": {"status": "APPROVED"},
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+    assert result["review_verdict"] == "APPROVE_WITH_WARNINGS"
+    assert not result["last_gate_context"].get("failed_gates")
+    assert any("REVIEW_BOARD_AREA_SANITIZE" in item for item in (result.get("feedback_history") or []))
+
+    with open("data/review_board_verdict.json", "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    assert payload.get("failed_areas") == []

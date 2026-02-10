@@ -127,6 +127,8 @@ def _collect_contract_views(base_dir: str = "data") -> Dict[str, Any]:
     view_names = [
         "de_view",
         "ml_view",
+        "cleaning_view",
+        "qa_view",
         "reviewer_view",
         "translator_view",
         "results_advisor_view",
@@ -139,6 +141,55 @@ def _collect_contract_views(base_dir: str = "data") -> Dict[str, Any]:
             paths[name] = path
             present.append(name)
     return {"paths": paths, "present": present}
+
+
+def _packet_has_no_findings(packet: Any) -> bool | None:
+    """
+    Return:
+    - True when packet is explicitly non-blocking (no failed/hard findings)
+    - False when packet has explicit findings
+    - None when packet is unavailable/unknown
+    """
+    if not isinstance(packet, dict):
+        return None
+    status = str(packet.get("status") or "").strip().upper()
+    failed = [str(x) for x in (packet.get("failed_gates") or []) if x]
+    hard = [str(x) for x in (packet.get("hard_failures") or []) if x]
+    if failed or hard:
+        return False
+    if status in {"REJECTED", "NEEDS_IMPROVEMENT", "FAIL", "FAILED", "ERROR", "CRASH"}:
+        return False
+    return True
+
+
+def _normalize_failed_gates_for_summary(state: Dict[str, Any], failed_gates: List[Any]) -> List[str]:
+    """
+    Keep deterministic failed gates, but drop broad board labels that are not backed
+    by reviewer packet evidence (e.g., "qa_gates" with empty qa_last_result findings).
+    """
+    raw = [str(item).strip() for item in (failed_gates or []) if str(item).strip()]
+    if not raw:
+        return []
+
+    qa_clean = _packet_has_no_findings(state.get("qa_last_result"))
+    reviewer_clean = _packet_has_no_findings(state.get("reviewer_last_result"))
+    results_clean = _packet_has_no_findings(state.get("results_last_result"))
+
+    drop_if_clean = {
+        "qa_gates": qa_clean,
+        "reviewer_alignment": reviewer_clean,
+        "results_quality": results_clean,
+    }
+
+    normalized: List[str] = []
+    for gate in raw:
+        key = gate.lower()
+        should_drop = drop_if_clean.get(key)
+        if should_drop is True:
+            continue
+        if gate not in normalized:
+            normalized.append(gate)
+    return normalized
 
 
 def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -290,6 +341,9 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     for gate in reducer_failed_gates:
         if gate and gate not in failed_gates:
             failed_gates.append(gate)
+
+    # Canonicalize broad failed-area labels against reviewer packet evidence.
+    failed_gates = _normalize_failed_gates_for_summary(state, failed_gates)
 
     # Counterfactual policy check
     counterfactual_policy = ""

@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import csv
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
@@ -226,12 +227,33 @@ def _human_size(num_bytes: Optional[int]) -> str:
 
 
 def _count_csv_rows(path: str) -> Optional[int]:
-    encodings = ("utf-8", "utf-8-sig", "latin-1")
+    dialect = load_output_dialect() or sniff_csv_dialect(path) or {}
+    sep = str(dialect.get("sep") or ",")
+    if len(sep) != 1:
+        sep = ","
+    quotechar = str(dialect.get("quotechar") or '"')
+    if len(quotechar) != 1:
+        quotechar = '"'
+    escapechar = dialect.get("escapechar")
+    if not isinstance(escapechar, str) or len(escapechar) != 1:
+        escapechar = None
+
+    encodings = [str(dialect.get("encoding") or "utf-8"), "utf-8-sig", "latin-1"]
+    tried = set()
     for enc in encodings:
+        if enc in tried:
+            continue
+        tried.add(enc)
         try:
-            with open(path, "r", encoding=enc, errors="ignore") as handle:
-                line_count = sum(1 for _ in handle)
-            return max(line_count - 1, 0)
+            with open(path, "r", encoding=enc, errors="replace", newline="") as handle:
+                reader = csv.reader(
+                    handle,
+                    delimiter=sep,
+                    quotechar=quotechar,
+                    escapechar=escapechar,
+                )
+                next(reader, None)  # header
+                return sum(1 for _ in reader)
         except Exception:
             continue
     return None
@@ -430,7 +452,11 @@ def _build_report_artifact_manifest(
         "governance_snapshot": {
             "review_verdict": review_verdict,
             "run_outcome": run_summary.get("run_outcome") if isinstance(run_summary, dict) else None,
-            "failed_gates": gate_context.get("failed_gates", []) if isinstance(gate_context, dict) else [],
+            "failed_gates": (
+                run_summary.get("failed_gates", [])
+                if isinstance(run_summary, dict) and isinstance(run_summary.get("failed_gates"), list)
+                else (gate_context.get("failed_gates", []) if isinstance(gate_context, dict) else [])
+            ),
             "required_fixes": gate_context.get("required_fixes", []) if isinstance(gate_context, dict) else [],
             "output_contract_status": output_contract_report.get("overall_status"),
         },
@@ -469,12 +495,19 @@ def _build_artifact_compliance_table_html(
     output_contract_report: Dict[str, Any],
     review_verdict: Optional[str],
     gate_context: Dict[str, Any],
+    run_summary: Optional[Dict[str, Any]] = None,
 ) -> str:
     summary = manifest.get("summary", {}) if isinstance(manifest, dict) else {}
     overall_status = str(output_contract_report.get("overall_status") or "unknown").lower()
-    failed_gates = gate_context.get("failed_gates", []) if isinstance(gate_context, dict) else []
-    if not isinstance(failed_gates, list):
-        failed_gates = []
+    failed_gates: List[str] = []
+    if isinstance(run_summary, dict):
+        summary_failed = run_summary.get("failed_gates")
+        if isinstance(summary_failed, list):
+            failed_gates = [str(g) for g in summary_failed if g]
+    if not failed_gates and isinstance(gate_context, dict):
+        context_failed = gate_context.get("failed_gates", [])
+        if isinstance(context_failed, list):
+            failed_gates = [str(g) for g in context_failed if g]
     rows: List[List[Any]] = [
         ["Output Contract Status", _status_badge(overall_status)],
         ["Review Verdict", html.escape(str(review_verdict or "UNKNOWN"))],
@@ -1494,6 +1527,7 @@ class BusinessTranslatorAgent:
             output_contract_report,
             review_verdict or compliance,
             gate_context if isinstance(gate_context, dict) else {},
+            run_summary if isinstance(run_summary, dict) else {},
         )
         kpi_snapshot_table_html = _build_kpi_snapshot_table_html(
             metrics_payload if isinstance(metrics_payload, dict) else {},

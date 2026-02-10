@@ -1802,15 +1802,41 @@ def _extract_manifest_row_count(manifest: Dict[str, Any]) -> int | None:
             return int(value)
     return None
 
-def _estimate_row_count(csv_path: str, encoding: str = "utf-8") -> int | None:
+def _estimate_row_count(
+    csv_path: str,
+    encoding: str = "utf-8",
+    sep: str = ",",
+    quotechar: str = '"',
+    escapechar: str | None = None,
+) -> int | None:
     if not csv_path or not os.path.exists(csv_path):
         return None
-    try:
-        with open(csv_path, "r", encoding=encoding, errors="ignore") as f:
-            total = sum(1 for _ in f)
-        return max(total - 1, 0)
-    except Exception:
-        return None
+    if not isinstance(sep, str) or len(sep) != 1:
+        sep = ","
+    if not isinstance(quotechar, str) or len(quotechar) != 1:
+        quotechar = '"'
+    if not isinstance(escapechar, str) or len(escapechar) != 1:
+        escapechar = None
+
+    encodings = [encoding, "utf-8-sig", "latin-1"]
+    tried: set[str] = set()
+    for enc in encodings:
+        if not enc or enc in tried:
+            continue
+        tried.add(enc)
+        try:
+            with open(csv_path, "r", encoding=enc, errors="replace", newline="") as f:
+                reader = csv.reader(
+                    f,
+                    delimiter=sep,
+                    quotechar=quotechar,
+                    escapechar=escapechar,
+                )
+                next(reader, None)  # header
+                return sum(1 for _ in reader)
+        except Exception:
+            continue
+    return None
 
 def _compute_exact_non_null_ratio(
     csv_path: str,
@@ -1864,7 +1890,13 @@ def _build_signal_summary_context(
 ) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
     manifest = _load_json_safe("data/cleaning_manifest.json")
-    row_count = _extract_manifest_row_count(manifest) or _estimate_row_count(csv_path, dialect.get("encoding", "utf-8"))
+    row_count = _extract_manifest_row_count(manifest) or _estimate_row_count(
+        csv_path,
+        dialect.get("encoding", "utf-8"),
+        str(dialect.get("sep") or ","),
+        str(dialect.get("quotechar") or '"'),
+        dialect.get("escapechar"),
+    )
     if row_count is not None:
         summary["row_count"] = row_count
     if header_cols:
@@ -16486,6 +16518,12 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         results_packet["status"] = "NEEDS_IMPROVEMENT"
     elif status == "APPROVE_WITH_WARNINGS":
         results_packet["status"] = "APPROVE_WITH_WARNINGS"
+    result_state["results_last_result"] = {
+        "status": results_packet.get("status"),
+        "failed_gates": [],
+        "required_fixes": [],
+        "hard_failures": [],
+    }
     facts_state = dict(state or {})
     facts_state.update(result_state)
     review_board_facts = _build_review_board_facts(facts_state)
@@ -16582,6 +16620,61 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     return result_state
 
 
+def _packet_has_explicit_findings(packet: Any) -> bool | None:
+    """
+    Return:
+    - True if packet explicitly indicates findings/failures
+    - False if packet explicitly indicates no findings
+    - None if packet is unavailable
+    """
+    if not isinstance(packet, dict):
+        return None
+    status = str(packet.get("status") or "").strip().upper()
+    failed = [str(x) for x in (packet.get("failed_gates") or []) if x]
+    hard = [str(x) for x in (packet.get("hard_failures") or []) if x]
+    if failed or hard:
+        return True
+    if status in {"REJECTED", "NEEDS_IMPROVEMENT", "FAIL", "FAILED", "ERROR", "CRASH"}:
+        return True
+    return False
+
+
+def _sanitize_board_failed_areas(
+    failed_areas: List[str],
+    board_context: Dict[str, Any],
+) -> tuple[List[str], List[str]]:
+    """
+    Remove broad failed-area labels when reviewer packets do not support them.
+    This keeps failed_areas aligned with deterministic packet evidence.
+    """
+    if not failed_areas:
+        return [], []
+    qa_findings = _packet_has_explicit_findings(board_context.get("qa_reviewer"))
+    reviewer_findings = _packet_has_explicit_findings(board_context.get("reviewer"))
+    results_findings = _packet_has_explicit_findings(board_context.get("results_advisor"))
+
+    qa_aliases = {"qa_gates", "qa", "qa_reviewer"}
+    reviewer_aliases = {"reviewer_alignment", "reviewer_gates", "reviewer", "code_alignment"}
+    results_aliases = {"results_quality", "results_advisor"}
+
+    kept: List[str] = []
+    dropped: List[str] = []
+    for area in [str(x) for x in failed_areas if x]:
+        key = area.strip().lower()
+        if key in qa_aliases and qa_findings is False:
+            dropped.append(area)
+            continue
+        if key in reviewer_aliases and reviewer_findings is False:
+            dropped.append(area)
+            continue
+        if key in results_aliases and results_findings is False:
+            dropped.append(area)
+            continue
+        if area not in kept:
+            kept.append(area)
+    return kept, dropped
+
+
 def run_review_board(state: AgentState) -> AgentState:
     print("--- [5.6] Review Board: Consolidating reviewer outputs ---")
     abort_state = _abort_if_requested(state, "review_board")
@@ -16637,6 +16730,7 @@ def run_review_board(state: AgentState) -> AgentState:
     final_status = _board_status_to_pipeline(board_status)
     board_summary = str(verdict.get("summary") or "").strip()
     failed_areas = [str(x) for x in (verdict.get("failed_areas") or []) if x]
+    failed_areas, dropped_failed_areas = _sanitize_board_failed_areas(failed_areas, board_context)
     required_actions = [str(x) for x in (verdict.get("required_actions") or []) if x]
     evidence = verdict.get("evidence") if isinstance(verdict.get("evidence"), list) else []
     confidence = str(verdict.get("confidence") or "medium").lower()
@@ -16649,6 +16743,11 @@ def run_review_board(state: AgentState) -> AgentState:
             current_feedback = f"REVIEW_BOARD: {board_summary}"
 
     history = list(state.get("feedback_history", []) or [])
+    if dropped_failed_areas:
+        history.append(
+            "REVIEW_BOARD_AREA_SANITIZE: dropped unsupported failed_areas="
+            + ", ".join(dropped_failed_areas[:6])
+        )
     if board_summary:
         history.append(f"REVIEW_BOARD[{board_status}]: {board_summary}")
     elif required_actions:
