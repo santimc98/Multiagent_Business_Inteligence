@@ -2861,6 +2861,16 @@ def _is_artifact_path_like(value: Any) -> bool:
     return True
 
 
+def _has_nonempty_runbook_payload(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value)
+    if isinstance(value, list):
+        return bool(value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return False
+
+
 def _validate_projected_views_for_execution(
     contract: Dict[str, Any],
     views: Dict[str, Any],
@@ -2878,12 +2888,25 @@ def _validate_projected_views_for_execution(
             output_path = de_view.get("output_path")
             manifest_path = de_view.get("output_manifest_path") or de_view.get("manifest_path")
             req_cols = de_view.get("required_columns")
+            cleaning_gates = de_view.get("cleaning_gates")
+            de_runbook = de_view.get("data_engineer_runbook")
             if not _is_artifact_path_like(output_path):
                 errors.append("de_view_output_path_invalid")
             if not _is_artifact_path_like(manifest_path):
                 errors.append("de_view_manifest_path_invalid")
             if not isinstance(req_cols, list) or not any(isinstance(col, str) and col.strip() for col in req_cols):
                 errors.append("de_view_required_columns_empty")
+            gates_ok = (
+                isinstance(cleaning_gates, list)
+                and any(
+                    (isinstance(g, str) and g.strip()) or (isinstance(g, dict) and bool(g))
+                    for g in cleaning_gates
+                )
+            )
+            if not gates_ok:
+                errors.append("de_view_cleaning_gates_empty")
+            if not _has_nonempty_runbook_payload(de_runbook):
+                errors.append("de_view_data_engineer_runbook_missing")
 
         cleaning_view = views.get("cleaning_view") if isinstance(views, dict) else None
         if not isinstance(cleaning_view, dict) or not cleaning_view:

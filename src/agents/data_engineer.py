@@ -96,8 +96,29 @@ class DataEngineerAgent:
         contract = execution_contract or contract_min or {}
         from src.utils.context_pack import compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
 
-        contract_json = json.dumps(compress_long_lists(contract)[0], indent=2)
         de_view = de_view or {}
+        contract_context = contract if isinstance(contract, dict) else {}
+        if not contract_context:
+            de_contract_context = {}
+            for key in (
+                "required_columns",
+                "optional_passthrough_columns",
+                "output_path",
+                "output_manifest_path",
+                "manifest_path",
+                "output_dialect",
+                "cleaning_gates",
+                "data_engineer_runbook",
+                "constraints",
+            ):
+                value = de_view.get(key)
+                if value in (None, "", [], {}):
+                    continue
+                if key == "manifest_path" and "output_manifest_path" in de_contract_context:
+                    continue
+                de_contract_context[key] = value
+            contract_context = de_contract_context
+        contract_json = json.dumps(compress_long_lists(contract_context)[0], indent=2)
         de_view_json = json.dumps(compress_long_lists(de_view)[0], indent=2)
         de_output_path = str(de_view.get("output_path") or "").strip()
         de_manifest_path = str(
@@ -105,11 +126,23 @@ class DataEngineerAgent:
             or de_view.get("manifest_path")
             or ""
         ).strip()
-        cleaning_gates = get_cleaning_gates(contract) or get_cleaning_gates(execution_contract or {}) or []
+        view_cleaning_gates = get_cleaning_gates({"cleaning_gates": de_view.get("cleaning_gates")})
+        cleaning_gates = (
+            get_cleaning_gates(contract)
+            or get_cleaning_gates(execution_contract or {})
+            or view_cleaning_gates
+            or []
+        )
         cleaning_gates_json = json.dumps(compress_long_lists(cleaning_gates)[0], indent=2)
 
         # V4.1: Use data_engineer_runbook only, no legacy role_runbooks fallback
-        de_runbook = contract.get("data_engineer_runbook") or {}
+        de_runbook = contract.get("data_engineer_runbook")
+        if de_runbook in (None, "", [], {}):
+            de_runbook = de_view.get("data_engineer_runbook")
+        if isinstance(de_runbook, str):
+            de_runbook = de_runbook.strip()
+        if de_runbook in (None, "", [], {}):
+            de_runbook = {}
         de_runbook_json = json.dumps(compress_long_lists(de_runbook)[0], indent=2)
 
         # [SAFETY] Truncate data_audit if massive to prevent context overflow

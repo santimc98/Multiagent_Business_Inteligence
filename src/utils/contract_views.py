@@ -41,7 +41,10 @@ class DEView(TypedDict, total=False):
     optional_passthrough_columns: List[str]
     output_path: str
     output_manifest_path: str
+    required_columns_path: str
     output_dialect: Dict[str, Any]
+    cleaning_gates: List[Dict[str, Any]]
+    data_engineer_runbook: Any
     constraints: Dict[str, Any]
 
 
@@ -125,6 +128,7 @@ _PRESERVE_KEYS = {
     "reviewer_gates",
     "qa_gates",
     "cleaning_gates",
+    "data_engineer_runbook",
     "evaluation_spec",
     "objective_analysis",
     "ml_engineer_runbook",
@@ -526,6 +530,20 @@ def _resolve_cleaning_gates(contract_min: Dict[str, Any], contract_full: Dict[st
     return []
 
 
+def _resolve_data_engineer_runbook(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> Any:
+    for source in (contract_full, contract_min):
+        if not isinstance(source, dict):
+            continue
+        runbook = source.get("data_engineer_runbook")
+        if isinstance(runbook, dict) and runbook:
+            return runbook
+        if isinstance(runbook, list) and runbook:
+            return runbook
+        if isinstance(runbook, str) and runbook.strip():
+            return runbook.strip()
+    return {}
+
+
 def _resolve_optional_outputs(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[str]:
     artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
         contract_full.get("artifact_requirements")
@@ -836,12 +854,16 @@ def build_de_view(
     passthrough_columns = _resolve_passthrough_columns(contract_min, contract_full, required_columns)
     output_path = _resolve_output_path(contract_min, contract_full, required_outputs)
     manifest_path = _resolve_manifest_path(contract_min, contract_full, required_outputs)
+    cleaning_gates = _resolve_cleaning_gates(contract_min, contract_full)
+    data_engineer_runbook = _resolve_data_engineer_runbook(contract_min, contract_full)
     view: DEView = {
         "role": "data_engineer",
         "required_columns": required_columns,
         "optional_passthrough_columns": passthrough_columns,
         "output_path": output_path or "",
         "required_columns_path": "data/required_columns.json",
+        "cleaning_gates": cleaning_gates,
+        "data_engineer_runbook": data_engineer_runbook,
         "constraints": {
             "scope": "cleaning_only",
             "hard_constraints": [
@@ -1479,6 +1501,13 @@ def build_contract_views_projection(
     reviewer_gates = get_reviewer_gates(contract_full)
     qa_gates = get_qa_gates(contract_full)
     cleaning_gates = get_cleaning_gates(contract_full)
+    data_engineer_runbook = contract_full.get("data_engineer_runbook")
+    if not isinstance(data_engineer_runbook, (dict, list, str)):
+        data_engineer_runbook = {}
+    if isinstance(data_engineer_runbook, str):
+        data_engineer_runbook = data_engineer_runbook.strip()
+        if not data_engineer_runbook:
+            data_engineer_runbook = {}
     reporting_policy = contract_full.get("reporting_policy")
     if not isinstance(reporting_policy, dict):
         reporting_policy = {}
@@ -1504,6 +1533,8 @@ def build_contract_views_projection(
         "optional_passthrough_columns": de_passthrough,
         "output_path": output_path,
         "required_columns_path": "data/required_columns.json",
+        "cleaning_gates": cleaning_gates if isinstance(cleaning_gates, list) else [],
+        "data_engineer_runbook": data_engineer_runbook,
         "constraints": {
             "scope": "cleaning_only",
             "hard_constraints": [

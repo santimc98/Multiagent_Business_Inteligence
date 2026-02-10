@@ -31,6 +31,8 @@ def test_de_view_excludes_prohibited_fields():
     assert "weights" not in payload
     assert "optimization" not in payload
     assert de_view.get("required_columns")
+    assert isinstance(de_view.get("cleaning_gates"), list)
+    assert "data_engineer_runbook" in de_view
 
 
 def test_ml_view_includes_required_fields():
@@ -72,6 +74,28 @@ def test_projection_ml_view_includes_contract_context_blocks():
     assert isinstance(ml_view.get("qa_gates"), list)
     assert isinstance(ml_view.get("reviewer_gates"), list)
     assert isinstance(ml_view.get("ml_engineer_runbook"), dict)
+
+
+def test_projection_de_view_includes_gates_and_runbook():
+    contract = {
+        "scope": "cleaning_only",
+        "cleaning_gates": [{"name": "required_columns_present", "severity": "HARD", "params": {}}],
+        "data_engineer_runbook": {"steps": ["load", "clean", "persist"]},
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["id", "feature_a"],
+                "output_path": "data/cleaned_data.csv",
+                "manifest_path": "data/cleaning_manifest.json",
+            }
+        },
+    }
+    projected = build_contract_views_projection(contract, artifact_index=[])
+    de_view = projected.get("de_view") or {}
+
+    assert isinstance(de_view.get("cleaning_gates"), list)
+    assert de_view.get("cleaning_gates")
+    assert isinstance(de_view.get("data_engineer_runbook"), dict)
+    assert de_view.get("data_engineer_runbook")
 
 
 def test_projection_ml_view_preserves_runbook_list_shape():

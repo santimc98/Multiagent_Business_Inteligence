@@ -2491,6 +2491,26 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                             required_cols,
                         )
                     )
+                de_cleaning_gates = de_view.get("cleaning_gates")
+                if not _gate_list_valid(de_cleaning_gates):
+                    issues.append(
+                        _strict_issue(
+                            "contract.de_view_cleaning_gates",
+                            "error",
+                            "de_view.cleaning_gates must be a non-empty list of consumable gate objects.",
+                            de_cleaning_gates,
+                        )
+                    )
+                de_runbook = de_view.get("data_engineer_runbook")
+                if not _runbook_present(de_runbook):
+                    issues.append(
+                        _strict_issue(
+                            "contract.de_view_data_engineer_runbook",
+                            "error",
+                            "de_view.data_engineer_runbook must be present and non-empty.",
+                            de_runbook,
+                        )
+                    )
 
         if requires_ml:
             ml_view = projected_views.get("ml_view") if isinstance(projected_views, dict) else None
