@@ -3216,8 +3216,8 @@ def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
             caption_template="Segment sizes based on available segment identifiers.",
         )
 
-    max_plots = 8
-    trimmed_plots = plots[:max_plots]
+    trimmed_plots = plots
+    max_plots = len(trimmed_plots)
 
     return {
         "enabled": bool(trimmed_plots),
@@ -3355,6 +3355,153 @@ def _build_visual_requirements(
         "notes": notes,
         "plot_spec": plot_spec,
     }
+
+
+def _ensure_contract_visual_policy(
+    contract: Dict[str, Any],
+    strategy: Dict[str, Any] | None,
+    business_objective: str | None,
+) -> Dict[str, Any]:
+    """
+    Ensure ML-capable contracts expose visual requirements and plot spec through
+    canonical contract fields consumed by downstream views.
+
+    Rules:
+    - Preserve explicit LLM-provided visual config when present.
+    - Fill missing pieces from contract/strategy context (no dataset hardcodes).
+    - Keep reporting_policy.plot_spec aligned with artifact_requirements.visual_requirements.plot_spec.
+    """
+    if not isinstance(contract, dict):
+        return contract
+    scope = normalize_contract_scope(contract.get("scope"))
+    if scope not in {"ml_only", "full_pipeline"}:
+        return contract
+
+    strategy_payload = strategy if isinstance(strategy, dict) else {}
+    objective_text = str(
+        business_objective
+        or contract.get("business_objective")
+        or ""
+    )
+
+    generated_visuals = _build_visual_requirements(contract, strategy_payload, objective_text)
+    auto_plot_spec = build_plot_spec(contract)
+    artifact_reqs = contract.get("artifact_requirements")
+    if not isinstance(artifact_reqs, dict):
+        artifact_reqs = {}
+    existing_visuals = artifact_reqs.get("visual_requirements")
+    has_explicit_visuals = isinstance(existing_visuals, dict) and bool(existing_visuals)
+    explicit_enabled = (
+        isinstance(existing_visuals, dict)
+        and isinstance(existing_visuals.get("enabled"), bool)
+    )
+    explicit_required = (
+        isinstance(existing_visuals, dict)
+        and isinstance(existing_visuals.get("required"), bool)
+    )
+
+    merged_visuals: Dict[str, Any] = dict(generated_visuals)
+    if isinstance(existing_visuals, dict):
+        for key in ("enabled", "required", "outputs_dir", "notes"):
+            if key in existing_visuals:
+                merged_visuals[key] = existing_visuals.get(key)
+        existing_items = existing_visuals.get("items")
+        if isinstance(existing_items, list) and existing_items:
+            merged_visuals["items"] = existing_items
+        existing_plot_spec = existing_visuals.get("plot_spec")
+        if isinstance(existing_plot_spec, dict) and existing_plot_spec:
+            merged_visuals["plot_spec"] = existing_plot_spec
+
+    plot_spec = merged_visuals.get("plot_spec")
+    if has_explicit_visuals:
+        if not isinstance(plot_spec, dict):
+            plot_spec = {}
+    else:
+        generated_plots = (
+            plot_spec.get("plots") if isinstance(plot_spec, dict) and isinstance(plot_spec.get("plots"), list) else []
+        )
+        if not generated_plots:
+            plot_spec = auto_plot_spec
+        elif not isinstance(plot_spec, dict) or not plot_spec:
+            plot_spec = auto_plot_spec
+    plots = plot_spec.get("plots") if isinstance(plot_spec.get("plots"), list) else []
+    normalized_plot_spec = dict(plot_spec)
+    normalized_plot_spec["enabled"] = bool(normalized_plot_spec.get("enabled", bool(plots)))
+    normalized_plot_spec["max_plots"] = int(normalized_plot_spec.get("max_plots", len(plots)))
+    merged_visuals["plot_spec"] = normalized_plot_spec
+
+    if not explicit_enabled:
+        merged_visuals["enabled"] = bool(plots)
+    if not explicit_required:
+        merged_visuals["required"] = bool(generated_visuals.get("required", False))
+    outputs_dir = merged_visuals.get("outputs_dir")
+    if not isinstance(outputs_dir, str) or not outputs_dir.strip():
+        merged_visuals["outputs_dir"] = "static/plots"
+    if not isinstance(merged_visuals.get("notes"), str):
+        merged_visuals["notes"] = str(generated_visuals.get("notes") or "")
+
+    items = merged_visuals.get("items")
+    if not isinstance(items, list) or not items:
+        merged_visuals["items"] = generated_visuals.get("items", []) if isinstance(generated_visuals.get("items"), list) else []
+        items = merged_visuals.get("items")
+
+    normalized_items: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, item in enumerate(items if isinstance(items, list) else []):
+        if not isinstance(item, dict):
+            continue
+        plot_id = str(item.get("id") or item.get("plot_id") or f"visual_{idx}")
+        safe_id = re.sub(r"[^0-9a-zA-Z]+", "_", plot_id).strip("_").lower() or f"visual_{idx}"
+        if safe_id in seen_ids:
+            safe_id = f"{safe_id}_{idx}"
+        seen_ids.add(safe_id)
+        normalized = dict(item)
+        normalized["id"] = safe_id
+        expected_filename = normalized.get("expected_filename")
+        if not isinstance(expected_filename, str) or not expected_filename.strip():
+            normalized["expected_filename"] = f"{safe_id}.png"
+        normalized_items.append(normalized)
+    merged_visuals["items"] = normalized_items
+    if not isinstance(existing_visuals, dict) or "notes" not in existing_visuals:
+        if bool(merged_visuals.get("enabled")) and normalized_items:
+            merged_visuals["notes"] = (
+                "Visual requirements are contract-driven. If items are listed, produce each exactly and "
+                "store status in data/visuals_status.json."
+            )
+        else:
+            merged_visuals["notes"] = "Visual requirements are disabled for this strategy."
+
+    artifact_reqs["visual_requirements"] = merged_visuals
+    contract["artifact_requirements"] = artifact_reqs
+
+    required_outputs = contract.get("required_outputs")
+    if not isinstance(required_outputs, list):
+        required_outputs = []
+    if bool(merged_visuals.get("required")) and normalized_items:
+        outputs_dir = str(merged_visuals.get("outputs_dir") or "static/plots")
+        for item in normalized_items:
+            expected = item.get("expected_filename")
+            if not expected:
+                continue
+            if os.path.isabs(str(expected)):
+                plot_path = str(expected)
+            else:
+                plot_path = os.path.normpath(os.path.join(outputs_dir, str(expected)))
+            if is_probably_path(plot_path) and plot_path not in required_outputs:
+                required_outputs.append(plot_path)
+    contract["required_outputs"] = required_outputs
+
+    policy = contract.get("reporting_policy")
+    if not isinstance(policy, dict):
+        execution_plan = contract.get("execution_plan")
+        policy = build_reporting_policy(
+            execution_plan if isinstance(execution_plan, dict) else {},
+            strategy_payload,
+        )
+    policy = dict(policy)
+    policy["plot_spec"] = merged_visuals.get("plot_spec")
+    contract["reporting_policy"] = policy
+    return contract
 
 
 def _build_decisioning_requirements(
@@ -6293,6 +6440,8 @@ class ExecutionPlannerAgent:
                 "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "For ML scopes, include non-empty evaluation_spec and ensure objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
+                "For ML scopes, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
+                "aligned with strategy/evidence so views can request the right visuals.\n"
                 "Gate lists must be executable by downstream views: use gate objects with "
                 "{name, severity, params} (severity in HARD|SOFT). If using metric/check/rule language, "
                 "map it to name and keep semantic details in params.\n"
@@ -6587,6 +6736,8 @@ class ExecutionPlannerAgent:
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
+                "For ML scope, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
+                "aligned with strategy/evidence so views can request the right visuals.\n"
                 "Gate lists must be executable by downstream views: each gate should expose a consumable identifier "
                 "(prefer name) and include severity + params.\n"
                 f"Required keys for this section: {json.dumps(required_keys)}\n"
@@ -6624,6 +6775,8 @@ class ExecutionPlannerAgent:
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n\n"
+                "For ML scope, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
+                "aligned with strategy/evidence so views can request the right visuals.\n\n"
                 "Gate lists must be executable by downstream views: each gate should expose a consumable identifier "
                 "(prefer name) and include severity + params.\n\n"
                 "ORIGINAL INPUTS:\n"
@@ -6948,6 +7101,12 @@ class ExecutionPlannerAgent:
             return diagnostics
 
         def _finalize_and_persist(contract, where, llm_success: bool):
+            if isinstance(contract, dict) and contract:
+                contract = _ensure_contract_visual_policy(
+                    contract=contract,
+                    strategy=strategy if isinstance(strategy, dict) else {},
+                    business_objective=business_objective,
+                )
             diagnostics = _build_contract_diagnostics(contract if isinstance(contract, dict) else {}, where, llm_success)
             self.last_contract_diagnostics = diagnostics
             _persist_contracts(
