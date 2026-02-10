@@ -2036,6 +2036,205 @@ def _build_signal_summary_context(
                 }
     return summary
 
+def _invert_column_roles(column_roles: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Build column -> roles mapping from contract column_roles payload."""
+    inverted: Dict[str, List[str]] = {}
+    if not isinstance(column_roles, dict):
+        return inverted
+    for role, cols in column_roles.items():
+        if not isinstance(cols, list):
+            continue
+        for col in cols:
+            if not col:
+                continue
+            key = str(col)
+            roles = inverted.setdefault(key, [])
+            if role not in roles:
+                roles.append(str(role))
+    return inverted
+
+
+def _pick_split_column(df: pd.DataFrame, column_roles: Dict[str, Any]) -> str | None:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    candidates: List[str] = []
+    if isinstance(column_roles, dict):
+        split_cols = column_roles.get("split_indicator")
+        if isinstance(split_cols, list):
+            candidates.extend([str(c) for c in split_cols if c])
+    if "__split" not in candidates:
+        candidates.append("__split")
+    for cand in candidates:
+        if cand in df.columns:
+            return cand
+    return None
+
+
+def _build_cleaned_data_summary_min(
+    df_clean: pd.DataFrame,
+    contract: Dict[str, Any] | None,
+    required_columns: List[str] | None,
+    data_path: str | None = None,
+    max_columns: int = 120,
+) -> Dict[str, Any]:
+    """
+    Build compact cleaned-data facts for ML context without duplicating full profiling.
+    The summary is deterministic, small, and derived from DE output + contract decisions.
+    """
+    contract = contract if isinstance(contract, dict) else {}
+    required_columns = [str(col) for col in (required_columns or []) if col]
+    column_roles = get_column_roles(contract)
+    canonical_columns = get_canonical_columns(contract)
+    role_by_column = _invert_column_roles(column_roles if isinstance(column_roles, dict) else {})
+
+    df_cols = [str(c) for c in list(df_clean.columns)]
+    df_col_set = set(df_cols)
+
+    # Prioritize contract columns for compact context. Fall back to full columns for narrow datasets.
+    priority: List[str] = []
+    for seq in (
+        required_columns,
+        canonical_columns if isinstance(canonical_columns, list) else [],
+        list(role_by_column.keys()),
+    ):
+        for col in seq:
+            col_s = str(col)
+            if col_s and col_s not in priority:
+                priority.append(col_s)
+    if len(df_cols) <= max_columns:
+        columns_for_summary = list(df_cols)
+    else:
+        columns_for_summary = [col for col in priority if col in df_col_set]
+        for col in df_cols:
+            if col in columns_for_summary:
+                continue
+            columns_for_summary.append(col)
+            if len(columns_for_summary) >= max_columns:
+                break
+
+    split_column = _pick_split_column(df_clean, column_roles if isinstance(column_roles, dict) else {})
+    train_mask = None
+    test_mask = None
+    train_rows = None
+    test_rows = None
+    if split_column and split_column in df_clean.columns:
+        try:
+            split_series = df_clean[split_column].astype(str).str.strip().str.lower()
+            train_mask = split_series.eq("train")
+            test_mask = split_series.eq("test")
+            train_rows = int(train_mask.sum())
+            test_rows = int(test_mask.sum())
+        except Exception:
+            train_mask = None
+            test_mask = None
+            train_rows = None
+            test_rows = None
+
+    objective_type = (
+        str(contract.get("objective_type") or "")
+        or str((contract.get("objective_analysis") or {}).get("problem_type") or "")
+        or str((contract.get("evaluation_spec") or {}).get("objective_type") or "")
+    ).strip().lower()
+
+    def _role_dtype_warning(roles: List[str], series: pd.Series) -> str | None:
+        if not roles:
+            return None
+        roles_set = {str(r) for r in roles}
+        is_numeric = pd.api.types.is_numeric_dtype(series)
+        is_datetime = pd.api.types.is_datetime64_any_dtype(series)
+        is_object = pd.api.types.is_object_dtype(series)
+        if "temporal_features" in roles_set and not (is_datetime or is_object):
+            return "temporal_role_with_non_temporal_dtype"
+        if ("numerical_features" in roles_set or "spatial_features" in roles_set) and not is_numeric:
+            return "numeric_role_with_non_numeric_dtype"
+        if any(r in roles_set for r in ("categorical_features", "id", "split_indicator")) and is_numeric:
+            return "categorical_role_with_numeric_dtype"
+        if "target" in roles_set and objective_type in {"regression", "forecasting", "time_series"} and not is_numeric:
+            return "target_role_with_non_numeric_dtype_for_regression"
+        return None
+
+    def _masked_null_frac(series: pd.Series, mask: pd.Series | None) -> float | None:
+        if mask is None:
+            return None
+        try:
+            sliced = series[mask]
+        except Exception:
+            return None
+        if sliced.shape[0] == 0:
+            return None
+        try:
+            return round(float(sliced.isna().mean()), 6)
+        except Exception:
+            return None
+
+    rows_total = int(len(df_clean))
+    missing_required = [col for col in required_columns if col not in df_col_set]
+    column_summaries: List[Dict[str, Any]] = []
+    role_dtype_warnings: List[Dict[str, Any]] = []
+
+    for col in columns_for_summary:
+        present = col in df_col_set
+        expected_roles = role_by_column.get(col, [])
+        summary: Dict[str, Any] = {
+            "column_name": col,
+            "present": bool(present),
+            "dtype_observed": None,
+            "null_frac": None,
+            "in_train": None,
+            "in_test": None,
+            "mismatch_with_contract": {
+                "expected_in_required_columns": col in required_columns,
+                "required_but_missing": bool(col in required_columns and not present),
+                "expected_roles": expected_roles,
+                "role_dtype_warning": None,
+            },
+        }
+        if present:
+            series = df_clean[col]
+            try:
+                summary["dtype_observed"] = str(series.dtype)
+            except Exception:
+                summary["dtype_observed"] = None
+            try:
+                summary["null_frac"] = round(float(series.isna().mean()), 6)
+            except Exception:
+                summary["null_frac"] = None
+            if train_mask is not None:
+                summary["in_train"] = {
+                    "rows": train_rows,
+                    "null_frac": _masked_null_frac(series, train_mask),
+                }
+            if test_mask is not None:
+                summary["in_test"] = {
+                    "rows": test_rows,
+                    "null_frac": _masked_null_frac(series, test_mask),
+                }
+            warning = _role_dtype_warning(expected_roles, series)
+            if warning:
+                summary["mismatch_with_contract"]["role_dtype_warning"] = warning
+                role_dtype_warnings.append(
+                    {"column": col, "warning": warning, "expected_roles": expected_roles, "dtype": summary["dtype_observed"]}
+                )
+        column_summaries.append(summary)
+
+    omitted_columns_count = max(0, len(df_cols) - len(columns_for_summary))
+    return {
+        "version": "v1",
+        "source": "system_after_data_engineer",
+        "advisory_only": True,
+        "contract_precedence_policy": "if_conflict_use_ml_view_and_execution_contract",
+        "data_path": str(data_path or "data/cleaned_data.csv"),
+        "row_count": rows_total,
+        "column_count": int(len(df_cols)),
+        "split_column": split_column,
+        "required_columns": required_columns,
+        "missing_required_columns": missing_required,
+        "omitted_columns_count": omitted_columns_count,
+        "role_dtype_warnings": role_dtype_warnings,
+        "column_summaries": column_summaries,
+    }
+
+
 def _build_required_raw_map(
     required_cols: List[str],
     norm_map: Dict[str, str],
@@ -7778,6 +7977,8 @@ class AgentState(TypedDict):
     csv_decimal: str
     dataset_scale_hints: Dict[str, Any]
     dataset_scale: str
+    cleaned_data_summary_min: Dict[str, Any]
+    cleaned_data_summary_min_path: str
     dataset_semantics: Dict[str, Any]
     dataset_semantics_summary: str
     dataset_training_mask: Dict[str, Any]
@@ -12702,6 +12903,33 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 df_final = df_mapped
                 print(f"Host mapping disabled; using DE cleaned artifact as-is: {local_cleaned_path}")
 
+            cleaned_data_summary_min = {}
+            cleaned_data_summary_min_path = "data/cleaned_data_summary_min.json"
+            try:
+                cleaned_data_summary_min = _build_cleaned_data_summary_min(
+                    df_clean=df_final,
+                    contract=contract,
+                    required_columns=required_cols,
+                    data_path=local_cleaned_path,
+                )
+                dump_json(cleaned_data_summary_min_path, cleaned_data_summary_min)
+                if run_id:
+                    log_run_event(
+                        run_id,
+                        "cleaned_data_summary_min_built",
+                        {
+                            "path": cleaned_data_summary_min_path,
+                            "row_count": cleaned_data_summary_min.get("row_count"),
+                            "column_count": cleaned_data_summary_min.get("column_count"),
+                            "missing_required_columns": cleaned_data_summary_min.get("missing_required_columns", []),
+                            "role_dtype_warnings": len(cleaned_data_summary_min.get("role_dtype_warnings", [])),
+                        },
+                    )
+            except Exception as summary_err:
+                print(f"Warning: failed to build cleaned_data_summary_min: {summary_err}")
+                cleaned_data_summary_min = {}
+                cleaned_data_summary_min_path = ""
+
             # Save Summary
             with open("data/column_mapping_summary.json", "w", encoding="utf-8") as f:
                 json.dump(mapping_result, f, indent=2)
@@ -12749,6 +12977,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "dataset_scale": dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None,
             "ml_data_path": local_cleaned_path,
             "cleaning_manifest_path": local_manifest_path,
+            "cleaned_data_summary_min": cleaned_data_summary_min,
+            "cleaned_data_summary_min_path": cleaned_data_summary_min_path,
         }
         merged_state = dict(state or {})
         merged_state.update(result)
@@ -12958,6 +13188,11 @@ def run_engineer(state: AgentState) -> AgentState:
         )
     required_input_cols = _resolve_required_input_columns(execution_contract, strategy)
     header_cols = _read_csv_header(data_path, csv_encoding, csv_sep) if os.path.exists(data_path) else []
+    cleaned_data_summary_min = state.get("cleaned_data_summary_min")
+    if not isinstance(cleaned_data_summary_min, dict) or not cleaned_data_summary_min:
+        cleaned_data_summary_min = _load_json_safe("data/cleaned_data_summary_min.json")
+    if not isinstance(cleaned_data_summary_min, dict):
+        cleaned_data_summary_min = {}
     if required_input_cols and header_cols and not minimal_context_mode:
         header_norm = {_norm_name(c) for c in header_cols}
         missing_required = [c for c in required_input_cols if _norm_name(c) not in header_norm]
@@ -13060,6 +13295,8 @@ def run_engineer(state: AgentState) -> AgentState:
             if not ml_plan_for_gen:
                 ml_plan_for_gen = _load_json_safe("data/ml_plan.json")
             kwargs["ml_plan"] = ml_plan_for_gen or {}
+        if "cleaned_data_summary_min" in sig.parameters:
+            kwargs["cleaned_data_summary_min"] = cleaned_data_summary_min or {}
         aliasing = {}
         derived_present = []
         sample_context = ""
@@ -13085,6 +13322,12 @@ def run_engineer(state: AgentState) -> AgentState:
             if isinstance(ml_view, dict) and ml_view:
                 context_ops_blocks.append(
                     "ML_VIEW_CONTEXT:\n" + json.dumps(compress_long_lists(ml_view)[0], ensure_ascii=True)
+                )
+            if cleaned_data_summary_min:
+                compact_cleaned_summary = compress_long_lists(cleaned_data_summary_min)[0]
+                context_ops_blocks.append(
+                    "CLEANED_DATA_SUMMARY_MIN (ADVISORY_ONLY; NEVER_OVERRIDE_ML_VIEW_OR_EXECUTION_CONTRACT):\n"
+                    + json.dumps(compact_cleaned_summary, ensure_ascii=True)
                 )
             if header_cols:
                 norm_map = {}
@@ -13197,6 +13440,7 @@ def run_engineer(state: AgentState) -> AgentState:
                     "csv_sep": csv_sep,
                     "csv_decimal": csv_decimal,
                     "ml_view": kwargs.get("ml_view"),
+                    "cleaned_data_summary_min": cleaned_data_summary_min,
                     "data_audit_context": data_audit_context,
                     "last_gate_context": gate_context,
                     "iteration_handoff": iteration_handoff,
@@ -13216,6 +13460,7 @@ def run_engineer(state: AgentState) -> AgentState:
                     "required_features": strategy.get("required_columns", []),
                     "execution_contract": execution_contract,
                     "ml_view": state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view"),
+                    "cleaned_data_summary_min": cleaned_data_summary_min,
                     "data_audit_context": data_audit_context,
                     "iteration_handoff": iteration_handoff,
                     "ml_engineer_audit_override": ml_audit_override,

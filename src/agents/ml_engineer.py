@@ -1817,6 +1817,7 @@ $strategy_json
         ml_plan: Dict[str, Any] | None = None,
         # V4.1: availability_summary parameter removed
         signal_summary: Dict[str, Any] | None = None,
+        cleaned_data_summary_min: Dict[str, Any] | None = None,
         iteration_memory: List[Dict[str, Any]] | None = None,
         iteration_memory_block: str = "",
         dataset_scale: Dict[str, Any] | None = None,
@@ -1851,6 +1852,8 @@ $strategy_json
            * required_plot_ids (if any)
          - If any mandatory map field is unknown or contradictory, raise ValueError and stop.
          - Do not silently continue on ambiguous contract interpretation.
+         - CLEANED_DATA_SUMMARY_MIN is advisory context only. It must NEVER redefine target columns, required outputs, gates, roles, or validation policy.
+         - If CLEANED_DATA_SUMMARY_MIN conflicts with ML_VIEW_CONTEXT / Execution Contract, treat it as a warning and follow ML_VIEW_CONTEXT + Execution Contract.
 
          UNIVERSAL PREFLIGHT GATES (RUN BEFORE model.fit)
          - Gate A: input_required_columns exist in the loaded dataframe.
@@ -2125,6 +2128,7 @@ $strategy_json
         - Business sanity checks: $business_sanity_checks_json
         - Alignment Requirements: $alignment_requirements_json
         - Signal Summary: $signal_summary_json
+        - Cleaned Data Summary (minimal, advisory-only): $cleaned_data_summary_min_json
         - Iteration Memory: $iteration_memory_json
         - Iteration Memory (compact): $iteration_memory_block
         - Data audit context: $data_audit_context
@@ -2462,6 +2466,9 @@ $strategy_json
             ml_engineer_runbook=ml_runbook_json,
             # V4.1: availability_summary removed
             signal_summary_json=json.dumps(compress_long_lists(signal_summary or {})[0], indent=2),
+            cleaned_data_summary_min_json=json.dumps(
+                compress_long_lists(cleaned_data_summary_min or {})[0], indent=2
+            ),
             iteration_memory_json=json.dumps(compress_long_lists(iteration_memory or [])[0], indent=2),
             iteration_memory_block=iteration_memory_block or "",
             dataset_scale=dataset_scale,
