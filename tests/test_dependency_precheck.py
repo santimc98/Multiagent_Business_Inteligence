@@ -1,4 +1,4 @@
-from src.utils.sandbox_deps import check_dependency_precheck
+from src.utils.sandbox_deps import check_dependency_precheck, cloudrun_imports_from_code
 
 
 def test_dependency_precheck_blocks_banned_import():
@@ -26,3 +26,23 @@ def test_dependency_precheck_blocks_extended_when_not_requested():
     code = "import rapidfuzz\n"
     result = check_dependency_precheck(code, required_dependencies=[])
     assert "rapidfuzz" in result["blocked"]
+
+
+def test_dependency_precheck_blocks_torch_on_e2b():
+    code = "import torch\n"
+    result = check_dependency_precheck(code, required_dependencies=[], backend_profile="e2b")
+    assert "torch" in result["banned"]
+
+
+def test_dependency_precheck_allows_torch_on_cloudrun():
+    code = "import torch\n"
+    result = check_dependency_precheck(code, required_dependencies=[], backend_profile="cloudrun")
+    assert "torch" not in result["banned"]
+    assert "torch" not in result["blocked"]
+
+
+def test_cloudrun_import_detection_handles_markdown_fences():
+    code = "```python\nfrom transformers import AutoModel\nimport torch\n```"
+    imports = cloudrun_imports_from_code(code)
+    assert "transformers" in imports
+    assert "torch" in imports

@@ -69,11 +69,10 @@ from src.utils.output_contract import check_required_outputs, get_csv_dialect
 from src.utils.cloudrun_launcher import launch_heavy_runner_job, CloudRunLaunchError
 from src.utils.column_sets import expand_column_sets
 from src.utils.sandbox_deps import (
-    BASE_ALLOWLIST,
-    EXTENDED_ALLOWLIST,
-    BANNED_ALLOWLIST,
     check_dependency_precheck,
     get_sandbox_install_packages,
+    requires_cloudrun_backend,
+    cloudrun_imports_from_code,
 )
 from src.utils.case_alignment import build_case_alignment_report
 # REMOVED: from src.utils.contract_validation import ensure_role_runbooks  # V4.1 cutover
@@ -9032,6 +9031,57 @@ def _should_use_heavy_runner(
     return bool(memory_decision.get("use_heavy")), str(memory_decision.get("reason") or "unknown")
 
 
+def _resolve_ml_backend_selection(state: Dict[str, Any]) -> Dict[str, Any]:
+    heavy_cfg = _get_heavy_runner_config()
+    contract, _contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
+    required_deps = contract.get("required_dependencies", []) if isinstance(contract, dict) else []
+    heavy_deps_required = requires_cloudrun_backend(required_deps)
+    generated_code = str(state.get("generated_code") or "")
+    heavy_imports_in_code = cloudrun_imports_from_code(generated_code)
+    heavy_deps_from_code = bool(heavy_imports_in_code)
+    ml_plan = state.get("ml_plan")
+    if not isinstance(ml_plan, dict) or not ml_plan:
+        loaded_plan = _load_json_safe("data/ml_plan.json")
+        ml_plan = loaded_plan if isinstance(loaded_plan, dict) else {}
+    data_profile = state.get("data_profile")
+    if not isinstance(data_profile, dict):
+        data_profile = {}
+    use_heavy = False
+    reason = "no_heavy_config"
+    heavy_unavailable = bool(state.get("heavy_runner_unavailable"))
+    if heavy_cfg:
+        if heavy_deps_from_code and not heavy_unavailable:
+            use_heavy = True
+            reason = "heavy_imports_in_code"
+        elif heavy_deps_required and not heavy_unavailable:
+            use_heavy = True
+            reason = "heavy_dependencies_required"
+        elif heavy_deps_from_code and heavy_unavailable:
+            use_heavy = False
+            reason = "heavy_imports_in_code_but_cloudrun_unavailable"
+        elif heavy_deps_required and heavy_unavailable:
+            use_heavy = False
+            reason = "heavy_dependencies_required_but_cloudrun_unavailable"
+        else:
+            use_heavy, reason = _should_use_heavy_runner(state, data_profile, ml_plan)
+    elif heavy_deps_from_code:
+        reason = "heavy_imports_in_code_but_cloudrun_unavailable"
+    elif heavy_deps_required:
+        reason = "heavy_dependencies_required_but_cloudrun_unavailable"
+    backend_profile = "cloudrun" if heavy_cfg and use_heavy else "e2b"
+    return {
+        "heavy_cfg": heavy_cfg,
+        "use_heavy": bool(use_heavy),
+        "reason": reason,
+        "backend_profile": backend_profile,
+        "heavy_deps_required": bool(heavy_deps_required),
+        "heavy_deps_from_code": bool(heavy_deps_from_code),
+        "heavy_imports_in_code": list(heavy_imports_in_code),
+        "ml_plan": ml_plan,
+        "data_profile": data_profile,
+    }
+
+
 def _build_de_backend_memory_decision(
     state: Dict[str, Any],
     required_cols_count: int = 0,
@@ -13701,7 +13751,9 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     contract = state.get("execution_contract", {}) or {}
     strategy = state.get("selected_strategy", {}) or {}
     required_deps = contract.get("required_dependencies", []) or []
-    dep_result = check_dependency_precheck(code, required_deps)
+    backend_selection = _resolve_ml_backend_selection(state if isinstance(state, dict) else {})
+    dep_backend_profile = backend_selection.get("backend_profile", "e2b")
+    dep_result = check_dependency_precheck(code, required_deps, backend_profile=dep_backend_profile)
     if dep_result.get("banned") or dep_result.get("blocked"):
         blocked = dep_result.get("blocked", [])
         banned = dep_result.get("banned", [])
@@ -13717,7 +13769,10 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             if hint:
                 hint_parts.append(f"{key}: {hint}")
         hint_text = f" Suggestions: {' | '.join(hint_parts)}" if hint_parts else ""
-        feedback = f"DEPENDENCY_BLOCKED: {'; '.join(parts)}.{hint_text}"
+        feedback = (
+            f"DEPENDENCY_BLOCKED[{dep_backend_profile}]: {'; '.join(parts)}."
+            f"{hint_text}"
+        )
         history = list(state.get("feedback_history", []))
         history.append(feedback)
         gate_context = {
@@ -14028,16 +14083,55 @@ def execute_code(state: AgentState) -> AgentState:
     code = state['generated_code']
     attempt_id = int(state.get("execution_attempt", 0)) + 1
     visuals_missing = False
+    contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
+    backend_selection = _resolve_ml_backend_selection(state if isinstance(state, dict) else {})
+    heavy_cfg = backend_selection.get("heavy_cfg")
+    use_heavy = bool(backend_selection.get("use_heavy"))
+    heavy_reason = str(backend_selection.get("reason") or "unknown")
+    dependency_backend = str(backend_selection.get("backend_profile") or "e2b")
+    ml_plan = backend_selection.get("ml_plan") if isinstance(backend_selection.get("ml_plan"), dict) else {}
+    data_profile = (
+        backend_selection.get("data_profile")
+        if isinstance(backend_selection.get("data_profile"), dict)
+        else {}
+    )
+
+    # Shared prechecks for both backends (Cloud Run + E2B) to keep behavior aligned.
+    is_safe, violations = scan_code_safety(code)
+    if not is_safe:
+        failure_reason = "CRITICAL: Security Violations:\n" + "\n".join(violations)
+        print(f"Security Block: {failure_reason}")
+        if run_id:
+            log_run_event(run_id, "execution_security_blocked", {"violations": violations[:20]})
+        return {"error_message": failure_reason, "execution_output": failure_reason, "budget_counters": counters}
+
+    required_deps = contract.get("required_dependencies", []) if isinstance(contract, dict) else []
+    dep_result = check_dependency_precheck(code, required_deps or [], backend_profile=dependency_backend)
+    blocked = dep_result.get("blocked") or []
+    banned = dep_result.get("banned") or []
+    if banned or blocked:
+        parts: List[str] = []
+        if banned:
+            parts.append(f"banned imports: {', '.join(banned)}")
+        if blocked:
+            parts.append(f"imports not in allowlist: {', '.join(blocked)}")
+        msg = f"EXECUTION ERROR: DEPENDENCY_BLOCKED[{dependency_backend}] " + "; ".join(parts)
+        suggestions = dep_result.get("suggestions", {}) if isinstance(dep_result, dict) else {}
+        hints = [f"{name}: {suggestions.get(name)}" for name in (banned + blocked) if suggestions.get(name)]
+        if hints:
+            msg += " | Suggestions: " + " | ".join(hints)
+        fh = list(state.get("feedback_history", []))
+        fh.append(msg)
+        if run_id:
+            log_run_event(
+                run_id,
+                "execution_dependency_blocked",
+                {"banned": banned, "blocked": blocked, "suggestions": suggestions},
+            )
+        return {"error_message": msg, "execution_output": msg, "feedback_history": fh, "budget_counters": counters}
 
     # Optional heavy runner path (Cloud Run Job) for large workloads
-    heavy_cfg = _get_heavy_runner_config()
     if heavy_cfg:
-        ml_plan = state.get("ml_plan")
-        if not ml_plan:
-            ml_plan = _load_json_safe("data/ml_plan.json")
-        ml_plan = ml_plan or {}
-        data_profile = state.get("data_profile") or {}
-        use_heavy, heavy_reason = _should_use_heavy_runner(state, data_profile, ml_plan)
         if run_id:
             hints = state.get("dataset_scale_hints") or {}
             cv_policy = ml_plan.get("cv_policy") if isinstance(ml_plan, dict) else {}
@@ -14060,7 +14154,6 @@ def execute_code(state: AgentState) -> AgentState:
             )
         if use_heavy:
             print(f"    Backend: Cloud Run Heavy Runner (reason={heavy_reason})")
-            contract = state.get("execution_contract", {}) or {}
             dialect = _resolve_artifact_gate_dialect(state, contract)
             csv_sep = dialect["sep"]
             csv_decimal = dialect["decimal"]
@@ -14425,34 +14518,11 @@ def execute_code(state: AgentState) -> AgentState:
     except Exception:
         pass
 
-    # 0. Static Safety Scan
-    is_safe, violations = scan_code_safety(code)
-    if not is_safe:
-        failure_reason = "CRITICAL: Security Violations:\n" + "\n".join(violations)
-        print(f"🚫 Security Block: {failure_reason}")
-        return {"error_message": failure_reason, "execution_output": failure_reason, "budget_counters": counters}
-
-    # Dependency allowlist precheck
-    contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     artifact_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
     visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
     visual_outputs_dir = str(visual_reqs.get("outputs_dir") or "static/plots")
     visual_items = visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else []
     visual_required = bool(visual_reqs.get("required")) and bool(visual_items)
-    required_deps = contract.get("required_dependencies", []) or []
-    dep_result = check_dependency_precheck(code, required_deps)
-    if dep_result.get("banned"):
-        banned = ", ".join(dep_result["banned"])
-        msg = f"EXECUTION ERROR: DEPENDENCY_BLOCKED banned imports: {banned}"
-        fh = list(state.get("feedback_history", []))
-        fh.append(f"DEPENDENCY_BLOCKED: {banned}")
-        return {"error_message": msg, "execution_output": msg, "feedback_history": fh, "budget_counters": counters}
-    if dep_result.get("blocked"):
-        blocked = ", ".join(dep_result["blocked"])
-        msg = f"EXECUTION ERROR: DEPENDENCY_BLOCKED imports not in allowlist: {blocked}"
-        fh = list(state.get("feedback_history", []))
-        fh.append(f"DEPENDENCY_BLOCKED: {blocked}")
-        return {"error_message": msg, "execution_output": msg, "feedback_history": fh, "budget_counters": counters}
 
     required_outputs = _resolve_required_outputs(contract, state)
     expected_outputs = _resolve_expected_output_paths(contract, state)
@@ -14551,7 +14621,7 @@ def execute_code(state: AgentState) -> AgentState:
                     )
                 run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
                 print("Installing dependencies in Sandbox...")
-                pkg_sets = get_sandbox_install_packages(required_deps)
+                pkg_sets = get_sandbox_install_packages(required_deps, backend_profile="e2b")
                 base_cmd = "pip install -q " + " ".join(pkg_sets["base"])
                 run_cmd_with_retry(sandbox, base_cmd, retries=2)
                 if pkg_sets["extra"]:

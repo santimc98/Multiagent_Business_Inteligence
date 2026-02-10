@@ -1,4 +1,5 @@
 from src.graph import graph as graph_mod
+from unittest.mock import patch
 
 
 def _profile(n_rows: int, n_cols: int, dtype: str = "float64"):
@@ -170,3 +171,64 @@ def test_detect_de_heavy_runner_protocol_mismatch_requires_de_mode():
         )
         is False
     )
+
+
+def test_ml_backend_selection_forces_cloudrun_when_contract_requires_heavy_deps():
+    state = {
+        "execution_contract": {"required_dependencies": ["torch"]},
+        "dataset_scale_hints": {"file_mb": 5.0, "est_rows": 1000, "cols": 10},
+    }
+    with patch.object(graph_mod, "_get_heavy_runner_config", return_value={"job": "j"}), patch.object(
+        graph_mod, "_should_use_heavy_runner", return_value=(False, "e2b_memory_safe")
+    ):
+        decision = graph_mod._resolve_ml_backend_selection(state)
+
+    assert decision.get("use_heavy") is True
+    assert decision.get("backend_profile") == "cloudrun"
+    assert decision.get("reason") == "heavy_dependencies_required"
+    assert decision.get("heavy_deps_required") is True
+
+
+def test_ml_backend_selection_heavy_deps_without_cloudrun_stays_e2b():
+    state = {
+        "execution_contract": {"required_dependencies": ["torch"]},
+    }
+    with patch.object(graph_mod, "_get_heavy_runner_config", return_value=None):
+        decision = graph_mod._resolve_ml_backend_selection(state)
+
+    assert decision.get("use_heavy") is False
+    assert decision.get("backend_profile") == "e2b"
+    assert decision.get("reason") == "heavy_dependencies_required_but_cloudrun_unavailable"
+    assert decision.get("heavy_deps_required") is True
+
+
+def test_ml_backend_selection_forces_cloudrun_when_script_imports_heavy_libs():
+    state = {
+        "execution_contract": {"required_dependencies": []},
+        "generated_code": "import torch\nprint('train')\n",
+        "dataset_scale_hints": {"file_mb": 2.0, "est_rows": 4000, "cols": 12},
+    }
+    with patch.object(graph_mod, "_get_heavy_runner_config", return_value={"job": "j"}), patch.object(
+        graph_mod, "_should_use_heavy_runner", return_value=(False, "e2b_memory_safe")
+    ):
+        decision = graph_mod._resolve_ml_backend_selection(state)
+
+    assert decision.get("use_heavy") is True
+    assert decision.get("backend_profile") == "cloudrun"
+    assert decision.get("reason") == "heavy_imports_in_code"
+    assert decision.get("heavy_deps_from_code") is True
+    assert "torch" in (decision.get("heavy_imports_in_code") or [])
+
+
+def test_ml_backend_selection_marks_unavailable_when_script_imports_heavy_libs():
+    state = {
+        "execution_contract": {"required_dependencies": []},
+        "generated_code": "from transformers import AutoModel\n",
+    }
+    with patch.object(graph_mod, "_get_heavy_runner_config", return_value=None):
+        decision = graph_mod._resolve_ml_backend_selection(state)
+
+    assert decision.get("use_heavy") is False
+    assert decision.get("backend_profile") == "e2b"
+    assert decision.get("reason") == "heavy_imports_in_code_but_cloudrun_unavailable"
+    assert decision.get("heavy_deps_from_code") is True

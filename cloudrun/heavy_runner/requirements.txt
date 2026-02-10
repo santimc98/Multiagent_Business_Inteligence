@@ -25,6 +25,10 @@ optuna
 # --- Explainability (XAI) ---
 shap
 
+# --- Deep Learning / NLP (Cloud Run heavy profile only) ---
+torch
+transformers
+
 # --- Visualization ---
 matplotlib
 seaborn
