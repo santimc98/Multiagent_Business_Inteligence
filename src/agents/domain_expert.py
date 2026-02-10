@@ -58,13 +58,13 @@ class DomainExpertAgent:
         2. **Technical Feasibility:** Do we have the data? Is the approach realistic given dataset size and complexity?
         3. **Implementability:** Can our AI engineers (ML + Data) execute this with their capabilities?
            - Consider dataset scale hints from the data summary (small/medium/large).
-           - Penalize complex techniques when data scale is small or limited.
+           - Do not penalize complexity by default; evaluate whether complexity is justified by expected business lift and risks.
            - Reward strategies with fallback plans for complex approaches
         4. **Risk Assessment:** Overfitting risk? "Black box" non-explainability where transparency is needed?
         
         Implementability Guidelines:
-        - Small or limited scale + Complex techniques (causal, elasticity) = Lower score (-1 to -2 pts)
-        - Medium/large scale + Standard techniques (LR, RF, segmentation) = Higher score
+        - Score by evidence quality: objective fit, validation soundness, expected business impact, and delivery risk.
+        - Complexity is acceptable when justified with a clear value/risk argument and feasible fallback.
         - Strategies with explicit fallbacks = Bonus (+0.5 pts) for risk mitigation
         
         *** OUTPUT FORMAT ***

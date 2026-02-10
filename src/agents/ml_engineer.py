@@ -1925,7 +1925,7 @@ $strategy_json
          - Dataset is MEDIUM ({{dataset_scale.file_mb:.1f}} MB, ~{{dataset_scale.est_rows}} rows).
          - TRAINING LIMIT: Use at most {{dataset_scale.max_train_rows}} rows for training (sample with train_test_split if needed).
          - CHUNK PROCESSING: If scoring many rows, process in chunks of {{dataset_scale.chunk_size}}.
-         - Avoid heavy gridsearch; prefer faster models (linear, tree with limited depth).
+         - Use budgeted search and monitor runtime/memory (avoid unbounded search spaces).
          {% if dataset_scale.prefer_parquet %}
          - ACCELERATION: data/cleaned_data.parquet is available. You may load it instead of CSV for faster reads.
          {% endif %}
@@ -1933,7 +1933,7 @@ $strategy_json
          - Dataset is LARGE ({{dataset_scale.file_mb:.1f}} MB, ~{{dataset_scale.est_rows}} rows).
          - TRAINING LIMIT: Use at most {{dataset_scale.max_train_rows}} rows for training (CRITICAL).
          - CHUNK PROCESSING: Score in chunks of {{dataset_scale.chunk_size}} to avoid memory issues.
-         - MODEL SELECTION: Prefer SGD/linear models or tree models with limited depth.
+         - MODEL SELECTION: choose complexity proportional to objective signal and compute budget; avoid arbitrary family preferences.
          - DO NOT use full dataset for training - sample down to {{dataset_scale.max_train_rows}} rows.
          {% endif %}
          {% endif %}
@@ -2121,57 +2121,33 @@ $strategy_json
 
         DEPENDENCIES
         - Core ML: numpy, pandas, scipy, sklearn, statsmodels, joblib
-        - Gradient Boosting: xgboost, lightgbm, catboost (use for large datasets or when sklearn underperforms)
+        - Gradient Boosting: xgboost, lightgbm, catboost
         - Preprocessing: category_encoders, imbalanced-learn (for class imbalance: SMOTE, ADASYN, etc.)
-        - Hyperparameter Tuning: optuna (for efficient Bayesian optimization, better than GridSearchCV for large search spaces)
-        - Explainability: shap (for feature importance and model explanations)
+        - Hyperparameter Tuning: optuna
+        - Explainability: shap
         - Visualization: matplotlib, seaborn, plotly
         - Data I/O: pyarrow, openpyxl, duckdb, sqlalchemy
         - Utilities: dateutil, pytz, tqdm, yaml
         - Extended deps (rapidfuzz, pydantic, pandera, networkx) ONLY if listed in execution_contract.required_dependencies.
-        - Do not import deep learning frameworks (tensorflow, keras, torch) unless explicitly required by contract.
+        - Deep learning frameworks (tensorflow, keras, torch) are allowed when justified by contract, objective, and data profile.
+        - If using heavy dependencies, include them in required_dependencies and keep a simpler fallback path documented.
 
         COMPUTE CONTEXT (HARDWARE-AWARE OPTIMIZATION)
         =============================================
-        You have access to TWO execution environments. Choose hyperparameters accordingly:
-
-        1. DEFAULT ENVIRONMENT (E2B Sandbox):
-           - Resources: 2 vCPU, 8GB RAM
-           - Best for: Standard workflows, small-medium datasets (<100k rows)
-           - Recommendations:
-             * n_jobs=2 (match vCPU count)
-             * Prefer sklearn over heavy frameworks
-             * Use chunked processing for >50k rows
-             * Avoid large GridSearchCV (use RandomizedSearchCV or optuna with n_trials<50)
-             * batch_size: 1000-5000 for iterative operations
-
-        2. HEAVY ENVIRONMENT (Cloud Run):
-           - Resources: 4-8 vCPU, 32GB RAM
-           - Best for: Large datasets, deep ensembles, memory-intensive operations
-           - Recommendations:
-             * n_jobs=4 to n_jobs=8 (scale with vCPU)
-             * Can use full GridSearchCV with moderate param grids
-             * LightGBM/XGBoost with larger num_leaves, more trees
-             * batch_size: 10000-50000 for iterative operations
-             * Can load entire dataset into memory for most tabular tasks
-
-        ENVIRONMENT SELECTION HEURISTICS:
-        - Dataset > 500MB or > 500k rows → Heavy environment recommended
-        - Ensemble with > 100 estimators → Heavy environment recommended
-        - Deep hyperparameter search (> 100 combinations) → Heavy environment recommended
-        - Simple baseline or EDA → Default environment is sufficient
+        You run under orchestrated sandbox resources. Adapt computation to available CPU/RAM and timeout budget.
+        - Set n_jobs from available CPUs (N_CPUS) and avoid oversubscription.
+        - Prefer bounded search spaces with explicit time/iteration budgets.
+        - For large datasets, use chunked scoring and memory-aware transforms.
+        - Choose implementation complexity by expected business lift per compute cost, not by fixed model-family preference.
 
         ADAPTIVE CODING PATTERNS:
         ```python
         # Pattern: Detect environment and adapt
         import os
-        N_CPUS = int(os.environ.get('N_CPUS', 2))  # Injected by orchestrator
-        IS_HEAVY = N_CPUS >= 4
-
-        # Adapt hyperparameters
-        n_jobs = N_CPUS
-        n_estimators = 200 if IS_HEAVY else 50
-        cv_folds = 10 if IS_HEAVY else 5
+        N_CPUS = int(os.environ.get('N_CPUS', 2))
+        n_jobs = max(1, N_CPUS)
+        # Keep optimization bounded and explicit
+        max_trials = 40 if N_CPUS >= 4 else 20
         ```
 
         SELF-CORRECTION PROTOCOL (EXECUTION-BASED VALIDATION)
@@ -2277,12 +2253,13 @@ $strategy_json
 
         Step 5) Models (contract-first):
         - If the contract/plan specifies model family or a single model, follow that exactly.
-        - If not specified, choose based on dataset characteristics:
-          * Small datasets (<10k rows): sklearn models (LogisticRegression, RandomForest, GradientBoosting)
-          * Medium datasets (10k-100k rows): Consider xgboost or lightgbm for better performance
-          * Large datasets (>100k rows): Prefer lightgbm (faster) or catboost (handles categoricals natively)
-          * High-cardinality categoricals: catboost handles them well without encoding
-          * Class imbalance: Use imbalanced-learn (SMOTE, ADASYN) or model's built-in class_weight
+        - If not specified, choose model family via evidence:
+          * objective/task type, feature types, class balance, data volume, and runtime budget
+          * expected lift versus a simple baseline
+          * robustness and explainability needs from business objective/qa gates
+        - Build at least one strong baseline and one higher-capacity candidate when justified.
+        - Select final model strictly by the contract primary metric and validation policy.
+        - Class imbalance handling (resampling/class_weight/thresholding) must be justified by observed distribution and metric tradeoffs.
         - For calibrated probabilities: sklearn's CalibratedClassifierCV (note: does NOT accept random_state)
         - Any predict_proba call must pass a 2D array (e.g., X.reshape(1, -1) or [[x]] for a single row).
 
