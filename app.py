@@ -10,6 +10,7 @@ import threading
 import io
 import zipfile
 from datetime import datetime
+from typing import Any, Dict, List, Tuple
 
 # Ensure src is in path
 APP_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -33,6 +34,109 @@ def _load_json(path: str):
             return json.load(f)
     except Exception:
         return None
+
+
+def _is_glob_pattern(path: str) -> bool:
+    return any(ch in path for ch in ("*", "?", "["))
+
+
+def _build_artifact_roots(result: Dict[str, Any]) -> List[str]:
+    roots: List[str] = [APP_ROOT]
+
+    for key in ("work_dir_abs", "work_dir"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            roots.append(value.strip())
+
+    run_id = str(result.get("run_id") or "").strip()
+    if run_id:
+        roots.extend(
+            [
+                os.path.join(APP_ROOT, "runs", run_id, "work"),
+                os.path.join(APP_ROOT, "runs", run_id, "artifacts"),
+                os.path.join(APP_ROOT, "runs", run_id, "report"),
+                os.path.join(APP_ROOT, "runs", run_id, "sandbox"),
+            ]
+        )
+
+    unique_roots: List[str] = []
+    seen = set()
+    for root in roots:
+        try:
+            abs_root = os.path.abspath(root)
+        except Exception:
+            continue
+        if abs_root in seen:
+            continue
+        seen.add(abs_root)
+        unique_roots.append(abs_root)
+    return unique_roots
+
+
+def _resolve_ml_artifact_files(output_report: Dict[str, Any], result: Dict[str, Any]) -> List[Tuple[str, str]]:
+    present_outputs = output_report.get("present", []) if isinstance(output_report, dict) else []
+    if not present_outputs and isinstance(result.get("artifact_paths"), list):
+        present_outputs = [p for p in result.get("artifact_paths", []) if isinstance(p, str)]
+
+    roots = _build_artifact_roots(result if isinstance(result, dict) else {})
+    resolved: List[Tuple[str, str]] = []
+    seen_files = set()
+
+    def _register(path: str, arcname_hint: str) -> None:
+        try:
+            abs_path = os.path.abspath(path)
+        except Exception:
+            return
+        if not os.path.isfile(abs_path):
+            return
+        if abs_path in seen_files:
+            return
+        seen_files.add(abs_path)
+        arcname = str(arcname_hint or os.path.basename(abs_path)).replace("\\", "/").lstrip("./")
+        if not arcname or arcname.startswith("../"):
+            arcname = os.path.basename(abs_path)
+        resolved.append((abs_path, arcname))
+
+    for raw in present_outputs:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        rel_path = raw.strip()
+        rel_norm = rel_path.replace("\\", "/")
+
+        if os.path.isabs(rel_path):
+            if _is_glob_pattern(rel_path):
+                for match in glob.glob(rel_path):
+                    _register(match, os.path.basename(match))
+            else:
+                _register(rel_path, os.path.basename(rel_path))
+            continue
+
+        matched = False
+        for root in roots:
+            candidate = os.path.join(root, rel_path)
+            if _is_glob_pattern(rel_path):
+                matches = glob.glob(candidate)
+                if matches:
+                    matched = True
+                for match in matches:
+                    try:
+                        arcname = os.path.relpath(match, root)
+                    except Exception:
+                        arcname = os.path.basename(match)
+                    _register(match, arcname)
+            else:
+                if os.path.isfile(candidate):
+                    matched = True
+                    _register(candidate, rel_norm)
+
+        if not matched:
+            if _is_glob_pattern(rel_path):
+                for match in glob.glob(rel_path):
+                    _register(match, os.path.basename(match))
+            else:
+                _register(rel_path, rel_norm)
+
+    return resolved
 
 def _handle_shutdown(signum, frame):
     request_abort(f"signal={signum}")
@@ -1429,15 +1533,13 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         output_report = result.get("output_contract_report")
         if not isinstance(output_report, dict):
             output_report = _load_json("data/output_contract_report.json") or {}
-        present_outputs = output_report.get("present", []) if isinstance(output_report, dict) else []
-        present_files = [p for p in present_outputs if isinstance(p, str) and os.path.exists(p)]
+        present_files = _resolve_ml_artifact_files(output_report, result if isinstance(result, dict) else {})
 
         with dl_col2:
             if present_files:
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for file_path in present_files:
-                        arcname = os.path.relpath(file_path, start=os.getcwd())
+                    for file_path, arcname in present_files:
                         zf.write(file_path, arcname=arcname)
                 zip_buffer.seek(0)
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M')
