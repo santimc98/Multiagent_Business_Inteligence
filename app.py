@@ -102,7 +102,10 @@ section[data-testid="stSidebar"] .stMarkdown li,
 section[data-testid="stSidebar"] .stMarkdown label,
 section[data-testid="stSidebar"] h1,
 section[data-testid="stSidebar"] h2,
-section[data-testid="stSidebar"] h3 {
+section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] h4,
+section[data-testid="stSidebar"] h5,
+section[data-testid="stSidebar"] h6 {
     color: #e6edf3 !important;
 }
 section[data-testid="stSidebar"] .stTextArea label,
@@ -265,10 +268,12 @@ section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
 .hero-subtitle {
     font-size: 1.1rem;
     color: var(--text-secondary);
-    max-width: 600px;
-    margin: 0 auto;
+    max-width: 700px;
+    margin-left: auto;
+    margin-right: auto;
     line-height: 1.6;
     text-align: center;
+    display: block;
 }
 
 /* ---------- Feature Cards ---------- */
