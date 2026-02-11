@@ -144,6 +144,18 @@ class DataEngineerAgent:
         if de_runbook in (None, "", [], {}):
             de_runbook = {}
         de_runbook_json = json.dumps(compress_long_lists(de_runbook)[0], indent=2)
+        outlier_policy = de_view.get("outlier_policy")
+        if not isinstance(outlier_policy, dict) or not outlier_policy:
+            policy_from_contract = contract.get("outlier_policy")
+            outlier_policy = policy_from_contract if isinstance(policy_from_contract, dict) else {}
+        if not isinstance(outlier_policy, dict):
+            outlier_policy = {}
+        outlier_policy_json = json.dumps(compress_long_lists(outlier_policy)[0], indent=2)
+        outlier_report_path = str(
+            de_view.get("outlier_report_path")
+            or outlier_policy.get("report_path")
+            or ""
+        ).strip()
 
         # [SAFETY] Truncate data_audit if massive to prevent context overflow
         # The audit concatenates many sources; preserve head (structure) and tail (recent instructions).
@@ -188,6 +200,9 @@ class DataEngineerAgent:
         - MUST NOT: compute scores, case assignment, weight fitting, regression/optimization, correlations, rank checks.
         - MUST: parse types, normalize numeric formats, preserve canonical column names.
         - Manifest MUST include: output_dialect, row_counts, conversions.
+        - If OUTLIER_POLICY_CONTEXT.enabled=true and apply_stage is data_engineer/both:
+          apply the policy during cleaning and persist an outlier treatment report to $outlier_report_path.
+          If OUTLIER_POLICY_CONTEXT is empty/disabled, do not invent outlier rules.
 
         *** COLUMN SYNCHRONIZATION RULE (CRITICAL) ***
         - Your output CSV MUST contain EXACTLY the columns listed in "Required Columns (DE View)" - no more, no less.
@@ -230,6 +245,7 @@ class DataEngineerAgent:
         - Required Columns (DE View): $required_columns
         - Optional Passthrough Columns (keep if present): $optional_passthrough_columns
         - DE_VIEW_CONTEXT (json): $de_view_context
+        - OUTLIER_POLICY_CONTEXT (json): $outlier_policy_context
         - EXECUTION_CONTRACT_CONTEXT (json): $execution_contract_context
         - CLEANING_GATES_CONTEXT (json): $cleaning_gates_context
         - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
@@ -242,6 +258,8 @@ class DataEngineerAgent:
         - Save cleaned CSV to $de_output_path.
         - Save manifest to $de_manifest_path (use _safe_dump_json if present; otherwise json.dump(..., default=_json_default)).
         - CRITICAL: Manifest MUST include "output_dialect": {"sep": "...", "decimal": "...", "encoding": "..."} matching the saved file.
+        - If outlier policy is enabled, manifest MUST include an "outlier_treatment" block summarizing:
+          policy_applied, method(s), target_columns, and affected_rows/flags.
         - Use standard CSV (sep=',', decimal='.', encoding='utf-8') for output unless forbidden.
         - Use canonical_name from the contract for all column references.
         - Derive required columns using clear, deterministic logic.
@@ -286,11 +304,13 @@ class DataEngineerAgent:
             data_audit=data_audit,
             execution_contract_context=contract_json,
             de_view_context=de_view_json,
+            outlier_policy_context=outlier_policy_json,
             data_engineer_runbook=de_runbook_json,
             cleaning_gates_context=cleaning_gates_json,
             senior_engineering_protocol=SENIOR_ENGINEERING_PROTOCOL,
             de_output_path=de_output_path,
             de_manifest_path=de_manifest_path,
+            outlier_report_path=outlier_report_path,
         )
         self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE
         print(f"DEBUG: DE System Prompt Len: {len(system_prompt)}")

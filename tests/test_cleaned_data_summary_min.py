@@ -47,3 +47,40 @@ def test_cleaned_data_summary_min_flags_missing_required_and_role_dtype_warnings
     assert vendor["in_train"]["rows"] == 2
     assert vendor["in_test"]["rows"] == 2
 
+
+def test_cleaned_data_summary_min_includes_outlier_treatment_advisory():
+    df = pd.DataFrame(
+        {
+            "feature_a": [1.0, 2.0, 1000.0],
+            "target": [10.0, 20.0, 30.0],
+        }
+    )
+    contract = {
+        "canonical_columns": ["feature_a", "target"],
+        "column_roles": {"pre_decision": ["feature_a"], "outcome": ["target"]},
+    }
+    summary = _build_cleaned_data_summary_min(
+        df_clean=df,
+        contract=contract,
+        required_columns=["feature_a", "target"],
+        outlier_policy={
+            "enabled": True,
+            "apply_stage": "data_engineer",
+            "target_columns": ["feature_a"],
+            "report_path": "data/outlier_treatment_report.json",
+            "strict": True,
+        },
+        outlier_report={
+            "status": "applied",
+            "columns_touched": ["feature_a"],
+            "rows_affected": 1,
+            "flags_created": ["feature_a_outlier_flag"],
+        },
+        cleaning_manifest={"outlier_treatment": {"policy_applied": True}},
+    )
+
+    outlier = summary.get("outlier_treatment") or {}
+    assert outlier.get("enabled") is True
+    assert outlier.get("report_present") is True
+    assert outlier.get("status") == "applied"
+    assert "feature_a" in (outlier.get("columns_touched") or [])

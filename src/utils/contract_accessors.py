@@ -107,6 +107,7 @@ ALLOWED_TOP_LEVEL_KEYS_V41: Set[str] = {
     # Policies & handling
     "reporting_policy",
     "decisioning_requirements",
+    "outlier_policy",
     "omitted_columns_policy",
     "missing_columns_handling",
     "output_dialect",
@@ -661,6 +662,24 @@ def get_preprocessing_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(prep, dict):
         return {}
     return prep
+
+
+def get_outlier_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return outlier_policy section when provided by the execution contract.
+
+    This policy is optional and contract-driven. If absent or malformed, callers
+    must treat it as disabled and avoid deterministic assumptions.
+
+    Returns:
+        Dictionary with outlier policy fields (possibly empty).
+    """
+    if not isinstance(contract, dict):
+        return {}
+    policy = contract.get("outlier_policy")
+    if not isinstance(policy, dict):
+        return {}
+    return policy
 
 
 def get_validation_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:

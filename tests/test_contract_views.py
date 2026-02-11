@@ -119,6 +119,49 @@ def test_projection_ml_view_preserves_runbook_list_shape():
     assert runbook and runbook[0].get("step") == "train_baseline"
 
 
+def test_projection_propagates_outlier_policy_to_relevant_views():
+    contract = {
+        "scope": "full_pipeline",
+        "strategy_title": "Robust modeling with outlier handling",
+        "business_objective": "Predict target robustly",
+        "canonical_columns": ["feature_a", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "outcome": ["target"],
+        },
+        "cleaning_gates": [{"name": "required_columns_present", "severity": "HARD", "params": {}}],
+        "qa_gates": [{"name": "benchmark_kpi_report", "severity": "HARD", "params": {}}],
+        "reviewer_gates": [{"name": "runtime_success", "severity": "HARD", "params": {}}],
+        "validation_requirements": {"primary_metric": "rmse"},
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["feature_a", "target"],
+                "output_path": "data/cleaned_data.csv",
+                "output_manifest_path": "data/cleaning_manifest.json",
+            }
+        },
+        "required_outputs": ["data/metrics.json", "data/scored_rows.csv"],
+        "outlier_policy": {
+            "enabled": True,
+            "apply_stage": "data_engineer",
+            "target_columns": ["feature_a"],
+            "report_path": "data/outlier_treatment_report.json",
+            "strict": True,
+        },
+    }
+
+    projected = build_contract_views_projection(contract, artifact_index=[])
+    de_view = projected.get("de_view") or {}
+    cleaning_view = projected.get("cleaning_view") or {}
+    ml_view = projected.get("ml_view") or {}
+
+    assert isinstance(de_view.get("outlier_policy"), dict)
+    assert de_view.get("outlier_report_path") == "data/outlier_treatment_report.json"
+    assert isinstance(cleaning_view.get("outlier_policy"), dict)
+    assert cleaning_view.get("outlier_report_path") == "data/outlier_treatment_report.json"
+    assert isinstance(ml_view.get("outlier_policy"), dict)
+
+
 def test_ml_view_includes_scored_rows_schema():
     contract_min = {
         "canonical_columns": ["id", "feature_a"],

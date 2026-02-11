@@ -10,6 +10,7 @@ from src.utils.contract_accessors import (
     get_column_roles,
     get_cleaning_gates,
     get_derived_column_names,
+    get_outlier_policy,
     get_outcome_columns,
     get_qa_gates,
     get_reviewer_gates,
@@ -45,6 +46,8 @@ class DEView(TypedDict, total=False):
     output_dialect: Dict[str, Any]
     cleaning_gates: List[Dict[str, Any]]
     data_engineer_runbook: Any
+    outlier_policy: Dict[str, Any]
+    outlier_report_path: str
     constraints: Dict[str, Any]
 
 
@@ -70,6 +73,7 @@ class MLView(TypedDict, total=False):
     case_rules: Any
     plot_spec: Dict[str, Any]
     artifact_requirements: Dict[str, Any]
+    outlier_policy: Dict[str, Any]
 
 
 class ReviewerView(TypedDict, total=False):
@@ -108,6 +112,8 @@ class CleaningView(TypedDict, total=False):
     cleaning_gates: List[Dict[str, Any]]
     column_roles: Dict[str, List[str]]
     allowed_feature_sets: Dict[str, Any]
+    outlier_policy: Dict[str, Any]
+    outlier_report_path: str
 
 
 class QAView(TypedDict, total=False):
@@ -135,6 +141,7 @@ _PRESERVE_KEYS = {
     "gates",
     "plot_spec",
     "plots",
+    "outlier_policy",
 }
 
 _IDENTIFIER_TOKENS = {
@@ -584,6 +591,42 @@ def _resolve_case_rules(contract_full: Dict[str, Any]) -> Any:
     return None
 
 
+def _resolve_outlier_policy(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> Dict[str, Any]:
+    for source in (contract_min, contract_full):
+        if not isinstance(source, dict):
+            continue
+        policy = get_outlier_policy(source)
+        if isinstance(policy, dict) and policy:
+            normalized = dict(policy)
+            enabled = normalized.get("enabled")
+            if isinstance(enabled, str):
+                enabled = enabled.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+            if enabled is None:
+                enabled = bool(
+                    normalized.get("target_columns")
+                    or normalized.get("methods")
+                    or normalized.get("treatment")
+                )
+            normalized["enabled"] = bool(enabled)
+            stage = str(normalized.get("apply_stage") or "data_engineer").strip().lower()
+            if stage not in {"data_engineer", "ml_engineer", "both"}:
+                stage = "data_engineer"
+            normalized["apply_stage"] = stage
+            report_path = normalized.get("report_path") or normalized.get("output_path")
+            if isinstance(report_path, str) and report_path.strip():
+                normalized["report_path"] = report_path.strip()
+            target_columns = normalized.get("target_columns")
+            if isinstance(target_columns, list):
+                normalized["target_columns"] = [str(col) for col in target_columns if col]
+            strict = normalized.get("strict")
+            if isinstance(strict, str):
+                strict = strict.strip().lower() in {"1", "true", "yes", "on", "required"}
+            if strict is not None:
+                normalized["strict"] = bool(strict)
+            return normalized
+    return {}
+
+
 def _resolve_reviewer_gates(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[Any]:
     gates = get_reviewer_gates(contract_full)
     if gates:
@@ -856,6 +899,7 @@ def build_de_view(
     manifest_path = _resolve_manifest_path(contract_min, contract_full, required_outputs)
     cleaning_gates = _resolve_cleaning_gates(contract_min, contract_full)
     data_engineer_runbook = _resolve_data_engineer_runbook(contract_min, contract_full)
+    outlier_policy = _resolve_outlier_policy(contract_min, contract_full)
     view: DEView = {
         "role": "data_engineer",
         "required_columns": required_columns,
@@ -874,6 +918,11 @@ def build_de_view(
             ],
         },
     }
+    if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
+        view["outlier_policy"] = outlier_policy
+        report_path = outlier_policy.get("report_path")
+        if isinstance(report_path, str) and report_path.strip():
+            view["outlier_report_path"] = report_path.strip()
     if manifest_path:
         view["output_manifest_path"] = manifest_path
     output_dialect = _resolve_output_dialect(contract_min, contract_full)
@@ -1048,6 +1097,7 @@ def build_ml_view(
         allowed_sets["audit_only_features"] = [str(c) for c in audit_only_features if c]
     validation = _resolve_validation_requirements(contract_min, contract_full)
     case_rules = _resolve_case_rules(contract_full)
+    outlier_policy = _resolve_outlier_policy(contract_min, contract_full)
 
     artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
         contract_full.get("artifact_requirements")
@@ -1140,6 +1190,8 @@ def build_ml_view(
         view["view_warnings"] = merged_warnings
     if case_rules is not None:
         view["case_rules"] = case_rules
+    if outlier_policy:
+        view["outlier_policy"] = outlier_policy
     if plot_spec is not None:
         view["plot_spec"] = plot_spec
     view["visual_requirements"] = visual_payload
@@ -1314,6 +1366,7 @@ def build_cleaning_view(
     allowed_feature_sets = _resolve_allowed_feature_sets(contract_min, contract_full)
     dialect = _resolve_output_dialect(contract_min, contract_full)
     cleaning_gates = _resolve_cleaning_gates(contract_min, contract_full)
+    outlier_policy = _resolve_outlier_policy(contract_min, contract_full)
     view: CleaningView = {
         "role": "cleaning_reviewer",
         "strategy_title": _first_value(contract_full.get("strategy_title"), contract_min.get("strategy_title")) or "",
@@ -1326,6 +1379,11 @@ def build_cleaning_view(
         "column_roles": column_roles,
         "allowed_feature_sets": allowed_feature_sets,
     }
+    if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
+        view["outlier_policy"] = outlier_policy
+        report_path = outlier_policy.get("report_path")
+        if isinstance(report_path, str) and report_path.strip():
+            view["outlier_report_path"] = report_path.strip()
     # Include cleaning code for intent verification (rescale detection, synthetic data check)
     if cleaning_code and isinstance(cleaning_code, str):
         # Truncate if too long to fit in budget
@@ -1415,6 +1473,7 @@ def build_contract_views_projection(
         if c
     ]
     decisioning_requirements = _project_decisioning_requirements(contract_full)
+    outlier_policy = _resolve_outlier_policy({}, contract_full)
     visual_requirements, plot_spec = _project_plot_payload(contract_full)
     derived_columns = [str(c) for c in get_derived_column_names(contract_full) if c]
     validation_requirements = contract_full.get("validation_requirements")
@@ -1545,6 +1604,11 @@ def build_contract_views_projection(
             ],
         },
     }
+    if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
+        de_view["outlier_policy"] = outlier_policy
+        report_path = outlier_policy.get("report_path")
+        if isinstance(report_path, str) and report_path.strip():
+            de_view["outlier_report_path"] = report_path.strip()
     if manifest_path:
         de_view["output_manifest_path"] = manifest_path
     output_dialect = contract_full.get("output_dialect")
@@ -1574,6 +1638,8 @@ def build_contract_views_projection(
         "decisioning_requirements": decisioning_requirements,
         "visual_requirements": visual_requirements,
     }
+    if outlier_policy:
+        ml_view["outlier_policy"] = outlier_policy
     if plot_spec is not None:
         ml_view["plot_spec"] = plot_spec
     case_rules = contract_full.get("case_rules")
@@ -1633,6 +1699,11 @@ def build_contract_views_projection(
         "column_roles": column_roles,
         "allowed_feature_sets": allowed_feature_sets,
     }
+    if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
+        cleaning_view["outlier_policy"] = outlier_policy
+        report_path = outlier_policy.get("report_path")
+        if isinstance(report_path, str) and report_path.strip():
+            cleaning_view["outlier_report_path"] = report_path.strip()
     if cleaning_code and isinstance(cleaning_code, str):
         max_code_len = 8000
         cleaning_view["cleaning_code"] = cleaning_code[:max_code_len] if len(cleaning_code) > max_code_len else cleaning_code

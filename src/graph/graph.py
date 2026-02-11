@@ -2219,6 +2219,9 @@ def _build_cleaned_data_summary_min(
     required_columns: List[str] | None,
     data_path: str | None = None,
     max_columns: int = 120,
+    outlier_policy: Dict[str, Any] | None = None,
+    outlier_report: Dict[str, Any] | None = None,
+    cleaning_manifest: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Build compact cleaned-data facts for ML context without duplicating full profiling.
@@ -2361,6 +2364,37 @@ def _build_cleaned_data_summary_min(
         column_summaries.append(summary)
 
     omitted_columns_count = max(0, len(df_cols) - len(columns_for_summary))
+    outlier_summary: Dict[str, Any] = {}
+    if isinstance(outlier_policy, dict) and outlier_policy:
+        enabled_raw = outlier_policy.get("enabled")
+        if isinstance(enabled_raw, str):
+            enabled = enabled_raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        elif enabled_raw is None:
+            enabled = bool(
+                outlier_policy.get("target_columns")
+                or outlier_policy.get("methods")
+                or outlier_policy.get("treatment")
+            )
+        else:
+            enabled = bool(enabled_raw)
+        outlier_summary = {
+            "enabled": bool(enabled),
+            "apply_stage": str(outlier_policy.get("apply_stage") or "data_engineer").strip().lower(),
+            "target_columns": [str(col) for col in (outlier_policy.get("target_columns") or []) if col],
+            "report_present": bool(isinstance(outlier_report, dict) and outlier_report),
+        }
+        if isinstance(outlier_report, dict) and outlier_report:
+            for key in ("status", "columns_touched", "rows_affected", "flags_created"):
+                if key in outlier_report:
+                    outlier_summary[key] = outlier_report.get(key)
+        manifest_outlier = (
+            cleaning_manifest.get("outlier_treatment")
+            if isinstance(cleaning_manifest, dict) and isinstance(cleaning_manifest.get("outlier_treatment"), dict)
+            else None
+        )
+        if manifest_outlier:
+            outlier_summary["manifest_outlier_treatment"] = manifest_outlier
+
     return {
         "version": "v1",
         "source": "system_after_data_engineer",
@@ -2375,6 +2409,7 @@ def _build_cleaned_data_summary_min(
         "omitted_columns_count": omitted_columns_count,
         "role_dtype_warnings": role_dtype_warnings,
         "column_summaries": column_summaries,
+        "outlier_treatment": outlier_summary,
     }
 
 
@@ -3252,6 +3287,25 @@ def _validate_projected_views_for_execution(
     scope = normalize_contract_scope((contract or {}).get("scope"))
     requires_cleaning = scope in {"cleaning_only", "full_pipeline"}
     requires_ml = scope in {"ml_only", "full_pipeline"}
+    outlier_policy = contract.get("outlier_policy") if isinstance(contract, dict) else {}
+    outlier_policy_enabled = False
+    outlier_policy_stage = ""
+    if isinstance(outlier_policy, dict) and outlier_policy:
+        enabled_raw = outlier_policy.get("enabled")
+        if isinstance(enabled_raw, str):
+            outlier_policy_enabled = enabled_raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        elif enabled_raw is None:
+            outlier_policy_enabled = bool(
+                outlier_policy.get("target_columns")
+                or outlier_policy.get("methods")
+                or outlier_policy.get("treatment")
+            )
+        else:
+            outlier_policy_enabled = bool(enabled_raw)
+        outlier_policy_stage = str(outlier_policy.get("apply_stage") or "data_engineer").strip().lower()
+    outlier_requires_cleaning_views = bool(
+        outlier_policy_enabled and outlier_policy_stage in {"", "data_engineer", "both"}
+    )
 
     de_view = views.get("de_view") if isinstance(views, dict) else None
     if requires_cleaning:
@@ -3280,6 +3334,8 @@ def _validate_projected_views_for_execution(
                 errors.append("de_view_cleaning_gates_empty")
             if not _has_nonempty_runbook_payload(de_runbook):
                 errors.append("de_view_data_engineer_runbook_missing")
+            if outlier_requires_cleaning_views and not isinstance(de_view.get("outlier_policy"), dict):
+                errors.append("de_view_outlier_policy_missing")
 
         cleaning_view = views.get("cleaning_view") if isinstance(views, dict) else None
         if not isinstance(cleaning_view, dict) or not cleaning_view:
@@ -3295,6 +3351,8 @@ def _validate_projected_views_for_execution(
             )
             if not gates_ok:
                 errors.append("cleaning_view_cleaning_gates_empty")
+            if outlier_requires_cleaning_views and not isinstance(cleaning_view.get("outlier_policy"), dict):
+                errors.append("cleaning_view_outlier_policy_missing")
 
     if requires_ml:
         ml_view = views.get("ml_view") if isinstance(views, dict) else None
@@ -9646,6 +9704,25 @@ def _resolve_de_output_artifacts(state: Dict[str, Any]) -> tuple[str, str, List[
     return output_path, manifest_path, required_artifacts
 
 
+def _resolve_de_outlier_report_path(state: Dict[str, Any]) -> str:
+    """
+    Resolve optional DE outlier treatment report path from de_view projection.
+    Returns normalized relative path or empty string when not configured.
+    """
+    de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+    if not isinstance(de_view, dict):
+        return ""
+    explicit = de_view.get("outlier_report_path")
+    if isinstance(explicit, str) and explicit.strip():
+        return _normalize_output_path(explicit)
+    outlier_policy = de_view.get("outlier_policy")
+    if isinstance(outlier_policy, dict):
+        report_path = outlier_policy.get("report_path")
+        if isinstance(report_path, str) and report_path.strip():
+            return _normalize_output_path(report_path)
+    return ""
+
+
 def _candidate_ml_input_paths(state: Dict[str, Any]) -> List[str]:
     """
     Collect candidate local cleaned-dataset paths from state + contract views.
@@ -9728,6 +9805,10 @@ def _execute_data_engineer_via_heavy_runner(
     reason: str,
 ) -> Dict[str, Any]:
     _, _, required_artifacts = _resolve_de_output_artifacts(state)
+    optional_outlier_report = _resolve_de_outlier_report_path(state)
+    optional_download_artifacts: List[str] = []
+    if optional_outlier_report and optional_outlier_report not in required_artifacts:
+        optional_download_artifacts.append(optional_outlier_report)
     if not required_artifacts:
         return {
             "ok": False,
@@ -9742,6 +9823,8 @@ def _execute_data_engineer_via_heavy_runner(
     }
     for rel_path in required_artifacts:
         download_map[rel_path] = rel_path
+    for rel_path in optional_download_artifacts:
+        download_map.setdefault(rel_path, rel_path)
     support_files: List[Dict[str, str]] = []
     for rel_path in [
         "data/required_columns.json",
@@ -9786,6 +9869,7 @@ def _execute_data_engineer_via_heavy_runner(
                 "attempt_id": attempt_id,
                 "download_keys": list(download_map.keys()),
                 "required_artifacts": required_artifacts,
+                "optional_download_artifacts": optional_download_artifacts,
                 "support_files": [item.get("path") for item in support_files],
                 "script_timeout_seconds": request.get("script_timeout_seconds"),
                 "script_timeout_decision": timeout_decision,
@@ -9848,6 +9932,7 @@ def _execute_data_engineer_via_heavy_runner(
     missing = list(heavy_result.get("missing_artifacts") or [])
     status_ok = str(heavy_result.get("status") or "").lower() == "success"
     required_ok = all(path in downloaded for path in required_artifacts)
+    outlier_report_downloaded = bool(optional_outlier_report and optional_outlier_report in downloaded)
     protocol_mismatch = False
     protocol_mismatch_hint = ""
     try:
@@ -9948,6 +10033,8 @@ def _execute_data_engineer_via_heavy_runner(
         "protocol_mismatch": bool(protocol_mismatch),
         "error_details": error_details,
         "heavy_result": heavy_result,
+        "outlier_report_path": optional_outlier_report,
+        "outlier_report_downloaded": outlier_report_downloaded,
     }
 
 
@@ -10723,15 +10810,18 @@ def run_execution_planner(state: AgentState) -> AgentState:
             ml_len = len(json.dumps(view_payload["contract_views"].get("ml_view", {}), ensure_ascii=True))
             cleaning_len = len(json.dumps(view_payload["contract_views"].get("cleaning_view", {}), ensure_ascii=True))
             qa_len = len(json.dumps(view_payload["contract_views"].get("qa_view", {}), ensure_ascii=True))
+            reviewer_len = len(json.dumps(view_payload["contract_views"].get("reviewer_view", {}), ensure_ascii=True))
             print(f"Using DE_VIEW_CONTEXT length={de_len}")
             print(f"Using ML_VIEW_CONTEXT length={ml_len}")
             print(f"Using CLEANING_VIEW_CONTEXT length={cleaning_len}")
             print(f"Using QA_VIEW_CONTEXT length={qa_len}")
+            print(f"Using REVIEWER_VIEW_CONTEXT length={reviewer_len}")
             if run_id:
                 log_run_event(run_id, "de_view_context", {"length": de_len})
                 log_run_event(run_id, "ml_view_context", {"length": ml_len})
                 log_run_event(run_id, "cleaning_view_context", {"length": cleaning_len})
                 log_run_event(run_id, "qa_view_context", {"length": qa_len})
+                log_run_event(run_id, "reviewer_view_context", {"length": reviewer_len})
         except Exception:
             pass
     if run_id:
@@ -11098,6 +11188,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
         or de_view.get("manifest_path")
         or ""
     ).strip()
+    de_outlier_report_path = _resolve_de_outlier_report_path(
+        {"de_view": de_view, "contract_views": state.get("contract_views") or {}}
+    )
     if not de_output_path or not de_manifest_path:
         msg = (
             "DE_VIEW_OUTPUTS_MISSING: contract-derived de_view must define "
@@ -11717,6 +11810,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 downloaded_paths.append(local_cleaned_path)
             if os.path.exists(local_manifest_path):
                 downloaded_paths.append(local_manifest_path)
+            heavy_outlier_path = str(de_heavy_result.get("outlier_report_path") or de_outlier_report_path or "").strip()
+            if heavy_outlier_path and os.path.exists(heavy_outlier_path):
+                downloaded_paths.append(heavy_outlier_path)
+                de_outlier_report_path = heavy_outlier_path
             csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
                 local_manifest_path, csv_sep, csv_decimal, csv_encoding
             )
@@ -12200,6 +12297,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         print(f"Warning: Manifest download failed (not found?): {remote_manifest_rel}")
                     if os.path.exists(local_manifest_path):
                         downloaded_paths.append(local_manifest_path)
+                    if de_outlier_report_path:
+                        remote_outlier_rel = _normalize_output_path(de_outlier_report_path)
+                        outlier_content = safe_download_bytes(sandbox, f"{run_root}/{remote_outlier_rel}")
+                        if outlier_content is not None:
+                            os.makedirs(os.path.dirname(remote_outlier_rel) or ".", exist_ok=True)
+                            with open(remote_outlier_rel, "wb") as f_local:
+                                f_local.write(outlier_content)
+                            if os.path.exists(remote_outlier_rel):
+                                downloaded_paths.append(remote_outlier_rel)
                     try:
                         os.makedirs("artifacts", exist_ok=True)
                         with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
@@ -13053,11 +13159,25 @@ def run_data_engineer(state: AgentState) -> AgentState:
             cleaned_data_summary_min = {}
             cleaned_data_summary_min_path = "data/cleaned_data_summary_min.json"
             try:
+                cleaning_manifest_payload = _load_json_safe(local_manifest_path)
+                if not isinstance(cleaning_manifest_payload, dict):
+                    cleaning_manifest_payload = {}
+                outlier_report_payload = (
+                    _load_json_safe(de_outlier_report_path) if de_outlier_report_path else {}
+                )
+                if not isinstance(outlier_report_payload, dict):
+                    outlier_report_payload = {}
+                outlier_policy_payload = de_view.get("outlier_policy")
+                if not isinstance(outlier_policy_payload, dict):
+                    outlier_policy_payload = {}
                 cleaned_data_summary_min = _build_cleaned_data_summary_min(
                     df_clean=df_final,
                     contract=contract,
                     required_columns=required_cols,
                     data_path=local_cleaned_path,
+                    outlier_policy=outlier_policy_payload,
+                    outlier_report=outlier_report_payload,
+                    cleaning_manifest=cleaning_manifest_payload,
                 )
                 dump_json(cleaned_data_summary_min_path, cleaned_data_summary_min)
                 if run_id:
@@ -13070,6 +13190,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "column_count": cleaned_data_summary_min.get("column_count"),
                             "missing_required_columns": cleaned_data_summary_min.get("missing_required_columns", []),
                             "role_dtype_warnings": len(cleaned_data_summary_min.get("role_dtype_warnings", [])),
+                            "outlier_policy_enabled": bool(
+                                ((cleaned_data_summary_min.get("outlier_treatment") or {}).get("enabled"))
+                            ),
+                            "outlier_report_present": bool(
+                                ((cleaned_data_summary_min.get("outlier_treatment") or {}).get("report_present"))
+                            ),
                         },
                     )
             except Exception as summary_err:
@@ -13124,6 +13250,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "dataset_scale": dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None,
             "ml_data_path": local_cleaned_path,
             "cleaning_manifest_path": local_manifest_path,
+            "outlier_report_path": de_outlier_report_path,
             "cleaned_data_summary_min": cleaned_data_summary_min,
             "cleaned_data_summary_min_path": cleaned_data_summary_min_path,
         }

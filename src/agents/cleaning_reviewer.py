@@ -347,6 +347,13 @@ def _review_cleaning_impl(
 
     # Extract cleaning code from view for LLM intent verification
     cleaning_code = view.get("cleaning_code")
+    outlier_policy = view.get("outlier_policy") if isinstance(view.get("outlier_policy"), dict) else {}
+    outlier_report_path = str(
+        view.get("outlier_report_path")
+        or outlier_policy.get("report_path")
+        or "data/outlier_treatment_report.json"
+    )
+    outlier_report = _load_json(outlier_report_path) if outlier_report_path else {}
 
     facts = _build_facts(
         cleaned_header=cleaned_header,
@@ -356,6 +363,9 @@ def _review_cleaning_impl(
         sample_infer=sample_infer,
         raw_sample=raw_sample,
         dataset_profile=dataset_profile,
+        outlier_policy=outlier_policy,
+        outlier_report=outlier_report,
+        outlier_report_path=outlier_report_path,
     )
 
     deterministic = _evaluate_gates_deterministic(
@@ -371,6 +381,9 @@ def _review_cleaning_impl(
         allowed_feature_sets=view.get("allowed_feature_sets") or {},
         dataset_profile=dataset_profile,
         cleaning_code=cleaning_code,
+        outlier_policy=outlier_policy,
+        outlier_report=outlier_report,
+        outlier_report_path=outlier_report_path,
     )
     warnings.extend(dialect_warnings)
     deterministic_result = _assemble_result(
@@ -545,7 +558,42 @@ def _merge_cleaning_gates(view: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], s
         merged = universal_gates
         source = "fallback"
         warnings.append(_CLEANING_FALLBACK_WARNING)
+
+    outlier_policy = view.get("outlier_policy") if isinstance(view.get("outlier_policy"), dict) else {}
+    if _outlier_policy_enabled(outlier_policy):
+        existing = {_normalize_gate_name(g.get("name")) for g in merged if isinstance(g, dict)}
+        if "outlier_policy_applied" not in existing:
+            strict = outlier_policy.get("strict")
+            if isinstance(strict, str):
+                strict = strict.strip().lower() in {"1", "true", "yes", "on", "required"}
+            severity = "HARD" if strict is None or bool(strict) else "SOFT"
+            gate_params = {
+                "report_path": str(
+                    outlier_policy.get("report_path")
+                    or view.get("outlier_report_path")
+                    or "data/outlier_treatment_report.json"
+                ),
+                "strict": bool(True if strict is None else strict),
+            }
+            merged.append(
+                {
+                    "name": "outlier_policy_applied",
+                    "severity": severity,
+                    "params": gate_params,
+                }
+            )
     return merged, source, warnings
+
+
+def _outlier_policy_enabled(policy: Dict[str, Any]) -> bool:
+    if not isinstance(policy, dict) or not policy:
+        return False
+    enabled = policy.get("enabled")
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    if enabled is not None:
+        return bool(enabled)
+    return bool(policy.get("target_columns") or policy.get("methods") or policy.get("treatment"))
 
 
 def _normalize_cleaning_gates(raw: Any) -> List[Dict[str, Any]]:
@@ -1094,6 +1142,9 @@ def _build_facts(
     sample_infer: Optional[pd.DataFrame],
     raw_sample: Optional[pd.DataFrame],
     dataset_profile: Optional[Dict[str, Any]] = None,
+    outlier_policy: Optional[Dict[str, Any]] = None,
+    outlier_report: Optional[Dict[str, Any]] = None,
+    outlier_report_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     facts: Dict[str, Any] = {}
     facts["cleaned_header"] = cleaned_header[:200]
@@ -1132,6 +1183,30 @@ def _build_facts(
                     }
             if numeric_ranges:
                 facts["source_data_numeric_ranges"] = numeric_ranges
+
+    if isinstance(outlier_policy, dict) and outlier_policy:
+        policy_enabled = _outlier_policy_enabled(outlier_policy)
+        report_present = isinstance(outlier_report, dict) and bool(outlier_report)
+        policy_summary: Dict[str, Any] = {
+            "enabled": policy_enabled,
+            "apply_stage": outlier_policy.get("apply_stage"),
+            "target_columns": outlier_policy.get("target_columns"),
+            "report_path": outlier_report_path,
+            "report_present": report_present,
+        }
+        if report_present:
+            if outlier_report.get("columns_touched") is not None:
+                policy_summary["columns_touched"] = outlier_report.get("columns_touched")
+            if outlier_report.get("rows_affected") is not None:
+                policy_summary["rows_affected"] = outlier_report.get("rows_affected")
+            if outlier_report.get("flags_created") is not None:
+                policy_summary["flags_created"] = outlier_report.get("flags_created")
+            if outlier_report.get("status") is not None:
+                policy_summary["status"] = outlier_report.get("status")
+        manifest_outlier = manifest.get("outlier_treatment") if isinstance(manifest.get("outlier_treatment"), dict) else None
+        if manifest_outlier:
+            policy_summary["manifest_outlier_treatment"] = manifest_outlier
+        facts["outlier_policy"] = policy_summary
 
     return facts
 
@@ -1186,6 +1261,9 @@ def _evaluate_gates_deterministic(
     allowed_feature_sets: Dict[str, Any],
     dataset_profile: Optional[Dict[str, Any]] = None,
     cleaning_code: Optional[str] = None,
+    outlier_policy: Optional[Dict[str, Any]] = None,
+    outlier_report: Optional[Dict[str, Any]] = None,
+    outlier_report_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     hard_failures: List[str] = []
     soft_failures: List[str] = []
@@ -1196,6 +1274,8 @@ def _evaluate_gates_deterministic(
     warning_summaries: List[str] = []
     gate_results: List[Dict[str, Any]] = []
     model_features = _list_str(allowed_feature_sets.get("model_features")) if isinstance(allowed_feature_sets, dict) else []
+    outlier_policy = outlier_policy if isinstance(outlier_policy, dict) else {}
+    outlier_report = outlier_report if isinstance(outlier_report, dict) else {}
 
     for gate in gates:
         name = gate["name"]
@@ -1314,6 +1394,14 @@ def _evaluate_gates_deterministic(
                 if null_frac is None or null_frac < warn_threshold_val:
                     continue
                 warnings.append(f"NULLS_OUTSIDE_GATE: {col} null_frac={null_frac:.4f}")
+        elif gate_key == "outlier_policy_applied":
+            issues, evidence = _check_outlier_policy_applied(
+                outlier_policy=outlier_policy,
+                outlier_report=outlier_report,
+                outlier_report_path=outlier_report_path or params.get("report_path"),
+                manifest=manifest,
+                params=params,
+            )
         else:
             evaluated = False
             evidence["deterministic_support"] = "not_implemented"
@@ -2040,6 +2128,101 @@ def _check_row_count_sanity(manifest: Dict[str, Any], params: Dict[str, Any]) ->
         if increase_pct > max_dup_increase_pct:
             issues.append(f"Row increase {increase_pct:.2f}% exceeds {max_dup_increase_pct:.2f}%")
     return issues
+
+
+def _check_outlier_policy_applied(
+    outlier_policy: Dict[str, Any],
+    outlier_report: Dict[str, Any],
+    outlier_report_path: Optional[str],
+    manifest: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {}
+
+    policy = outlier_policy if isinstance(outlier_policy, dict) else {}
+    enabled = _outlier_policy_enabled(policy)
+    apply_stage = str(policy.get("apply_stage") or "data_engineer").strip().lower()
+    evidence["policy_enabled"] = enabled
+    evidence["apply_stage"] = apply_stage
+    evidence["report_path"] = outlier_report_path
+
+    if not enabled:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "policy_disabled_or_missing"
+        return [], evidence
+
+    if apply_stage not in {"", "data_engineer", "both"}:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "policy_not_assigned_to_data_engineer"
+        return [], evidence
+
+    strict = params.get("strict", policy.get("strict", True))
+    if isinstance(strict, str):
+        strict = strict.strip().lower() in {"1", "true", "yes", "on", "required"}
+    strict = bool(strict)
+    evidence["strict"] = strict
+
+    report = outlier_report if isinstance(outlier_report, dict) else {}
+    report_present = bool(report)
+    evidence["report_present"] = report_present
+    if outlier_report_path:
+        evidence["report_file_exists"] = os.path.exists(outlier_report_path)
+
+    manifest_outlier = (
+        manifest.get("outlier_treatment")
+        if isinstance(manifest, dict) and isinstance(manifest.get("outlier_treatment"), dict)
+        else {}
+    )
+    if manifest_outlier:
+        evidence["manifest_outlier_treatment"] = manifest_outlier
+
+    if not report_present:
+        if strict:
+            issues.append("outlier_treatment_report_missing_or_empty")
+        else:
+            evidence["warning"] = "outlier_treatment_report_missing_or_empty"
+
+    policy_targets = _list_str(policy.get("target_columns")) or _list_str(params.get("target_columns"))
+    evidence["policy_target_columns"] = policy_targets
+
+    report_columns = _list_str(report.get("columns_touched"))
+    if not report_columns:
+        report_columns = _list_str(report.get("target_columns"))
+    if not report_columns and isinstance(report.get("columns"), list):
+        report_columns = _list_str(report.get("columns"))
+    evidence["report_columns_touched"] = report_columns
+
+    if policy_targets:
+        if not report_columns:
+            if strict:
+                issues.append("outlier_treatment_columns_missing_in_report")
+        else:
+            policy_norm = {str(col).strip().lower() for col in policy_targets if col}
+            report_norm = {str(col).strip().lower() for col in report_columns if col}
+            missing_targets = sorted([col for col in policy_targets if str(col).strip().lower() not in report_norm])
+            evidence["missing_target_columns_in_report"] = missing_targets
+            if missing_targets and strict:
+                issues.append(
+                    "outlier_treatment_report_missing_target_columns: "
+                    + ", ".join(missing_targets[:10])
+                )
+
+    manifest_applied = None
+    if manifest_outlier:
+        for key in ("policy_applied", "enabled", "applied"):
+            if key in manifest_outlier:
+                raw = manifest_outlier.get(key)
+                if isinstance(raw, str):
+                    manifest_applied = raw.strip().lower() in {"1", "true", "yes", "on", "applied"}
+                else:
+                    manifest_applied = bool(raw)
+                break
+    evidence["manifest_policy_applied"] = manifest_applied
+    if strict and manifest_outlier and manifest_applied is False:
+        issues.append("manifest_outlier_treatment_policy_applied_false")
+
+    return issues, evidence
 
 
 def _string_values(sample: Optional[pd.DataFrame], col: str) -> List[str]:

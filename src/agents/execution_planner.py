@@ -186,6 +186,9 @@ Minimal contract interface:
 - column_roles: object mapping role -> list[str]
 - artifact_requirements: object
 - iteration_policy: object with practical retry/iteration limits (small, numeric, and actionable)
+- outlier_policy (optional): object for robust outlier handling when strategy/data justify it.
+  - recommended fields: enabled(bool), apply_stage("data_engineer"|"ml_engineer"|"both"),
+    target_columns(list[str]), methods/treatment(object|list), report_path(file path), strict(bool).
 
 Scope-dependent required fields:
 - If scope includes cleaning ("cleaning_only" or "full_pipeline"):
@@ -236,6 +239,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "artifact_requirements.clean_dataset.required_columns",
             "cleaning_gates",
             "data_engineer_runbook",
+            "outlier_policy (optional)",
         ],
     },
     "cleaning_reviewer": {
@@ -246,6 +250,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "artifact_requirements.clean_dataset.output_path",
             "artifact_requirements.clean_dataset.output_manifest_path|manifest_path",
             "artifact_requirements.clean_dataset.required_columns",
+            "outlier_policy (optional)",
         ],
     },
     "ml_engineer": {
@@ -6438,6 +6443,8 @@ class ExecutionPlannerAgent:
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
                 "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
+                "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
+                "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scopes, include non-empty evaluation_spec and ensure objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
                 "For ML scopes, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
@@ -6475,6 +6482,7 @@ class ExecutionPlannerAgent:
             "objective_analysis": dict,
             "evaluation_spec": dict,
             "iteration_policy": (dict, str),
+            "outlier_policy": dict,
         }
         _SCOPE_VALUES = {"cleaning_only", "ml_only", "full_pipeline"}
 
@@ -6734,6 +6742,8 @@ class ExecutionPlannerAgent:
                 "Keep semantics aligned with strategy/business objective.\n"
                 "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
+                "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
+                "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
                 "For ML scope, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
@@ -6773,6 +6783,8 @@ class ExecutionPlannerAgent:
                 "Do not invent columns not present in column_inventory.\n\n"
                 "Use artifact file paths for required_outputs.\n\n"
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
+                "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
+                "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n\n"
                 "For ML scope, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
@@ -6838,8 +6850,8 @@ class ExecutionPlannerAgent:
                 },
                 {
                     "id": "optional_context",
-                    "goal": "Optionally add useful execution context and supplemental hints.",
-                    "required_keys": [],
+                    "goal": "Optionally add useful execution context and supplemental hints, including outlier policy.",
+                    "required_keys": ["outlier_policy"],
                     "optional": True,
                 },
             ]
