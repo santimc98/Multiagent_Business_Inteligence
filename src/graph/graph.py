@@ -1080,6 +1080,9 @@ def _harmonize_review_packets_with_final_eval(
     advisory_fixes = [str(item) for item in (eval_required_fixes or []) if item][:5]
     advisory_gates = [str(item) for item in (eval_failed_gates or []) if item][:5]
     eval_feedback_trimmed = str(eval_feedback or "").strip()
+    blocking_eval = any(_looks_blocking_retry_signal(item) for item in (advisory_gates + advisory_fixes))
+    if not blocking_eval and eval_feedback_trimmed:
+        blocking_eval = _looks_blocking_retry_signal(eval_feedback_trimmed)
     notes: List[str] = []
 
     def _patch_packet(packet: Dict[str, Any], label: str) -> Dict[str, Any]:
@@ -1090,11 +1093,18 @@ def _harmonize_review_packets_with_final_eval(
         if status != "APPROVED" or failed or hard:
             return patched
 
-        patched["status"] = "APPROVE_WITH_WARNINGS"
-        message = (
-            f"{label.upper()}_CROSS_REVIEW_ALIGNMENT: result_evaluator reported unresolved "
-            "contract/business coverage issues; approval downgraded to warning-only context."
-        )
+        if blocking_eval:
+            patched["status"] = "REJECTED"
+            message = (
+                f"{label.upper()}_CROSS_REVIEW_ALIGNMENT: deterministic/blocking issues reported by "
+                "result_evaluator; approval converted to REJECTED."
+            )
+        else:
+            patched["status"] = "APPROVE_WITH_WARNINGS"
+            message = (
+                f"{label.upper()}_CROSS_REVIEW_ALIGNMENT: result_evaluator reported unresolved "
+                "contract/business coverage issues; approval downgraded to warning-only context."
+            )
         feedback = str(patched.get("feedback") or "").strip()
         if eval_feedback_trimmed:
             message = f"{message} evaluator_feedback={eval_feedback_trimmed[:320]}"
@@ -1111,9 +1121,21 @@ def _harmonize_review_packets_with_final_eval(
         for fix in advisory_fixes:
             if fix not in required:
                 required.append(fix)
+        if blocking_eval and not required:
+            required.append("Resolve deterministic blockers before requesting approval again.")
         if required:
             patched["required_fixes"] = required
-        notes.append(f"{label}: downgraded APPROVED -> APPROVE_WITH_WARNINGS due to evaluator status {status_norm}")
+        if blocking_eval:
+            hard_failures = [str(item) for item in (patched.get("hard_failures") or []) if item]
+            for blocker in advisory_gates:
+                if _looks_blocking_retry_signal(blocker) and blocker not in hard_failures:
+                    hard_failures.append(blocker)
+            if "cross_review_alignment_gap" not in hard_failures:
+                hard_failures.append("cross_review_alignment_gap")
+            patched["hard_failures"] = hard_failures
+            notes.append(f"{label}: escalated APPROVED -> REJECTED due to blocking evaluator status {status_norm}")
+        else:
+            notes.append(f"{label}: downgraded APPROVED -> APPROVE_WITH_WARNINGS due to evaluator status {status_norm}")
         return patched
 
     return _patch_packet(dict(reviewer_packet or {}), "reviewer"), _patch_packet(dict(qa_packet or {}), "qa_reviewer"), notes
@@ -9714,6 +9736,7 @@ def _build_ml_execution_profile_for_prompt(
         ml_plan=ml_plan if isinstance(ml_plan, dict) else None,
         configured_timeout_seconds=heavy_cfg.get("script_timeout_seconds") if isinstance(heavy_cfg, dict) else None,
     )
+    backend = "cloudrun" if bool(backend_selection.get("use_heavy")) else "e2b"
     cpu_hint = _read_int_env_hint(
         "HEAVY_RUNNER_CPU_HINT",
         "HEAVY_RUNNER_CPU",
@@ -9727,7 +9750,36 @@ def _build_ml_execution_profile_for_prompt(
         "CLOUDRUN_JOB_MEMORY",
         "CLOUD_RUN_MEMORY",
     )
-    backend = "cloudrun" if bool(backend_selection.get("use_heavy")) else "e2b"
+    resource_source = "env_hints"
+    if backend == "cloudrun":
+        # Keep infrastructure context actionable even when env hints are absent.
+        # Defaults match heavy-runner deploy defaults and remain advisory-only.
+        if cpu_hint is None:
+            cpu_hint = _safe_int(os.getenv("HEAVY_RUNNER_DEFAULT_CPU"), 0)
+            if cpu_hint <= 0:
+                cpu_hint = 8
+        if memory_gb_hint is None:
+            memory_gb_hint = _parse_memory_gb_hint(
+                os.getenv("HEAVY_RUNNER_DEFAULT_MEMORY_GB")
+                or os.getenv("HEAVY_RUNNER_DEFAULT_MEMORY")
+                or "32Gi"
+            )
+            if memory_gb_hint is None or memory_gb_hint <= 0:
+                memory_gb_hint = 32.0
+        if (
+            os.getenv("HEAVY_RUNNER_CPU_HINT") is None
+            and os.getenv("HEAVY_RUNNER_CPU") is None
+            and os.getenv("CLOUDRUN_JOB_CPU") is None
+            and os.getenv("CLOUD_RUN_CPU") is None
+            and os.getenv("HEAVY_RUNNER_MEMORY_GB_HINT") is None
+            and os.getenv("HEAVY_RUNNER_MEMORY_GB") is None
+            and os.getenv("HEAVY_RUNNER_MEMORY") is None
+            and os.getenv("CLOUDRUN_JOB_MEMORY") is None
+            and os.getenv("CLOUD_RUN_MEMORY") is None
+        ):
+            resource_source = "cloudrun_defaults"
+    else:
+        resource_source = "env_hints_or_unknown"
     return {
         "backend": backend,
         "selection_reason": str(backend_selection.get("reason") or "unknown"),
@@ -9740,7 +9792,7 @@ def _build_ml_execution_profile_for_prompt(
         "resources": {
             "cpu_hint": cpu_hint,
             "memory_gb_hint": memory_gb_hint,
-            "source": "env_hints_or_unknown",
+            "source": resource_source,
         },
         "runtime_budget": {
             "hard_timeout_seconds": _safe_int(timeout_decision.get("timeout_seconds"), 0),
@@ -17627,7 +17679,6 @@ def run_review_board(state: AgentState) -> AgentState:
         )
         if critical_action not in required_actions:
             required_actions.append(critical_action)
-
     current_feedback = str(state.get("review_feedback") or "")
     if board_summary:
         if current_feedback:
@@ -17650,7 +17701,6 @@ def run_review_board(state: AgentState) -> AgentState:
             "REVIEW_BOARD_POLICY: escalated to NEEDS_IMPROVEMENT due to critical failed_areas="
             + ", ".join(critical_failed_areas[:6])
         )
-
     gate_context = dict(state.get("last_gate_context") or {})
     current_failed = [str(g) for g in (gate_context.get("failed_gates") or []) if g]
     current_required = [str(g) for g in (gate_context.get("required_fixes") or []) if g]

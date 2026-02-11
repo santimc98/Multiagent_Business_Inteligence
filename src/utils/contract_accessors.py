@@ -843,19 +843,40 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
         return str(item)
 
     def _normalize_plot_path(candidate: Any, outputs_dir: str, fallback: str) -> str:
+        """
+        Normalize plot artifact paths while preserving explicit filenames/extensions.
+        Important: never transform "name.png" into "name_png.png".
+        """
         base_dir = str(outputs_dir or "static/plots").replace("\\", "/").rstrip("/")
         if not base_dir:
             base_dir = "static/plots"
         raw = str(candidate or "").strip().replace("\\", "/")
         if not raw:
             raw = fallback
-        if "/" not in raw and not os.path.isabs(raw):
-            raw = _slug(raw, fallback)
-        if not os.path.splitext(raw)[1]:
-            raw = f"{raw}.png"
-        if not os.path.isabs(raw) and "/" not in raw:
-            raw = f"{base_dir}/{raw}"
-        return raw
+
+        # Preserve wildcard plot contracts (e.g., "*.png", "static/plots/*.png").
+        if any(tok in raw for tok in ("*", "?", "[")):
+            if not os.path.isabs(raw) and "/" not in raw:
+                return f"{base_dir}/{raw}"
+            return raw
+
+        is_abs = os.path.isabs(raw)
+        dirname, filename = os.path.split(raw)
+        filename = filename or fallback
+
+        stem, ext = os.path.splitext(filename)
+        safe_stem = _slug(stem or filename, fallback)
+        safe_ext = str(ext or "").lower().strip()
+        if not safe_ext:
+            safe_ext = ".png"
+        elif not safe_ext.startswith("."):
+            safe_ext = f".{safe_ext}"
+
+        normalized_filename = f"{safe_stem}{safe_ext}"
+        normalized = f"{dirname.rstrip('/')}/{normalized_filename}" if dirname else normalized_filename
+        if not is_abs and "/" not in normalized:
+            normalized = f"{base_dir}/{normalized}"
+        return normalized
     
     if not isinstance(contract, dict):
         return []
