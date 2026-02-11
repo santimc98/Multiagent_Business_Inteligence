@@ -10,7 +10,7 @@
 
 ---
 
-## 🚀 What is StrategyEngine AI ?
+## 🚀 What is StrategyEngine AI?
 
 **StrategyEngine AI** is an autonomous Data Science department powered by AI. Upload a CSV, describe your business objective, and a team of **13 specialized AI agents** — orchestrated by **LangGraph** and powered by **Gemini, OpenRouter, MIMO, and other LLMs** — collaborates end-to-end to deliver executive-ready business intelligence reports.
 
