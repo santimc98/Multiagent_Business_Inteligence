@@ -430,6 +430,94 @@ section[data-testid="stSidebar"] .stButton > button:hover {
 }
 .fade-in { animation: fadeIn 0.4s ease-out; }
 
+/* ---------- Progress Header ---------- */
+.progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem 1.25rem;
+    background: linear-gradient(135deg, #f8f9ff 0%, #f0f4ff 100%);
+    border: 1px solid #d0daf5;
+    border-radius: var(--radius);
+    margin-bottom: 0.75rem;
+}
+.progress-timer {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.progress-timer-icon {
+    font-size: 1.1rem;
+}
+.progress-pct {
+    font-size: 1.3rem;
+    font-weight: 800;
+    color: var(--accent);
+}
+.progress-stage {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+/* ---------- Iteration Badge ---------- */
+.iter-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: linear-gradient(135deg, #1e1e2e 0%, #2d2d44 100%);
+    border: 1px solid #3d3d5c;
+    border-radius: 8px;
+    padding: 0.4rem 0.85rem;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.78rem;
+    color: #cdd6f4;
+    margin-top: 0.5rem;
+}
+.iter-badge-label { color: #6c7086; }
+.iter-badge-value { color: #89b4fa; font-weight: 700; }
+.iter-badge-metric { color: #a6e3a1; font-weight: 600; }
+.iter-badge-sep { color: #45475a; }
+
+/* ---------- Sidebar Run Status ---------- */
+.sidebar-run-status {
+    background: linear-gradient(135deg, rgba(79,139,249,0.1) 0%, rgba(124,58,237,0.1) 100%);
+    border: 1px solid rgba(79,139,249,0.25);
+    border-radius: 10px;
+    padding: 1rem;
+    margin: 0.5rem 0;
+}
+.sidebar-run-status .srs-title {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #8b949e;
+    margin-bottom: 0.6rem;
+}
+.sidebar-run-status .srs-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.25rem 0;
+    font-size: 0.8rem;
+}
+.sidebar-run-status .srs-label { color: #8b949e; }
+.sidebar-run-status .srs-value { color: #e6edf3; font-weight: 600; }
+.sidebar-run-status .srs-step {
+    color: #89b4fa;
+    font-weight: 700;
+    font-size: 0.85rem;
+}
+.sidebar-run-status .srs-timer {
+    color: #a6e3a1;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 600;
+}
+
 /* ---------- Footer ---------- */
 .footer {
     text-align: center;
@@ -774,8 +862,8 @@ PIPELINE_STEPS = [
     ("translator",     "Report",     "&#128202;"),
 ]
 
-def _render_pipeline(completed_steps: set, active_step: str | None = None):
-    """Render the visual pipeline tracker."""
+def _render_pipeline(completed_steps: set, active_step: str | None = None, iter_info: str = ""):
+    """Render the visual pipeline tracker with optional iteration info."""
     parts = []
     for key, label, icon in PIPELINE_STEPS:
         if key in completed_steps:
@@ -793,7 +881,40 @@ def _render_pipeline(completed_steps: set, active_step: str | None = None):
             f'  <div class="step-label {cls_label}">{label}</div>'
             f'</div>'
         )
-    return '<div class="pipeline-container">' + "".join(parts) + '</div>'
+    html = '<div class="pipeline-container">' + "".join(parts) + '</div>'
+    if iter_info:
+        html += iter_info
+    return html
+
+def _fmt_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as MM:SS or HH:MM:SS."""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+# Progress weight per step (cumulative %)
+_STEP_PROGRESS = {
+    "steward": 12,
+    "strategist": 22,
+    "domain_expert": 34,
+    "data_engineer": 48,
+    "engineer": 60,       # first ML iteration start
+    "evaluate_results": 82,
+    "translator": 94,
+    "generate_pdf": 100,
+}
+
+# Friendly stage names for the progress header
+_STAGE_NAMES = {
+    "steward": "Auditando datos",
+    "strategist": "Generando estrategias",
+    "domain_expert": "Deliberacion experta",
+    "data_engineer": "Limpieza de datos",
+    "engineer": "Entrenando modelo ML",
+    "evaluate_results": "Evaluando resultados",
+    "translator": "Generando reporte",
+    None: "Completado",
+}
 
 # ---------------------------------------------------------------------------
 # Start Analysis
@@ -814,13 +935,26 @@ if start_btn:
                 os.remove(f)
 
         try:
-            # Pipeline visual tracker
+            # --- UI placeholders ---
+            progress_header_placeholder = st.empty()
+            progress_bar = st.progress(0)
             pipeline_placeholder = st.empty()
             log_placeholder = st.empty()
 
+            # --- Sidebar status placeholders ---
+            sidebar_status_placeholder = st.sidebar.empty()
+
+            # --- Tracking state ---
             completed_steps: set = set()
             active_step: str | None = "steward"
             log_entries: list[str] = []
+            run_start = time.time()
+            current_progress: int = 0
+            ml_iteration: int = 0
+            ml_max_iterations: int = 6
+            best_metric_name: str = ""
+            best_metric_value: str = ""
+            current_metric_value: str = ""
 
             def add_log(agent: str, message: str, level: str = "info"):
                 ts = datetime.now().strftime("%H:%M:%S")
@@ -833,17 +967,83 @@ if start_btn:
                     f'</div>'
                 )
 
+            def _build_iter_badge() -> str:
+                """Build HTML for the ML iteration badge."""
+                if ml_iteration < 1:
+                    return ""
+                parts = [
+                    f'<span class="iter-badge-label">Iteracion</span>',
+                    f'<span class="iter-badge-value">{ml_iteration}/{ml_max_iterations}</span>',
+                ]
+                if current_metric_value:
+                    parts.append(f'<span class="iter-badge-sep">|</span>')
+                    parts.append(f'<span class="iter-badge-metric">{best_metric_name}: {current_metric_value}</span>')
+                return '<div class="iter-badge">' + " ".join(parts) + '</div>'
+
             def refresh_ui():
+                elapsed = time.time() - run_start
+                elapsed_str = _fmt_elapsed(elapsed)
+                stage_name = _STAGE_NAMES.get(active_step, active_step or "Procesando")
+
+                # Progress header with timer and percentage
+                progress_header_placeholder.markdown(f"""
+                <div class="progress-header">
+                    <div class="progress-timer">
+                        <span class="progress-timer-icon">&#9202;</span>
+                        <span>{elapsed_str}</span>
+                    </div>
+                    <div style="text-align:center;">
+                        <div class="progress-stage">{stage_name}</div>
+                    </div>
+                    <div class="progress-pct">{current_progress}%</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Progress bar
+                progress_bar.progress(min(current_progress, 100))
+
+                # Pipeline tracker with iteration badge
                 pipeline_placeholder.markdown(
                     '<div class="card">'
-                    + _render_pipeline(completed_steps, active_step)
+                    + _render_pipeline(completed_steps, active_step, _build_iter_badge())
                     + '</div>',
                     unsafe_allow_html=True
                 )
+
+                # Activity log
                 log_placeholder.markdown(
                     '<div class="activity-log">' + "\n".join(log_entries) + '</div>',
                     unsafe_allow_html=True
                 )
+
+                # Sidebar run status
+                iter_display = f"{ml_iteration}/{ml_max_iterations}" if ml_iteration > 0 else "--"
+                metric_display = f"{best_metric_name}: {current_metric_value}" if current_metric_value else "--"
+                sidebar_status_placeholder.markdown(f"""
+                <div class="sidebar-run-status">
+                    <div class="srs-title">Ejecucion en Curso</div>
+                    <div class="srs-row">
+                        <span class="srs-label">Etapa</span>
+                        <span class="srs-step">{stage_name}</span>
+                    </div>
+                    <div class="srs-row">
+                        <span class="srs-label">Progreso</span>
+                        <span class="srs-value">{current_progress}%</span>
+                    </div>
+                    <div class="srs-row">
+                        <span class="srs-label">Tiempo</span>
+                        <span class="srs-timer">{elapsed_str}</span>
+                    </div>
+                    <div class="srs-row">
+                        <span class="srs-label">Iteracion ML</span>
+                        <span class="srs-value">{iter_display}</span>
+                    </div>
+                    <div class="srs-row">
+                        <span class="srs-label">Metrica</span>
+                        <span class="srs-value">{metric_display}</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
             add_log("Sistema", "Iniciando pipeline de analisis...", "info")
             add_log("Data Steward", "Analizando calidad e integridad de datos...", "info")
@@ -867,47 +1067,128 @@ if start_btn:
                 if 'steward' in event:
                     completed_steps.add("steward")
                     active_step = "strategist"
-                    add_log("Data Steward", "Auditoria completada.", "ok")
-                    add_log("Strategist", "Diseñando estrategias de alto impacto...", "info")
+                    current_progress = _STEP_PROGRESS["steward"]
+                    # Extract data summary stats
+                    summary = final_state.get('data_summary', '')
+                    add_log("Data Steward", "Auditoria de calidad completada.", "ok")
+                    add_log("Strategist", "Generando 3 estrategias de alto impacto...", "info")
 
                 elif 'strategist' in event:
                     completed_steps.add("strategist")
                     active_step = "domain_expert"
-                    add_log("Strategist", "3 estrategias generadas. Iniciando deliberacion...", "ok")
+                    current_progress = _STEP_PROGRESS["strategist"]
+                    # Extract strategy titles for detailed logging
+                    strategies = final_state.get('strategies', {})
+                    if isinstance(strategies, dict) and 'strategies' in strategies:
+                        strat_list = strategies['strategies']
+                        titles = [s.get('title', '?') for s in strat_list[:3]]
+                        add_log("Strategist", f"{len(strat_list)} estrategias generadas:", "ok")
+                        for i, t in enumerate(titles, 1):
+                            add_log("Strategist", f"  {i}. {t}", "info")
+                    else:
+                        add_log("Strategist", "Estrategias generadas.", "ok")
+                    add_log("Domain Expert", "Evaluando y puntuando cada estrategia...", "info")
 
                 elif 'domain_expert' in event:
                     completed_steps.add("domain_expert")
                     active_step = "data_engineer"
+                    current_progress = _STEP_PROGRESS["domain_expert"]
                     selected = final_state.get('selected_strategy', {})
-                    add_log("Domain Expert", f"Estrategia seleccionada: {selected.get('title', 'N/A')}", "ok")
-                    add_log("Data Engineer", "Limpiando y estandarizando dataset...", "info")
+                    reviews = final_state.get('domain_expert_reviews', [])
+                    # Log each strategy score
+                    if reviews:
+                        for rev in reviews:
+                            score = rev.get('score', '?')
+                            title = rev.get('title', '?')
+                            add_log("Domain Expert", f"  {title} — {score}/10", "info")
+                    sel_title = selected.get('title', 'N/A') if isinstance(selected, dict) else 'N/A'
+                    add_log("Domain Expert", f"Estrategia ganadora: {sel_title}", "ok")
+                    add_log("Data Engineer", "Ejecutando script de limpieza y estandarizacion...", "info")
 
                 elif 'data_engineer' in event:
                     completed_steps.add("data_engineer")
                     active_step = "engineer"
-                    add_log("Data Engineer", "Datos limpiados y estandarizados.", "ok")
-                    add_log("ML Engineer", "Optimizando modelo (iteracion en curso)...", "info")
+                    current_progress = _STEP_PROGRESS["data_engineer"]
+                    add_log("Data Engineer", "Dataset limpiado y estandarizado.", "ok")
+                    # Detect iteration policy from contract
+                    contract = final_state.get('execution_contract', {})
+                    if isinstance(contract, dict):
+                        iter_policy = contract.get('iteration_policy', {})
+                        if isinstance(iter_policy, dict):
+                            limit = iter_policy.get('max_iterations', iter_policy.get('limit', ml_max_iterations))
+                            if isinstance(limit, (int, float)) and limit >= 1:
+                                ml_max_iterations = int(limit)
+                        metric = contract.get('primary_metric', contract.get('metric', ''))
+                        if metric:
+                            best_metric_name = str(metric).upper()
+                    if not best_metric_name:
+                        best_metric_name = "Metric"
+                    ml_iteration = 1
+                    add_log("ML Engineer", f"Generando codigo — Iteracion 1/{ml_max_iterations}...", "info")
 
                 elif 'engineer' in event:
-                    pass
+                    # ML code generation event
+                    iteration = final_state.get('current_iteration', ml_iteration)
+                    if isinstance(iteration, int) and iteration > ml_iteration:
+                        ml_iteration = iteration
+                    add_log("ML Engineer", f"Codigo generado (Iteracion {ml_iteration}). Ejecutando...", "info")
+                    # Interpolate progress between data_engineer (48%) and evaluate_results (82%)
+                    ml_range = _STEP_PROGRESS["evaluate_results"] - _STEP_PROGRESS["data_engineer"]
+                    iter_progress = min(ml_iteration / ml_max_iterations, 1.0)
+                    current_progress = _STEP_PROGRESS["data_engineer"] + int(ml_range * iter_progress * 0.7)
 
                 elif 'execute_code' in event:
-                    add_log("ML Engineer", "Ejecucion de codigo finalizada.", "ok")
-                    add_log("Reviewer", "Evaluando resultados de negocio...", "info")
+                    # Extract metric from execution output
+                    exec_output = str(final_state.get('execution_output', ''))
+                    import re
+                    # Try to find common metric patterns in output
+                    for pattern in [
+                        r'(?:RMSLE|rmsle)[:\s=]+([0-9]+\.?[0-9]*)',
+                        r'(?:RMSE|rmse)[:\s=]+([0-9]+\.?[0-9]*)',
+                        r'(?:MAE|mae)[:\s=]+([0-9]+\.?[0-9]*)',
+                        r'(?:AUC|auc)[:\s=]+([0-9]+\.?[0-9]*)',
+                        r'(?:F1|f1)[:\s=]+([0-9]+\.?[0-9]*)',
+                        r'(?:Accuracy|accuracy)[:\s=]+([0-9]+\.?[0-9]*)',
+                        r'(?:R2|r2|R-squared)[:\s=]+([0-9]+\.?[0-9]*)',
+                    ]:
+                        match = re.search(pattern, exec_output, re.IGNORECASE)
+                        if match:
+                            current_metric_value = match.group(1)
+                            # Auto-detect metric name if generic
+                            if best_metric_name == "Metric":
+                                name_match = re.search(r'([A-Za-z0-9_-]+)[:\s=]+' + re.escape(current_metric_value), exec_output)
+                                if name_match:
+                                    best_metric_name = name_match.group(1).upper()
+                            break
+                    metric_str = f" — {best_metric_name}: {current_metric_value}" if current_metric_value else ""
+                    add_log("ML Engineer", f"Ejecucion completada (Iteracion {ml_iteration}){metric_str}.", "ok")
+                    add_log("Reviewer", "Evaluando resultados vs. objetivo de negocio...", "info")
                     active_step = "evaluate_results"
 
                 elif 'evaluate_results' in event:
                     verdict = final_state.get('review_verdict', 'APPROVED')
                     if verdict == "NEEDS_IMPROVEMENT":
                         feedback = final_state.get('execution_feedback', '')
-                        add_log("Reviewer", f"Resultados insuficientes: {feedback}", "warn")
-                        add_log("ML Engineer", "Refinando modelo (retry)...", "info")
+                        # Truncate long feedback for the log
+                        if len(feedback) > 200:
+                            feedback = feedback[:200] + "..."
+                        add_log("Reviewer", f"Requiere mejoras: {feedback}", "warn")
+                        ml_iteration += 1
+                        if ml_iteration <= ml_max_iterations:
+                            add_log("ML Engineer", f"Refinando modelo — Iteracion {ml_iteration}/{ml_max_iterations}...", "info")
                         active_step = "engineer"
+                        # Update progress for retry iterations
+                        ml_range = _STEP_PROGRESS["evaluate_results"] - _STEP_PROGRESS["data_engineer"]
+                        iter_progress = min(ml_iteration / ml_max_iterations, 1.0)
+                        current_progress = _STEP_PROGRESS["data_engineer"] + int(ml_range * iter_progress)
                     else:
                         completed_steps.add("engineer")
                         completed_steps.add("evaluate_results")
                         active_step = "translator"
-                        add_log("Reviewer", "Resultados aprobados.", "ok")
+                        current_progress = _STEP_PROGRESS["evaluate_results"]
+                        metric_str = f" — {best_metric_name}: {current_metric_value}" if current_metric_value else ""
+                        add_log("Reviewer", f"Resultados aprobados{metric_str}.", "ok")
+                        add_log("Translator", "Generando informe ejecutivo...", "info")
 
                 elif 'retry_handler' in event:
                     pass
@@ -915,9 +1196,11 @@ if start_btn:
                 elif 'translator' in event:
                     completed_steps.add("translator")
                     active_step = None
+                    current_progress = _STEP_PROGRESS["translator"]
                     add_log("Translator", "Reporte ejecutivo generado.", "ok")
 
                 elif 'generate_pdf' in event:
+                    current_progress = _STEP_PROGRESS["generate_pdf"]
                     add_log("Sistema", "PDF final generado.", "ok")
 
                 refresh_ui()
@@ -928,10 +1211,14 @@ if start_btn:
             # Final pipeline: all complete
             completed_steps = {s[0] for s in PIPELINE_STEPS}
             active_step = None
-            add_log("Sistema", "Pipeline completado exitosamente.", "ok")
+            current_progress = 100
+            elapsed_total = _fmt_elapsed(time.time() - run_start)
+            add_log("Sistema", f"Pipeline completado en {elapsed_total}.", "ok")
             refresh_ui()
 
             time.sleep(0.5)
+            # Clear sidebar status before rerun
+            sidebar_status_placeholder.empty()
             st.rerun()
 
         except Exception as e:
