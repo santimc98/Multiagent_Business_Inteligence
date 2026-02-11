@@ -53,9 +53,94 @@ def _dedupe_reasons(reasons: List[str]) -> List[str]:
     return result
 
 
+def _normalize_gate_name(name: Any) -> str:
+    return str(name or "").strip().lower()
+
+
+def _extract_hard_gate_names(contract: Dict[str, Any]) -> Set[str]:
+    contract = contract if isinstance(contract, dict) else {}
+    hard_names: Set[str] = set()
+    gate_blocks = [
+        contract.get("cleaning_gates"),
+        contract.get("qa_gates"),
+        contract.get("reviewer_gates"),
+    ]
+    eval_spec = contract.get("evaluation_spec")
+    if isinstance(eval_spec, dict):
+        gate_blocks.extend([eval_spec.get("qa_gates"), eval_spec.get("gates")])
+
+    for block in gate_blocks:
+        if not isinstance(block, list):
+            continue
+        for gate in block:
+            if isinstance(gate, dict):
+                name = gate.get("name") or gate.get("id") or gate.get("gate")
+                if not name:
+                    continue
+                severity = str(gate.get("severity") or "").strip().upper()
+                required = gate.get("required")
+                is_hard = severity == "HARD" or (severity == "" and required is not False)
+                if is_hard:
+                    hard_names.add(_normalize_gate_name(name))
+            elif isinstance(gate, str):
+                hard_names.add(_normalize_gate_name(gate))
+    return hard_names
+
+
+def _segmentation_requirement_enabled(contract: Dict[str, Any]) -> bool:
+    eval_spec = contract.get("evaluation_spec")
+    if not isinstance(eval_spec, dict):
+        return False
+    seg_obj = eval_spec.get("segmentation")
+    if isinstance(seg_obj, dict):
+        if bool(seg_obj.get("required")):
+            return True
+        features = seg_obj.get("features")
+        if isinstance(features, list) and any(str(x).strip() for x in features):
+            return True
+    seg_required = eval_spec.get("segmentation_required")
+    if isinstance(seg_required, list) and any(str(x).strip() for x in seg_required):
+        return True
+    return False
+
+
+def _decisioning_requirement_enabled(contract: Dict[str, Any]) -> bool:
+    req = contract.get("decisioning_requirements")
+    if not isinstance(req, dict):
+        return False
+    enabled = req.get("enabled")
+    required = req.get("required")
+    if required is True:
+        return True
+    if enabled is True and required is not False:
+        return True
+    return False
+
+
+def _is_contract_hard_gate_failed(
+    gate_name: str,
+    hard_gate_names: Set[str],
+    segmentation_required: bool,
+    decisioning_required: bool,
+) -> bool:
+    gate_key = _normalize_gate_name(gate_name)
+    if not gate_key:
+        return False
+    if gate_key in hard_gate_names:
+        return True
+    if segmentation_required and "segmentation" in gate_key:
+        return True
+    if decisioning_required and any(
+        token in gate_key for token in ("decisioning", "operational", "uncertainty", "review_rule")
+    ):
+        return True
+    return False
+
+
 def compute_governance_verdict(
     output_contract_report: Dict[str, Any],
     state: Dict[str, Any],
+    contract: Dict[str, Any] = None,
     integrity_report: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """
@@ -81,6 +166,7 @@ def compute_governance_verdict(
     output_contract_report = output_contract_report if isinstance(output_contract_report, dict) else {}
     state = state if isinstance(state, dict) else {}
     integrity_report = integrity_report if isinstance(integrity_report, dict) else {}
+    contract = contract if isinstance(contract, dict) else {}
 
     hard_failures: List[str] = []
     failed_gates: List[str] = []
@@ -131,6 +217,9 @@ def compute_governance_verdict(
         overall_status = "error"
         reasons.append(f"review_verdict={review_verdict}")
         hard_failures.append(f"review_{_normalize_status(review_verdict).lower()}")
+    elif _normalize_status(review_verdict) == "APPROVE_WITH_WARNINGS" and overall_status == "ok":
+        overall_status = "warning"
+        reasons.append("review_verdict=APPROVE_WITH_WARNINGS")
 
     # B2: Check gate_context status
     gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context")
@@ -140,6 +229,9 @@ def compute_governance_verdict(
             overall_status = "error"
             reasons.append(f"gate_context.status={gc_status}")
             hard_failures.append(f"gate_{_normalize_status(gc_status).lower()}")
+        elif _normalize_status(gc_status) == "APPROVE_WITH_WARNINGS" and overall_status == "ok":
+            overall_status = "warning"
+            reasons.append("gate_context.status=APPROVE_WITH_WARNINGS")
 
         # B3: Collect failed_gates from gate_context
         gc_failed_gates = _safe_list(gate_context.get("failed_gates"))
@@ -212,10 +304,37 @@ def compute_governance_verdict(
         hard_failures.append("integrity_critical")
         failed_gates.append("integrity_critical")
 
+    # E: Failed gates severity reduction.
+    # - Any hard gate failure -> overall_status=error.
+    # - Any remaining failed gate -> at least warning (never "ok" with unresolved gates).
+    failed_gates = _dedupe_reasons([str(g) for g in failed_gates if g])
+    if failed_gates:
+        hard_gate_names = _extract_hard_gate_names(contract)
+        segmentation_required = _segmentation_requirement_enabled(contract)
+        decisioning_required = _decisioning_requirement_enabled(contract)
+        hard_failed = [
+            gate
+            for gate in failed_gates
+            if _is_contract_hard_gate_failed(
+                gate_name=gate,
+                hard_gate_names=hard_gate_names,
+                segmentation_required=segmentation_required,
+                decisioning_required=decisioning_required,
+            )
+        ]
+        if hard_failed:
+            overall_status = "error"
+            reasons.append(f"hard_failed_gates={hard_failed}")
+            for gate in hard_failed:
+                hard_failures.append(f"hard_gate_failed:{gate}")
+        elif overall_status == "ok":
+            overall_status = "warning"
+            reasons.append("failed_gates_present")
+
     return {
         "overall_status": overall_status,
-        "hard_failures": hard_failures,
-        "failed_gates": _dedupe_reasons(failed_gates),
+        "hard_failures": _dedupe_reasons(hard_failures),
+        "failed_gates": failed_gates,
         "reasons": _dedupe_reasons(reasons),
     }
 

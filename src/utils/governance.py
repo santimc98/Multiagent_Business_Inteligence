@@ -346,6 +346,7 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     governance_verdict = compute_governance_verdict(
         output_contract_report=output_contract,
         state=state,
+        contract=contract,
         integrity_report=integrity,
     )
 

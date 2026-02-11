@@ -334,6 +334,70 @@ def _scan_encoding_file(path: str, max_sample: int = 5000) -> Dict[str, Any]:
     return payload
 
 
+def _repair_text_file_inplace(path: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"path": path, "changed": False, "error": None}
+    if not path or not os.path.exists(path):
+        result["exists"] = False
+        return result
+    result["exists"] = True
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            original = handle.read()
+        repaired = sanitize_text(original or "")
+        result["before_score"] = int(mojibake_score(original or ""))
+        result["after_score"] = int(mojibake_score(repaired or ""))
+        if repaired != original:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(repaired)
+            result["changed"] = True
+    except Exception as err:
+        result["error"] = str(err)
+    return result
+
+
+def _repair_jsonl_file_inplace(path: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"path": path, "changed": False, "error": None}
+    if not path or not os.path.exists(path):
+        result["exists"] = False
+        return result
+    result["exists"] = True
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            original_text = handle.read()
+        original_score = int(mojibake_score(original_text or ""))
+        lines = original_text.splitlines()
+        repaired_lines: List[str] = []
+        changed = False
+        for line in lines:
+            raw_line = str(line or "")
+            if not raw_line.strip():
+                repaired_lines.append(raw_line)
+                continue
+            repaired_line = raw_line
+            try:
+                payload = json.loads(raw_line)
+                payload = sanitize_text_payload(payload)
+                repaired_line = json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                repaired_line = sanitize_text(raw_line)
+            if repaired_line != raw_line:
+                changed = True
+            repaired_lines.append(repaired_line)
+        repaired_text = "\n".join(repaired_lines)
+        if original_text.endswith("\n"):
+            repaired_text += "\n"
+        repaired_score = int(mojibake_score(repaired_text or ""))
+        result["before_score"] = original_score
+        result["after_score"] = repaired_score
+        if changed:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(repaired_text)
+            result["changed"] = True
+    except Exception as err:
+        result["error"] = str(err)
+    return result
+
+
 def _persist_encoding_audit(state: Dict[str, Any], report_text: str | None = None) -> Dict[str, Any]:
     run_id = state.get("run_id") if isinstance(state, dict) else None
     run_dir = get_run_dir(run_id) if run_id else None
@@ -343,10 +407,26 @@ def _persist_encoding_audit(state: Dict[str, Any], report_text: str | None = Non
 
     report_before = str(report_text or "")
     report_after = sanitize_text(report_before) if report_before else report_before
+    report_repaired_runtime = False
+    if report_before and report_after != report_before:
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open(report_path, "w", encoding="utf-8") as handle:
+                handle.write(report_after)
+            report_repaired_runtime = True
+        except Exception:
+            report_repaired_runtime = False
     _, report_stats = sanitize_text_payload_with_stats({"report": report_before})
     state_objective = str((state or {}).get("business_objective", "") or "")
     objective_before = state_objective
     objective_after = sanitize_text(objective_before) if objective_before else objective_before
+    if objective_after != objective_before and isinstance(state, dict):
+        state["business_objective"] = objective_after
+
+    repaired_files: List[Dict[str, Any]] = []
+    repaired_files.append(_repair_jsonl_file_inplace(event_log))
+    repaired_files.append(_repair_text_file_inplace(translator_response))
+    repaired_files.append(_repair_text_file_inplace(report_path))
 
     files = [
         _scan_encoding_file(event_log),
@@ -360,10 +440,12 @@ def _persist_encoding_audit(state: Dict[str, Any], report_text: str | None = Non
     ]
     audit = {
         "run_id": run_id,
-        "report_repaired": bool(report_after != report_before),
+        "report_repaired": bool((report_after != report_before) or report_repaired_runtime),
         "objective_repaired": bool(objective_after != objective_before),
         "report_mojibake_hits": int(report_stats.get("mojibake_hits", 0)),
         "report_strings_changed": int(report_stats.get("strings_changed", 0)),
+        "repaired_files": repaired_files,
+        "repaired_files_count": sum(1 for item in repaired_files if isinstance(item, dict) and item.get("changed")),
         "files_checked": files,
         "mojibake_detected": bool(flagged_files),
         "flagged_files": flagged_files,
@@ -3917,6 +3999,10 @@ def _looks_blocking_retry_signal(text: Any) -> bool:
         "visual_requirements",
         "schema_inconsistent",
         "alignment_check",
+        "segmentation",
+        "operational_logic",
+        "decisioning",
+        "uncertainty",
         "dependency",
         "dialect",
         "static_precheck",
@@ -17055,6 +17141,19 @@ def run_review_board(state: AgentState) -> AgentState:
     required_actions = [str(x) for x in (verdict.get("required_actions") or []) if x]
     evidence = verdict.get("evidence") if isinstance(verdict.get("evidence"), list) else []
     confidence = str(verdict.get("confidence") or "medium").lower()
+    critical_failed_areas = [area for area in failed_areas if _looks_blocking_retry_signal(area)]
+    if critical_failed_areas and final_status in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+        final_status = "NEEDS_IMPROVEMENT"
+        board_note = (
+            "Critical contract/business requirements are unresolved and require another iteration."
+        )
+        board_summary = f"{board_summary} {board_note}".strip() if board_summary else board_note
+        critical_action = (
+            "Resolve critical failed areas before approval: "
+            + ", ".join(critical_failed_areas[:6])
+        )
+        if critical_action not in required_actions:
+            required_actions.append(critical_action)
 
     current_feedback = str(state.get("review_feedback") or "")
     if board_summary:
@@ -17073,6 +17172,11 @@ def run_review_board(state: AgentState) -> AgentState:
         history.append(f"REVIEW_BOARD[{board_status}]: {board_summary}")
     elif required_actions:
         history.append(f"REVIEW_BOARD[{board_status}]: required_actions={required_actions}")
+    if critical_failed_areas and final_status == "NEEDS_IMPROVEMENT":
+        history.append(
+            "REVIEW_BOARD_POLICY: escalated to NEEDS_IMPROVEMENT due to critical failed_areas="
+            + ", ".join(critical_failed_areas[:6])
+        )
 
     gate_context = dict(state.get("last_gate_context") or {})
     current_failed = [str(g) for g in (gate_context.get("failed_gates") or []) if g]
