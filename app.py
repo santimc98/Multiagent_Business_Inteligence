@@ -459,19 +459,156 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown("##### Datos de Entrada")
+    st.markdown("##### Fuente de Datos")
 
-    uploaded_file = st.file_uploader("Cargar archivo CSV", type=["csv"])
+    data_source = st.radio(
+        "Selecciona la fuente de datos",
+        ["Archivo Local", "Salesforce", "HubSpot"],
+        label_visibility="collapsed",
+    )
 
-    if uploaded_file is not None:
-        file_size = uploaded_file.size
-        if file_size < 1024:
-            size_str = f"{file_size} B"
-        elif file_size < 1024 * 1024:
-            size_str = f"{file_size / 1024:.1f} KB"
+    uploaded_file = None
+
+    # ---- Archivo Local ----
+    if data_source == "Archivo Local":
+        uploaded_file = st.file_uploader("Cargar archivo CSV o Excel", type=["csv", "xlsx", "xls"])
+        if uploaded_file is not None:
+            file_size = uploaded_file.size
+            if file_size < 1024:
+                size_str = f"{file_size} B"
+            elif file_size < 1024 * 1024:
+                size_str = f"{file_size / 1024:.1f} KB"
+            else:
+                size_str = f"{file_size / (1024*1024):.1f} MB"
+            st.markdown(f'<span class="metric-pill">{uploaded_file.name} &mdash; {size_str}</span>', unsafe_allow_html=True)
+
+    # ---- Salesforce ----
+    elif data_source == "Salesforce":
+        sf_auth_mode = st.selectbox("Modo de autenticacion", ["Token API", "OAuth (Access Token)"], key="sf_auth_mode")
+
+        if sf_auth_mode == "Token API":
+            sf_username = st.text_input("Username", key="sf_username")
+            sf_password = st.text_input("Password", type="password", key="sf_password")
+            sf_token = st.text_input("Security Token", type="password", key="sf_security_token")
+            sf_connect = st.button("Conectar a Salesforce", key="sf_connect")
+
+            if sf_connect and sf_username and sf_password and sf_token:
+                try:
+                    from src.connectors.salesforce_connector import SalesforceConnector
+                    connector = SalesforceConnector()
+                    connector.authenticate({
+                        "mode": "token",
+                        "username": sf_username,
+                        "password": sf_password,
+                        "security_token": sf_token,
+                    })
+                    st.session_state["crm_connector"] = connector
+                    st.session_state["crm_authenticated"] = True
+                    st.session_state["crm_objects"] = connector.list_objects()
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
+                    st.session_state["crm_authenticated"] = False
         else:
-            size_str = f"{file_size / (1024*1024):.1f} MB"
-        st.markdown(f'<span class="metric-pill">{uploaded_file.name} &mdash; {size_str}</span>', unsafe_allow_html=True)
+            sf_access_token = st.text_input("Access Token", type="password", key="sf_oauth_token")
+            sf_instance_url = st.text_input("Instance URL", placeholder="https://your-instance.salesforce.com", key="sf_instance_url")
+            sf_connect_oauth = st.button("Conectar a Salesforce", key="sf_connect_oauth")
+
+            if sf_connect_oauth and sf_access_token and sf_instance_url:
+                try:
+                    from src.connectors.salesforce_connector import SalesforceConnector
+                    connector = SalesforceConnector()
+                    connector.authenticate({
+                        "mode": "oauth",
+                        "access_token": sf_access_token,
+                        "instance_url": sf_instance_url,
+                    })
+                    st.session_state["crm_connector"] = connector
+                    st.session_state["crm_authenticated"] = True
+                    st.session_state["crm_objects"] = connector.list_objects()
+                except Exception as exc:
+                    st.error(f"Error: {exc}")
+                    st.session_state["crm_authenticated"] = False
+
+        # Object selection & data fetch (shared for both SF auth modes)
+        if st.session_state.get("crm_authenticated") and type(st.session_state.get("crm_connector")).__name__ == "SalesforceConnector":
+            st.markdown('<span class="badge badge-success">Conectado a Salesforce</span>', unsafe_allow_html=True)
+            crm_objects = st.session_state.get("crm_objects", [])
+            if crm_objects:
+                obj_labels = [f"{o['label']} ({o['name']})" for o in crm_objects]
+                selected_idx = st.selectbox("Objeto CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="sf_obj_select")
+                max_recs = st.number_input("Max registros", min_value=100, max_value=50000, value=10000, step=500, key="sf_max_recs")
+                fetch_btn = st.button("Extraer Datos", key="sf_fetch")
+
+                if fetch_btn:
+                    selected_obj = crm_objects[selected_idx]["name"]
+                    try:
+                        connector = st.session_state["crm_connector"]
+                        df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
+                        if df_crm.empty:
+                            st.warning(f"El objeto '{selected_obj}' no contiene registros.")
+                        else:
+                            os.makedirs("data", exist_ok=True)
+                            crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")
+                            df_crm.to_csv(crm_csv, index=False, encoding="utf-8")
+                            st.session_state["crm_data_path"] = crm_csv
+                            st.session_state["crm_preview_df"] = df_crm
+                            st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extraidos</span>', unsafe_allow_html=True)
+                    except Exception as exc:
+                        st.error(f"Error al extraer datos: {exc}")
+
+            if st.session_state.get("crm_data_path"):
+                preview_df = st.session_state.get("crm_preview_df")
+                if preview_df is not None:
+                    st.markdown(f'<span class="metric-pill">{len(preview_df):,} registros listos</span>', unsafe_allow_html=True)
+
+    # ---- HubSpot ----
+    elif data_source == "HubSpot":
+        hs_auth_mode = st.selectbox("Modo de autenticacion", ["Private App Token", "OAuth (Access Token)"], key="hs_auth_mode")
+        hs_token = st.text_input("Token", type="password", key="hs_token")
+        hs_connect = st.button("Conectar a HubSpot", key="hs_connect")
+
+        if hs_connect and hs_token:
+            try:
+                from src.connectors.hubspot_connector import HubSpotConnector
+                connector = HubSpotConnector()
+                connector.authenticate({"access_token": hs_token})
+                st.session_state["crm_connector"] = connector
+                st.session_state["crm_authenticated"] = True
+                st.session_state["crm_objects"] = connector.list_objects()
+            except Exception as exc:
+                st.error(f"Error: {exc}")
+                st.session_state["crm_authenticated"] = False
+
+        if st.session_state.get("crm_authenticated") and type(st.session_state.get("crm_connector")).__name__ == "HubSpotConnector":
+            st.markdown('<span class="badge badge-success">Conectado a HubSpot</span>', unsafe_allow_html=True)
+            crm_objects = st.session_state.get("crm_objects", [])
+            if crm_objects:
+                obj_labels = [f"{o['label']} ({o['name']})" for o in crm_objects]
+                selected_idx = st.selectbox("Objeto CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="hs_obj_select")
+                max_recs = st.number_input("Max registros", min_value=100, max_value=50000, value=10000, step=500, key="hs_max_recs")
+                fetch_btn = st.button("Extraer Datos", key="hs_fetch")
+
+                if fetch_btn:
+                    selected_obj = crm_objects[selected_idx]["name"]
+                    try:
+                        connector = st.session_state["crm_connector"]
+                        df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
+                        if df_crm.empty:
+                            st.warning(f"El objeto '{selected_obj}' no contiene registros.")
+                        else:
+                            os.makedirs("data", exist_ok=True)
+                            crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")
+                            df_crm.to_csv(crm_csv, index=False, encoding="utf-8")
+                            st.session_state["crm_data_path"] = crm_csv
+                            st.session_state["crm_preview_df"] = df_crm
+                            st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extraidos</span>', unsafe_allow_html=True)
+                    except Exception as exc:
+                        st.error(f"Error al extraer datos: {exc}")
+
+            if st.session_state.get("crm_data_path"):
+                preview_df = st.session_state.get("crm_preview_df")
+                if preview_df is not None:
+                    st.markdown(f'<span class="metric-pill">{len(preview_df):,} registros listos</span>', unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("##### Objetivo de Negocio")
@@ -495,9 +632,33 @@ if "analysis_result" not in st.session_state:
     st.session_state["analysis_result"] = None
 
 # ---------------------------------------------------------------------------
-# Welcome Screen (no file uploaded and no results)
+# Resolve data_path from any source
 # ---------------------------------------------------------------------------
-if uploaded_file is None and not st.session_state.get("analysis_complete"):
+data_path = None
+
+if data_source == "Archivo Local" and uploaded_file is not None:
+    os.makedirs("data", exist_ok=True)
+    temp_path = os.path.join("data", uploaded_file.name)
+    with open(temp_path, "wb") as f:
+        uploaded_file.seek(0)
+        while chunk := uploaded_file.read(8 * 1024 * 1024):
+            f.write(chunk)
+
+    ext = os.path.splitext(uploaded_file.name)[1].lower()
+    if ext in ('.xlsx', '.xls'):
+        from src.connectors.excel_converter import convert_to_csv
+        data_path = convert_to_csv(temp_path)
+        st.info(f"Archivo Excel convertido a CSV: {os.path.basename(data_path)}")
+    else:
+        data_path = temp_path
+
+elif data_source in ("Salesforce", "HubSpot"):
+    data_path = st.session_state.get("crm_data_path")
+
+# ---------------------------------------------------------------------------
+# Welcome Screen (no data loaded and no results)
+# ---------------------------------------------------------------------------
+if data_path is None and not st.session_state.get("analysis_complete"):
     st.markdown("""
     <div class="hero fade-in">
         <h1><span class="hero-gradient">Inteligencia de Negocio Autonoma</span></h1>
@@ -538,7 +699,7 @@ if uploaded_file is None and not st.session_state.get("analysis_complete"):
     <div class="steps-container fade-in">
         <div class="step-item">
             <div class="step-number">1</div>
-            <div class="step-text"><strong>Sube tus datos</strong>Carga un archivo CSV desde el panel lateral.</div>
+            <div class="step-text"><strong>Sube tus datos</strong>Carga un archivo CSV/Excel o conecta tu CRM desde el panel lateral.</div>
         </div>
         <div class="step-item">
             <div class="step-number">2</div>
@@ -552,43 +713,23 @@ if uploaded_file is None and not st.session_state.get("analysis_complete"):
     """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# File uploaded: save + preview
+# Unified preview for any data source
 # ---------------------------------------------------------------------------
-if uploaded_file is not None:
-    os.makedirs("data", exist_ok=True)
-    data_path = os.path.join("data", uploaded_file.name)
-    with open(data_path, "wb") as f:
-        uploaded_file.seek(0)
-        while chunk := uploaded_file.read(8 * 1024 * 1024):
-            f.write(chunk)
-
-    # Preview (only when not analyzing and no results)
+if data_path is not None:
     if not st.session_state["analysis_complete"] and not start_btn:
-        def load_preview(file):
-            file.seek(0)
-            try:
-                df = pd.read_csv(file)
-                if len(df.columns) > 1:
-                    return df
-            except Exception:
-                pass
-            file.seek(0)
-            try:
-                df = pd.read_csv(file, sep=';')
-                if len(df.columns) > 1:
-                    return df
-            except Exception:
-                pass
-            file.seek(0)
-            try:
-                df = pd.read_csv(file, sep=';', encoding='latin-1')
-                return df
-            except Exception:
-                return None
+        try:
+            df_preview = pd.read_csv(data_path, nrows=50)
+        except Exception:
+            df_preview = None
 
-        df_preview = load_preview(uploaded_file)
+        # Fallback: try CSV with semicolon separator
+        if df_preview is None or (df_preview is not None and len(df_preview.columns) <= 1):
+            try:
+                df_preview = pd.read_csv(data_path, sep=';', nrows=50)
+            except Exception:
+                df_preview = None
 
-        if df_preview is not None:
+        if df_preview is not None and len(df_preview.columns) > 1:
             n_rows, n_cols = df_preview.shape
             dtypes_summary = df_preview.dtypes.value_counts()
             dtype_parts = [f"{count} {str(dtype)}" for dtype, count in dtypes_summary.items()]
@@ -606,8 +747,8 @@ if uploaded_file is not None:
 
             st.dataframe(df_preview.head(10), use_container_width=True, height=300)
             st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.error("Error al leer CSV: No se pudo detectar el formato automaticamente.")
+        elif df_preview is not None:
+            st.warning("El dataset parece tener solo una columna. Verifica el formato del archivo.")
 
 # ---------------------------------------------------------------------------
 # Pipeline steps definition (for visual tracker)
@@ -647,8 +788,8 @@ def _render_pipeline(completed_steps: set, active_step: str | None = None):
 # Start Analysis
 # ---------------------------------------------------------------------------
 if start_btn:
-    if uploaded_file is None:
-        st.sidebar.error("Por favor sube un archivo CSV.")
+    if data_path is None:
+        st.sidebar.error("Por favor carga datos: sube un archivo o conecta un CRM.")
     elif not business_objective:
         st.sidebar.error("Por favor define un objetivo de negocio.")
     else:

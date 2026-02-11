@@ -39,6 +39,10 @@ seaborn
 plotly
 altair
 
+# --- CRM Connectors ---
+simple-salesforce>=1.12.0
+hubspot-api-client>=8.0.0
+
 # --- Utils & Reporting ---
 fpdf
 reportlab
