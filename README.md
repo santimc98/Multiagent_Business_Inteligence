@@ -1,4 +1,4 @@
-# 🏭 The Insight Foundry
+# 🏭 StrategyEngine AI 
 
 ### Autonomous Multi-Agent Business Intelligence System
 
@@ -10,9 +10,9 @@
 
 ---
 
-## 🚀 What is The Insight Foundry?
+## 🚀 What is StrategyEngine AI ?
 
-**The Insight Foundry** is an autonomous Data Science department powered by AI. Upload a CSV, describe your business objective, and a team of **13 specialized AI agents** — orchestrated by **LangGraph** and powered by **Gemini, OpenRouter, MIMO, and other LLMs** — collaborates end-to-end to deliver executive-ready business intelligence reports.
+**StrategyEngine AI ** is an autonomous Data Science department powered by AI. Upload a CSV, describe your business objective, and a team of **13 specialized AI agents** — orchestrated by **LangGraph** and powered by **Gemini, OpenRouter, MIMO, and other LLMs** — collaborates end-to-end to deliver executive-ready business intelligence reports.
 
 No notebooks. No manual tuning. No code. Just strategic insights.
 
