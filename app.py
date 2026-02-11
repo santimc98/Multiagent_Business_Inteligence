@@ -106,8 +106,13 @@ section[data-testid="stSidebar"] h3 {
     color: #e6edf3 !important;
 }
 section[data-testid="stSidebar"] .stTextArea label,
-section[data-testid="stSidebar"] .stFileUploader label {
-    color: #e6edf3 !important;
+section[data-testid="stSidebar"] .stFileUploader label,
+section[data-testid="stSidebar"] .stSelectbox label,
+section[data-testid="stSidebar"] .stRadio label,
+section[data-testid="stSidebar"] .stNumberInput label,
+section[data-testid="stSidebar"] .stTextInput label,
+section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
+    color: #ffffff !important;
 }
 
 /* ---------- Cards ---------- */
@@ -263,6 +268,7 @@ section[data-testid="stSidebar"] .stFileUploader label {
     max-width: 600px;
     margin: 0 auto;
     line-height: 1.6;
+    text-align: center;
 }
 
 /* ---------- Feature Cards ---------- */
