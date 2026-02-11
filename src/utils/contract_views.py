@@ -257,7 +257,9 @@ def _resolve_required_outputs(contract_min: Dict[str, Any], contract_full: Dict[
         for item in values:
             if not item:
                 continue
-            text = str(item)
+            text = str(item).replace("\\", "/").strip()
+            if not text:
+                continue
             key = text.lower()
             if key in seen:
                 continue
@@ -265,7 +267,10 @@ def _resolve_required_outputs(contract_min: Dict[str, Any], contract_full: Dict[
             merged.append(text)
 
     _add(contract_min.get("required_outputs"))
-    _add(get_required_outputs(contract_full))
+    _add(contract_full.get("required_outputs"))
+    # Backward-compatible fallback: only widen from accessor when contract outputs are absent.
+    if not merged:
+        _add(get_required_outputs(contract_full))
     return merged
 
 
@@ -1418,8 +1423,23 @@ def _project_objective_type(contract_full: Dict[str, Any]) -> str:
 
 
 def _project_required_outputs(contract_full: Dict[str, Any]) -> List[str]:
-    outputs = get_required_outputs(contract_full)
-    return [str(item) for item in outputs if item]
+    outputs = contract_full.get("required_outputs")
+    if not isinstance(outputs, list) or not outputs:
+        outputs = get_required_outputs(contract_full)
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in outputs:
+        if not item:
+            continue
+        text = str(item).replace("\\", "/").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
 
 
 def _project_artifact_requirements(contract_full: Dict[str, Any]) -> Dict[str, Any]:

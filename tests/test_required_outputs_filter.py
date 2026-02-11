@@ -24,7 +24,7 @@ def test_resolve_required_outputs_filters_conceptual():
     assert "Priority Rank" in conceptual
 
 
-def test_resolve_required_outputs_includes_visualization_required_plots():
+def test_resolve_required_outputs_prefers_contract_outputs_as_source_of_truth():
     contract = {
         "required_outputs": ["data/metrics.json"],
         "visualization_requirements": {
@@ -35,5 +35,18 @@ def test_resolve_required_outputs_includes_visualization_required_plots():
     }
     outputs = _resolve_required_outputs(contract, {})
 
-    assert "data/metrics.json" in outputs
+    assert outputs == ["data/metrics.json"]
+
+
+def test_resolve_required_outputs_falls_back_to_visualization_outputs_when_contract_missing():
+    contract = {
+        "visualization_requirements": {
+            "required": True,
+            "required_plots": [{"name": "confidence_distribution"}],
+            "outputs_dir": "static/plots",
+        },
+    }
+
+    outputs = _resolve_required_outputs(contract, {})
+
     assert "static/plots/confidence_distribution.png" in outputs

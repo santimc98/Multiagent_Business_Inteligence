@@ -78,3 +78,32 @@ def test_extract_primary_metric_for_board_reports_missing_contract_metric(tmp_pa
     assert primary.get("name") == "normalized_gini"
     assert primary.get("value") is None
     assert primary.get("source") == "contract.primary_metric_missing"
+
+
+def test_extract_primary_metric_for_board_reads_nested_primary_metric_value(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state = {
+        "execution_contract": {
+            "evaluation_spec": {
+                "objective_type": "regression",
+                "primary_metric": "RMSLE",
+            }
+        }
+    }
+    metrics_report = {
+        "source": "reports/evaluation_metrics.json",
+        "model_performance": {
+            "primary_metric": {
+                "name": "RMSLE",
+                "value": 0.4265,
+                "std": 0.01,
+            },
+            "secondary_metrics": {"MAE": 322.2},
+        },
+    }
+
+    primary = graph_mod._extract_primary_metric_for_board(state, metrics_report)
+
+    assert primary.get("name") in {"RMSLE", "primary_metric"}
+    assert primary.get("value") == 0.4265
+    assert primary.get("source") != "contract.primary_metric_missing"

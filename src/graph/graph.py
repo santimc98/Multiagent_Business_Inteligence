@@ -2729,9 +2729,9 @@ def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | 
     """
     Resolve required outputs from V4.1 contract structure.
     Priority:
-      1. evaluation_spec.required_outputs
-      2. contract.required_outputs
-      3. artifact_requirements.required_files
+      1. contract.required_outputs (single source of truth)
+      2. evaluation_spec.required_outputs (fallback when contract list is absent/empty)
+      3. accessor union (legacy fallback only)
     NO LONGER uses spec_extraction.deliverables (legacy).
     """
     if not isinstance(contract, dict):
@@ -2766,7 +2766,40 @@ def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | 
         seen.add(key)
         resolved.append(normalized)
 
-    # Priority 1: evaluation_spec.required_outputs
+    # Priority 1: contract.required_outputs (canonical)
+    has_contract_required_outputs = False
+    req_outputs = contract.get("required_outputs")
+    if isinstance(req_outputs, list) and req_outputs:
+        file_like, conceptual_like = _split_outputs(req_outputs)
+        conceptual_outputs.extend(conceptual_like)
+        for path in file_like:
+            _add_output(path)
+        has_contract_required_outputs = bool(file_like)
+
+    # If canonical required_outputs exists, do not widen with eval/accessor outputs.
+    # This avoids runtime/view desynchronization and keeps contract as single source of truth.
+    if has_contract_required_outputs:
+        eval_spec = contract.get("evaluation_spec")
+        if isinstance(eval_spec, dict):
+            eval_outputs = eval_spec.get("required_outputs")
+            if isinstance(eval_outputs, list) and eval_outputs:
+                _, conceptual_like = _split_outputs(eval_outputs)
+                conceptual_outputs.extend(conceptual_like)
+        try:
+            accessor_outputs = get_required_outputs(contract)
+        except Exception:
+            accessor_outputs = []
+        if isinstance(accessor_outputs, list):
+            for entry in accessor_outputs:
+                if not entry:
+                    continue
+                text = str(entry)
+                if not _looks_like_filesystem_path(text):
+                    conceptual_outputs.append(text)
+        _merge_conceptual_outputs(state, contract, conceptual_outputs)
+        return resolved
+
+    # Fallback 1: evaluation_spec.required_outputs
     eval_spec = contract.get("evaluation_spec")
     if isinstance(eval_spec, dict):
         eval_outputs = eval_spec.get("required_outputs")
@@ -2776,15 +2809,7 @@ def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | 
             for path in file_like:
                 _add_output(path)
 
-    # Priority 2: contract.required_outputs
-    req_outputs = contract.get("required_outputs")
-    if isinstance(req_outputs, list) and req_outputs:
-        file_like, conceptual_like = _split_outputs(req_outputs)
-        conceptual_outputs.extend(conceptual_like)
-        for path in file_like:
-            _add_output(path)
-
-    # Priority 3: V4.1 accessor union (required_files, required_plots, visual required items)
+    # Fallback 2: accessor union (required_files/required_plots/visual required items)
     try:
         accessor_outputs = get_required_outputs(contract)
     except Exception:
@@ -7151,34 +7176,64 @@ def _coerce_float(value: Any) -> float | None:
 
 def _collect_metric_candidates(metrics_report: Dict[str, Any], weights_report: Dict[str, Any]) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
+
+    def _append_candidate(
+        name: str,
+        value: Any,
+        ci_lower: Any = None,
+        ci_upper: Any = None,
+    ) -> None:
+        metric_name = str(name or "").strip()
+        num = _coerce_float(value)
+        if not metric_name or num is None:
+            return
+        candidates.append(
+            {
+                "name": metric_name,
+                "value": num,
+                "ci_lower": _coerce_float(ci_lower),
+                "ci_upper": _coerce_float(ci_upper),
+                "is_baseline": _is_baseline_metric_name(metric_name),
+            }
+        )
+
+    def _walk_metric_tree(prefix: str, node: Any, depth: int = 0) -> None:
+        if depth > 3:
+            return
+        if isinstance(node, dict):
+            # Standard metric containers: {"mean": x} or {"value": x}
+            if prefix:
+                _append_candidate(prefix, node.get("mean"), node.get("ci_lower"), node.get("ci_upper"))
+                _append_candidate(prefix, node.get("value"), node.get("ci_lower"), node.get("ci_upper"))
+                metric_alias = node.get("name") or node.get("metric")
+                if metric_alias:
+                    _append_candidate(str(metric_alias), node.get("value"), node.get("ci_lower"), node.get("ci_upper"))
+            # Flatten nested metric trees (e.g., secondary_metrics.MAE, segmentation.by_vendor.n_vendors)
+            ignored_keys = {
+                "mean",
+                "value",
+                "name",
+                "metric",
+                "ci_lower",
+                "ci_upper",
+                "std",
+                "stdev",
+                "std_dev",
+                "threshold",
+                "status",
+            }
+            for child_key, child_val in node.items():
+                if str(child_key) in ignored_keys:
+                    continue
+                child_prefix = f"{prefix}.{child_key}" if prefix else str(child_key)
+                _walk_metric_tree(child_prefix, child_val, depth + 1)
+            return
+        _append_candidate(prefix, node)
+
     model_perf = metrics_report.get("model_performance") if isinstance(metrics_report, dict) else {}
     if isinstance(model_perf, dict):
         for key, value in model_perf.items():
-            if isinstance(value, dict) and "mean" in value:
-                mean = _coerce_float(value.get("mean"))
-                if mean is None:
-                    continue
-                candidates.append(
-                    {
-                        "name": str(key),
-                        "value": mean,
-                        "ci_lower": _coerce_float(value.get("ci_lower")),
-                        "ci_upper": _coerce_float(value.get("ci_upper")),
-                        "is_baseline": _is_baseline_metric_name(str(key)),
-                    }
-                )
-            else:
-                num = _coerce_float(value)
-                if num is not None:
-                    candidates.append(
-                        {
-                            "name": str(key),
-                            "value": num,
-                            "ci_lower": None,
-                            "ci_upper": None,
-                            "is_baseline": _is_baseline_metric_name(str(key)),
-                        }
-                    )
+            _walk_metric_tree(str(key), value)
     if isinstance(weights_report, dict):
         for container in ("metrics", "classification", "regression", "propensity_model", "price_model", "optimization"):
             block = weights_report.get(container)
@@ -7508,6 +7563,27 @@ def _build_reviewer_evidence_packet(
         primary_value = primary.get("value")
         if primary_name and isinstance(primary_value, (int, float)):
             metric_lines.append(f"{primary_name}={float(primary_value):.6g}")
+    if not metric_lines:
+        for cand in _collect_metric_candidates(metrics_report, {}):
+            name = str(cand.get("name") or "").strip()
+            value = cand.get("value")
+            if not name or not isinstance(value, (int, float)):
+                continue
+            if bool(cand.get("is_baseline")):
+                continue
+            metric_lines.append(f"{name}={float(value):.6g}")
+            if len(metric_lines) >= 6:
+                break
+
+    perf_keys = [str(k).lower() for k in perf.keys()]
+    has_segmentation = any("segment" in key for key in perf_keys)
+    if not has_segmentation:
+        seg_block = metrics_report.get("segmentation") if isinstance(metrics_report, dict) else None
+        has_segmentation = isinstance(seg_block, dict) and bool(seg_block)
+    has_alignment_check = os.path.exists("data/alignment_check.json") or any(
+        "alignment_check.json" in str(path).lower() for path in present_outputs
+    )
+    has_metrics = bool(metric_lines)
 
     summary_lines = [
         "=== DETERMINISTIC_EVIDENCE ===",
@@ -7518,19 +7594,26 @@ def _build_reviewer_evidence_packet(
         summary_lines.append(f"output_contract_present_preview={preview}")
     if metric_lines:
         summary_lines.append(f"metrics={'; '.join(metric_lines[:6])}")
+    if has_segmentation:
+        summary_lines.append("segmentation=present")
+    if has_alignment_check:
+        summary_lines.append("alignment_check=present")
     summary_lines.append("=== END_DETERMINISTIC_EVIDENCE ===")
     summary_text = "\n".join(summary_lines)
-    has_structured_evidence = (not missing_required) and bool(metric_lines)
+    has_structured_evidence = (not missing_required) and has_metrics
 
     return {
         "has_structured_evidence": has_structured_evidence,
         "summary_text": summary_text,
         "metrics_preview": metric_lines[:6],
         "missing_required": missing_required,
+        "has_metrics": has_metrics,
+        "has_segmentation": has_segmentation,
+        "has_alignment_check": has_alignment_check,
     }
 
 
-def _feedback_claims_missing_evidence(feedback: str | None) -> bool:
+def _feedback_claims_missing_evidence(feedback: str | None, evidence: Dict[str, Any] | None = None) -> bool:
     text = str(feedback or "").lower()
     if not text:
         return False
@@ -7541,7 +7624,53 @@ def _feedback_claims_missing_evidence(feedback: str | None) -> bool:
         "not verifiable",
         "insufficient evidence",
     )
-    return any(token in text for token in tokens)
+    if any(token in text for token in tokens):
+        return True
+
+    evidence = evidence if isinstance(evidence, dict) else {}
+    has_metrics = bool(evidence.get("has_metrics"))
+    has_segmentation = bool(evidence.get("has_segmentation"))
+    has_alignment_check = bool(evidence.get("has_alignment_check"))
+    missing_required = [str(x) for x in (evidence.get("missing_required") or []) if x]
+
+    claims_missing_artifacts = any(
+        token in text
+        for token in (
+            "required artifact",
+            "missing artifact",
+            "artifacts are missing",
+            "not generated",
+            "not found",
+        )
+    )
+    claims_missing_metrics = any(
+        token in text
+        for token in (
+            "not reported",
+            "metric is missing",
+            "metrics are missing",
+            "metrics are not",
+            "primary kpi",
+            "secondary metrics",
+            "no metrics",
+        )
+    )
+    claims_missing_segmentation = ("segment" in text) and any(
+        token in text for token in ("missing", "not present", "not reported", "not available", "no segmentation")
+    )
+    claims_missing_alignment = ("alignment_check" in text) and any(
+        token in text for token in ("missing", "not generated", "not found", "not available")
+    )
+
+    if claims_missing_artifacts and not missing_required:
+        return True
+    if claims_missing_metrics and has_metrics:
+        return True
+    if claims_missing_segmentation and has_segmentation:
+        return True
+    if claims_missing_alignment and has_alignment_check:
+        return True
+    return False
 
 def _collect_outputs_state(required_outputs: List[str]) -> Dict[str, List[str]]:
     present: List[str] = []
@@ -16138,7 +16267,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         )
         if (
             reviewer_evidence.get("has_structured_evidence")
-            and _feedback_claims_missing_evidence(eval_result.get("feedback"))
+            and _feedback_claims_missing_evidence(eval_result.get("feedback"), reviewer_evidence)
         ):
             metrics_preview = reviewer_evidence.get("metrics_preview") or []
             metrics_text = ", ".join([str(item) for item in metrics_preview if item])
