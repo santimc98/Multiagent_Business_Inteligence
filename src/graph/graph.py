@@ -8311,6 +8311,7 @@ class AgentState(TypedDict):
     csv_decimal: str
     dataset_scale_hints: Dict[str, Any]
     dataset_scale: str
+    ml_execution_profile: Dict[str, Any]
     cleaned_data_summary_min: Dict[str, Any]
     cleaned_data_summary_min_path: str
     dataset_semantics: Dict[str, Any]
@@ -9633,6 +9634,128 @@ def _resolve_ml_backend_selection(state: Dict[str, Any]) -> Dict[str, Any]:
         "heavy_imports_in_code": list(heavy_imports_in_code),
         "ml_plan": ml_plan,
         "data_profile": data_profile,
+    }
+
+
+def _parse_memory_gb_hint(raw_value: Any) -> float | None:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip().lower()
+    if not text:
+        return None
+    mult = 1.0
+    if text.endswith("gi"):
+        text = text[:-2]
+    elif text.endswith("gib"):
+        text = text[:-3]
+    elif text.endswith("gb"):
+        text = text[:-2]
+    elif text.endswith("mi"):
+        text = text[:-2]
+        mult = 1.0 / 1024.0
+    elif text.endswith("mib"):
+        text = text[:-3]
+        mult = 1.0 / 1024.0
+    elif text.endswith("mb"):
+        text = text[:-2]
+        mult = 1.0 / 1024.0
+    try:
+        parsed = float(text)
+    except Exception:
+        return None
+    if parsed <= 0:
+        return None
+    return round(parsed * mult, 3)
+
+
+def _read_int_env_hint(*names: str) -> int | None:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        try:
+            parsed = int(str(raw).strip())
+            if parsed > 0:
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _read_memory_env_hint(*names: str) -> float | None:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        parsed = _parse_memory_gb_hint(raw)
+        if parsed and parsed > 0:
+            return parsed
+    return None
+
+
+def _build_ml_execution_profile_for_prompt(
+    state: Dict[str, Any],
+    *,
+    code: str = "",
+    ml_plan: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """
+    Build runtime-context profile for ML Engineer and reviewers.
+    This profile is advisory context only and never mutates the execution contract.
+    """
+    state = state if isinstance(state, dict) else {}
+    backend_selection = _resolve_ml_backend_selection(state)
+    heavy_cfg = backend_selection.get("heavy_cfg") if isinstance(backend_selection.get("heavy_cfg"), dict) else {}
+    hints = state.get("dataset_scale_hints") if isinstance(state.get("dataset_scale_hints"), dict) else {}
+    timeout_decision = _estimate_heavy_script_timeout(
+        stage="ml_engineer",
+        code=str(code or ""),
+        state=state,
+        ml_plan=ml_plan if isinstance(ml_plan, dict) else None,
+        configured_timeout_seconds=heavy_cfg.get("script_timeout_seconds") if isinstance(heavy_cfg, dict) else None,
+    )
+    cpu_hint = _read_int_env_hint(
+        "HEAVY_RUNNER_CPU_HINT",
+        "HEAVY_RUNNER_CPU",
+        "CLOUDRUN_JOB_CPU",
+        "CLOUD_RUN_CPU",
+    )
+    memory_gb_hint = _read_memory_env_hint(
+        "HEAVY_RUNNER_MEMORY_GB_HINT",
+        "HEAVY_RUNNER_MEMORY_GB",
+        "HEAVY_RUNNER_MEMORY",
+        "CLOUDRUN_JOB_MEMORY",
+        "CLOUD_RUN_MEMORY",
+    )
+    backend = "cloudrun" if bool(backend_selection.get("use_heavy")) else "e2b"
+    return {
+        "backend": backend,
+        "selection_reason": str(backend_selection.get("reason") or "unknown"),
+        "dataset_scale": str(hints.get("scale") or state.get("dataset_scale") or "unknown"),
+        "dataset_estimate": {
+            "est_rows": _safe_int(hints.get("est_rows"), 0),
+            "file_mb": round(_safe_float(hints.get("file_mb"), 0.0), 3),
+            "n_cols": _safe_int(hints.get("cols") or hints.get("n_cols"), 0),
+        },
+        "resources": {
+            "cpu_hint": cpu_hint,
+            "memory_gb_hint": memory_gb_hint,
+            "source": "env_hints_or_unknown",
+        },
+        "runtime_budget": {
+            "hard_timeout_seconds": _safe_int(timeout_decision.get("timeout_seconds"), 0),
+            "estimated_seconds_before_clamp": _safe_int(timeout_decision.get("estimated_seconds_before_clamp"), 0),
+            "cv_folds": _safe_int(timeout_decision.get("cv_folds"), 0),
+            "max_detected_n_estimators": _safe_int(timeout_decision.get("max_detected_n_estimators"), 0),
+            "complexity_tags": timeout_decision.get("tags") if isinstance(timeout_decision.get("tags"), list) else [],
+        },
+        "objective": "optimize business KPI under runtime budget; prefer robust completion over timeout risk",
+        "adaptation_order": [
+            "bound_search_space",
+            "bound_cv_cost",
+            "bound_model_complexity",
+            "bound_train_rows",
+        ],
     }
 
 
@@ -13693,10 +13816,10 @@ def run_engineer(state: AgentState) -> AgentState:
                     log_run_event(run_id, "ml_view_context", {"length": ml_view_len})
             except Exception:
                 pass
+        ml_plan_for_gen = state.get("ml_plan")
+        if not ml_plan_for_gen:
+            ml_plan_for_gen = _load_json_safe("data/ml_plan.json")
         if "ml_plan" in sig.parameters:
-            ml_plan_for_gen = state.get("ml_plan")
-            if not ml_plan_for_gen:
-                ml_plan_for_gen = _load_json_safe("data/ml_plan.json")
             kwargs["ml_plan"] = ml_plan_for_gen or {}
         if "cleaned_data_summary_min" in sig.parameters:
             kwargs["cleaned_data_summary_min"] = cleaned_data_summary_min or {}
@@ -13704,7 +13827,24 @@ def run_engineer(state: AgentState) -> AgentState:
         derived_present = []
         sample_context = ""
         context_ops_blocks = []
+        execution_profile: Dict[str, Any] = {}
         dataset_scale_hints = state.get("dataset_scale_hints") or {}
+        code_hint = previous_code if isinstance(previous_code, str) else str(state.get("generated_code") or "")
+        execution_profile = _build_ml_execution_profile_for_prompt(
+            state if isinstance(state, dict) else {},
+            code=code_hint,
+            ml_plan=ml_plan_for_gen if isinstance(ml_plan_for_gen, dict) else None,
+        )
+        if execution_profile:
+            execution_profile_payload = compress_long_lists(execution_profile)[0]
+            execution_profile_block = (
+                "EXECUTION_PROFILE_CONTEXT (INFRASTRUCTURE BUDGET; ADVISORY, NEVER OVERRIDE CONTRACT):\n"
+                + json.dumps(execution_profile_payload, ensure_ascii=True)
+            )
+            data_audit_context = _merge_de_audit_override(data_audit_context, execution_profile_block)
+            kwargs["data_audit_context"] = data_audit_context
+            if "execution_profile" in sig.parameters:
+                kwargs["execution_profile"] = execution_profile
         if not minimal_context_mode:
             scale_line = (
                 "POST-CLEAN DATASET SCALE: "
@@ -13715,6 +13855,11 @@ def run_engineer(state: AgentState) -> AgentState:
                 f"chunk_size={dataset_scale_hints.get('chunk_size') or 'unknown'}"
             )
             context_ops_blocks.append(scale_line)
+            if execution_profile:
+                context_ops_blocks.append(
+                    "EXECUTION_PROFILE_CONTEXT:\n"
+                    + json.dumps(compress_long_lists(execution_profile)[0], ensure_ascii=True)
+                )
             # V4.1: Removed feature_availability and availability_summary blocks
             if iteration_memory:
                 memory_slice = iteration_memory[-2:]
@@ -13843,6 +13988,7 @@ def run_engineer(state: AgentState) -> AgentState:
                     "csv_sep": csv_sep,
                     "csv_decimal": csv_decimal,
                     "ml_view": kwargs.get("ml_view"),
+                    "execution_profile": execution_profile,
                     "cleaned_data_summary_min": cleaned_data_summary_min,
                     "data_audit_context": data_audit_context,
                     "last_gate_context": gate_context,
@@ -13863,6 +14009,7 @@ def run_engineer(state: AgentState) -> AgentState:
                     "required_features": strategy.get("required_columns", []),
                     "execution_contract": execution_contract,
                     "ml_view": state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view"),
+                    "execution_profile": execution_profile,
                     "cleaned_data_summary_min": cleaned_data_summary_min,
                     "data_audit_context": data_audit_context,
                     "iteration_handoff": iteration_handoff,
@@ -13956,6 +14103,36 @@ def run_engineer(state: AgentState) -> AgentState:
             data_audit_context = _merge_de_audit_override(data_audit_context, plan_context)
             kwargs["data_audit_context"] = data_audit_context
 
+        # Build/refresh runtime execution profile after plan resolution.
+        execution_profile = _build_ml_execution_profile_for_prompt(
+            state if isinstance(state, dict) else {},
+            code=code_hint,
+            ml_plan=ml_plan if isinstance(ml_plan, dict) else None,
+        )
+        if execution_profile:
+            if "execution_profile" in sig.parameters:
+                kwargs["execution_profile"] = execution_profile
+            exec_profile_ctx = (
+                "EXECUTION_PROFILE_CONTEXT (INFRASTRUCTURE BUDGET; ADVISORY, NEVER OVERRIDE CONTRACT):\n"
+                + json.dumps(compress_long_lists(execution_profile)[0], ensure_ascii=True)
+            )
+            data_audit_context = _merge_de_audit_override(data_audit_context, exec_profile_ctx)
+            kwargs["data_audit_context"] = data_audit_context
+            if run_id:
+                try:
+                    log_run_event(
+                        run_id,
+                        "ml_execution_profile",
+                        {
+                            "backend": execution_profile.get("backend"),
+                            "selection_reason": execution_profile.get("selection_reason"),
+                            "runtime_budget": execution_profile.get("runtime_budget"),
+                            "resources": execution_profile.get("resources"),
+                        },
+                    )
+                except Exception:
+                    pass
+
         code = ml_engineer.generate_code(**kwargs)
         try:
             os.makedirs("artifacts", exist_ok=True)
@@ -14037,6 +14214,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "feature_semantics": (execution_contract or {}).get("feature_semantics", []),
                 "business_sanity_checks": (execution_contract or {}).get("business_sanity_checks", []),
                 "execution_contract": execution_contract,
+                "execution_profile": execution_profile,
             },
             "budget_counters": counters,
             "strategy_lock_snapshot": strategy_lock_snapshot,
@@ -14046,6 +14224,7 @@ def run_engineer(state: AgentState) -> AgentState:
             "ml_plan": ml_plan if 'ml_plan' in dir() else state.get("ml_plan"),
             "ml_plan_path": state.get("ml_plan_path"),
             "ml_engineer_attempt": ml_attempt,
+            "ml_execution_profile": execution_profile,
         }
         merged_state = dict(state or {})
         merged_state.update(result)
@@ -14123,9 +14302,19 @@ def run_reviewer(state: AgentState) -> AgentState:
         )
         reviewer_view = projected_views.get("reviewer_view") or {}
     dataset_semantics_summary = state.get("dataset_semantics_summary")
+    execution_profile = state.get("ml_execution_profile")
+    if not isinstance(execution_profile, dict) or not execution_profile:
+        execution_profile = _build_ml_execution_profile_for_prompt(
+            state if isinstance(state, dict) else {},
+            code=str(code or ""),
+            ml_plan=state.get("ml_plan") if isinstance(state.get("ml_plan"), dict) else None,
+        )
     if dataset_semantics_summary and isinstance(reviewer_view, dict):
         reviewer_view = dict(reviewer_view)
         reviewer_view["dataset_semantics_summary"] = dataset_semantics_summary
+    if isinstance(reviewer_view, dict) and execution_profile:
+        reviewer_view = dict(reviewer_view)
+        reviewer_view["execution_profile"] = execution_profile
     if isinstance(reviewer_view, dict):
         reviewer_view = compress_long_lists(reviewer_view)[0]
     analysis_type = reviewer_view.get("objective_type") or strategy.get('analysis_type', 'predictive')
@@ -14213,6 +14402,7 @@ def run_reviewer(state: AgentState) -> AgentState:
             context={
                 "analysis_type": analysis_type,
                 "business_objective": business_objective,
+                "execution_profile": execution_profile,
             },
             verdicts=review,
         )
@@ -14277,6 +14467,15 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             qa_context = {}
             contract_source = "fallback"
         qa_context["_contract_source"] = contract_source
+        execution_profile = state.get("ml_execution_profile")
+        if not isinstance(execution_profile, dict) or not execution_profile:
+            execution_profile = _build_ml_execution_profile_for_prompt(
+                state if isinstance(state, dict) else {},
+                code=str(code or ""),
+                ml_plan=state.get("ml_plan") if isinstance(state.get("ml_plan"), dict) else None,
+            )
+        if execution_profile:
+            qa_context["execution_profile"] = execution_profile
 
         # Wire ML Plan for QA coherence check (Senior Reasoning)
         qa_context.setdefault("evaluation_spec", {})
@@ -14407,7 +14606,10 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                 "qa_reviewer",
                 prompt=getattr(qa_reviewer, "last_prompt", None),
                 response=getattr(qa_reviewer, "last_response", None) or qa_result,
-                context={"business_objective": business_objective},
+                context={
+                    "business_objective": business_objective,
+                    "execution_profile": qa_context.get("execution_profile") if isinstance(qa_context, dict) else {},
+                },
                 verdicts=qa_result,
             )
         return {
@@ -17067,6 +17269,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
 
     results_insights: Dict[str, Any] = {}
     try:
+        execution_profile = state.get("ml_execution_profile")
+        if not isinstance(execution_profile, dict) or not execution_profile:
+            execution_profile = _build_ml_execution_profile_for_prompt(
+                state if isinstance(state, dict) else {},
+                code=str(state.get("generated_code") or ""),
+                ml_plan=state.get("ml_plan") if isinstance(state.get("ml_plan"), dict) else None,
+            )
         strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
         objective_type = objective_type or (strategy_spec or {}).get("objective_type")
         if not objective_type:
@@ -17094,6 +17303,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "iteration_policy": (contract or {}).get("iteration_policy", {}) if isinstance(contract, dict) else {},
             "strategy_spec": strategy_spec,
             "reporting_policy": contract.get("reporting_policy", {}) if isinstance(contract, dict) else {},
+            "execution_profile": execution_profile,
         }
         insights = results_advisor.generate_insights(insights_context)
         if insights:
@@ -17128,6 +17338,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "runtime_fix_terminal": runtime_terminal,
         "runtime_fix_count": int(state.get("runtime_fix_count", 0) or 0),
         "sandbox_failed": bool(state.get("sandbox_failed")),
+        "execution_profile": state.get("ml_execution_profile")
+        if isinstance(state.get("ml_execution_profile"), dict)
+        else _build_ml_execution_profile_for_prompt(
+            state if isinstance(state, dict) else {},
+            code=str(state.get("generated_code") or ""),
+            ml_plan=state.get("ml_plan") if isinstance(state.get("ml_plan"), dict) else None,
+        ),
     }
     raw_eval_status = str(eval_result.get("status") or "").upper()
     eval_packet = {

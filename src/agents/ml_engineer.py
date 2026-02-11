@@ -1822,6 +1822,7 @@ $strategy_json
         iteration_memory_block: str = "",
         dataset_scale: Dict[str, Any] | None = None,
         dataset_scale_str: str | None = None,
+        execution_profile: Dict[str, Any] | None = None,
     ) -> str:
 
         SYSTEM_PROMPT_TEMPLATE = """
@@ -2129,6 +2130,7 @@ $strategy_json
         - Alignment Requirements: $alignment_requirements_json
         - Signal Summary: $signal_summary_json
         - Cleaned Data Summary (minimal, advisory-only): $cleaned_data_summary_min_json
+        - Execution Profile (runtime budget, advisory-only): $execution_profile_json
         - Iteration Memory: $iteration_memory_json
         - Iteration Memory (compact): $iteration_memory_block
         - Data audit context: $data_audit_context
@@ -2149,10 +2151,21 @@ $strategy_json
         COMPUTE CONTEXT (HARDWARE-AWARE OPTIMIZATION)
         =============================================
         You run under orchestrated sandbox resources. Adapt computation to available CPU/RAM and timeout budget.
+        - EXECUTION_PROFILE is your runtime budget context. Use it to size CV/search/model complexity and training volume.
+        - Never ignore a hard timeout signal from EXECUTION_PROFILE.
         - Set n_jobs from available CPUs (N_CPUS) and avoid oversubscription.
         - Prefer bounded search spaces with explicit time/iteration budgets.
         - For large datasets, use chunked scoring and memory-aware transforms.
         - Choose implementation complexity by expected business lift per compute cost, not by fixed model-family preference.
+
+        RUNTIME PLAN (MANDATORY, CONTEXT-DRIVEN)
+        - Define and print a compact `RUNTIME_PLAN` dictionary before training.
+        - Include:
+          * budget_inputs (backend, timeout, rows estimate if available),
+          * major_cost_drivers (CV folds, model complexity, search loops),
+          * safety_controls (how you bound runtime),
+          * fallback_order (what to reduce first if budget risk appears).
+        - This is reasoning transparency, not a rigid template.
 
         ADAPTIVE CODING PATTERNS:
         ```python
@@ -2390,6 +2403,10 @@ $strategy_json
         ml_view_payload = compress_long_lists(ml_view)[0]
         ml_view_json = json.dumps(ml_view_payload, indent=2)
         plot_spec_json = json.dumps(compress_long_lists(ml_view.get("plot_spec", {}))[0], indent=2)
+        execution_profile_json = json.dumps(
+            compress_long_lists(execution_profile or {})[0],
+            indent=2,
+        )
         evaluation_spec_source = execution_contract_input.get("evaluation_spec")
         if not isinstance(evaluation_spec_source, dict):
             evaluation_spec_source = ml_view.get("evaluation_spec") if isinstance(ml_view.get("evaluation_spec"), dict) else {}
@@ -2469,6 +2486,7 @@ $strategy_json
             cleaned_data_summary_min_json=json.dumps(
                 compress_long_lists(cleaned_data_summary_min or {})[0], indent=2
             ),
+            execution_profile_json=execution_profile_json,
             iteration_memory_json=json.dumps(compress_long_lists(iteration_memory or [])[0], indent=2),
             iteration_memory_block=iteration_memory_block or "",
             dataset_scale=dataset_scale,
