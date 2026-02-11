@@ -117,6 +117,10 @@ section[data-testid="stSidebar"] .stTextInput label,
 section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
     color: #ffffff !important;
 }
+section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label p,
+section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label span {
+    color: #8b949e !important;
+}
 
 /* ---------- Cards ---------- */
 .card {
@@ -268,12 +272,8 @@ section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
 .hero-subtitle {
     font-size: 1.1rem;
     color: var(--text-secondary);
-    max-width: 700px;
-    margin-left: auto;
-    margin-right: auto;
     line-height: 1.6;
     text-align: center;
-    display: block;
 }
 
 /* ---------- Feature Cards ---------- */
