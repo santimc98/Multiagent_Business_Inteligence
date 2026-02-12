@@ -1,45 +1,78 @@
 import os
 import json
 import re
+import logging
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from openai import OpenAI
 from src.utils.senior_protocol import SENIOR_STRATEGY_PROTOCOL
+from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
 
 load_dotenv()
 
 class StrategistAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Strategist Agent with Gemini 3 Flash Preview.
+        Initializes the Strategist Agent with OpenRouter primary + fallback models.
         """
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        self.logger = logging.getLogger(__name__)
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
-            raise ValueError("Google API Key is required.")
+            raise ValueError("OpenRouter API Key is required.")
 
-        genai.configure(api_key=self.api_key)
-        generation_config = {
-            "temperature": 0.3,
-            "top_p": 0.9,
-            "top_k": 40,
-            "response_mime_type": "application/json",
+        timeout_raw = os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+        try:
+            timeout_seconds = float(timeout_raw) if timeout_raw else 120.0
+        except ValueError:
+            timeout_seconds = 120.0
+        headers = {}
+        referer = os.getenv("OPENROUTER_HTTP_REFERER")
+        if referer:
+            headers["HTTP-Referer"] = referer
+        title = os.getenv("OPENROUTER_X_TITLE")
+        if title:
+            headers["X-Title"] = title
+        client_kwargs = {
+            "api_key": self.api_key,
+            "base_url": "https://openrouter.ai/api/v1",
+            "timeout": timeout_seconds,
         }
-        self.safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
-        self.model = genai.GenerativeModel(
-            model_name="gemini-3-flash-preview",
-            generation_config=generation_config,
-            safety_settings=self.safety_settings,
+        if headers:
+            client_kwargs["default_headers"] = headers
+        self.client = OpenAI(**client_kwargs)
+
+        self.model_name = (
+            os.getenv("STRATEGIST_MODEL")
+            or os.getenv("OPENROUTER_STRATEGIST_PRIMARY_MODEL")
+            or "z-ai/glm-5"
         )
+        self.fallback_model_name = (
+            os.getenv("STRATEGIST_FALLBACK_MODEL")
+            or os.getenv("OPENROUTER_STRATEGIST_FALLBACK_MODEL")
+            or "z-ai/glm-4.7"
+        )
+        self.model_chain = [m for m in [self.model_name, self.fallback_model_name] if m]
+
         self.last_prompt = None
         self.last_response = None
         self.last_repair_prompt = None
         self.last_repair_response = None
+        self.last_model_used = None
+
+    def _call_model(self, prompt: str, *, temperature: float, context_tag: str) -> str:
+        response, model_used = call_chat_with_fallback(
+            llm_client=self.client,
+            messages=[{"role": "user", "content": prompt}],
+            model_chain=self.model_chain,
+            call_kwargs={"temperature": temperature},
+            logger=self.logger,
+            context_tag=context_tag,
+        )
+        content = extract_response_text(response)
+        if not content:
+            raise ValueError("EMPTY_COMPLETION")
+        self.last_model_used = model_used
+        return content
 
     def generate_strategies(
         self,
@@ -259,8 +292,11 @@ class StrategistAgent:
         self.last_prompt = system_prompt
         
         try:
-            response = self.model.generate_content(system_prompt)
-            content = response.text
+            content = self._call_model(
+                system_prompt,
+                temperature=0.3,
+                context_tag="strategist_generate",
+            )
             self.last_response = content
             cleaned_content = self._clean_json(content)
             parsed = json.loads(cleaned_content)
@@ -305,7 +341,7 @@ class StrategistAgent:
                 "required_columns": [],
                 "techniques": ["correlation_analysis"],
                 "estimated_difficulty": "Low",
-                "reasoning": f"Gemini API Failed: {e}"
+                "reasoning": f"OpenRouter API Failed: {e}"
             }]}
             fallback["column_validation"] = self._validate_required_columns(fallback, allowed_columns)
             strategy_spec = self._build_strategy_spec_from_llm(fallback, data_summary, user_request)
@@ -510,9 +546,13 @@ class StrategistAgent:
             )
             self.last_repair_prompt = repair_prompt
             try:
-                repair_response = self.model.generate_content(repair_prompt)
-                self.last_repair_response = repair_response.text
-                repaired_raw = self._clean_json(repair_response.text)
+                repaired_content = self._call_model(
+                    repair_prompt,
+                    temperature=0.1,
+                    context_tag="strategist_repair",
+                )
+                self.last_repair_response = repaired_content
+                repaired_raw = self._clean_json(repaired_content)
                 repaired_parsed = json.loads(repaired_raw)
                 candidate = self._normalize_strategist_output(repaired_parsed)
                 candidate_validation = self._validate_required_columns(candidate, allowed_columns)

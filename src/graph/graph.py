@@ -8470,7 +8470,7 @@ def run_steward(state: AgentState) -> AgentState:
 
     agent_models = {
         "steward": getattr(getattr(steward, "model", None), "model_name", None),
-        "strategist": getattr(getattr(strategist, "model", None), "model_name", None),
+        "strategist": getattr(getattr(strategist, "model", None), "model_name", None) or getattr(strategist, "model_name", None),
         "domain_expert": getattr(domain_expert, "model_name", None),
         "execution_planner": getattr(execution_planner, "model_name", None),
         "data_engineer": getattr(data_engineer, "model_name", None),
@@ -8738,7 +8738,7 @@ def run_steward(state: AgentState) -> AgentState:
     return steward_payload
 
 def run_strategist(state: AgentState) -> AgentState:
-    print("--- [2] Strategist: Formulating 3 Strategies (MIMO v2 Flash) ---")
+    print("--- [2] Strategist: Formulating 3 Strategies (OpenRouter GLM-5) ---")
     abort_state = _abort_if_requested(state, "strategist")
     if abort_state:
         return abort_state

@@ -3,7 +3,7 @@ import json
 import re
 from typing import Dict, Any, List
 from dotenv import load_dotenv
-from openai import OpenAI
+import google.generativeai as genai
 from src.utils.senior_protocol import SENIOR_STRATEGY_PROTOCOL
 
 load_dotenv()
@@ -11,19 +11,22 @@ load_dotenv()
 class DomainExpertAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Domain Expert Agent with MIMO v2 Flash.
+        Initializes the Domain Expert Agent with Gemini 3 Flash Preview.
         Role: Senior Business Analyst / Product Owner.
         """
-        self.api_key = api_key or os.getenv("MIMO_API_KEY")
+        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
-            raise ValueError("MIMO API Key is required for Domain Expert.")
-        
-        # Initialize OpenAI-compatible client for MIMO
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://api.xiaomimimo.com/v1"
+            raise ValueError("Google API Key is required for Domain Expert.")
+
+        genai.configure(api_key=self.api_key)
+        self.model_name = os.getenv("DOMAIN_EXPERT_MODEL", "gemini-3-flash-preview")
+        self.model = genai.GenerativeModel(
+            model_name=self.model_name,
+            generation_config={
+                "temperature": 0.1,
+                "response_mime_type": "application/json",
+            },
         )
-        self.model_name = "mimo-v2-flash"
         self.last_prompt = None
         self.last_response = None
 
@@ -91,21 +94,10 @@ class DomainExpertAgent:
             senior_strategy_protocol=SENIOR_STRATEGY_PROTOCOL,
         )
         self.last_prompt = system_prompt
-        
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "Evaluate these strategies."}
-        ]
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                response_format={'type': 'json_object'},
-                temperature=0.1
-            )
-            
-            content = response.choices[0].message.content
+            response = self.model.generate_content(system_prompt)
+            content = response.text
             self.last_response = content
             cleaned_content = self._clean_json(content)
             return json.loads(cleaned_content)
