@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import hashlib
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -57,6 +58,7 @@ class StrategistAgent:
         self.last_response = None
         self.last_repair_prompt = None
         self.last_repair_response = None
+        self.last_json_repair_meta = None
         self.last_model_used = None
 
     def _call_model(self, prompt: str, *, temperature: float, context_tag: str) -> str:
@@ -74,6 +76,207 @@ class StrategistAgent:
         self.last_model_used = model_used
         return content
 
+    def _get_wide_schema_threshold(self) -> int:
+        raw = os.getenv("STRATEGIST_WIDE_SCHEMA_THRESHOLD", "240")
+        try:
+            value = int(raw)
+        except Exception:
+            value = 240
+        return max(50, min(value, 5000))
+
+    def _get_wide_required_columns_max(self) -> int:
+        raw = os.getenv("STRATEGIST_WIDE_REQUIRED_COLUMNS_MAX", "48")
+        try:
+            value = int(raw)
+        except Exception:
+            value = 48
+        return max(8, min(value, 256))
+
+    def _get_json_repair_attempts(self) -> int:
+        raw = os.getenv("STRATEGIST_JSON_REPAIR_ATTEMPTS", "2")
+        try:
+            value = int(raw)
+        except Exception:
+            value = 2
+        return max(0, min(value, 4))
+
+    def _get_json_repair_max_chars(self) -> int:
+        raw = os.getenv("STRATEGIST_JSON_REPAIR_MAX_CHARS", "180000")
+        try:
+            value = int(raw)
+        except Exception:
+            value = 180000
+        return max(12000, min(value, 400000))
+
+    def _column_families(self, allowed_columns: List[str]) -> List[Dict[str, Any]]:
+        buckets: Dict[str, List[Tuple[int, str]]] = {}
+        for col in allowed_columns:
+            if not isinstance(col, str):
+                continue
+            m = re.match(r"^([A-Za-z_]+)(\d+)$", col.strip())
+            if not m:
+                continue
+            prefix = m.group(1)
+            idx = int(m.group(2))
+            buckets.setdefault(prefix, []).append((idx, col))
+        families: List[Dict[str, Any]] = []
+        for prefix, pairs in buckets.items():
+            if len(pairs) < 6:
+                continue
+            pairs_sorted = sorted(pairs, key=lambda x: x[0])
+            families.append(
+                {
+                    "prefix": prefix,
+                    "count": len(pairs_sorted),
+                    "index_min": pairs_sorted[0][0],
+                    "index_max": pairs_sorted[-1][0],
+                    "examples": [
+                        pairs_sorted[0][1],
+                        pairs_sorted[len(pairs_sorted) // 2][1],
+                        pairs_sorted[-1][1],
+                    ],
+                }
+            )
+        families.sort(key=lambda item: int(item.get("count", 0)), reverse=True)
+        return families
+
+    def _build_inventory_payload(
+        self,
+        allowed_columns: List[str],
+        column_sets: Dict[str, Any],
+        *,
+        wide_schema_mode: bool,
+    ) -> str:
+        if not wide_schema_mode:
+            return json.dumps(allowed_columns, ensure_ascii=False)
+
+        families = self._column_families(allowed_columns)
+        family_columns = set()
+        for fam in families:
+            prefix = str(fam.get("prefix") or "")
+            if not prefix:
+                continue
+            pattern = re.compile(rf"^{re.escape(prefix)}\d+$")
+            for col in allowed_columns:
+                if pattern.match(col):
+                    family_columns.add(col)
+
+        special_columns = [col for col in allowed_columns if col not in family_columns]
+        payload = {
+            "mode": "wide_schema_compact_inventory",
+            "total_columns": len(allowed_columns),
+            "inventory_fingerprint_sha1": hashlib.sha1(
+                "\n".join(allowed_columns).encode("utf-8", errors="ignore")
+            ).hexdigest(),
+            "feature_families_detected": families,
+            "explicit_non_family_columns": special_columns,
+            "column_sets_hints": column_sets if isinstance(column_sets, dict) else {},
+            "instruction": (
+                "Use explicit_non_family_columns for exact names and feature_families_detected for dense "
+                "numeric families. Do not enumerate every member of large families in required_columns."
+            ),
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _build_json_repair_prompt(
+        self,
+        *,
+        raw_output: str,
+        parse_error: str,
+        data_summary: str,
+        user_request: str,
+    ) -> str:
+        from src.utils.prompting import render_prompt
+
+        REPAIR_TEMPLATE = """
+        You are repairing a strategist JSON that failed to parse.
+        IMPORTANT: Edit the provided JSON draft. Do NOT rewrite from scratch.
+
+        Return ONLY valid raw JSON.
+        No markdown, no commentary.
+
+        Constraints:
+        - Preserve existing strategy meaning, titles, metrics, and reasoning whenever present.
+        - Keep the same top-level schema: {"strategies":[...]}.
+        - If the tail is truncated, complete missing brackets/objects using existing context.
+        - Remove dangling commas and invalid tokens.
+
+        *** USER REQUEST ***
+        "$user_request"
+
+        *** DATA SUMMARY (REFERENCE) ***
+        $data_summary
+
+        *** PARSE ERROR ***
+        $parse_error
+
+        *** BROKEN JSON DRAFT TO EDIT ***
+        $broken_json
+        """
+        return render_prompt(
+            REPAIR_TEMPLATE,
+            user_request=user_request,
+            data_summary=data_summary,
+            parse_error=parse_error,
+            broken_json=raw_output,
+        )
+
+    def _parse_with_json_repair(
+        self,
+        raw_json: str,
+        *,
+        data_summary: str,
+        user_request: str,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        try:
+            parsed = json.loads(raw_json)
+            return parsed, {
+                "status": "ok",
+                "repair_applied": False,
+                "attempts_used": 0,
+            }
+        except json.JSONDecodeError as decode_err:
+            attempts = self._get_json_repair_attempts()
+            if attempts <= 0:
+                raise
+
+            print(f"Strategist JSON parse failed. Starting repair attempts. error={decode_err}")
+            current_draft = raw_json
+            max_chars = self._get_json_repair_max_chars()
+            last_err: Exception = decode_err
+            for attempt in range(1, attempts + 1):
+                print(f"Strategist JSON repair attempt {attempt}/{attempts}")
+                bounded_draft = current_draft if len(current_draft) <= max_chars else current_draft[-max_chars:]
+                repair_prompt = self._build_json_repair_prompt(
+                    raw_output=bounded_draft,
+                    parse_error=str(last_err),
+                    data_summary=data_summary,
+                    user_request=user_request,
+                )
+                self.last_repair_prompt = repair_prompt
+                repaired_content = self._call_model(
+                    repair_prompt,
+                    temperature=0.0,
+                    context_tag="strategist_json_repair",
+                )
+                self.last_repair_response = repaired_content
+                candidate_raw = self._clean_json(repaired_content)
+                try:
+                    parsed = json.loads(candidate_raw)
+                    return parsed, {
+                        "status": "repaired",
+                        "repair_applied": True,
+                        "attempts_used": attempt,
+                        "initial_error": str(decode_err),
+                    }
+                except json.JSONDecodeError as attempt_err:
+                    print(f"Strategist JSON repair attempt failed: {attempt_err}")
+                    last_err = attempt_err
+                    # Keep trying from the latest candidate, preserving prior reconstruction work.
+                    current_draft = candidate_raw or current_draft
+
+            raise decode_err
+
     def generate_strategies(
         self,
         data_summary: str,
@@ -88,6 +291,31 @@ class StrategistAgent:
         from src.utils.prompting import render_prompt
         allowed_columns = self._normalize_column_inventory(column_inventory)
         column_sets_payload = column_sets if isinstance(column_sets, dict) else {}
+        wide_schema_threshold = self._get_wide_schema_threshold()
+        wide_schema_mode = len(allowed_columns) > wide_schema_threshold
+        required_columns_budget = self._get_wide_required_columns_max() if wide_schema_mode else None
+        inventory_payload = self._build_inventory_payload(
+            allowed_columns,
+            column_sets_payload,
+            wide_schema_mode=wide_schema_mode,
+        )
+        wide_schema_guidance = (
+            (
+                f"WIDE-SCHEMA MODE ACTIVE: total columns={len(allowed_columns)} > threshold={wide_schema_threshold}. "
+                "Avoid enumerating dense feature families in required_columns. Use compact role-critical anchors "
+                "and optionally capture families under feature_families."
+            )
+            if wide_schema_mode
+            else "NORMAL-SCHEMA MODE: list required_columns explicitly, only those relevant to the strategy."
+        )
+        required_columns_budget_guidance = (
+            (
+                f"required_columns budget in this run: <= {required_columns_budget} per strategy. "
+                "If more features are relevant, keep anchors in required_columns and describe families in feature_families."
+            )
+            if required_columns_budget
+            else "No explicit required_columns budget in this run."
+        )
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Chief Data Strategist inside a multi-agent system. Your goal is to craft ONE optimal strategy
@@ -104,6 +332,12 @@ class StrategistAgent:
 
         *** COLUMN SETS (OPTIONAL, MAY BE EMPTY) ***
         $column_sets
+
+        *** SCHEMA MODE GUIDANCE ***
+        $wide_schema_guidance
+
+        *** REQUIRED COLUMNS BUDGET ***
+        $required_columns_budget_guidance
 
         *** USER REQUEST ***
         "$user_request"
@@ -261,6 +495,7 @@ class StrategistAgent:
             "analysis_type": "Brief label (e.g. 'Price Optimization', 'Churn Prediction')",
             "hypothesis": "What you expect to find or achieve",
             "required_columns": ["exact", "column", "names", "from", "summary"],
+            "feature_families": [{"family": "optional", "rationale": "optional", "selector_hint": "optional"}],
             "techniques": ["list", "of", "data science techniques"],
             "feasibility_analysis": {
               "statistical_power": "Assessment of n/p ratio and sample adequacy",
@@ -273,6 +508,10 @@ class StrategistAgent:
             "reasoning": "Why this strategy is optimal for the data and objective"
           }
         - "required_columns": Use EXACT column names from AUTHORIZED COLUMN INVENTORY only.
+        - If WIDE-SCHEMA MODE is active, keep required_columns compact and role-critical.
+        - In WIDE-SCHEMA MODE, do NOT enumerate all members of dense numeric families in required_columns.
+          Use explicit anchor columns in required_columns and document families in feature_families.
+        - In WIDE-SCHEMA MODE, required_columns count must stay inside the configured budget.
         - NEVER invent, rename, abbreviate, or infer columns not present in AUTHORIZED COLUMN INVENTORY.
         - If uncertain about a column, omit it (do not hallucinate).
         - "objective_reasoning" is MANDATORY and must connect business goal → objective_type.
@@ -284,8 +523,10 @@ class StrategistAgent:
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
             data_summary=data_summary,
-            authorized_column_inventory=json.dumps(allowed_columns, ensure_ascii=False),
+            authorized_column_inventory=inventory_payload,
             column_sets=json.dumps(column_sets_payload, ensure_ascii=False),
+            wide_schema_guidance=wide_schema_guidance,
+            required_columns_budget_guidance=required_columns_budget_guidance,
             user_request=user_request,
             senior_strategy_protocol=SENIOR_STRATEGY_PROTOCOL,
         )
@@ -299,15 +540,27 @@ class StrategistAgent:
             )
             self.last_response = content
             cleaned_content = self._clean_json(content)
-            parsed = json.loads(cleaned_content)
+            parsed, json_repair_meta = self._parse_with_json_repair(
+                cleaned_content,
+                data_summary=data_summary,
+                user_request=user_request,
+            )
+            self.last_json_repair_meta = json_repair_meta
 
             # Normalization (Fix for crash 'list' object has no attribute 'get')
             payload = self._normalize_strategist_output(parsed)
-            column_validation = self._validate_required_columns(payload, allowed_columns)
+            column_validation = self._validate_required_columns(
+                payload,
+                allowed_columns,
+                max_required_columns=required_columns_budget,
+            )
             max_repairs = self._get_column_repair_attempts()
             if (
                 allowed_columns
-                and column_validation.get("invalid_count", 0) > 0
+                and (
+                    int(column_validation.get("invalid_count", 0)) > 0
+                    or int(column_validation.get("over_budget_count", 0)) > 0
+                )
                 and max_repairs > 0
             ):
                 payload, column_validation = self._repair_required_columns_with_llm(
@@ -318,8 +571,12 @@ class StrategistAgent:
                     column_sets=column_sets_payload,
                     validation_report=column_validation,
                     max_attempts=max_repairs,
+                    max_required_columns=required_columns_budget,
                 )
+            column_validation["wide_schema_mode"] = wide_schema_mode
+            column_validation["required_columns_budget"] = required_columns_budget
             payload["column_validation"] = column_validation
+            payload["json_repair"] = json_repair_meta
 
             # Build strategy_spec from LLM reasoning (not hardcoded inference)
             strategy_spec = self._build_strategy_spec_from_llm(payload, data_summary, user_request)
@@ -343,7 +600,16 @@ class StrategistAgent:
                 "estimated_difficulty": "Low",
                 "reasoning": f"OpenRouter API Failed: {e}"
             }]}
-            fallback["column_validation"] = self._validate_required_columns(fallback, allowed_columns)
+            fallback["column_validation"] = self._validate_required_columns(
+                fallback,
+                allowed_columns,
+                max_required_columns=required_columns_budget,
+            )
+            fallback["json_repair"] = {
+                "status": "fallback",
+                "repair_applied": False,
+                "attempts_used": 0,
+            }
             strategy_spec = self._build_strategy_spec_from_llm(fallback, data_summary, user_request)
             fallback["strategy_spec"] = strategy_spec
             return fallback
@@ -422,7 +688,13 @@ class StrategistAgent:
                 names.append(name)
         return list(dict.fromkeys(names))
 
-    def _validate_required_columns(self, payload: Dict[str, Any], allowed_columns: List[str]) -> Dict[str, Any]:
+    def _validate_required_columns(
+        self,
+        payload: Dict[str, Any],
+        allowed_columns: List[str],
+        *,
+        max_required_columns: Optional[int] = None,
+    ) -> Dict[str, Any]:
         strategies = payload.get("strategies") if isinstance(payload, dict) else []
         if not isinstance(strategies, list):
             strategies = []
@@ -433,10 +705,15 @@ class StrategistAgent:
                 "checked_strategy_count": len(strategies),
                 "invalid_count": 0,
                 "invalid_details": [],
+                "max_required_columns": max_required_columns,
+                "over_budget_count": 0,
+                "over_budget_details": [],
             }
         allowed = set(allowed_columns)
         invalid_details: List[Dict[str, Any]] = []
         invalid_count = 0
+        over_budget_details: List[Dict[str, Any]] = []
+        over_budget_count = 0
         for idx, strategy in enumerate(strategies):
             if not isinstance(strategy, dict):
                 continue
@@ -452,13 +729,31 @@ class StrategistAgent:
                         "invalid_columns": invalid,
                     }
                 )
-        status = "ok" if invalid_count == 0 else "invalid_required_columns"
+            if isinstance(max_required_columns, int) and max_required_columns > 0 and len(names) > max_required_columns:
+                over_budget_count += 1
+                over_budget_details.append(
+                    {
+                        "strategy_index": idx,
+                        "strategy_title": strategy.get("title", f"strategy_{idx}"),
+                        "required_count": len(names),
+                        "max_required_columns": max_required_columns,
+                    }
+                )
+        if invalid_count > 0:
+            status = "invalid_required_columns"
+        elif over_budget_count > 0:
+            status = "required_columns_over_budget"
+        else:
+            status = "ok"
         return {
             "status": status,
             "allowed_column_count": len(allowed_columns),
             "checked_strategy_count": len(strategies),
             "invalid_count": invalid_count,
             "invalid_details": invalid_details,
+            "max_required_columns": max_required_columns,
+            "over_budget_count": over_budget_count,
+            "over_budget_details": over_budget_details,
         }
 
     def _get_column_repair_attempts(self) -> int:
@@ -477,17 +772,19 @@ class StrategistAgent:
         allowed_columns: List[str],
         column_sets: Dict[str, Any],
         validation_report: Dict[str, Any],
+        max_required_columns: Optional[int] = None,
     ) -> str:
         from src.utils.prompting import render_prompt
 
         REPAIR_PROMPT_TEMPLATE = """
-        You are repairing strategist JSON after validation found invalid required_columns.
+        You are repairing strategist JSON after validation found required_columns issues.
 
         Return ONLY raw JSON. No markdown, no comments.
         Keep the same top-level structure: {"strategies":[...]}.
         Preserve strategy meaning, but fix required_columns so every entry is in AUTHORIZED COLUMN INVENTORY.
         Never invent or rename columns.
         If a strategy cannot justify a column from inventory, return [] for required_columns.
+        If there is a max_required_columns budget, keep required_columns compact and move broad families to feature_families.
 
         *** USER REQUEST ***
         "$user_request"
@@ -506,7 +803,15 @@ class StrategistAgent:
 
         *** VALIDATION FAILURES ***
         $validation_report
+
+        *** REQUIRED COLUMNS BUDGET ***
+        $required_columns_budget_hint
         """
+        budget_hint = (
+            f"max_required_columns={max_required_columns}"
+            if isinstance(max_required_columns, int) and max_required_columns > 0
+            else "no_budget"
+        )
         return render_prompt(
             REPAIR_PROMPT_TEMPLATE,
             user_request=user_request,
@@ -515,6 +820,7 @@ class StrategistAgent:
             column_sets=json.dumps(column_sets or {}, ensure_ascii=False),
             current_payload=json.dumps(payload, ensure_ascii=False),
             validation_report=json.dumps(validation_report, ensure_ascii=False),
+            required_columns_budget_hint=budget_hint,
         )
 
     def _repair_required_columns_with_llm(
@@ -526,14 +832,16 @@ class StrategistAgent:
         column_sets: Dict[str, Any],
         validation_report: Dict[str, Any],
         max_attempts: int,
+        max_required_columns: Optional[int] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         best_payload = payload
         best_validation = validation_report
         best_invalid = int(validation_report.get("invalid_count", 0))
+        best_over_budget = int(validation_report.get("over_budget_count", 0))
         attempts_used = 0
         repaired = False
         for _ in range(max_attempts):
-            if best_invalid <= 0:
+            if best_invalid <= 0 and best_over_budget <= 0:
                 break
             attempts_used += 1
             repair_prompt = self._build_required_columns_repair_prompt(
@@ -543,6 +851,7 @@ class StrategistAgent:
                 allowed_columns=allowed_columns,
                 column_sets=column_sets,
                 validation_report=best_validation,
+                max_required_columns=max_required_columns,
             )
             self.last_repair_prompt = repair_prompt
             try:
@@ -555,14 +864,22 @@ class StrategistAgent:
                 repaired_raw = self._clean_json(repaired_content)
                 repaired_parsed = json.loads(repaired_raw)
                 candidate = self._normalize_strategist_output(repaired_parsed)
-                candidate_validation = self._validate_required_columns(candidate, allowed_columns)
+                candidate_validation = self._validate_required_columns(
+                    candidate,
+                    allowed_columns,
+                    max_required_columns=max_required_columns,
+                )
                 candidate_invalid = int(candidate_validation.get("invalid_count", 0))
-                if candidate_invalid < best_invalid:
+                candidate_over_budget = int(candidate_validation.get("over_budget_count", 0))
+                current_score = best_invalid * 1000 + best_over_budget
+                candidate_score = candidate_invalid * 1000 + candidate_over_budget
+                if candidate_score < current_score:
                     best_payload = candidate
                     best_validation = candidate_validation
                     best_invalid = candidate_invalid
+                    best_over_budget = candidate_over_budget
                     repaired = True
-                if candidate_invalid == 0:
+                if candidate_invalid == 0 and candidate_over_budget == 0:
                     break
             except Exception as repair_err:
                 print(f"Strategist required_columns repair error: {repair_err}")
