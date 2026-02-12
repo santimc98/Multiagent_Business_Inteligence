@@ -5537,6 +5537,8 @@ def _infer_de_failure_cause(text: str) -> str:
         return "np.select called with mismatched conditions/choices list lengths."
     if "typeerror" in lower or "ufunc" in lower:
         return "Type conversion missing; numeric ops executed on string/object data."
+    if "invalid error value specified" in lower and "to_numeric" in lower:
+        return "Invalid pd.to_numeric(errors=...) argument used; only supported values are accepted by current pandas runtime."
     if "numpy.bool_" in lower and "not serializable" in lower:
         return "JSON serialization failed due to numpy.bool_ values not handled in _json_default."
     if "json" in lower and "default" in lower:
@@ -5572,6 +5574,10 @@ def _build_de_runtime_diagnosis(error_details: str) -> List[str]:
     if "not supported between instances of 'str' and 'int'" in lower or "not supported between instances of 'str' and 'float'" in lower:
         lines.append(
             "Type comparison on object/string data: convert %plazoConsumido (or any percentage string) to numeric before >/< checks; use pd.to_numeric/clean_plazo_consumido and compare the numeric series."
+        )
+    if "invalid error value specified" in lower and "to_numeric" in lower:
+        lines.append(
+            "pd.to_numeric received an unsupported errors= value for this pandas runtime; use a valid option and handle exceptions explicitly."
         )
     if "keyerror" in lower and "'score'" in lower:
         lines.append(
@@ -12098,6 +12104,101 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     de_heavy_result.get("error_details")
                     or "HEAVY_RUNNER_ERROR: data engineer execution failed."
                 )
+                heavy_payload = de_heavy_result.get("heavy_result") if isinstance(de_heavy_result, dict) else {}
+                heavy_script_error = heavy_payload.get("error") if isinstance(heavy_payload, dict) else None
+                heavy_error_kind = "code" if heavy_script_error else "infra"
+                runtime_error_text = ""
+                if isinstance(heavy_script_error, dict):
+                    runtime_error_text = "\n".join(
+                        item
+                        for item in [
+                            str(heavy_script_error.get("error") or "").strip(),
+                            str(heavy_script_error.get("stacktrace") or "").strip(),
+                        ]
+                        if item
+                    )
+                elif heavy_script_error:
+                    runtime_error_text = str(heavy_script_error)
+                if not runtime_error_text:
+                    runtime_error_text = heavy_error
+
+                if (
+                    heavy_error_kind == "code"
+                    and not _flag_active_for_run(state, "de_runtime_retry_done", run_id)
+                ):
+                    new_state = dict(state)
+                    new_state["de_runtime_retry_done"] = True
+                    if run_id:
+                        new_state["de_runtime_retry_done_run_id"] = run_id
+                    new_state["execution_error_message"] = runtime_error_text[-4000:]
+                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                    error_snippet = _extract_error_snippet(code, runtime_error_text)
+                    payload = "RUNTIME_ERROR_CONTEXT:\n" + runtime_error_text[-3000:]
+                    if error_snippet:
+                        payload += "\n\nERROR_SNIPPET:\n" + error_snippet
+                    failure_cause = _infer_de_failure_cause(runtime_error_text)
+                    if failure_cause:
+                        payload += "\nWHY_IT_HAPPENED: " + failure_cause
+                    diagnosis_lines = _build_de_runtime_diagnosis(runtime_error_text)
+                    if diagnosis_lines:
+                        payload += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
+                    try:
+                        required_input = _resolve_required_input_columns(
+                            state.get("execution_contract", {}), selected
+                        )
+                        header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+                        norm_map = {}
+                        for col in header_cols:
+                            normed = _norm_name(col)
+                            if normed and normed not in norm_map:
+                                norm_map[normed] = col
+                        required_raw_map = _build_required_raw_map(required_input, norm_map)
+                        explainer_ctx = {
+                            "strategy_title": selected.get("title", "") if selected else "",
+                            "csv_dialect": input_dialect,
+                            "required_input_columns": required_input,
+                            "required_raw_header_map": required_raw_map,
+                            "error_snippet": error_snippet,
+                            "runtime_backend": "cloudrun_heavy_runner",
+                            "runtime_mode": "data_engineer_cleaning",
+                        }
+                        explainer_text = failure_explainer.explain_data_engineer_failure(
+                            code=code,
+                            error_details=runtime_error_text,
+                            context=explainer_ctx,
+                        )
+                        if explainer_text:
+                            payload += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                            try:
+                                os.makedirs("artifacts", exist_ok=True)
+                                with open(
+                                    os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
+                                    "w",
+                                    encoding="utf-8",
+                                ) as f_exp:
+                                    f_exp.write(explainer_text.strip())
+                            except Exception as exp_err:
+                                print(
+                                    f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}"
+                                )
+                    except Exception as explainer_err:
+                        print(f"Warning: heavy-runner DE failure explainer failed: {explainer_err}")
+                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(
+                        base_override, payload
+                    )
+                    print("Runtime error guard (heavy runner code): retrying Data Engineer with error context.")
+                    if run_id:
+                        log_run_event(
+                            run_id,
+                            "data_engineer_runtime_retry",
+                            {
+                                "attempt": attempt_id,
+                                "source": "heavy_runner_code",
+                                "error_kind": heavy_error_kind,
+                            },
+                        )
+                    return run_data_engineer(new_state)
+
                 return {
                     "cleaning_code": code,
                     "cleaned_data_preview": "Error: Cleaning Failed",

@@ -577,7 +577,8 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
         raise ValueError("code_uri is required for execute_code mode")
 
     script_path = os.path.join(work_dir, "ml_script.py")
-    log(f"Downloading ML script from {code_uri}")
+    role_label = "Data Engineer" if mode == "data_engineer_cleaning" else "ML Engineer"
+    log(f"Downloading {role_label} script from {code_uri}")
     _download_to_path(code_uri, script_path)
 
     dynamic_dep_install_enabled = str(os.getenv("HEAVY_RUNNER_DYNAMIC_DEP_INSTALL", "1")).strip().lower() not in {
@@ -597,7 +598,7 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
 
     # Execute script
     log("=" * 60)
-    log("EXECUTING ML SCRIPT")
+    log(f"EXECUTING SCRIPT ({role_label}, mode={mode})")
     log("=" * 60)
 
     exec_start = time.perf_counter()
@@ -645,7 +646,7 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
 
     # Check for execution failure
     if exit_code != 0:
-        error_msg = f"ML script failed with exit_code={exit_code}"
+        error_msg = f"{role_label} script failed with exit_code={exit_code} (mode={mode})"
         if "Traceback" in stderr:
             # Extract last traceback
             tb_lines = stderr.split("Traceback")[-1]
