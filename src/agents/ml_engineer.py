@@ -126,12 +126,12 @@ class MLEngineerAgent:
             self.model_name = (
                 os.getenv("ML_ENGINEER_PRIMARY_MODEL")
                 or os.getenv("OPENROUTER_ML_PRIMARY_MODEL")
-                or "moonshotai/kimi-k2.5"
+                or "minimax/minimax-m2.5"
             )
             self.fallback_model_name = (
                 os.getenv("ML_ENGINEER_FALLBACK_MODEL")
                 or os.getenv("OPENROUTER_ML_FALLBACK_MODEL")
-                or "z-ai/glm-4.7"
+                or "moonshotai/kimi-k2.5"
             )
         elif self.provider == "deepseek":
             self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")

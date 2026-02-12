@@ -32,9 +32,17 @@ def convert_dataset_profile_to_data_profile(
     contract = contract or {}
     dataset_profile = dataset_profile or {}
 
-    n_rows = int(dataset_profile.get("rows", 0))
+    sample_rows = int(dataset_profile.get("rows", 0))
     n_cols = int(dataset_profile.get("cols", 0))
     columns = list(dataset_profile.get("columns", []))
+    sampling = dataset_profile.get("sampling", {}) if isinstance(dataset_profile.get("sampling"), dict) else {}
+    was_sampled = bool(sampling.get("was_sampled"))
+    total_rows_in_file_raw = sampling.get("total_rows_in_file")
+    total_rows_in_file = int(total_rows_in_file_raw) if isinstance(total_rows_in_file_raw, (int, float)) else 0
+    # Prefer total_rows_in_file for scale-sensitive reasoning when profile was sampled.
+    # This avoids underestimating memory and cardinality ratios on large datasets.
+    n_rows = total_rows_in_file if (was_sampled and total_rows_in_file > 0) else sample_rows
+    sampled_profile_uncertain = was_sampled and total_rows_in_file > 0 and sample_rows > 0 and sample_rows < total_rows_in_file
 
     # 1. basic_stats
     basic_stats = {
@@ -122,26 +130,35 @@ def convert_dataset_profile_to_data_profile(
                 "unique_values_sample": unique_values_sample,
             })
 
-    # 6. constant_columns: columns with unique <= 1
+    # 6. constant_columns:
+    # For sampled profiles we keep sample evidence separate and avoid hard "constant"
+    # claims that can cause false deterministic filters downstream.
     constant_columns = []
+    constant_columns_sample = []
     for col in columns:
         card_info = cardinality.get(col, {})
         n_unique = card_info.get("unique", 0)
         if n_unique <= 1:
-            constant_columns.append(col)
+            constant_columns_sample.append(col)
+    if not sampled_profile_uncertain:
+        constant_columns = list(constant_columns_sample)
 
-    # 7. high_cardinality_columns: unique ratio > 0.95 and > 50 uniques
+    # 7. high_cardinality_columns: unique ratio > 0.95 and > 50 uniques.
+    # For sampled profiles, treat this as advisory evidence only.
     high_cardinality_columns = []
+    high_cardinality_columns_sample = []
     for col in columns:
         card_info = cardinality.get(col, {})
         n_unique = card_info.get("unique", 0)
         unique_ratio = n_unique / n_rows if n_rows > 0 else 0
         if unique_ratio > 0.95 and n_unique > 50:
-            high_cardinality_columns.append({
+            high_cardinality_columns_sample.append({
                 "column": col,
                 "n_unique": n_unique,
                 "unique_ratio": round(unique_ratio, 4),
             })
+    if not sampled_profile_uncertain:
+        high_cardinality_columns = list(high_cardinality_columns_sample)
 
     # 8. leakage_flags: outcome column name appears in other columns
     leakage_flags = []
@@ -165,13 +182,25 @@ def convert_dataset_profile_to_data_profile(
         "outcome_analysis": outcome_analysis,
         "split_candidates": split_candidates,
         "constant_columns": constant_columns,
+        "constant_columns_sample": constant_columns_sample,
+        "constant_columns_confidence": "low_sampled" if sampled_profile_uncertain else "high_full_or_complete",
         "high_cardinality_columns": high_cardinality_columns,
+        "high_cardinality_columns_sample": high_cardinality_columns_sample,
+        "high_cardinality_confidence": "low_sampled" if sampled_profile_uncertain else "high_full_or_complete",
         "leakage_flags": leakage_flags,
         "cardinality": dataset_profile.get("cardinality", {}),
         "numeric_summary": dataset_profile.get("numeric_summary", {}),
         "text_summary": dataset_profile.get("text_summary", {}),
         "duplicate_stats": dataset_profile.get("duplicate_stats", {}),
         "sampling": dataset_profile.get("sampling", {}),
+        "sampling_uncertainty": {
+            "is_uncertain_for_column_level_deterministic_inference": sampled_profile_uncertain,
+            "sample_rows": sample_rows,
+            "estimated_total_rows": total_rows_in_file if total_rows_in_file > 0 else None,
+            "row_coverage_ratio": round((sample_rows / total_rows_in_file), 6)
+            if sampled_profile_uncertain and total_rows_in_file > 0
+            else (1.0 if n_rows > 0 else None),
+        },
         "dialect": dataset_profile.get("dialect", {}),
         "pii_findings": dataset_profile.get("pii_findings", {}),
         "schema_version": "1.0",

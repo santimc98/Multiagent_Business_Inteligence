@@ -6368,7 +6368,25 @@ class ExecutionPlannerAgent:
                 return False
             if not bool(validation_result.get("accepted", False)):
                 return False
-            return str(validation_result.get("status") or "").lower() != "error"
+            status = str(validation_result.get("status") or "").lower()
+            if status == "error":
+                return False
+            summary = validation_result.get("summary")
+            if isinstance(summary, dict):
+                try:
+                    if int(summary.get("error_count", 0) or 0) > 0:
+                        return False
+                except Exception:
+                    pass
+            issues = validation_result.get("issues")
+            if isinstance(issues, list):
+                for issue in issues:
+                    if not isinstance(issue, dict):
+                        continue
+                    sev = str(issue.get("severity") or "").lower()
+                    if sev in {"error", "fail"}:
+                        return False
+            return True
 
         def _compact_validation_feedback(validation_result: Dict[str, Any] | None, max_issues: int = 10) -> str:
             if not isinstance(validation_result, dict):

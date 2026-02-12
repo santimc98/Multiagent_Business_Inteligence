@@ -2531,6 +2531,14 @@ def _load_constant_columns_from_profile(profile_path: str = "data/data_profile.j
     profile = _load_json_safe(profile_path)
     if not isinstance(profile, dict):
         return []
+    confidence = str(profile.get("constant_columns_confidence") or "").strip().lower()
+    sampling_uncertainty = profile.get("sampling_uncertainty")
+    if confidence == "low_sampled":
+        return []
+    if isinstance(sampling_uncertainty, dict) and sampling_uncertainty.get(
+        "is_uncertain_for_column_level_deterministic_inference"
+    ):
+        return []
     constant_cols = profile.get("constant_columns")
     if not isinstance(constant_cols, list):
         return []
@@ -7828,6 +7836,37 @@ def _build_iteration_handoff(
     metric_name = str(metric_snapshot.get("primary_metric_name") or "")
     metric_value = metric_snapshot.get("primary_metric_value")
     baseline_value = metric_snapshot.get("baseline_value")
+    # If snapshot is missing/incomplete, recover from deterministic facts so handoff
+    # preserves metric continuity across iterations.
+    if not metric_name or not _is_number(metric_value):
+        metrics_report_for_board = _resolve_metrics_report_for_facts(state if isinstance(state, dict) else {})
+        if not isinstance(metrics_report_for_board, dict):
+            metrics_report_for_board = {}
+        primary_for_board = _extract_primary_metric_for_board(
+            state if isinstance(state, dict) else {},
+            metrics_report_for_board,
+        )
+        if isinstance(primary_for_board, dict):
+            if not metric_name and primary_for_board.get("name"):
+                metric_name = str(primary_for_board.get("name"))
+            if not _is_number(metric_value):
+                metric_value = _coerce_float(primary_for_board.get("value"))
+    if not metric_name or not _is_number(metric_value):
+        metric_history = state.get("metric_history")
+        if isinstance(metric_history, list):
+            for item in reversed(metric_history):
+                if not isinstance(item, dict):
+                    continue
+                hist_name = str(item.get("primary_metric_name") or "")
+                hist_value = item.get("primary_metric_value")
+                if not metric_name and hist_name:
+                    metric_name = hist_name
+                if not _is_number(metric_value) and _is_number(hist_value):
+                    metric_value = float(hist_value)
+                if _is_number(item.get("baseline_value")) and not _is_number(baseline_value):
+                    baseline_value = float(item.get("baseline_value"))
+                if metric_name and _is_number(metric_value):
+                    break
     target_value, target_source = _extract_metric_target_hint(
         evaluation_spec if isinstance(evaluation_spec, dict) else {},
         contract,
@@ -17708,6 +17747,55 @@ def _sanitize_board_failed_areas(
     return kept, dropped
 
 
+def _collect_board_deterministic_blockers(board_context: Dict[str, Any]) -> List[str]:
+    blockers: List[str] = []
+    if not isinstance(board_context, dict):
+        return blockers
+
+    def _add(value: Any) -> None:
+        token = str(value or "").strip()
+        if token and token not in blockers:
+            blockers.append(token)
+
+    runtime = board_context.get("runtime") if isinstance(board_context.get("runtime"), dict) else {}
+    runtime_fix_terminal = bool(runtime.get("runtime_fix_terminal"))
+    if str(runtime.get("status") or "").strip().upper() == "FAILED_RUNTIME" and not runtime_fix_terminal:
+        _add("runtime_failed")
+    if bool(runtime.get("sandbox_failed")) and not runtime_fix_terminal:
+        _add("sandbox_failed")
+    deterministic_facts = (
+        board_context.get("deterministic_facts")
+        if isinstance(board_context.get("deterministic_facts"), dict)
+        else {}
+    )
+    output_contract = (
+        deterministic_facts.get("output_contract")
+        if isinstance(deterministic_facts.get("output_contract"), dict)
+        else {}
+    )
+    if str(output_contract.get("overall_status") or "").strip().lower() == "error":
+        _add("output_contract_error")
+    for path in output_contract.get("missing_required_artifacts") or []:
+        _add(f"missing_required_artifact:{path}")
+    for issue in output_contract.get("schema_issues") or []:
+        _add(f"output_schema_issue:{issue}")
+
+    for key in ("result_evaluator", "reviewer", "qa_reviewer"):
+        packet = board_context.get(key) if isinstance(board_context.get(key), dict) else {}
+        status = str(packet.get("status") or "").strip().upper()
+        status_blockers = {"REJECTED", "FAIL", "FAILED", "ERROR", "CRASH"}
+        if key != "result_evaluator":
+            status_blockers.add("NEEDS_IMPROVEMENT")
+        if status in status_blockers:
+            _add(f"{key}_status:{status}")
+        for hard in packet.get("hard_failures") or []:
+            _add(f"{key}_hard_failure:{hard}")
+        for gate in packet.get("failed_gates") or []:
+            if _looks_blocking_retry_signal(gate):
+                _add(f"{key}_failed_gate:{gate}")
+    return blockers
+
+
 def run_review_board(state: AgentState) -> AgentState:
     print("--- [5.6] Review Board: Consolidating reviewer outputs ---")
     abort_state = _abort_if_requested(state, "review_board")
@@ -17767,7 +17855,16 @@ def run_review_board(state: AgentState) -> AgentState:
     required_actions = [str(x) for x in (verdict.get("required_actions") or []) if x]
     evidence = verdict.get("evidence") if isinstance(verdict.get("evidence"), list) else []
     confidence = str(verdict.get("confidence") or "medium").lower()
+    deterministic_blockers = _collect_board_deterministic_blockers(board_context)
     critical_failed_areas = [area for area in failed_areas if _looks_blocking_retry_signal(area)]
+    runtime_terminal = bool(runtime_block.get("runtime_fix_terminal"))
+    if runtime_terminal and critical_failed_areas:
+        runtime_tokens = ("runtime", "traceback", "exception", "crash", "sandbox")
+        critical_failed_areas = [
+            area
+            for area in critical_failed_areas
+            if not any(token in str(area).strip().lower() for token in runtime_tokens)
+        ]
     if critical_failed_areas and final_status in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
         final_status = "NEEDS_IMPROVEMENT"
         board_note = (
@@ -17780,6 +17877,18 @@ def run_review_board(state: AgentState) -> AgentState:
         )
         if critical_action not in required_actions:
             required_actions.append(critical_action)
+    if deterministic_blockers and final_status in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+        final_status = "NEEDS_IMPROVEMENT"
+        if "deterministic_blockers" not in failed_areas:
+            failed_areas.append("deterministic_blockers")
+        for blocker in deterministic_blockers[:10]:
+            action = f"Resolve deterministic blocker before approval: {blocker}"
+            if action not in required_actions:
+                required_actions.append(action)
+        board_note = (
+            "Board verdict adjusted by deterministic evidence: unresolved runtime/QA/output blockers remain."
+        )
+        board_summary = f"{board_summary} {board_note}".strip() if board_summary else board_note
     current_feedback = str(state.get("review_feedback") or "")
     if board_summary:
         if current_feedback:
@@ -17802,6 +17911,11 @@ def run_review_board(state: AgentState) -> AgentState:
             "REVIEW_BOARD_POLICY: escalated to NEEDS_IMPROVEMENT due to critical failed_areas="
             + ", ".join(critical_failed_areas[:6])
         )
+    if deterministic_blockers and final_status == "NEEDS_IMPROVEMENT":
+        history.append(
+            "REVIEW_BOARD_POLICY: escalated to NEEDS_IMPROVEMENT due to deterministic_blockers="
+            + ", ".join(deterministic_blockers[:6])
+        )
     gate_context = dict(state.get("last_gate_context") or {})
     current_failed = [str(g) for g in (gate_context.get("failed_gates") or []) if g]
     current_required = [str(g) for g in (gate_context.get("required_fixes") or []) if g]
@@ -17822,6 +17936,12 @@ def run_review_board(state: AgentState) -> AgentState:
         "required_actions": required_actions,
         "confidence": confidence,
     }
+    if deterministic_blockers:
+        board_hard_failures = [str(x) for x in (gate_context.get("hard_failures") or []) if x]
+        for blocker in deterministic_blockers:
+            if blocker not in board_hard_failures:
+                board_hard_failures.append(blocker)
+        gate_context["hard_failures"] = board_hard_failures[:20]
     if final_status == "NEEDS_IMPROVEMENT":
         blocking_retry = _is_blocking_retry_reason(
             state if isinstance(state, dict) else {},
@@ -17891,6 +18011,7 @@ def run_review_board(state: AgentState) -> AgentState:
         "final_review_verdict": final_status,
         "summary": board_summary,
         "failed_areas": failed_areas,
+        "deterministic_blockers": deterministic_blockers,
         "required_actions": required_actions,
         "confidence": confidence,
         "evidence": evidence,

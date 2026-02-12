@@ -145,8 +145,10 @@ GOOGLE_API_KEY=your_api_key_here
 # OpenRouter (recommended for ML Engineer — supports primary + fallback)
 ML_ENGINEER_PROVIDER=openrouter
 OPENROUTER_API_KEY=your_api_key_here
-OPENROUTER_ML_PRIMARY_MODEL=moonshotai/kimi-k2.5
-OPENROUTER_ML_FALLBACK_MODEL=z-ai/glm-4.7
+OPENROUTER_ML_PRIMARY_MODEL=minimax/minimax-m2.5
+OPENROUTER_ML_FALLBACK_MODEL=moonshotai/kimi-k2.5
+OPENROUTER_DE_PRIMARY_MODEL=minimax/minimax-m2.5
+OPENROUTER_DE_FALLBACK_MODEL=moonshotai/kimi-k2.5
 OPENROUTER_TIMEOUT_SECONDS=120
 
 # Z.ai / GLM (alternative ML Engineer provider)

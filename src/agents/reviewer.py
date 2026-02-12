@@ -71,7 +71,11 @@ def apply_reviewer_gate_filter(result: Dict[str, Any], reviewer_gates: List[Any]
             if gate_name.lower() in allowed:
                 filtered.append(gate_name)
         result["failed_gates"] = filtered
-        if result.get("status") == "REJECTED" and not result.get("failed_gates"):
+        hard_failures = result.get("hard_failures")
+        has_hard_failures = isinstance(hard_failures, list) and any(
+            str(item).strip() for item in hard_failures
+        )
+        if result.get("status") == "REJECTED" and not result.get("failed_gates") and not has_hard_failures:
             result["status"] = "APPROVE_WITH_WARNINGS"
             result["feedback"] = "Spec-driven gating: no reviewer gates failed; downgraded to warnings."
     return result
