@@ -40,6 +40,7 @@ class DEView(TypedDict, total=False):
     role: str
     required_columns: List[str]
     optional_passthrough_columns: List[str]
+    column_transformations: Dict[str, Any]
     output_path: str
     output_manifest_path: str
     required_columns_path: str
@@ -108,6 +109,7 @@ class CleaningView(TypedDict, total=False):
     strategy_title: str
     business_objective: str
     required_columns: List[str]
+    column_transformations: Dict[str, Any]
     dialect: Dict[str, Any]
     cleaning_gates: List[Dict[str, Any]]
     column_roles: Dict[str, List[str]]
@@ -130,6 +132,7 @@ class QAView(TypedDict, total=False):
 _PRESERVE_KEYS = {
     "required_columns",
     "required_outputs",
+    "column_transformations",
     "forbidden_features",
     "reviewer_gates",
     "qa_gates",
@@ -268,9 +271,10 @@ def _resolve_required_outputs(contract_min: Dict[str, Any], contract_full: Dict[
 
     _add(contract_min.get("required_outputs"))
     _add(contract_full.get("required_outputs"))
-    # Backward-compatible fallback: only widen from accessor when contract outputs are absent.
-    if not merged:
-        _add(get_required_outputs(contract_full))
+    # Always widen with accessor-derived outputs to include artifact_requirements.required_files/plots
+    # while preserving top-level required_outputs precedence and de-duplication.
+    _add(get_required_outputs(contract_full))
+    _add(get_required_outputs(contract_min))
     return merged
 
 
@@ -348,6 +352,39 @@ def _resolve_output_dialect(contract_min: Dict[str, Any], contract_full: Dict[st
     if isinstance(dialect, dict) and dialect:
         return dialect
     return {}
+
+
+def _resolve_column_transformations(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> Dict[str, Any]:
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
+    transforms = clean_cfg.get("column_transformations")
+    if not isinstance(transforms, dict):
+        transforms = {}
+
+    def _collect(alias_keys: List[str]) -> List[str]:
+        values: List[str] = []
+        for source in (transforms, clean_cfg):
+            for key in alias_keys:
+                raw = source.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    values.append(raw.strip())
+                elif isinstance(raw, list):
+                    values.extend([str(item).strip() for item in raw if isinstance(item, str) and str(item).strip()])
+        return list(dict.fromkeys(values))
+
+    drop_columns = _collect(["drop_columns", "remove_columns", "columns_to_drop", "excluded_columns"])
+    scale_columns = _collect(
+        ["scale_columns", "normalize_columns", "standardize_columns", "rescale_columns"]
+    )
+    if not (drop_columns or scale_columns):
+        return {}
+
+    payload = dict(transforms)
+    payload["drop_columns"] = drop_columns
+    payload["scale_columns"] = scale_columns
+    return payload
 
 
 def _normalize_artifact_index(entries: Any) -> List[Dict[str, Any]]:
@@ -900,6 +937,7 @@ def build_de_view(
     required_outputs = _resolve_required_outputs(contract_min, contract_full)
     required_columns = _resolve_required_columns(contract_min, contract_full)
     passthrough_columns = _resolve_passthrough_columns(contract_min, contract_full, required_columns)
+    column_transformations = _resolve_column_transformations(contract_min, contract_full)
     output_path = _resolve_output_path(contract_min, contract_full, required_outputs)
     manifest_path = _resolve_manifest_path(contract_min, contract_full, required_outputs)
     cleaning_gates = _resolve_cleaning_gates(contract_min, contract_full)
@@ -928,6 +966,8 @@ def build_de_view(
         report_path = outlier_policy.get("report_path")
         if isinstance(report_path, str) and report_path.strip():
             view["outlier_report_path"] = report_path.strip()
+    if column_transformations:
+        view["column_transformations"] = column_transformations
     if manifest_path:
         view["output_manifest_path"] = manifest_path
     output_dialect = _resolve_output_dialect(contract_min, contract_full)
@@ -1371,6 +1411,7 @@ def build_cleaning_view(
     allowed_feature_sets = _resolve_allowed_feature_sets(contract_min, contract_full)
     dialect = _resolve_output_dialect(contract_min, contract_full)
     cleaning_gates = _resolve_cleaning_gates(contract_min, contract_full)
+    column_transformations = _resolve_column_transformations(contract_min, contract_full)
     outlier_policy = _resolve_outlier_policy(contract_min, contract_full)
     view: CleaningView = {
         "role": "cleaning_reviewer",
@@ -1389,6 +1430,8 @@ def build_cleaning_view(
         report_path = outlier_policy.get("report_path")
         if isinstance(report_path, str) and report_path.strip():
             view["outlier_report_path"] = report_path.strip()
+    if column_transformations:
+        view["column_transformations"] = column_transformations
     # Include cleaning code for intent verification (rescale detection, synthetic data check)
     if cleaning_code and isinstance(cleaning_code, str):
         # Truncate if too long to fit in budget
@@ -1539,6 +1582,28 @@ def build_contract_views_projection(
     if not isinstance(de_passthrough, list):
         de_passthrough = []
     de_passthrough = [str(c) for c in de_passthrough if c]
+    column_transformations = clean_cfg.get("column_transformations")
+    if not isinstance(column_transformations, dict):
+        column_transformations = {}
+    if not isinstance(column_transformations.get("drop_columns"), list):
+        column_transformations["drop_columns"] = [
+            str(c) for c in (clean_cfg.get("drop_columns") or []) if isinstance(c, str) and str(c).strip()
+        ]
+    else:
+        column_transformations["drop_columns"] = [
+            str(c) for c in column_transformations.get("drop_columns", []) if isinstance(c, str) and str(c).strip()
+        ]
+    if not isinstance(column_transformations.get("scale_columns"), list):
+        column_transformations["scale_columns"] = [
+            str(c) for c in (clean_cfg.get("scale_columns") or []) if isinstance(c, str) and str(c).strip()
+        ]
+    else:
+        column_transformations["scale_columns"] = [
+            str(c) for c in column_transformations.get("scale_columns", []) if isinstance(c, str) and str(c).strip()
+        ]
+    has_column_transformations = bool(
+        column_transformations.get("drop_columns") or column_transformations.get("scale_columns")
+    )
 
     output_path = clean_cfg.get("output_path") or clean_cfg.get("output")
     if not isinstance(output_path, str) or not output_path.strip():
@@ -1629,6 +1694,8 @@ def build_contract_views_projection(
         report_path = outlier_policy.get("report_path")
         if isinstance(report_path, str) and report_path.strip():
             de_view["outlier_report_path"] = report_path.strip()
+    if has_column_transformations:
+        de_view["column_transformations"] = column_transformations
     if manifest_path:
         de_view["output_manifest_path"] = manifest_path
     output_dialect = contract_full.get("output_dialect")
@@ -1724,6 +1791,8 @@ def build_contract_views_projection(
         report_path = outlier_policy.get("report_path")
         if isinstance(report_path, str) and report_path.strip():
             cleaning_view["outlier_report_path"] = report_path.strip()
+    if has_column_transformations:
+        cleaning_view["column_transformations"] = column_transformations
     if cleaning_code and isinstance(cleaning_code, str):
         max_code_len = 8000
         cleaning_view["cleaning_code"] = cleaning_code[:max_code_len] if len(cleaning_code) > max_code_len else cleaning_code

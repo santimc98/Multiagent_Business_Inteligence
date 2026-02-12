@@ -2239,6 +2239,163 @@ def _runbook_present(value: Any) -> bool:
     return False
 
 
+_DROP_COLUMN_DIRECTIVE_PATTERN = re.compile(
+    r"\b(drop|discard|remove|eliminar|descartar|quitar)\b.{0,32}\b(column|columns|columna|columnas)\b",
+    re.IGNORECASE,
+)
+_SCALE_COLUMN_DIRECTIVE_PATTERN = re.compile(
+    r"\b(scale|rescale|standardize|standardise|minmax|zscore|z-score|escalar|estandarizar)\b"
+    r"|(\b(normalize|normalise|normalizar)\b.{0,24}\b(column|columns|feature|features|variable|variables|columna|columnas)\b)",
+    re.IGNORECASE,
+)
+_ACTION_NEGATION_PATTERN = re.compile(
+    r"(do\s+not|don't|must\s+not|never|avoid|forbid|forbidden|prohibido|no\s+debe|no\b|sin\b)",
+    re.IGNORECASE,
+)
+_COLUMN_REF_KEYS = {
+    "column",
+    "columns",
+    "required_column",
+    "required_columns",
+    "target_column",
+    "target_columns",
+    "feature",
+    "features",
+    "field",
+    "fields",
+    "column_name",
+    "column_names",
+    "canonical_column",
+    "canonical_columns",
+}
+
+
+def _normalize_nonempty_str_list(value: Any) -> Tuple[List[str], List[Any]]:
+    if value is None:
+        return [], []
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return ([cleaned] if cleaned else []), []
+    if not isinstance(value, list):
+        return [], [value]
+    cleaned: List[str] = []
+    invalid: List[Any] = []
+    for item in value:
+        if isinstance(item, str):
+            item_clean = item.strip()
+            if item_clean:
+                cleaned.append(item_clean)
+            continue
+        invalid.append(item)
+    deduped = list(dict.fromkeys(cleaned))
+    return deduped, invalid
+
+
+def _flatten_runbook_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [_flatten_runbook_text(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        parts: List[str] = []
+        for key, item in value.items():
+            if isinstance(item, (str, list, dict)):
+                parts.append(_flatten_runbook_text(item))
+            elif item is not None:
+                parts.append(str(item))
+            if key in {"must", "must_not", "steps", "reasoning_checklist", "validation_checklist"}:
+                continue
+        return "\n".join(part for part in parts if part)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _has_non_negated_action(text: str, pattern: re.Pattern[str]) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    for match in pattern.finditer(text):
+        prefix = text[max(0, match.start() - 36):match.start()]
+        if _ACTION_NEGATION_PATTERN.search(prefix):
+            continue
+        return True
+    return False
+
+
+def _extract_columns_from_value(value: Any) -> List[str]:
+    values: List[str] = []
+    if isinstance(value, str):
+        val = value.strip()
+        if val:
+            values.append(val)
+        return values
+    if isinstance(value, list):
+        for item in value:
+            values.extend(_extract_columns_from_value(item))
+        return values
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_norm = str(key).strip().lower()
+            if key_norm in _COLUMN_REF_KEYS:
+                values.extend(_extract_columns_from_value(item))
+                continue
+            if key_norm == "params":
+                values.extend(_extract_columns_from_value(item))
+        return values
+    return values
+
+
+def _collect_gate_column_refs(gates: Any, hard_only: bool = True) -> List[str]:
+    if not isinstance(gates, list):
+        return []
+    refs: List[str] = []
+    for gate in gates:
+        if not isinstance(gate, dict):
+            continue
+        severity = str(gate.get("severity") or "HARD").strip().upper()
+        if hard_only and severity != "HARD":
+            continue
+        refs.extend(_extract_columns_from_value(gate))
+    return list(dict.fromkeys([ref for ref in refs if isinstance(ref, str) and ref.strip()]))
+
+
+def _resolve_cleaning_column_transformations(clean_dataset: Dict[str, Any]) -> Tuple[Dict[str, List[str]], List[str]]:
+    transform_block = clean_dataset.get("column_transformations")
+    issues: List[str] = []
+    if transform_block is None:
+        transform_block = {}
+    if not isinstance(transform_block, dict):
+        return {"drop_columns": [], "scale_columns": []}, [
+            "clean_dataset.column_transformations must be an object when present."
+        ]
+
+    def _collect(alias_keys: Tuple[str, ...]) -> Tuple[List[str], List[Any]]:
+        collected: List[str] = []
+        invalid_items: List[Any] = []
+        for source in (transform_block, clean_dataset):
+            for key in alias_keys:
+                if key not in source:
+                    continue
+                raw = source.get(key)
+                clean, invalid = _normalize_nonempty_str_list(raw)
+                collected.extend(clean)
+                invalid_items.extend(invalid)
+        return list(dict.fromkeys(collected)), invalid_items
+
+    drop_cols, invalid_drop = _collect(
+        ("drop_columns", "remove_columns", "columns_to_drop", "excluded_columns")
+    )
+    scale_cols, invalid_scale = _collect(
+        ("scale_columns", "normalize_columns", "standardize_columns", "rescale_columns")
+    )
+    if invalid_drop:
+        issues.append("column_transformations.drop_columns must be list[str].")
+    if invalid_scale:
+        issues.append("column_transformations.scale_columns must be list[str].")
+    return {"drop_columns": drop_cols, "scale_columns": scale_cols}, issues
+
+
 def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     Minimal, scope-driven contract validation.
@@ -2387,6 +2544,115 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                     "error",
                     "data_engineer_runbook missing for cleaning scope; fail-closed (DE execution contract incomplete).",
                     contract.get("data_engineer_runbook"),
+                )
+            )
+
+        artifact_requirements = contract.get("artifact_requirements")
+        clean_dataset = {}
+        if isinstance(artifact_requirements, dict):
+            candidate = artifact_requirements.get("clean_dataset")
+            if isinstance(candidate, dict):
+                clean_dataset = candidate
+        required_cols, invalid_required_cols = _normalize_nonempty_str_list(
+            clean_dataset.get("required_columns")
+        )
+        passthrough_cols, _ = _normalize_nonempty_str_list(
+            clean_dataset.get("optional_passthrough_columns")
+        )
+        transforms, transform_shape_issues = _resolve_cleaning_column_transformations(clean_dataset)
+        for msg in transform_shape_issues:
+            issues.append(
+                _strict_issue(
+                    "contract.clean_dataset_column_transformations_shape",
+                    "error",
+                    msg,
+                    clean_dataset.get("column_transformations"),
+                )
+            )
+        drop_cols = transforms.get("drop_columns") or []
+        scale_cols = transforms.get("scale_columns") or []
+        if invalid_required_cols:
+            issues.append(
+                _strict_issue(
+                    "contract.clean_dataset_required_columns_type",
+                    "error",
+                    "artifact_requirements.clean_dataset.required_columns must contain only strings.",
+                    invalid_required_cols[:10],
+                )
+            )
+
+        runbook_text = _flatten_runbook_text(contract.get("data_engineer_runbook"))
+        runbook_has_drop_columns = _has_non_negated_action(runbook_text, _DROP_COLUMN_DIRECTIVE_PATTERN)
+        runbook_has_scale_columns = _has_non_negated_action(runbook_text, _SCALE_COLUMN_DIRECTIVE_PATTERN)
+        if runbook_has_drop_columns and not drop_cols:
+            issues.append(
+                _strict_issue(
+                    "contract.cleaning_transforms_drop_missing",
+                    "error",
+                    "Runbook describes dropping columns but clean_dataset.column_transformations.drop_columns is missing.",
+                    "artifact_requirements.clean_dataset.column_transformations.drop_columns",
+                )
+            )
+        if runbook_has_scale_columns and not scale_cols:
+            issues.append(
+                _strict_issue(
+                    "contract.cleaning_transforms_scale_missing",
+                    "error",
+                    "Runbook describes column scaling/normalization but clean_dataset.column_transformations.scale_columns is missing.",
+                    "artifact_requirements.clean_dataset.column_transformations.scale_columns",
+                )
+            )
+
+        required_norm = {col.lower(): col for col in required_cols}
+        passthrough_norm = {col.lower(): col for col in passthrough_cols}
+        drop_norm = {col.lower(): col for col in drop_cols}
+        scale_norm = {col.lower(): col for col in scale_cols}
+
+        drop_in_required = [required_norm[key] for key in sorted(set(required_norm) & set(drop_norm))]
+        if drop_in_required:
+            issues.append(
+                _strict_issue(
+                    "contract.cleaning_transforms_drop_conflict",
+                    "error",
+                    "drop_columns cannot include columns declared in clean_dataset.required_columns.",
+                    drop_in_required[:20],
+                )
+            )
+
+        scale_outside_required = [scale_norm[key] for key in sorted(set(scale_norm) - set(required_norm))]
+        if scale_outside_required:
+            issues.append(
+                _strict_issue(
+                    "contract.cleaning_transforms_scale_conflict",
+                    "error",
+                    "scale_columns must be a subset of clean_dataset.required_columns.",
+                    scale_outside_required[:20],
+                )
+            )
+
+        hard_gate_cols = _collect_gate_column_refs(contract.get("cleaning_gates"), hard_only=True)
+        hard_gate_norm = {col.lower(): col for col in hard_gate_cols}
+        gate_missing = [
+            hard_gate_norm[key]
+            for key in sorted(set(hard_gate_norm) - (set(required_norm) | set(passthrough_norm)))
+        ]
+        if gate_missing:
+            issues.append(
+                _strict_issue(
+                    "contract.cleaning_gate_required_columns_contradiction",
+                    "error",
+                    "HARD cleaning gates reference columns outside required_columns/optional_passthrough_columns.",
+                    gate_missing[:20],
+                )
+            )
+        gate_drop_conflict = [hard_gate_norm[key] for key in sorted(set(hard_gate_norm) & set(drop_norm))]
+        if gate_drop_conflict:
+            issues.append(
+                _strict_issue(
+                    "contract.cleaning_gate_drop_conflict",
+                    "error",
+                    "HARD cleaning gates cannot target columns also declared in drop_columns.",
+                    gate_drop_conflict[:20],
                 )
             )
 

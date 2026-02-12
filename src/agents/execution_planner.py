@@ -197,6 +197,11 @@ Scope-dependent required fields:
   - artifact_requirements.clean_dataset.required_columns: list[str]
   - artifact_requirements.clean_dataset.output_path: file path for cleaned CSV
   - artifact_requirements.clean_dataset.output_manifest_path (or manifest_path): file path for cleaning manifest JSON
+  - If any column drop/scaling is requested, declare it explicitly in
+    artifact_requirements.clean_dataset.column_transformations with:
+    - drop_columns: list[str]
+    - scale_columns: list[str]
+    (do not encode these decisions only in free-text runbook)
 - If scope includes ML ("ml_only" or "full_pipeline"):
   - qa_gates: list of gate objects
   - reviewer_gates: list of gate objects
@@ -215,6 +220,8 @@ Hard rules:
 - Do not invent columns not present in column_inventory.
 - required_outputs must be artifact paths, never conceptual labels.
 - Keep de_view executable from contract alone: include both cleaned output CSV and cleaning manifest JSON paths.
+- Contract precedence for DE must be coherent: HARD cleaning_gates + required_columns + explicit column_transformations
+  are binding and must not contradict runbook narrative.
 - Keep contract coherent with strategy + business objective.
 - Every requirement must be consumable by at least one downstream agent view.
 - Follow evidence_policy from INPUTS: use direct evidence first, grounded inference second, and avoid unsupported assumptions.
@@ -237,6 +244,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "artifact_requirements.clean_dataset.output_path",
             "artifact_requirements.clean_dataset.output_manifest_path|manifest_path",
             "artifact_requirements.clean_dataset.required_columns",
+            "artifact_requirements.clean_dataset.column_transformations (optional)",
             "cleaning_gates",
             "data_engineer_runbook",
             "outlier_policy (optional)",
@@ -250,6 +258,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "artifact_requirements.clean_dataset.output_path",
             "artifact_requirements.clean_dataset.output_manifest_path|manifest_path",
             "artifact_requirements.clean_dataset.required_columns",
+            "artifact_requirements.clean_dataset.column_transformations (optional)",
             "outlier_policy (optional)",
         ],
     },
@@ -6461,6 +6470,9 @@ class ExecutionPlannerAgent:
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
                 "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
+                "If cleaning requires dropping/scaling columns, declare them in "
+                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns}; "
+                "do not leave these decisions only in runbook prose.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scopes, include non-empty evaluation_spec and ensure objective_analysis.problem_type "
@@ -6526,6 +6538,97 @@ class ExecutionPlannerAgent:
                     return any(bool(str(step).strip()) for step in value.get("steps") or [] if step is not None)
                 return bool(value)
             return False
+
+        _drop_column_pattern = re.compile(
+            r"\b(drop|discard|remove|eliminar|descartar|quitar)\b.{0,32}\b(column|columns|columna|columnas)\b",
+            re.IGNORECASE,
+        )
+        _scale_column_pattern = re.compile(
+            r"\b(scale|rescale|standardize|standardise|minmax|zscore|z-score|escalar|estandarizar)\b"
+            r"|(\b(normalize|normalise|normalizar)\b.{0,24}\b(column|columns|feature|features|variable|variables|columna|columnas)\b)",
+            re.IGNORECASE,
+        )
+        _action_negation_pattern = re.compile(
+            r"(do\s+not|don't|must\s+not|never|avoid|forbid|forbidden|prohibido|no\s+debe|no\b|sin\b)",
+            re.IGNORECASE,
+        )
+
+        def _flatten_text_payload(value: Any) -> str:
+            if isinstance(value, str):
+                return value
+            if isinstance(value, list):
+                return "\n".join(_flatten_text_payload(item) for item in value if item is not None)
+            if isinstance(value, dict):
+                parts: List[str] = []
+                for _, item in value.items():
+                    if item is None:
+                        continue
+                    parts.append(_flatten_text_payload(item))
+                return "\n".join(part for part in parts if part)
+            if value is None:
+                return ""
+            return str(value)
+
+        def _to_clean_str_list(value: Any) -> Tuple[List[str], bool]:
+            if value is None:
+                return [], False
+            if isinstance(value, str):
+                cleaned = value.strip()
+                return ([cleaned] if cleaned else []), False
+            if not isinstance(value, list):
+                return [], True
+            values: List[str] = []
+            had_invalid = False
+            for item in value:
+                if isinstance(item, str):
+                    item_clean = item.strip()
+                    if item_clean:
+                        values.append(item_clean)
+                    continue
+                had_invalid = True
+            return list(dict.fromkeys(values)), had_invalid
+
+        def _has_non_negated_action(text: str, pattern: re.Pattern[str]) -> bool:
+            if not isinstance(text, str) or not text.strip():
+                return False
+            for match in pattern.finditer(text):
+                prefix = text[max(0, match.start() - 36):match.start()]
+                if _action_negation_pattern.search(prefix):
+                    continue
+                return True
+            return False
+
+        def _extract_clean_dataset_transformations(clean_dataset: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
+            transform_block = clean_dataset.get("column_transformations")
+            if transform_block is None:
+                transform_block = {}
+            if not isinstance(transform_block, dict):
+                return [], [], ["artifact_requirements.clean_dataset.column_transformations must be an object"]
+
+            def _collect(alias_keys: Tuple[str, ...]) -> Tuple[List[str], bool]:
+                values: List[str] = []
+                invalid = False
+                for source in (transform_block, clean_dataset):
+                    for key in alias_keys:
+                        if key not in source:
+                            continue
+                        clean, has_invalid = _to_clean_str_list(source.get(key))
+                        values.extend(clean)
+                        invalid = invalid or has_invalid
+                return list(dict.fromkeys(values)), invalid
+
+            drop_columns, invalid_drop = _collect(
+                ("drop_columns", "remove_columns", "columns_to_drop", "excluded_columns")
+            )
+            scale_columns, invalid_scale = _collect(
+                ("scale_columns", "normalize_columns", "standardize_columns", "rescale_columns")
+            )
+            errors: List[str] = []
+            if invalid_drop:
+                errors.append("artifact_requirements.clean_dataset.column_transformations.drop_columns must be list[str]")
+            if invalid_scale:
+                errors.append("artifact_requirements.clean_dataset.column_transformations.scale_columns must be list[str]")
+            return drop_columns, scale_columns, errors
 
         def _gate_list_valid(value: Any, gate_key: str) -> bool:
             if not isinstance(value, list) or not value:
@@ -6654,6 +6757,45 @@ class ExecutionPlannerAgent:
                         errors.append(
                             f"{section_id}: artifact_requirements.clean_dataset.required_columns must be non-empty list"
                         )
+                    required_cols_clean, required_cols_invalid = _to_clean_str_list(req_cols)
+                    if required_cols_invalid:
+                        errors.append(
+                            f"{section_id}: artifact_requirements.clean_dataset.required_columns must contain only strings"
+                        )
+                    drop_columns, scale_columns, transform_errors = _extract_clean_dataset_transformations(clean_dataset)
+                    for transform_error in transform_errors:
+                        errors.append(f"{section_id}: {transform_error}")
+                    req_norm = {str(col).strip().lower() for col in required_cols_clean if str(col).strip()}
+                    drop_norm = {str(col).strip().lower() for col in drop_columns if str(col).strip()}
+                    scale_norm = {str(col).strip().lower() for col in scale_columns if str(col).strip()}
+                    if req_norm and drop_norm:
+                        overlap = sorted([col for col in req_norm if col in drop_norm])
+                        if overlap:
+                            errors.append(
+                                f"{section_id}: column_transformations.drop_columns conflicts with required_columns ({overlap[:8]})"
+                            )
+                    if req_norm and scale_norm:
+                        outside = sorted([col for col in scale_norm if col not in req_norm])
+                        if outside:
+                            errors.append(
+                                f"{section_id}: column_transformations.scale_columns must be subset of required_columns ({outside[:8]})"
+                            )
+
+                runbook_text = _flatten_text_payload(payload.get("data_engineer_runbook"))
+                has_drop_directive = _has_non_negated_action(runbook_text, _drop_column_pattern)
+                has_scale_directive = _has_non_negated_action(runbook_text, _scale_column_pattern)
+                if isinstance(clean_dataset, dict):
+                    drop_columns, scale_columns, _ = _extract_clean_dataset_transformations(clean_dataset)
+                else:
+                    drop_columns, scale_columns = [], []
+                if has_drop_directive and not drop_columns:
+                    errors.append(
+                        f"{section_id}: runbook indicates column dropping but clean_dataset.column_transformations.drop_columns is missing"
+                    )
+                if has_scale_directive and not scale_columns:
+                    errors.append(
+                        f"{section_id}: runbook indicates scaling/normalization but clean_dataset.column_transformations.scale_columns is missing"
+                    )
 
             if section_id == "ml_contract" and _scope_requires_ml(candidate_scope):
                 eval_spec = payload.get("evaluation_spec")
@@ -6760,6 +6902,8 @@ class ExecutionPlannerAgent:
                 "Keep semantics aligned with strategy/business objective.\n"
                 "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
+                "If cleaning requires dropping/scaling columns, set "
+                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns} explicitly.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
@@ -6801,6 +6945,8 @@ class ExecutionPlannerAgent:
                 "Do not invent columns not present in column_inventory.\n\n"
                 "Use artifact file paths for required_outputs.\n\n"
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
+                "If cleaning requires dropping/scaling columns, set "
+                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns} explicitly.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "

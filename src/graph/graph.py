@@ -8622,7 +8622,25 @@ def run_steward(state: AgentState) -> AgentState:
                 state["column_inventory_columns"] = header_cols
 
         header_preview = summarize_long_list(header_cols, head=12, tail=6) if header_cols else {"count": 0, "head": [], "tail": []}
-        sample_payload = sample_rows(csv_path, dialect_payload, head_n=50, tail_n=50, random_n=50, seed=42)
+        column_count = len(header_cols)
+        if column_count > 500:
+            sample_cfg = {"head_n": 6, "tail_n": 4, "random_n": 8, "max_columns": 24}
+        elif column_count > 200:
+            sample_cfg = {"head_n": 10, "tail_n": 6, "random_n": 12, "max_columns": 32}
+        elif column_count > 80:
+            sample_cfg = {"head_n": 14, "tail_n": 8, "random_n": 16, "max_columns": 40}
+        else:
+            sample_cfg = {"head_n": 20, "tail_n": 10, "random_n": 20, "max_columns": 60}
+        sample_payload = sample_rows(
+            csv_path,
+            dialect_payload,
+            head_n=sample_cfg["head_n"],
+            tail_n=sample_cfg["tail_n"],
+            random_n=sample_cfg["random_n"],
+            seed=42,
+            max_columns=sample_cfg["max_columns"],
+            max_value_chars=120,
+        )
         steward_pass1_input = {
             "business_objective": state.get("business_objective") if isinstance(state, dict) else "",
             "column_inventory_path": "data/column_inventory.json",

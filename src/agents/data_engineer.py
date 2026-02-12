@@ -233,6 +233,21 @@ class DataEngineerAgent:
             or outlier_policy.get("report_path")
             or ""
         ).strip()
+        artifact_requirements = contract.get("artifact_requirements")
+        clean_dataset_cfg = {}
+        if isinstance(artifact_requirements, dict):
+            clean_dataset_candidate = artifact_requirements.get("clean_dataset")
+            if isinstance(clean_dataset_candidate, dict):
+                clean_dataset_cfg = clean_dataset_candidate
+        column_transformations = de_view.get("column_transformations")
+        if not isinstance(column_transformations, dict) or not column_transformations:
+            column_transformations = clean_dataset_cfg.get("column_transformations")
+        if not isinstance(column_transformations, dict):
+            column_transformations = {}
+        column_transformations_json = json.dumps(
+            compress_long_lists(column_transformations)[0],
+            indent=2,
+        )
         runtime_dependency_context = self._build_runtime_dependency_context()
         runtime_dependency_context_json = json.dumps(
             compress_long_lists(runtime_dependency_context)[0], indent=2
@@ -290,11 +305,17 @@ class DataEngineerAgent:
         *** COLUMN SYNCHRONIZATION RULE (CRITICAL) ***
         - Your output CSV MUST contain EXACTLY the columns listed in "Required Columns (DE View)" - no more, no less.
         - If a column exists in raw data but is NOT in required_columns, DISCARD it (do not include in output).
-        - Constant columns (single unique value) have been PRE-EXCLUDED from required_columns by the contract.
-        - Do NOT second-guess the required_columns list; it represents the FINAL schema after cleaning.
+        - Constant columns may or may not be included in required_columns depending on strategy; do not infer constants to override required_columns.
+        - Do NOT second-guess the required_columns list; it represents the final output schema after cleaning.
         - The authoritative list is stored in data/required_columns.json (array). Use it directly; do NOT infer by counting constants.
         - If a required column is missing from the input, raise an error (no fabrication).
         - Optional passthrough columns: include ONLY if present in input AND listed in optional_passthrough.
+
+        *** CONTRACT PRECEDENCE (CRITICAL) ***
+        - Priority 1 (binding): HARD cleaning_gates + required_columns.
+        - Priority 2 (binding when present): COLUMN_TRANSFORMATIONS_CONTEXT from artifact_requirements.clean_dataset.column_transformations.
+        - Priority 3 (advisory): ROLE RUNBOOK narrative.
+        - If runbook text conflicts with Priority 1/2, follow Priority 1/2 and record the conflict in manifest.contract_conflicts_resolved.
 
         - Do NOT impute outcome/target columns. Use data/dataset_semantics.json + data/dataset_training_mask.json (Steward-decided); if partial labels exist, preserve missingness. Do not invent targets.
         - Preserve partition/split columns if they exist or are detected in the Dataset Semantics Summary.
@@ -313,12 +334,14 @@ class DataEngineerAgent:
         - UNIVERSAL DTYPE RULE: before any `.str` operation, explicitly cast the working Series to string dtype.
           After operations like `.replace(..., np.nan)`, dtype may no longer be string in pandas 2.x.
           Therefore use `series = series.astype(str)` or `series = series.astype('string')` immediately before `.str.*`.
-        - DO NOT rescale numeric columns in cleaning. Only parse formats (e.g., remove thousand separators).
+        - DO NOT rescale numeric columns in cleaning unless COLUMN_TRANSFORMATIONS_CONTEXT explicitly requests scaling for specific columns.
+          If scaling is explicitly requested there, apply only to those listed columns and document method + affected columns in the manifest.
+          Otherwise, only parse formats (e.g., remove thousand separators).
           CRITICAL: Check NUMERIC_RANGES_SUMMARY in DATA AUDIT to understand actual data scales:
           * If columns show [0, 1] range → data is ALREADY normalized, do NOT assume it needs 0-255 conversion
           * If columns show [0, 255] range → data may be pixel values, do NOT normalize to 0-1 in cleaning
           * If columns show [0, 100] range → may be percentages, check for '%' in name/values
-          Rescaling is the ML Engineer's responsibility, not cleaning. Only parse and preserve original scale.
+          Default behavior: preserve original scale and leave modeling transformations to ML Engineer.
         - For numeric parsing: ALWAYS sanitize symbols first (strip currency/letters; keep digits, sign, separators, parentheses, and %) and handle repeated thousands separators like '23.351.746'.
         
         *** INPUT PARAMETERS ***
@@ -329,6 +352,7 @@ class DataEngineerAgent:
         - Optional Passthrough Columns (keep if present): $optional_passthrough_columns
         - DE_VIEW_CONTEXT (json): $de_view_context
         - OUTLIER_POLICY_CONTEXT (json): $outlier_policy_context
+        - COLUMN_TRANSFORMATIONS_CONTEXT (json): $column_transformations_context
         - EXECUTION_CONTRACT_CONTEXT (json): $execution_contract_context
         - CLEANING_GATES_CONTEXT (json): $cleaning_gates_context
         - RUNTIME_DEPENDENCY_CONTEXT (json): $runtime_dependency_context
@@ -389,6 +413,7 @@ class DataEngineerAgent:
             execution_contract_context=contract_json,
             de_view_context=de_view_json,
             outlier_policy_context=outlier_policy_json,
+            column_transformations_context=column_transformations_json,
             data_engineer_runbook=de_runbook_json,
             cleaning_gates_context=cleaning_gates_json,
             runtime_dependency_context=runtime_dependency_context_json,
