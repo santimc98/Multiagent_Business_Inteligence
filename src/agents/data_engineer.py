@@ -9,6 +9,13 @@ from src.utils.static_safety_scan import scan_code_safety
 from src.utils.code_extract import extract_code_block
 from src.utils.senior_protocol import SENIOR_ENGINEERING_PROTOCOL
 from src.utils.contract_accessors import get_cleaning_gates
+from src.utils.sandbox_deps import (
+    BASE_ALLOWLIST,
+    EXTENDED_ALLOWLIST,
+    CLOUDRUN_NATIVE_ALLOWLIST,
+    CLOUDRUN_OPTIONAL_ALLOWLIST,
+    BANNED_ALWAYS_ALLOWLIST,
+)
 from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
 from openai import OpenAI
 
@@ -74,6 +81,76 @@ class DataEngineerAgent:
             raise ValueError("EMPTY_COMPLETION")
 
         return content
+
+    def _build_runtime_dependency_context(self) -> Dict[str, Any]:
+        """
+        Build a compact runtime dependency contract for DE prompts.
+        This gives the model explicit import allowlist + version hints
+        to reduce runtime incompatibilities across sandbox images.
+        """
+        requirements_path = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "cloudrun",
+                "heavy_runner",
+                "requirements.txt",
+            )
+        )
+        pinned_specs: Dict[str, str] = {}
+        try:
+            if os.path.exists(requirements_path):
+                with open(requirements_path, "r", encoding="utf-8") as f_req:
+                    for raw in f_req:
+                        line = str(raw or "").strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if line.startswith("-"):
+                            continue
+                        token = line.split(";", 1)[0].strip()
+                        token = token.split("#", 1)[0].strip()
+                        if not token:
+                            continue
+                        for op in ("==", ">=", "<=", "~=", "!=", ">", "<"):
+                            if op in token:
+                                name, spec = token.split(op, 1)
+                                pkg = name.strip().lower()
+                                if pkg:
+                                    pinned_specs[pkg] = f"{op}{spec.strip()}"
+                                break
+        except Exception:
+            pinned_specs = {}
+
+        pandas_spec = pinned_specs.get("pandas", "unbounded")
+
+        return {
+            "backend_profile": "cloudrun",
+            "allowlist": {
+                "base": sorted({str(item) for item in BASE_ALLOWLIST if str(item).strip()}),
+                "extended_optional": sorted(
+                    {str(item) for item in EXTENDED_ALLOWLIST if str(item).strip()}
+                ),
+                "cloudrun_native": sorted(
+                    {str(item) for item in CLOUDRUN_NATIVE_ALLOWLIST if str(item).strip()}
+                ),
+                "cloudrun_optional": sorted(
+                    {str(item) for item in CLOUDRUN_OPTIONAL_ALLOWLIST if str(item).strip()}
+                ),
+            },
+            "blocked_always": sorted(
+                {str(item) for item in BANNED_ALWAYS_ALLOWLIST if str(item).strip()}
+            ),
+            "version_hints": {
+                "python": "3.11",
+                "pandas": pandas_spec,
+            },
+            "guidance": [
+                "Import only allowlisted roots.",
+                "Use stable public APIs compatible with version_hints.",
+                "Avoid deprecated kwargs/behaviors when equivalent safe idioms exist.",
+            ],
+        }
 
     def generate_cleaning_script(
         self,
@@ -156,6 +233,10 @@ class DataEngineerAgent:
             or outlier_policy.get("report_path")
             or ""
         ).strip()
+        runtime_dependency_context = self._build_runtime_dependency_context()
+        runtime_dependency_context_json = json.dumps(
+            compress_long_lists(runtime_dependency_context)[0], indent=2
+        )
 
         # [SAFETY] Truncate data_audit if massive to prevent context overflow
         # The audit concatenates many sources; preserve head (structure) and tail (recent instructions).
@@ -188,6 +269,8 @@ class DataEngineerAgent:
            nulls_before = original_nulls; nulls_after_na = int(cleaned.isna().sum()); filled_nulls = original_nulls.
         9. SAFE READ: You MUST read input with pd.read_csv(..., dtype=str, low_memory=False) to preserve ID fidelity.
            If you choose not to use dtype=str, you MUST define dtype/converters for identifier-like columns (id/key/cod/entity).
+        10. DEPENDENCY CONTRACT: Use only imports allowed by RUNTIME_DEPENDENCY_CONTEXT.
+            If an API behavior can vary by version, write code compatible with RUNTIME_DEPENDENCY_CONTEXT.version_hints.
 
         COMMENT BLOCK REQUIREMENT:
         - At the top of the script, include comment sections:
@@ -248,6 +331,7 @@ class DataEngineerAgent:
         - OUTLIER_POLICY_CONTEXT (json): $outlier_policy_context
         - EXECUTION_CONTRACT_CONTEXT (json): $execution_contract_context
         - CLEANING_GATES_CONTEXT (json): $cleaning_gates_context
+        - RUNTIME_DEPENDENCY_CONTEXT (json): $runtime_dependency_context
         - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
 
         *** DATA AUDIT ***
@@ -307,6 +391,7 @@ class DataEngineerAgent:
             outlier_policy_context=outlier_policy_json,
             data_engineer_runbook=de_runbook_json,
             cleaning_gates_context=cleaning_gates_json,
+            runtime_dependency_context=runtime_dependency_context_json,
             senior_engineering_protocol=SENIOR_ENGINEERING_PROTOCOL,
             de_output_path=de_output_path,
             de_manifest_path=de_manifest_path,
