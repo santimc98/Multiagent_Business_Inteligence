@@ -316,7 +316,10 @@ def compact_data_profile_for_llm(
     compact = {}
 
     # 1. Basic Stats (Critical)
-    compact["basic_stats"] = profile.get("basic_stats", {})
+    compact["basic_stats"] = _compact_basic_stats_for_llm(
+        profile.get("basic_stats", {}),
+        max_cols=max_cols,
+    )
 
     # 2. Outcome Analysis (Critical)
     compact["outcome_analysis"] = profile.get("outcome_analysis", {})
@@ -342,7 +345,12 @@ def compact_data_profile_for_llm(
     # 7.6 Sampling metadata (helps interpret profile fidelity)
     compact["sampling"] = profile.get("sampling", {})
 
-    # 7.7 Target candidates (contextual evidence, not rules)
+    # 7.7 Numeric range digest (compact semantic guardrails for planner)
+    numeric_ranges_digest = _build_numeric_ranges_digest(profile, max_examples_per_bucket=4)
+    if numeric_ranges_digest:
+        compact["numeric_ranges_digest"] = numeric_ranges_digest
+
+    # 7.8 Target candidates (contextual evidence, not rules)
     target_candidates = _build_target_candidates(profile)
     if target_candidates:
         compact["target_candidates"] = target_candidates
@@ -361,6 +369,148 @@ def compact_data_profile_for_llm(
         compact["dtypes"] = dtypes
 
     return compact
+
+
+def _compact_basic_stats_for_llm(basic_stats: Dict[str, Any], max_cols: int = 60) -> Dict[str, Any]:
+    """Compact basic_stats to prevent prompt bloat on wide datasets."""
+    if not isinstance(basic_stats, dict):
+        return {}
+
+    compact_basic: Dict[str, Any] = {
+        "n_rows": basic_stats.get("n_rows"),
+        "n_cols": basic_stats.get("n_cols"),
+    }
+
+    columns = basic_stats.get("columns")
+    if not isinstance(columns, list):
+        return compact_basic
+
+    col_count = len(columns)
+    compact_basic["columns_count"] = col_count
+    if col_count <= max_cols:
+        compact_basic["columns"] = columns
+        return compact_basic
+
+    # Keep deterministic head/tail samples for auditability while staying token-efficient.
+    head_count = min(20, col_count)
+    tail_count = min(8, max(0, col_count - head_count))
+    compact_basic["columns_head"] = columns[:head_count]
+    compact_basic["columns_tail"] = columns[-tail_count:] if tail_count > 0 else []
+    compact_basic["columns_note"] = (
+        f"Column list compacted for LLM context: showing {head_count} head + {tail_count} tail "
+        f"out of {col_count} columns."
+    )
+    return compact_basic
+
+
+def _build_numeric_ranges_digest(
+    profile: Dict[str, Any],
+    max_examples_per_bucket: int = 4,
+) -> Dict[str, Any]:
+    """
+    Build compact numeric-range evidence for planner semantic decisions.
+
+    Purpose:
+    - Provide range evidence without dumping full numeric_summary.
+    - Help planner choose dtype/scaling directives that are compatible with observed data.
+    """
+    if not isinstance(profile, dict):
+        return {}
+
+    numeric_summary = profile.get("numeric_summary")
+    if not isinstance(numeric_summary, dict) or not numeric_summary:
+        return {}
+
+    buckets: Dict[str, List[str]] = {
+        "constant": [],
+        "normalized_0_1": [],
+        "normalized_neg1_1": [],
+        "byte_0_255": [],
+        "nonnegative_wide": [],
+        "mixed_sign": [],
+        "negative_only": [],
+    }
+    int8_unsafe: List[str] = []
+
+    for col, stats in numeric_summary.items():
+        if not isinstance(stats, dict):
+            continue
+        min_val = stats.get("min")
+        max_val = stats.get("max")
+        if min_val is None or max_val is None:
+            continue
+        try:
+            lo = float(min_val)
+            hi = float(max_val)
+        except (TypeError, ValueError):
+            continue
+
+        if lo < -128.0 or hi > 127.0:
+            int8_unsafe.append(str(col))
+
+        if lo == hi:
+            buckets["constant"].append(str(col))
+        elif lo >= 0.0 and hi <= 1.01:
+            buckets["normalized_0_1"].append(str(col))
+        elif lo >= -1.01 and hi <= 1.01:
+            buckets["normalized_neg1_1"].append(str(col))
+        elif lo >= 0.0 and hi <= 255.5:
+            buckets["byte_0_255"].append(str(col))
+        elif lo >= 0.0:
+            buckets["nonnegative_wide"].append(str(col))
+        elif lo < 0.0 and hi > 0.0:
+            buckets["mixed_sign"].append(str(col))
+        else:
+            buckets["negative_only"].append(str(col))
+
+    total_with_ranges = sum(len(v) for v in buckets.values())
+    if total_with_ranges == 0:
+        return {}
+
+    range_buckets_payload: List[Dict[str, Any]] = []
+    for bucket_name in (
+        "normalized_0_1",
+        "normalized_neg1_1",
+        "byte_0_255",
+        "nonnegative_wide",
+        "mixed_sign",
+        "negative_only",
+        "constant",
+    ):
+        cols = buckets.get(bucket_name, [])
+        if not cols:
+            continue
+        range_buckets_payload.append(
+            {
+                "bucket": bucket_name,
+                "count": len(cols),
+                "examples": cols[:max_examples_per_bucket],
+            }
+        )
+
+    digest: Dict[str, Any] = {
+        "numeric_columns_with_observed_ranges": total_with_ranges,
+        "range_buckets": range_buckets_payload,
+        "dtype_guardrails": {
+            "signed_int8_unsafe_count": len(int8_unsafe),
+            "signed_int8_unsafe_examples": int8_unsafe[:max_examples_per_bucket],
+            "conflict_rule": (
+                "If strategy wording suggests a dtype that conflicts with observed min/max ranges, "
+                "prioritize observed range evidence."
+            ),
+        },
+    }
+
+    # Useful compact signal for mixed-scale datasets.
+    has_norm = bool(buckets["normalized_0_1"] or buckets["normalized_neg1_1"])
+    has_large = bool(buckets["byte_0_255"] or buckets["nonnegative_wide"] or buckets["mixed_sign"])
+    if has_norm and has_large:
+        digest["scaling_guardrail"] = (
+            "Mixed feature scales detected. If scaling is requested, declare exact scale_columns and avoid "
+            "rescaling already normalized columns."
+        )
+
+    return digest
 
 
 def _build_target_candidates(profile: Dict[str, Any], max_candidates: int = 8) -> List[Dict[str, Any]]:

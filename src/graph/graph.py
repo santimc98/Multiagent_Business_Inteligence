@@ -10886,8 +10886,24 @@ def run_execution_planner(state: AgentState) -> AgentState:
             )
             compact_profile = compact_data_profile_for_llm(planner_data_profile)
             if compact_profile:
+                planner_semantic_context = {
+                    "strategy_techniques_role": "advisory_hypotheses",
+                    "conflict_resolution_priority": [
+                        "DATA_PROFILE_COMPACT_JSON.numeric_ranges_digest",
+                        "dataset_semantics",
+                        "strategy_text",
+                    ],
+                    "dtype_conflict_policy": (
+                        "If strategy wording conflicts with observed profile ranges/dtypes, prioritize "
+                        "observed profile evidence and encode safer dtype constraints."
+                    ),
+                }
                 compact_payload = json.dumps(compact_profile, indent=2, ensure_ascii=False)
-                data_summary_for_planner = f"{data_summary}\n\nDATA_PROFILE_COMPACT_JSON:\n{compact_payload}"
+                semantic_payload = json.dumps(planner_semantic_context, indent=2, ensure_ascii=False)
+                data_summary_for_planner = (
+                    f"{data_summary}\n\nDATA_PROFILE_COMPACT_JSON:\n{compact_payload}"
+                    f"\n\nPLANNER_SEMANTIC_CONTEXT_JSON:\n{semantic_payload}"
+                )
     except Exception:
         planner_data_profile = None
     business_objective = state.get("business_objective", "")

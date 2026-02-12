@@ -223,6 +223,11 @@ Hard rules:
 - Contract precedence for DE must be coherent: HARD cleaning_gates + required_columns + explicit column_transformations
   are binding and must not contradict runbook narrative.
 - Keep contract coherent with strategy + business objective.
+- Treat strategy techniques as advisory hypotheses, not immutable requirements.
+- If strategy wording conflicts with direct data evidence (profile ranges/dtypes/semantics), prioritize data evidence
+  and encode the safer choice in contract fields.
+- Avoid declaring dtype constraints that conflict with observed ranges (e.g., signed int8 when observed values exceed
+  [-128, 127]).
 - Every requirement must be consumable by at least one downstream agent view.
 - Follow evidence_policy from INPUTS: use direct evidence first, grounded inference second, and avoid unsupported assumptions.
 - You may add extra fields if useful, but do not omit required minimum fields.
@@ -317,6 +322,18 @@ CONTRACT_EVIDENCE_POLICY_V1 = {
         "conceptual_items_in_required_outputs",
         "requirements_without_downstream_consumer",
     ],
+}
+
+PLANNER_SEMANTIC_RESOLUTION_POLICY_V1 = {
+    "strategy_techniques_role": "advisory_hypotheses",
+    "conflict_resolution_priority": [
+        "data_profile_compact_json",
+        "dataset_semantics",
+        "strategy_text",
+    ],
+    "dtype_semantic_guardrail": (
+        "Choose dtype constraints compatible with observed value ranges; avoid narrow integer dtypes when out of range."
+    ),
 }
 
 
@@ -7399,6 +7416,9 @@ downstream_consumer_interface:
 
 evidence_policy:
 {json.dumps(CONTRACT_EVIDENCE_POLICY_V1, indent=2)}
+
+planner_semantic_resolution_policy:
+{json.dumps(PLANNER_SEMANTIC_RESOLUTION_POLICY_V1, indent=2)}
 
 domain_expert_critique:
 {critique_for_prompt or "None"}
