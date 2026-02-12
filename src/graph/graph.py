@@ -7,6 +7,7 @@ import json
 import copy
 import hashlib
 import csv
+import ast
 import math
 import threading
 import time
@@ -5554,6 +5555,98 @@ def _infer_de_failure_cause(text: str) -> str:
     if "syntaxerror" in lower:
         return "Generated code is not valid Python syntax."
     return ""
+
+
+def _is_python_syntax_error(text: str) -> bool:
+    lower = str(text or "").lower()
+    markers = (
+        "syntaxerror",
+        "invalid syntax",
+        "unterminated string literal",
+        "unterminated triple-quoted string",
+        "unexpected eof while parsing",
+        "eol while scanning string literal",
+        "indentationerror",
+        "taberror",
+    )
+    return any(marker in lower for marker in markers)
+
+
+def _is_likely_python_statement(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    pattern = re.compile(
+        r"^(from\s+\w+|import\s+\w+|def\s+\w+|class\s+\w+|if\s+|for\s+|while\s+|try:|"
+        r"except\b|finally:|with\s+|return\b|raise\b|pass\b|break\b|continue\b|@\w+|"
+        r"[A-Za-z_]\w*\s*=)"
+    )
+    if pattern.match(stripped):
+        return True
+    if stripped.startswith(("(", "[", "{")):
+        return True
+    return False
+
+
+def _attempt_de_local_syntax_repair(code: str, error_details: str) -> tuple[str, List[str]]:
+    """
+    Local, deterministic syntax repair for DE scripts.
+    Goal: recover from non-Python preambles/fences without spending an extra LLM call.
+    """
+    text = str(code or "")
+    if not text or not _is_python_syntax_error(error_details):
+        return text, []
+
+    lines = text.splitlines()
+    notes: List[str] = []
+    changed = False
+
+    # Strip/neutralize markdown fence lines if present.
+    for idx, raw_line in enumerate(lines):
+        if re.match(r"^\s*```", raw_line or ""):
+            lines[idx] = ""
+            changed = True
+            if "removed_markdown_fence_lines" not in notes:
+                notes.append("removed_markdown_fence_lines")
+
+    for _ in range(32):
+        candidate = "\n".join(lines)
+        try:
+            ast.parse(candidate)
+            return candidate, notes
+        except SyntaxError as exc:
+            line_no = int(getattr(exc, "lineno", 0) or 0)
+            if line_no <= 0 or line_no > len(lines):
+                break
+            current = lines[line_no - 1]
+            stripped = str(current or "").strip()
+            if not stripped:
+                lines[line_no - 1] = "#"
+                changed = True
+                notes.append(f"commented_blank_line_{line_no}")
+                continue
+            if stripped.startswith("#"):
+                break
+            if stripped.startswith(("- ", "* ")):
+                lines[line_no - 1] = re.sub(r"^(\s*)", r"\1# ", current, count=1)
+                changed = True
+                notes.append(f"commented_bullet_line_{line_no}")
+                continue
+            if not _is_likely_python_statement(stripped):
+                lines[line_no - 1] = re.sub(r"^(\s*)", r"\1# ", current, count=1)
+                changed = True
+                notes.append(f"commented_prose_line_{line_no}")
+                continue
+            break
+
+    if changed:
+        candidate = "\n".join(lines)
+        try:
+            ast.parse(candidate)
+            return candidate, notes
+        except Exception:
+            pass
+    return text, notes
 
 def _build_de_runtime_diagnosis(error_details: str) -> List[str]:
     if not error_details:
@@ -12195,8 +12288,88 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 if not runtime_error_text:
                     runtime_error_text = heavy_error
 
+                if heavy_error_kind == "code":
+                    repaired_code, repair_notes = _attempt_de_local_syntax_repair(code, runtime_error_text)
+                    if repaired_code and repaired_code != code:
+                        if run_id:
+                            log_run_event(
+                                run_id,
+                                "data_engineer_local_syntax_repair_retry",
+                                {
+                                    "attempt": attempt_id,
+                                    "notes": repair_notes[:12],
+                                },
+                            )
+                        try:
+                            os.makedirs("artifacts", exist_ok=True)
+                            with open(
+                                os.path.join("artifacts", "data_engineer_last_syntax_repaired.py"),
+                                "w",
+                                encoding="utf-8",
+                            ) as f_rep:
+                                f_rep.write(repaired_code)
+                        except Exception as rep_err:
+                            print(f"Warning: failed to persist syntax repaired DE script: {rep_err}")
+                        print("DE syntax recovery: retrying same script after local deterministic repair.")
+                        retry_reason = (
+                            f"{de_heavy_reason}|local_syntax_repair"
+                            if de_heavy_reason
+                            else "local_syntax_repair"
+                        )
+                        retry_result = _execute_data_engineer_via_heavy_runner(
+                            state=state,
+                            code=repaired_code,
+                            csv_path=csv_path,
+                            csv_sep=csv_sep,
+                            csv_decimal=csv_decimal,
+                            csv_encoding=csv_encoding,
+                            heavy_cfg=de_heavy_cfg,
+                            run_id=run_id,
+                            attempt_id=attempt_id,
+                            reason=retry_reason,
+                        )
+                        if retry_result.get("ok"):
+                            code = repaired_code
+                            de_heavy_result = retry_result
+                            if run_id:
+                                log_run_event(
+                                    run_id,
+                                    "data_engineer_local_syntax_repair_success",
+                                    {"attempt": attempt_id},
+                                )
+                        else:
+                            de_heavy_result = retry_result
+                            heavy_error = str(
+                                de_heavy_result.get("error_details")
+                                or "HEAVY_RUNNER_ERROR: data engineer execution failed."
+                            )
+                            heavy_payload = (
+                                de_heavy_result.get("heavy_result")
+                                if isinstance(de_heavy_result, dict)
+                                else {}
+                            )
+                            heavy_script_error = (
+                                heavy_payload.get("error") if isinstance(heavy_payload, dict) else None
+                            )
+                            heavy_error_kind = "code" if heavy_script_error else "infra"
+                            runtime_error_text = ""
+                            if isinstance(heavy_script_error, dict):
+                                runtime_error_text = "\n".join(
+                                    item
+                                    for item in [
+                                        str(heavy_script_error.get("error") or "").strip(),
+                                        str(heavy_script_error.get("stacktrace") or "").strip(),
+                                    ]
+                                    if item
+                                )
+                            elif heavy_script_error:
+                                runtime_error_text = str(heavy_script_error)
+                            if not runtime_error_text:
+                                runtime_error_text = heavy_error
+
                 if (
-                    heavy_error_kind == "code"
+                    not de_heavy_result.get("ok")
+                    and heavy_error_kind == "code"
                     and not _flag_active_for_run(state, "de_runtime_retry_done", run_id)
                 ):
                     new_state = dict(state)
@@ -12272,12 +12445,13 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         )
                     return run_data_engineer(new_state)
 
-                return {
-                    "cleaning_code": code,
-                    "cleaned_data_preview": "Error: Cleaning Failed",
-                    "error_message": heavy_error,
-                    "budget_counters": counters,
-                }
+                if not de_heavy_result.get("ok"):
+                    return {
+                        "cleaning_code": code,
+                        "cleaned_data_preview": "Error: Cleaning Failed",
+                        "error_message": heavy_error,
+                        "budget_counters": counters,
+                    }
 
             if os.path.exists(local_cleaned_path):
                 try:

@@ -601,21 +601,11 @@ class DataEngineerAgent:
             text = src.strip()
             if not text:
                 return False
-            markers = (
-                "import ",
-                "from ",
-                "def ",
-                "class ",
-                "if __name__",
-                "\n",
-                "=",
-                "print(",
-                "raise ",
-                "try:",
-                "# ",
+            code_pattern = re.compile(
+                r"(?m)^\s*(from\s+\w+|import\s+\w+|def\s+\w+|class\s+\w+|if\s+__name__|"
+                r"if\s+|for\s+|while\s+|try:|with\s+|@\w+|[A-Za-z_]\w*\s*=|print\(|raise\s+)"
             )
-            lowered = text.lower()
-            return any(marker in lowered for marker in markers)
+            return bool(code_pattern.search(text))
 
         candidates: List[str] = []
 
@@ -666,6 +656,16 @@ class DataEngineerAgent:
                     last_syntax_error = e
 
         if last_syntax_error:
+            # Best-effort fallback: return script-like output and let runtime
+            # diagnostics/retry handle syntax cleanup if needed.
+            for candidate in recovery_candidates:
+                candidate = (candidate or "").strip()
+                if candidate and _looks_like_script(candidate):
+                    print(
+                        "WARNING: Returning best-effort DE code despite syntax issue; "
+                        f"runtime will handle if needed: {last_syntax_error}"
+                    )
+                    return candidate
             print(f"ERROR: Auto-fix failed. Syntax still invalid: {last_syntax_error}")
             raise ValueError(f"UNFIXABLE_SYNTAX_ERROR: {last_syntax_error}")
         print("ERROR: EMPTY_CODE_AFTER_EXTRACTION")
