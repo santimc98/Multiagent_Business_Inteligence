@@ -9,7 +9,10 @@ import re
 import copy
 from typing import Any, Dict, List, Tuple, Optional
 
-from src.utils.cleaning_contract_semantics import extract_selector_drop_reasons
+from src.utils.cleaning_contract_semantics import (
+    extract_selector_drop_reasons,
+    selector_reference_matches_any,
+)
 
 
 # File extensions that indicate a path is an artifact file
@@ -2305,6 +2308,9 @@ def _looks_like_selector_token(value: str) -> bool:
     token = value.strip()
     if not token:
         return False
+    low = token.lower()
+    if low.startswith(("regex:", "pattern:", "prefix:", "suffix:", "contains:", "selector:")):
+        return True
     if "*" in token or "?" in token:
         return True
     if token.startswith("^") or token.endswith("$"):
@@ -2312,6 +2318,10 @@ def _looks_like_selector_token(value: str) -> bool:
     if "\\d" in token or "\\w" in token or "\\s" in token:
         return True
     if any(ch in token for ch in ("[", "]", "(", ")", "{", "}", "|", "+")):
+        return True
+    if low.endswith(("_features", "_feature_set", "_family")):
+        return True
+    if low in {"features", "feature_set", "model_features", "all_features"}:
         return True
     return False
 
@@ -2953,7 +2963,18 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             for key in scale_norm
             if _column_matches_any_selector(scale_norm[key], required_feature_selectors)
         }
-        scale_allowed_norm = set(required_norm) | set(passthrough_norm) | set(selector_norm) | set(selector_covered_scale)
+        selector_semantic_scale = {
+            key
+            for key in scale_norm
+            if selector_reference_matches_any(scale_norm[key], required_feature_selectors)
+        }
+        scale_allowed_norm = (
+            set(required_norm)
+            | set(passthrough_norm)
+            | set(selector_norm)
+            | set(selector_covered_scale)
+            | set(selector_semantic_scale)
+        )
         scale_outside_required = [scale_norm[key] for key in sorted(set(scale_norm) - scale_allowed_norm)]
         if scale_outside_required:
             issues.append(
@@ -2961,7 +2982,7 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                     "contract.cleaning_transforms_scale_conflict",
                     "error",
                     "scale_columns must be covered by clean_dataset.required_columns/optional_passthrough_columns "
-                    "or required_feature_selectors.",
+                    "or required_feature_selectors (including selector references like regex:/prefix:/selector:<name>).",
                     scale_outside_required[:20],
                 )
             )

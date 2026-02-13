@@ -27,7 +27,10 @@ from src.utils.contract_accessors import (
 )
 from src.utils.run_bundle import get_run_dir
 from src.utils.feature_selectors import infer_feature_selectors, compact_column_representation
-from src.utils.cleaning_contract_semantics import extract_selector_drop_reasons
+from src.utils.cleaning_contract_semantics import (
+    extract_selector_drop_reasons,
+    selector_reference_matches_any,
+)
 from src.utils.contract_validator import (
     validate_contract_minimal_readonly,
     normalize_contract_scope,
@@ -6837,13 +6840,22 @@ class ExecutionPlannerAgent:
             token = str(value or "").strip()
             if not token:
                 return False
+            low = token.lower()
+            if low.startswith(("regex:", "pattern:", "prefix:", "suffix:", "contains:", "selector:")):
+                return True
             if "*" in token or "?" in token:
                 return True
             if token.startswith("^") or token.endswith("$"):
                 return True
             if "\\d" in token or "\\w" in token or "\\s" in token:
                 return True
-            return any(ch in token for ch in ("[", "]", "(", ")", "{", "}", "|", "+"))
+            if any(ch in token for ch in ("[", "]", "(", ")", "{", "}", "|", "+")):
+                return True
+            if low.endswith(("_features", "_feature_set", "_family")):
+                return True
+            if low in {"features", "feature_set", "model_features", "all_features"}:
+                return True
+            return False
 
         def _selector_matches_column(selector: Dict[str, Any], column: str) -> bool:
             if not isinstance(selector, dict) or not isinstance(column, str) or not column.strip():
@@ -7011,7 +7023,8 @@ class ExecutionPlannerAgent:
                     "HARD cleaning gates must not depend on selector-covered columns when selector-drop policy is enabled."
                 ),
                 "contract.cleaning_transforms_scale_conflict": (
-                    "Ensure scale_columns are covered by required_columns/optional_passthrough_columns or required_feature_selectors."
+                    "Ensure scale_columns are covered by required_columns/optional_passthrough_columns or required_feature_selectors "
+                    "(use concrete columns or explicit selector refs such as regex:/prefix:/selector:<name>)."
                 ),
                 "contract.clean_dataset_selector_drop_policy_missing": (
                     "When using required_feature_selectors with criteria-based drop directives, declare "
@@ -7109,6 +7122,8 @@ class ExecutionPlannerAgent:
                 "do not leave these decisions only in runbook prose.\n"
                 "If required_feature_selectors are used and any drop-by-criteria is requested, define "
                 "column_transformations.drop_policy.allow_selector_drops_when with explicit reasons.\n"
+                "When scaling a selector-defined family on wide schemas, scale_columns may use selector refs "
+                "(regex:/prefix:/suffix:/contains:/selector:<name>) instead of enumerating every column.\n"
                 "If selector-drop policy is active, required_columns and optional_passthrough_columns MUST be non-droppable anchors "
                 "and therefore must not overlap required_feature_selectors.\n"
                 "If selector-drop policy is active, HARD cleaning gates must not rely on selector-covered columns.\n"
@@ -7525,11 +7540,14 @@ class ExecutionPlannerAgent:
                                 continue
                             if _column_matches_any_selector(col, selectors):
                                 continue
+                            if selector_reference_matches_any(col, selectors):
+                                continue
                             uncovered.append(col)
                         if uncovered:
                             errors.append(
                                 f"{section_id}: column_transformations.scale_columns must be covered by "
-                                f"required_columns/optional_passthrough_columns/required_feature_selectors ({uncovered[:8]})"
+                                "required_columns/optional_passthrough_columns/required_feature_selectors "
+                                f"(including selector refs like regex:/prefix:/selector:<name>) ({uncovered[:8]})"
                             )
                     has_declared_selectors = bool(selectors)
                     if has_declared_selectors and criteria_drop_directives and not (drop_columns or selector_drop_reasons):
@@ -7687,6 +7705,8 @@ class ExecutionPlannerAgent:
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
                 "If cleaning requires dropping/scaling columns, set "
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy} explicitly.\n"
+                "For wide feature families, scale_columns may use selector refs "
+                "(regex:/prefix:/suffix:/contains:/selector:<name>) instead of exhaustive lists.\n"
                 "If required_feature_selectors are used and any drop-by-criteria is requested, set "
                 "column_transformations.drop_policy.allow_selector_drops_when.\n"
                 "If selector-drop policy is active, required_columns and optional_passthrough_columns must remain "
@@ -7825,6 +7845,8 @@ class ExecutionPlannerAgent:
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "If cleaning requires dropping/scaling columns, set "
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy} explicitly.\n"
+                "For wide feature families, scale_columns may use selector refs "
+                "(regex:/prefix:/suffix:/contains:/selector:<name>) instead of exhaustive lists.\n"
                 "If required_feature_selectors are used and any drop-by-criteria is requested, set "
                 "column_transformations.drop_policy.allow_selector_drops_when.\n"
                 "If selector-drop policy is active, required/passthrough anchors and HARD gate columns must stay "

@@ -262,3 +262,55 @@ def test_validate_contract_minimal_readonly_rejects_selector_drop_hard_gate_over
     assert result.get("accepted") is False
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.cleaning_gate_selector_drop_conflict" in rules
+
+
+def test_validate_contract_minimal_readonly_accepts_scale_selector_reference():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["id", "feature_a", "feature_b", "target"]
+    contract["column_roles"] = {
+        "pre_decision": ["feature_a", "feature_b"],
+        "decision": [],
+        "outcome": ["target"],
+        "post_decision_audit_only": [],
+        "unknown": [],
+    }
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["id", "feature_a", "feature_b", "target"]
+    clean_dataset["required_feature_selectors"] = [
+        {"type": "regex", "pattern": "^feature_[ab]$", "name": "model_features"}
+    ]
+    clean_dataset["column_transformations"] = {
+        "scale_columns": ["regex:^feature_[ab]$"],
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is True
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_transforms_scale_conflict" not in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_unresolved_scale_selector_reference():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["id", "feature_a", "feature_b", "target"]
+    contract["column_roles"] = {
+        "pre_decision": ["feature_a", "feature_b"],
+        "decision": [],
+        "outcome": ["target"],
+        "post_decision_audit_only": [],
+        "unknown": [],
+    }
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["id", "feature_a", "feature_b", "target"]
+    clean_dataset["required_feature_selectors"] = [
+        {"type": "regex", "pattern": "^feature_[ab]$", "name": "model_features"}
+    ]
+    clean_dataset["column_transformations"] = {
+        "scale_columns": ["selector:unknown_family"],
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_transforms_scale_conflict" in rules

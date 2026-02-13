@@ -1,3 +1,4 @@
+import fnmatch
 import re
 from typing import Any, Dict, List, Set, Tuple
 
@@ -61,6 +62,127 @@ def _infer_drop_reasons_from_text(*values: Any) -> List[str]:
     if "low information" in normalized or "near constant" in normalized or "low variance" in normalized:
         reasons.append("low_information")
     return list(dict.fromkeys(reasons))
+
+
+def _normalize_selector_ref_token(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    token = re.sub(r"[^a-z0-9]+", "_", token).strip("_")
+    return token
+
+
+def _looks_like_selector_reference(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    if not token:
+        return False
+    low = token.lower()
+    if low.startswith(("regex:", "pattern:", "prefix:", "suffix:", "contains:", "selector:")):
+        return True
+    if "*" in token or "?" in token:
+        return True
+    if token.startswith("^") or token.endswith("$"):
+        return True
+    if "\\d" in token or "\\w" in token or "\\s" in token:
+        return True
+    if any(ch in token for ch in ("[", "]", "(", ")", "{", "}", "|", "+")):
+        return True
+    if low.endswith(("_features", "_feature_set", "_family")):
+        return True
+    if low in {"features", "feature_set", "model_features", "all_features"}:
+        return True
+    return False
+
+
+def selector_reference_matches_any(
+    reference: Any,
+    selectors: Any,
+) -> bool:
+    """
+    Determine whether a semantic selector reference token is covered by declared selector objects.
+
+    This allows planner/validator to treat compact family refs (e.g. regex/prefix/selector:name)
+    as valid communication between agents on wide schemas.
+    """
+    ref = str(reference or "").strip()
+    if not ref:
+        return False
+    if not isinstance(selectors, list):
+        return False
+    selector_dicts = [item for item in selectors if isinstance(item, dict)]
+    if not selector_dicts:
+        return False
+
+    low_ref = ref.lower()
+    norm_ref = _normalize_selector_ref_token(ref)
+
+    # selector:<name|id|family|role> explicit indirection
+    if low_ref.startswith("selector:"):
+        selector_key = _normalize_selector_ref_token(ref.split(":", 1)[1])
+        if not selector_key:
+            return False
+        for selector in selector_dicts:
+            for key in ("name", "id", "family", "role", "selector_hint"):
+                if _normalize_selector_ref_token(selector.get(key)) == selector_key:
+                    return True
+        return False
+
+    # Generic family aliases can map to the declared selector family when present.
+    if low_ref.endswith(("_features", "_feature_set", "_family")) or low_ref in {
+        "features",
+        "feature_set",
+        "model_features",
+        "all_features",
+    }:
+        return True
+
+    # Inline selector declarations (regex:/prefix:/suffix:/contains:)
+    for prefix, selector_type, selector_key in (
+        ("regex:", "regex", "pattern"),
+        ("pattern:", "regex", "pattern"),
+        ("prefix:", "prefix", "prefix"),
+        ("suffix:", "suffix", "suffix"),
+        ("contains:", "contains", "value"),
+    ):
+        if low_ref.startswith(prefix):
+            payload = ref[len(prefix) :].strip()
+            if not payload:
+                return False
+            for selector in selector_dicts:
+                sel_type = str(selector.get("type") or "").strip().lower()
+                if sel_type == "pattern":
+                    sel_type = "regex"
+                if sel_type != selector_type:
+                    continue
+                if str(selector.get(selector_key) or "").strip() == payload:
+                    return True
+            return False
+
+    # Wildcard token can be matched against an equivalent regex selector.
+    if "*" in ref or "?" in ref:
+        wildcard_regex = fnmatch.translate(ref)
+        for selector in selector_dicts:
+            sel_type = str(selector.get("type") or "").strip().lower()
+            if sel_type in {"regex", "pattern"}:
+                pattern = str(selector.get("pattern") or "").strip()
+                if pattern and pattern == wildcard_regex:
+                    return True
+
+    # Raw regex-like token support (e.g., ^pixel\\d+$).
+    if _looks_like_selector_reference(ref):
+        for selector in selector_dicts:
+            sel_type = str(selector.get("type") or "").strip().lower()
+            if sel_type in {"regex", "pattern"}:
+                if str(selector.get("pattern") or "").strip() == ref:
+                    return True
+
+    # Name/family/role direct references without selector: prefix.
+    for selector in selector_dicts:
+        for key in ("name", "id", "family", "role"):
+            if _normalize_selector_ref_token(selector.get(key)) == norm_ref:
+                return True
+
+    return False
 
 
 def expand_required_feature_selectors(
@@ -362,4 +484,3 @@ def resolve_required_columns_for_cleaning(
         "policy_issues": policy_issues,
         "manifest_dropped_columns_by_reason": dropped_by_reason,
     }
-
