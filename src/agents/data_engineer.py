@@ -71,7 +71,7 @@ class DataEngineerAgent:
     def _extract_nonempty(self, response) -> str:
         """
         Extracts non-empty content from LLM response.
-        Raises ValueError("EMPTY_COMPLETION") if content is empty (CAUSA RAÍZ 2).
+        Raises ValueError("EMPTY_COMPLETION") if content is empty (CAUSA RAIZ 2).
         This triggers retry logic in call_with_retries.
         """
         content = extract_response_text(response)
@@ -152,6 +152,65 @@ class DataEngineerAgent:
             ],
         }
 
+    def _build_contract_focus_context(
+        self,
+        contract: Dict[str, Any],
+        de_view: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Build a compact DE-focused contract context to reduce prompt noise.
+        """
+        contract = contract if isinstance(contract, dict) else {}
+        de_view = de_view if isinstance(de_view, dict) else {}
+        focus: Dict[str, Any] = {}
+
+        for key in ("scope", "required_outputs", "column_roles", "outlier_policy"):
+            value = contract.get(key)
+            if value not in (None, "", [], {}):
+                focus[key] = value
+
+        artifact_requirements = contract.get("artifact_requirements")
+        if isinstance(artifact_requirements, dict):
+            clean_dataset = artifact_requirements.get("clean_dataset")
+            if isinstance(clean_dataset, dict) and clean_dataset:
+                focus["artifact_requirements"] = {"clean_dataset": clean_dataset}
+
+        if de_view:
+            view_focus: Dict[str, Any] = {}
+            for key in (
+                "required_columns",
+                "required_feature_selectors",
+                "optional_passthrough_columns",
+                "output_path",
+                "output_manifest_path",
+                "cleaning_gates",
+                "column_transformations",
+            ):
+                value = de_view.get(key)
+                if value not in (None, "", [], {}):
+                    view_focus[key] = value
+            if view_focus:
+                focus["de_view_projection"] = view_focus
+
+        return focus
+
+    def _detect_repair_mode(self, data_audit: str, requested: bool) -> bool:
+        """
+        Detect if DE should operate in repair mode.
+        """
+        if requested:
+            return True
+        text = str(data_audit or "")
+        repair_markers = (
+            "RUNTIME_ERROR_CONTEXT",
+            "PREFLIGHT_ERROR_CONTEXT",
+            "STATIC_SCAN_VIOLATIONS",
+            "UNDEFINED_NAME_GUARD",
+            "CLEANING_REVIEWER_ALERT",
+            "LLM_FAILURE_EXPLANATION",
+        )
+        return any(marker in text for marker in repair_markers)
+
     def generate_cleaning_script(
         self,
         data_audit: str,
@@ -164,6 +223,7 @@ class DataEngineerAgent:
         execution_contract: Optional[Dict[str, Any]] = None,
         contract_min: Optional[Dict[str, Any]] = None,
         de_view: Optional[Dict[str, Any]] = None,
+        repair_mode: bool = False,
     ) -> str:
         """
         Generates a Python script to clean and standardize the dataset.
@@ -195,6 +255,7 @@ class DataEngineerAgent:
                     continue
                 de_contract_context[key] = value
             contract_context = de_contract_context
+        contract_context = self._build_contract_focus_context(contract_context, de_view or {})
         contract_json = json.dumps(compress_long_lists(contract_context)[0], indent=2)
         de_view_json = json.dumps(compress_long_lists(de_view)[0], indent=2)
         de_output_path = str(de_view.get("output_path") or "").strip()
@@ -265,6 +326,13 @@ class DataEngineerAgent:
         runtime_dependency_context_json = json.dumps(
             compress_long_lists(runtime_dependency_context)[0], indent=2
         )
+        effective_repair_mode = self._detect_repair_mode(data_audit, repair_mode)
+        operating_mode = "REPAIR" if effective_repair_mode else "INITIAL"
+        repair_notes = (
+            "Patch root causes from error context first. Keep working logic stable."
+            if effective_repair_mode
+            else "Build the first executable script from contract and context."
+        )
 
         # [SAFETY] Truncate data_audit if massive to prevent context overflow
         # The audit concatenates many sources; preserve head (structure) and tail (recent instructions).
@@ -273,97 +341,65 @@ class DataEngineerAgent:
             head_len = 50000
             tail_len = 50000
             data_audit = data_audit[:head_len] + "\n...[AUDIT TRUNCATED FOR CONTEXT SAFETY]...\n" + data_audit[-tail_len:]
-
-        # SYSTEM TEMPLATE with PYTHON SYNTAX GOTCHAS (Fix CAUSA RAÍZ 3)
         SYSTEM_TEMPLATE = """
-        You are a Senior Data Engineer. Produce a robust cleaning SCRIPT for downstream ML.
+        You are a Senior Data Engineer producing a deterministic cleaning script.
 
         === SENIOR ENGINEERING PROTOCOL ===
         $senior_engineering_protocol
-        
-        *** HARD CONSTRAINTS (VIOLATION = FAILURE) ***
-        1. OUTPUT VALID PYTHON CODE ONLY (no markdown/code fences).
-        2. Do NOT output JSON plans or pseudo-code.
-        3. NO NETWORK/FS OPS: Do NOT use requests/subprocess/os.system and do not access filesystem outside declared input/output paths.
-        4. NO SYS MODULE: Do NOT use 'import sys' or 'sys.exit()'. Your code runs in a controlled sandbox, not as a standalone script.
-           - For error handling, use: raise ValueError("descriptive error message") or print("ERROR: ...") and return early.
-           - Example (WRONG): sys.exit(1)
-           - Example (CORRECT): raise FileNotFoundError(f"Input file '{input_path}' not found")
-        5. BAN pandas private APIs: do not use pandas.io.* or pd.io.parsers.*.
-        6. If the audit includes RUNTIME_ERROR_CONTEXT, fix the root cause and regenerate the full script.
-        7. Do NOT use np.bool (deprecated). Use bool or np.bool_ if needed.
-        8. Never call int(series) or float(series). For boolean masks use int(mask.sum()).
-           If you fill NaN with a sentinel (e.g., 'Unknown'), log nulls via original_nulls = int(col.isna().sum());
-           nulls_before = original_nulls; nulls_after_na = int(cleaned.isna().sum()); filled_nulls = original_nulls.
-        9. SAFE READ: You MUST read input with pd.read_csv(..., dtype=str, low_memory=False) to preserve ID fidelity.
-           If you choose not to use dtype=str, you MUST define dtype/converters for identifier-like columns (id/key/cod/entity).
-        10. DEPENDENCY CONTRACT: Use only imports allowed by RUNTIME_DEPENDENCY_CONTEXT.
-            If an API behavior can vary by version, write code compatible with RUNTIME_DEPENDENCY_CONTEXT.version_hints.
 
-        COMMENT BLOCK REQUIREMENT:
-        - At the top of the script, include comment sections:
-          # Decision Log:
-          # Assumptions:
-          # Risks & Checks:
+        OPERATING_MODE: $operating_mode
+        MODE_NOTE: $repair_notes
 
-        *** SCOPE OF WORK (NON-NEGOTIABLE) ***
-        - Output ONLY: $de_output_path and $de_manifest_path.
-        - MUST NOT: compute scores, case assignment, weight fitting, regression/optimization, correlations, rank checks.
-        - MUST: parse types, normalize numeric formats, preserve canonical column names.
-        - Manifest MUST include: output_dialect, row_counts, conversions.
-        - If OUTLIER_POLICY_CONTEXT.enabled=true and apply_stage is data_engineer/both:
-          apply the policy during cleaning and persist an outlier treatment report to $outlier_report_path.
-          If OUTLIER_POLICY_CONTEXT is empty/disabled, do not invent outlier rules.
+        SOURCE-OF-TRUTH PRECEDENCE:
+        1) CLEANING_GATES_CONTEXT + required_columns + required_feature_selectors from DE_VIEW_CONTEXT
+        2) COLUMN_TRANSFORMATIONS_CONTEXT
+        3) ROLE RUNBOOK (advisory)
 
-        *** COLUMN SYNCHRONIZATION RULE (CRITICAL) ***
-        - Baseline: your output CSV MUST include all columns listed in "Required Columns (DE View)".
-        - If DE_VIEW_CONTEXT includes required_feature_selectors, expand them against input header and treat
-          expanded columns as additional required columns (unless explicitly dropped by COLUMN_TRANSFORMATIONS_CONTEXT
-          via drop_columns or via drop_policy with evidence reported in manifest).
-        - required_columns are anchor columns; when selectors are present they are NOT the exhaustive final schema.
-        - If a column exists in raw data but is NOT in required_columns/selectors/optional_passthrough, DISCARD it.
-        - Constant columns may or may not be included in required_columns depending on strategy; do not infer constants to override required_columns.
-        - Do NOT second-guess required_columns anchors. Resolve selectors to determine full required feature families.
-        - The anchors list is stored in data/required_columns.json (array). Use it directly and combine with selectors.
-        - If a required column is missing from the input, raise an error (no fabrication).
-        - Optional passthrough columns: include ONLY if present in input AND listed in optional_passthrough.
+        CORE CONSTRAINTS:
+        - Output valid Python code only (no markdown/code fences, no prose, no JSON plans).
+        - No network/system calls (requests/subprocess/os.system forbidden).
+        - No pandas private APIs.
+        - Use only dependencies allowed by RUNTIME_DEPENDENCY_CONTEXT.
+        - Script must parse as valid Python.
 
-        *** CONTRACT PRECEDENCE (CRITICAL) ***
-        - Priority 1 (binding): HARD cleaning_gates + required_columns + required_feature_selectors.
-        - Priority 2 (binding when present): COLUMN_TRANSFORMATIONS_CONTEXT from artifact_requirements.clean_dataset.column_transformations.
-          If drop_policy.allow_selector_drops_when is present, selector-expanded columns may be dropped only when
-          evidence matches allowed reasons and is written to manifest.
-        - Priority 3 (advisory): ROLE RUNBOOK narrative.
-        - If runbook text conflicts with Priority 1/2, follow Priority 1/2 and record the conflict in manifest.contract_conflicts_resolved.
+        SCOPE:
+        - Cleaning only (no modeling/scoring/optimization/analytics).
+        - Read input with pd.read_csv(..., dtype=str, low_memory=False, sep, decimal, encoding from inputs).
+        - Write cleaned CSV to $de_output_path.
+        - Write manifest to $de_manifest_path.
+        - If outlier policy is enabled for data_engineer/both, write report to $outlier_report_path.
 
-        - Do NOT impute outcome/target columns. Use data/dataset_semantics.json + data/dataset_training_mask.json (Steward-decided); if partial labels exist, preserve missingness. Do not invent targets.
-        - Preserve partition/split columns if they exist or are detected in the Dataset Semantics Summary.
-        - If you create a partition column (split/fold/bucket), document it in the manifest and do not drop it.
-        - For wide datasets, avoid enumerating all columns in code comments or logic. If data/column_sets.json exists, use src.utils.column_sets.expand_column_sets to manage column lists; fall back gracefully if the file is missing.
-        - Note: data/column_sets.json is a feature-grouping view over full inventory and may be broader than required_columns anchors.
-        - Do NOT drop columns just because they are missing from a truncated list; use selectors + explicit columns from column_sets.json when available.
-        - If column_sets.json is present, preserve all columns matched by its selectors plus explicit_columns unless the contract explicitly forbids them.
-        - Never assume canonical_columns is the full inventory on wide datasets. Use data/column_inventory.json + data/column_sets.json as source of truth when present.
+        REQUIRED MANIFEST CONTENT:
+        - output_dialect
+        - row_counts
+        - conversions
+        - contract_conflicts_resolved (empty list if none)
 
-        *** PYTHON SYNTAX GOTCHAS (CRITICAL) ***
-        - Column names starting with a digit (e.g., '1stYearAmount') are NOT valid Python identifiers.
-        - NEVER use: df.assign(1stYearAmount=...) - This causes SyntaxError!
-        - ALWAYS use: df.assign(**{'1stYearAmount': ...}) or df['1stYearAmount'] = ...
-        - np.where returns a NumPy array. If you need pandas .str operations, keep a Series (use Series.where/mask or wrap back into a Series before .str).
-        - UNIVERSAL DTYPE RULE: before any `.str` operation, explicitly cast the working Series to string dtype.
-          After operations like `.replace(..., np.nan)`, dtype may no longer be string in pandas 2.x.
-          Therefore use `series = series.astype(str)` or `series = series.astype('string')` immediately before `.str.*`.
-        - DO NOT rescale numeric columns in cleaning unless COLUMN_TRANSFORMATIONS_CONTEXT explicitly requests scaling for specific columns.
-          If scaling is explicitly requested there, apply only to those listed columns and document method + affected columns in the manifest.
-          Otherwise, only parse formats (e.g., remove thousand separators).
-          CRITICAL: Check NUMERIC_RANGES_SUMMARY in DATA AUDIT to understand actual data scales:
-          * If columns show [0, 1] range → data is ALREADY normalized, do NOT assume it needs 0-255 conversion
-          * If columns show [0, 255] range → data may be pixel values, do NOT normalize to 0-1 in cleaning
-          * If columns show [0, 100] range → may be percentages, check for '%' in name/values
-          Default behavior: preserve original scale and leave modeling transformations to ML Engineer.
-        - For numeric parsing: ALWAYS sanitize symbols first (strip currency/letters; keep digits, sign, separators, parentheses, and %) and handle repeated thousands separators like '23.351.746'.
-        
-        *** INPUT PARAMETERS ***
+        COLUMN BEHAVIOR:
+        - required_columns are anchor columns.
+        - Expand required_feature_selectors against input header; expanded columns are required unless
+          explicitly dropped by COLUMN_TRANSFORMATIONS_CONTEXT + allowed drop_policy evidence.
+        - Keep optional passthrough columns only if listed and present.
+        - Missing required columns -> fail fast with ValueError.
+        - Never fabricate columns.
+
+        TARGET/PARTITION SAFETY:
+        - Do not impute outcome/target columns unless contract explicitly requests it.
+        - Preserve missingness for partially labeled targets.
+        - Preserve split/partition columns when present.
+        - If integer target can include nulls, use pandas nullable integer dtype.
+
+        REPAIR RULES (when OPERATING_MODE is REPAIR):
+        - Use RUNTIME_ERROR_CONTEXT/PREFLIGHT_ERROR_CONTEXT to fix root causes first.
+        - Keep already-correct logic stable; avoid unrelated rewrites.
+        - Prioritize executable syntax and required artifacts.
+
+        TOP-OF-SCRIPT COMMENT BLOCKS (required):
+        # Decision Log:
+        # Assumptions:
+        # Risks & Checks:
+
+        INPUT PARAMETERS:
         - Input: '$input_path'
         - Encoding: '$csv_encoding' | Sep: '$csv_sep' | Decimal: '$csv_decimal'
         - DE Cleaning Objective: "$business_objective"
@@ -375,39 +411,16 @@ class DataEngineerAgent:
         - EXECUTION_CONTRACT_CONTEXT (json): $execution_contract_context
         - CLEANING_GATES_CONTEXT (json): $cleaning_gates_context
         - RUNTIME_DEPENDENCY_CONTEXT (json): $runtime_dependency_context
-        - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
+        - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook
 
-        *** DATA AUDIT ***
+        DATA AUDIT:
         $data_audit
-        
-        *** CLEANING OUTPUT REQUIREMENTS ***
-        - CRITICAL: Read input with pd.read_csv(..., sep='$csv_sep', decimal='$csv_decimal', encoding='$csv_encoding', dtype=str, low_memory=False). DO NOT rely on defaults.
-        - Save cleaned CSV to $de_output_path.
-        - Save manifest to $de_manifest_path (use _safe_dump_json if present; otherwise json.dump(..., default=_json_default)).
-        - CRITICAL: Manifest MUST include "output_dialect": {"sep": "...", "decimal": "...", "encoding": "..."} matching the saved file.
-        - If outlier policy is enabled, manifest MUST include an "outlier_treatment" block summarizing:
-          policy_applied, method(s), target_columns, and affected_rows/flags.
-        - Use standard CSV (sep=',', decimal='.', encoding='utf-8') for output unless forbidden.
-        - Use canonical_name from the contract for all column references.
-        - Derive required columns using clear, deterministic logic.
-        - Build a header map for lookup (normalize only for matching), but preserve canonical_name exactly (including spaces/symbols) in the output.
-        - Canonical columns must contain cleaned values (do not leave raw strings in canonical columns while writing cleaned_* shadows).
-        - Optional passthrough columns: if present in the input, keep them in the cleaned output without modification; if missing, do NOT fabricate them.
-        - Print a CLEANING_VALIDATION section that reports dtype and null_frac for each required column (no advanced metrics).
-        - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
-        - If a derived column has derived_owner='ml_engineer', do NOT create placeholders; leave it absent and document in the manifest.
-        - OUTCOME/TARGET COLUMNS MAY HAVE MISSING VALUES. Do NOT fail or impute when outcome values are NaN.
-          Only raise an error if NON-NULL outcome values cannot be parsed. Preserve missingness and record null_frac in the manifest.
-        - Manifest audit counts: include n_cols_in, n_cols_out, kept_by_selectors_count, dropped_forbidden_count, dropped_constant_count.
-        - If selector drops are performed via drop_policy, persist reason-specific dropped columns
-          (e.g., constant_columns_dropped, all_null_columns_dropped) in manifest for reviewer evidence.
 
-        *** GATE CHECKLIST (CONTRACT-DRIVEN) ***
-        - Enumerate cleaning_gates by column and requirement (max_null_fraction, allow_nulls, required_columns, etc.).
-        - Before writing the cleaned output CSV, compute null_fraction for each gated column.
-        - For *_type_cast gates, validate conversion over the full gate scope (column or selector expansion), not only one sampled column.
-        - If any HARD gate is violated, raise ValueError with a clear message: "CLEANING_GATE_FAILED: <gate_name> <details>".
-        - If a gate references a column that is missing, raise ValueError (do not fabricate columns).
+        CONTRACT-CHECKLIST BEFORE RETURNING (silent self-check):
+        - Python parses without SyntaxError.
+        - Required output paths are used.
+        - HARD gates fail with ValueError("CLEANING_GATE_FAILED: ...") when violated.
+        - No markdown/code fences in output.
         """
 
         USER_TEMPLATE = "Generate the cleaning script following Principles."
@@ -443,6 +456,8 @@ class DataEngineerAgent:
             de_output_path=de_output_path,
             de_manifest_path=de_manifest_path,
             outlier_report_path=outlier_report_path,
+            operating_mode=operating_mode,
+            repair_notes=repair_notes,
         )
         self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE
         print(f"DEBUG: DE System Prompt Len: {len(system_prompt)}")
@@ -678,17 +693,8 @@ class DataEngineerAgent:
                     last_syntax_error = e
 
         if last_syntax_error:
-            # Best-effort fallback: return script-like output and let runtime
-            # diagnostics/retry handle syntax cleanup if needed.
-            for candidate in recovery_candidates:
-                candidate = (candidate or "").strip()
-                if candidate and _looks_like_script(candidate):
-                    print(
-                        "WARNING: Returning best-effort DE code despite syntax issue; "
-                        f"runtime will handle if needed: {last_syntax_error}"
-                    )
-                    return candidate
             print(f"ERROR: Auto-fix failed. Syntax still invalid: {last_syntax_error}")
-            raise ValueError(f"UNFIXABLE_SYNTAX_ERROR: {last_syntax_error}")
+            raise ValueError(f"INVALID_PYTHON_SYNTAX: {last_syntax_error}")
         print("ERROR: EMPTY_CODE_AFTER_EXTRACTION")
         raise ValueError("EMPTY_CODE_AFTER_EXTRACTION")
+

@@ -12050,6 +12050,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
         kwargs["execution_contract"] = execution_contract
     if "de_view" in sig.parameters:
         kwargs["de_view"] = de_view
+    if "repair_mode" in sig.parameters:
+        kwargs["repair_mode"] = bool(attempt_id > 1)
     code = data_engineer.generate_cleaning_script(**kwargs)
     try:
         os.makedirs("artifacts", exist_ok=True)
