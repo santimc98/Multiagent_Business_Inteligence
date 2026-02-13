@@ -178,6 +178,7 @@ _STRICT_IDENTIFIER_EXACT = {
 _STRICT_IDENTIFIER_PATTERN = re.compile(r"^(row|record)[ _\-]?id$", re.IGNORECASE)
 _CANDIDATE_IDENTIFIER_TOKENS = {"key", "ref", "code", "cod"}
 _CANDIDATE_SUFFIXES = ("_id", "-id", " id")
+_DEFAULT_DE_OUTLIER_REPORT_PATH = "data/outlier_treatment_report.json"
 
 
 def _coerce_list(value: Any) -> List[Any]:
@@ -657,6 +658,8 @@ def _resolve_outlier_policy(contract_min: Dict[str, Any], contract_full: Dict[st
             report_path = normalized.get("report_path") or normalized.get("output_path")
             if isinstance(report_path, str) and report_path.strip():
                 normalized["report_path"] = report_path.strip()
+            elif bool(enabled) and stage in {"data_engineer", "both"}:
+                normalized["report_path"] = _DEFAULT_DE_OUTLIER_REPORT_PATH
             target_columns = normalized.get("target_columns")
             if isinstance(target_columns, list):
                 normalized["target_columns"] = [str(col) for col in target_columns if col]
@@ -687,6 +690,27 @@ def _resolve_reviewer_gates(contract_min: Dict[str, Any], contract_full: Dict[st
         if normalized:
             return normalized
     return []
+
+
+def _resolve_de_outlier_report_path_from_policy(outlier_policy: Dict[str, Any]) -> str:
+    if not isinstance(outlier_policy, dict) or not outlier_policy:
+        return ""
+    enabled = outlier_policy.get("enabled")
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    if enabled is None:
+        enabled = bool(
+            outlier_policy.get("target_columns")
+            or outlier_policy.get("methods")
+            or outlier_policy.get("treatment")
+        )
+    stage = str(outlier_policy.get("apply_stage") or "data_engineer").strip().lower()
+    if not bool(enabled) or stage not in {"data_engineer", "both"}:
+        return ""
+    report_path = outlier_policy.get("report_path") or outlier_policy.get("output_path")
+    if isinstance(report_path, str) and report_path.strip():
+        return report_path.strip()
+    return _DEFAULT_DE_OUTLIER_REPORT_PATH
 
 
 def _summarize_strategy(contract_full: Dict[str, Any], contract_min: Dict[str, Any], max_chars: int = 180) -> str:
@@ -963,9 +987,9 @@ def build_de_view(
     }
     if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
         view["outlier_policy"] = outlier_policy
-        report_path = outlier_policy.get("report_path")
-        if isinstance(report_path, str) and report_path.strip():
-            view["outlier_report_path"] = report_path.strip()
+        report_path = _resolve_de_outlier_report_path_from_policy(outlier_policy)
+        if report_path:
+            view["outlier_report_path"] = report_path
     if column_transformations:
         view["column_transformations"] = column_transformations
     if manifest_path:
@@ -1427,9 +1451,9 @@ def build_cleaning_view(
     }
     if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
         view["outlier_policy"] = outlier_policy
-        report_path = outlier_policy.get("report_path")
-        if isinstance(report_path, str) and report_path.strip():
-            view["outlier_report_path"] = report_path.strip()
+        report_path = _resolve_de_outlier_report_path_from_policy(outlier_policy)
+        if report_path:
+            view["outlier_report_path"] = report_path
     if column_transformations:
         view["column_transformations"] = column_transformations
     # Include cleaning code for intent verification (rescale detection, synthetic data check)
@@ -1691,9 +1715,9 @@ def build_contract_views_projection(
     }
     if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
         de_view["outlier_policy"] = outlier_policy
-        report_path = outlier_policy.get("report_path")
-        if isinstance(report_path, str) and report_path.strip():
-            de_view["outlier_report_path"] = report_path.strip()
+        report_path = _resolve_de_outlier_report_path_from_policy(outlier_policy)
+        if report_path:
+            de_view["outlier_report_path"] = report_path
     if has_column_transformations:
         de_view["column_transformations"] = column_transformations
     if manifest_path:
@@ -1788,9 +1812,9 @@ def build_contract_views_projection(
     }
     if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
         cleaning_view["outlier_policy"] = outlier_policy
-        report_path = outlier_policy.get("report_path")
-        if isinstance(report_path, str) and report_path.strip():
-            cleaning_view["outlier_report_path"] = report_path.strip()
+        report_path = _resolve_de_outlier_report_path_from_policy(outlier_policy)
+        if report_path:
+            cleaning_view["outlier_report_path"] = report_path
     if has_column_transformations:
         cleaning_view["column_transformations"] = column_transformations
     if cleaning_code and isinstance(cleaning_code, str):

@@ -233,6 +233,19 @@ class DataEngineerAgent:
             or outlier_policy.get("report_path")
             or ""
         ).strip()
+        if not outlier_report_path and outlier_policy:
+            outlier_enabled = outlier_policy.get("enabled")
+            if isinstance(outlier_enabled, str):
+                outlier_enabled = outlier_enabled.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+            if outlier_enabled is None:
+                outlier_enabled = bool(
+                    outlier_policy.get("target_columns")
+                    or outlier_policy.get("methods")
+                    or outlier_policy.get("treatment")
+                )
+            outlier_stage = str(outlier_policy.get("apply_stage") or "data_engineer").strip().lower()
+            if bool(outlier_enabled) and outlier_stage in {"data_engineer", "both"}:
+                outlier_report_path = "data/outlier_treatment_report.json"
         artifact_requirements = contract.get("artifact_requirements")
         clean_dataset_cfg = {}
         if isinstance(artifact_requirements, dict):

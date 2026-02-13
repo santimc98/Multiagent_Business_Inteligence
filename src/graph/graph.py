@@ -10176,10 +10176,25 @@ def _resolve_de_outlier_report_path(state: Dict[str, Any]) -> str:
     if isinstance(explicit, str) and explicit.strip():
         return _normalize_output_path(explicit)
     outlier_policy = de_view.get("outlier_policy")
-    if isinstance(outlier_policy, dict):
-        report_path = outlier_policy.get("report_path")
-        if isinstance(report_path, str) and report_path.strip():
-            return _normalize_output_path(report_path)
+    if not isinstance(outlier_policy, dict):
+        return ""
+    report_path = outlier_policy.get("report_path")
+    if isinstance(report_path, str) and report_path.strip():
+        return _normalize_output_path(report_path)
+    enabled_raw = outlier_policy.get("enabled")
+    if isinstance(enabled_raw, str):
+        enabled = enabled_raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    elif enabled_raw is None:
+        enabled = bool(
+            outlier_policy.get("target_columns")
+            or outlier_policy.get("methods")
+            or outlier_policy.get("treatment")
+        )
+    else:
+        enabled = bool(enabled_raw)
+    stage = str(outlier_policy.get("apply_stage") or "data_engineer").strip().lower()
+    if enabled and stage in {"data_engineer", "both"}:
+        return _normalize_output_path("data/outlier_treatment_report.json")
     return ""
 
 
