@@ -1100,10 +1100,28 @@ def _compute_null_fraction(
 
 
 def _list_str(value: Any) -> List[str]:
+    def _is_compaction_marker(token: str) -> bool:
+        text = str(token or "").strip()
+        if not text:
+            return True
+        if re.match(r"^\.\.\.\(\d+\s+total\)$", text):
+            return True
+        return text in {"...", "...total", "...(total)"}
+
     if isinstance(value, list):
-        return [str(item) for item in value if item]
+        out: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if _is_compaction_marker(text):
+                continue
+            out.append(text)
+        return out
     if isinstance(value, str) and value.strip():
-        return [value.strip()]
+        text = value.strip()
+        if text and not _is_compaction_marker(text):
+            return [text]
     return []
 
 
@@ -1211,6 +1229,18 @@ def _expand_required_feature_selectors_for_review(
 def _resolve_required_columns_for_review(view: Dict[str, Any]) -> List[str]:
     required = view.get("required_columns")
     required_selectors = view.get("required_feature_selectors")
+    column_transformations = view.get("column_transformations")
+    if not isinstance(column_transformations, dict):
+        column_transformations = {}
+
+    drop_columns_raw = (
+        column_transformations.get("drop_columns")
+        if isinstance(column_transformations.get("drop_columns"), list)
+        else []
+    )
+    drop_columns = _list_str(drop_columns_raw)
+    drop_norm = {col.lower() for col in drop_columns if col}
+
     base_required: List[str] = []
     if isinstance(required, list):
         base_required = _list_str(required)
@@ -1238,7 +1268,11 @@ def _resolve_required_columns_for_review(view: Dict[str, Any]) -> List[str]:
 
     inventory_cols = _load_column_inventory_names("data/column_inventory.json")
     selector_required = _expand_required_feature_selectors_for_review(required_selectors, inventory_cols)
-    merged = list(dict.fromkeys(base_required + selector_required))
+    # Contract precedence:
+    # - explicit required_columns are always required
+    # - selector-expanded columns are required unless explicitly dropped by column_transformations.drop_columns
+    selector_required_effective = [col for col in selector_required if col.lower() not in drop_norm]
+    merged = list(dict.fromkeys(base_required + selector_required_effective))
     return merged
 
 

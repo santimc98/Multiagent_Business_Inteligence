@@ -135,8 +135,12 @@ class QAView(TypedDict, total=False):
 
 _PRESERVE_KEYS = {
     "required_columns",
+    "optional_passthrough_columns",
+    "required_feature_selectors",
     "required_outputs",
     "column_transformations",
+    "drop_columns",
+    "scale_columns",
     "forbidden_features",
     "reviewer_gates",
     "qa_gates",
