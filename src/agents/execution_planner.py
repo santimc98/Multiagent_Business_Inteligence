@@ -6619,6 +6619,271 @@ class ExecutionPlannerAgent:
                 }
             return base_result
 
+        _ROLE_BUCKETS = (
+            "pre_decision",
+            "decision",
+            "outcome",
+            "post_decision_audit_only",
+            "identifiers",
+            "time_columns",
+            "unknown",
+        )
+
+        _ROLE_ALIASES = {
+            "pre_decision": "pre_decision",
+            "predecision": "pre_decision",
+            "pre_decision_features": "pre_decision",
+            "feature": "pre_decision",
+            "features": "pre_decision",
+            "model_feature": "pre_decision",
+            "model_features": "pre_decision",
+            "predictor": "pre_decision",
+            "predictors": "pre_decision",
+            "input": "pre_decision",
+            "inputs": "pre_decision",
+            "decision": "decision",
+            "decisions": "decision",
+            "action": "decision",
+            "actions": "decision",
+            "outcome": "outcome",
+            "target": "outcome",
+            "targets": "outcome",
+            "label": "outcome",
+            "labels": "outcome",
+            "post_decision_audit_only": "post_decision_audit_only",
+            "post_decision": "post_decision_audit_only",
+            "audit_only": "post_decision_audit_only",
+            "audit": "post_decision_audit_only",
+            "forbidden": "post_decision_audit_only",
+            "forbidden_for_modeling": "post_decision_audit_only",
+            "id": "identifiers",
+            "identifier": "identifiers",
+            "identifiers": "identifiers",
+            "key": "identifiers",
+            "keys": "identifiers",
+            "split": "identifiers",
+            "split_identifier": "identifiers",
+            "split_indicator": "identifiers",
+            "partition": "identifiers",
+            "fold": "identifiers",
+            "time": "time_columns",
+            "timestamp": "time_columns",
+            "datetime": "time_columns",
+            "date": "time_columns",
+            "time_columns": "time_columns",
+            "unknown": "unknown",
+        }
+
+        def _normalize_role_token(token: Any) -> str:
+            key = re.sub(r"[^a-z0-9]+", "_", str(token or "").strip().lower()).strip("_")
+            return _ROLE_ALIASES.get(key, "")
+
+        def _looks_like_selector_token(value: str) -> bool:
+            token = str(value or "").strip()
+            if not token:
+                return False
+            if "*" in token or "?" in token:
+                return True
+            if token.startswith("^") or token.endswith("$"):
+                return True
+            if "\\d" in token or "\\w" in token or "\\s" in token:
+                return True
+            return any(ch in token for ch in ("[", "]", "(", ")", "{", "}", "|", "+"))
+
+        def _selector_matches_column(selector: Dict[str, Any], column: str) -> bool:
+            if not isinstance(selector, dict) or not isinstance(column, str) or not column.strip():
+                return False
+            selector_type = str(selector.get("type") or "").strip().lower()
+            col = column.strip()
+            if not selector_type:
+                return False
+            try:
+                if selector_type in {"regex", "pattern"}:
+                    pattern = str(selector.get("pattern") or "").strip()
+                    return bool(pattern) and re.compile(pattern, flags=re.IGNORECASE).match(col) is not None
+                if selector_type == "prefix":
+                    prefix = str(selector.get("value") or selector.get("prefix") or "").strip()
+                    return bool(prefix) and col.lower().startswith(prefix.lower())
+                if selector_type == "suffix":
+                    suffix = str(selector.get("value") or selector.get("suffix") or "").strip()
+                    return bool(suffix) and col.lower().endswith(suffix.lower())
+                if selector_type == "contains":
+                    token = str(selector.get("value") or "").strip()
+                    return bool(token) and token.lower() in col.lower()
+                if selector_type == "list":
+                    cols, _ = _to_clean_str_list(selector.get("columns"))
+                    return col in set(cols)
+                if selector_type == "all_columns_except":
+                    excluded, _ = _to_clean_str_list(selector.get("except_columns"))
+                    return col.lower() not in {c.lower() for c in excluded}
+                if selector_type == "prefix_numeric_range":
+                    prefix = str(selector.get("prefix") or "").strip()
+                    start = selector.get("start")
+                    end = selector.get("end")
+                    if not prefix or not isinstance(start, int) or not isinstance(end, int):
+                        return False
+                    m = re.compile(rf"^{re.escape(prefix)}(\d+)$", flags=re.IGNORECASE).match(col)
+                    if not m:
+                        return False
+                    idx = int(m.group(1))
+                    lo = min(start, end)
+                    hi = max(start, end)
+                    return lo <= idx <= hi
+            except Exception:
+                return False
+            return False
+
+        def _column_matches_any_selector(column: str, selectors: Any) -> bool:
+            if not isinstance(selectors, list):
+                return False
+            for selector in selectors:
+                if _selector_matches_column(selector, column):
+                    return True
+            return False
+
+        def _normalize_column_roles_payload(
+            raw_roles: Any,
+            canonical_columns: List[str] | None = None,
+        ) -> Tuple[Dict[str, List[str]], List[str]]:
+            issues: List[str] = []
+            normalized: Dict[str, List[str]] = {bucket: [] for bucket in _ROLE_BUCKETS}
+
+            canon_norm_map: Dict[str, str] = {}
+            for col in (canonical_columns or []):
+                norm = _normalize_column_identifier(col)
+                if norm and norm not in canon_norm_map:
+                    canon_norm_map[norm] = str(col)
+
+            def _resolve_col(col_name: str) -> str:
+                col = str(col_name or "").strip()
+                if not col:
+                    return ""
+                if _looks_like_selector_token(col):
+                    return col
+                norm = _normalize_column_identifier(col)
+                return canon_norm_map.get(norm) or col
+
+            def _add(bucket: str, col_name: str) -> None:
+                col = _resolve_col(col_name)
+                if not col:
+                    return
+                values = normalized.setdefault(bucket, [])
+                if col not in values:
+                    values.append(col)
+
+            if not isinstance(raw_roles, dict):
+                return {}, ["column_roles must be an object."]
+            if not raw_roles:
+                return {}, ["column_roles cannot be empty."]
+
+            value_types = {type(v).__name__ for v in raw_roles.values()}
+            role_bucket_mode = any(isinstance(v, list) for v in raw_roles.values())
+
+            if role_bucket_mode:
+                for raw_role, cols in raw_roles.items():
+                    bucket = _normalize_role_token(raw_role)
+                    if not bucket:
+                        issues.append(
+                            f"column_roles role '{raw_role}' is not canonical; use one of {list(_ROLE_BUCKETS)}"
+                        )
+                        bucket = "unknown"
+                    clean_cols, invalid_cols = _to_clean_str_list(cols)
+                    if invalid_cols:
+                        issues.append(f"column_roles['{raw_role}'] must be list[str].")
+                    for col in clean_cols:
+                        _add(bucket, col)
+            else:
+                for raw_col, raw_role in raw_roles.items():
+                    role_token = ""
+                    if isinstance(raw_role, dict):
+                        role_token = str(raw_role.get("role") or "").strip()
+                    elif isinstance(raw_role, str):
+                        role_token = raw_role.strip()
+                    if not role_token:
+                        issues.append(f"column_roles mapping for '{raw_col}' is missing role.")
+                        bucket = "unknown"
+                    else:
+                        bucket = _normalize_role_token(role_token)
+                        if not bucket:
+                            issues.append(
+                                f"column_roles role '{role_token}' is not canonical; use one of {list(_ROLE_BUCKETS)}"
+                            )
+                            bucket = "unknown"
+                    _add(bucket, str(raw_col))
+
+            normalized = {k: v for k, v in normalized.items() if isinstance(v, list) and v}
+
+            # Ensure feature bucket can be projected even when split/target buckets are present.
+            if not normalized.get("pre_decision"):
+                canonical = [str(c) for c in (canonical_columns or []) if c]
+                assigned = set()
+                for bucket in ("outcome", "decision", "post_decision_audit_only", "identifiers", "time_columns"):
+                    assigned.update(str(c) for c in normalized.get(bucket, []) if c)
+                inferred = [col for col in canonical if col not in assigned]
+                if inferred:
+                    normalized["pre_decision"] = inferred
+
+            if not normalized.get("outcome"):
+                issues.append("column_roles must include outcome/target bucket with at least one column.")
+
+            if not normalized.get("pre_decision"):
+                issues.append("column_roles must include pre_decision/model feature columns or resolvable selectors.")
+
+            if issues:
+                issues.append(f"column_roles mode detected: {sorted(value_types)}")
+            return normalized, issues
+
+        def _build_targeted_repair_actions(previous_validation: Dict[str, Any] | None) -> str:
+            if not isinstance(previous_validation, dict):
+                return "- Fix all structural and semantic issues while preserving unchanged valid fields."
+            issues = previous_validation.get("issues")
+            if not isinstance(issues, list):
+                return "- Fix all structural and semantic issues while preserving unchanged valid fields."
+            actions: List[str] = []
+            seen: set[str] = set()
+            rule_to_action = {
+                "contract.cleaning_transforms_drop_conflict": (
+                    "Ensure drop_columns NEVER contains columns listed in clean_dataset.required_columns."
+                ),
+                "contract.cleaning_transforms_scale_conflict": (
+                    "Ensure scale_columns are covered by required_columns/optional_passthrough_columns or required_feature_selectors."
+                ),
+                "contract.clean_dataset_ml_columns_missing": (
+                    "Ensure every ML-required column is covered by clean_dataset.required_columns, passthrough, or selectors."
+                ),
+                "contract.clean_dataset_drop_ml_columns_conflict": (
+                    "Do not drop columns needed by ML stage."
+                ),
+                "contract.role_ontology": (
+                    "Use canonical column_roles buckets only: pre_decision, decision, outcome, post_decision_audit_only, identifiers, time_columns, unknown."
+                ),
+                "contract.scope_unknown": (
+                    "Set scope to one of: cleaning_only, ml_only, full_pipeline."
+                ),
+                "contract.required_outputs_path": (
+                    "required_outputs must contain artifact file paths only (no conceptual labels)."
+                ),
+            }
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                rule = str(issue.get("rule") or "").strip()
+                if not rule or rule in seen:
+                    continue
+                seen.add(rule)
+                action = rule_to_action.get(rule)
+                if action:
+                    actions.append(f"- {action}")
+                else:
+                    msg = str(issue.get("message") or "").strip()
+                    if msg:
+                        actions.append(f"- Resolve `{rule}`: {msg}")
+                if len(actions) >= 8:
+                    break
+            if not actions:
+                actions.append("- Fix all structural and semantic issues while preserving unchanged valid fields.")
+            return "\n".join(actions)
+
         def _build_quality_repair_prompt(
             *,
             previous_contract: Dict[str, Any] | None,
@@ -6645,20 +6910,37 @@ class ExecutionPlannerAgent:
                 if isinstance(previous_contract, dict)
                 else (previous_response_text or "")
             )
+            targeted_actions = _build_targeted_repair_actions(previous_validation)
+            original_inputs_compact = _compress_text_preserve_ends(
+                original_inputs_text or "",
+                max_chars=20000,
+                head=15000,
+                tail=5000,
+            )
+            previous_payload_compact = _compress_text_preserve_ends(
+                previous_payload or "",
+                max_chars=20000,
+                head=15000,
+                tail=5000,
+            )
             return (
                 "Repair the previous execution contract.\n"
                 "Return ONLY one valid JSON object (no markdown, no comments, no code fences).\n"
+                "Patch policy: keep unchanged valid fields stable; modify ONLY fields needed to resolve listed issues.\n"
                 "scope MUST be one of: cleaning_only, ml_only, full_pipeline.\n"
                 "Do not invent columns outside column_inventory.\n"
                 "Use downstream_consumer_interface + evidence_policy from ORIGINAL INPUTS.\n"
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
+                "column_roles MUST use canonical role buckets only: "
+                "pre_decision, decision, outcome, post_decision_audit_only, identifiers, time_columns, unknown.\n"
                 "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "If cleaning requires dropping/scaling columns, declare them in "
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns}; "
                 "do not leave these decisions only in runbook prose.\n"
                 "For wide feature families, you may declare compact selectors in "
                 "artifact_requirements.clean_dataset.required_feature_selectors (regex/prefix/range/list).\n"
+                "Never place wildcard selector tokens (e.g., pixel*) inside required_columns.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scopes, include non-empty evaluation_spec and ensure objective_analysis.problem_type "
@@ -6670,14 +6952,16 @@ class ExecutionPlannerAgent:
                 "map it to name and keep semantic details in params.\n"
                 "Top-level minimum keys (required interface for executable views): "
                 + json.dumps(required_top_level)
+                + "\n\nTargeted fixes to apply first:\n"
+                + targeted_actions
                 + "\n\nORIGINAL INPUTS (source of truth):\n"
-                + (original_inputs_text or "")
+                + original_inputs_compact
                 + "\n\nValidation issues to fix:\n"
                 + validation_feedback
                 + "\n\nParse diagnostics from previous attempt:\n"
                 + parse_feedback
                 + "\n\nPrevious candidate contract/response:\n"
-                + previous_payload
+                + previous_payload_compact
             )
 
         _SECTION_REQUIRED_TYPES: Dict[str, Any] = {
@@ -6816,6 +7100,38 @@ class ExecutionPlannerAgent:
                 errors.append("artifact_requirements.clean_dataset.column_transformations.scale_columns must be list[str]")
             return drop_columns, scale_columns, errors
 
+        def _extract_clean_dataset_selectors(clean_dataset: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+            raw_selectors = clean_dataset.get("required_feature_selectors")
+            if raw_selectors is None:
+                return [], []
+            if not isinstance(raw_selectors, list):
+                return [], ["artifact_requirements.clean_dataset.required_feature_selectors must be list[object]"]
+            selectors: List[Dict[str, Any]] = []
+            errors: List[str] = []
+            for idx, item in enumerate(raw_selectors):
+                if not isinstance(item, dict):
+                    errors.append(
+                        f"artifact_requirements.clean_dataset.required_feature_selectors[{idx}] must be an object"
+                    )
+                    continue
+                selector_type = str(item.get("type") or "").strip().lower()
+                if not selector_type:
+                    errors.append(
+                        f"artifact_requirements.clean_dataset.required_feature_selectors[{idx}] is missing type"
+                    )
+                    continue
+                selector = dict(item)
+                selector["type"] = selector_type
+                selectors.append(selector)
+            return selectors, errors
+
+        def _extract_optional_passthrough_columns(clean_dataset: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+            optional_cols, invalid_optional = _to_clean_str_list(clean_dataset.get("optional_passthrough_columns"))
+            errors: List[str] = []
+            if invalid_optional:
+                errors.append("artifact_requirements.clean_dataset.optional_passthrough_columns must be list[str]")
+            return optional_cols, errors
+
         def _gate_list_valid(value: Any, gate_key: str) -> bool:
             if not isinstance(value, list) or not value:
                 return False
@@ -6900,6 +7216,27 @@ class ExecutionPlannerAgent:
                 column_roles = payload.get("column_roles")
                 if not isinstance(column_roles, dict) or not column_roles:
                     errors.append(f"{section_id}: column_roles must be a non-empty object")
+                else:
+                    canonical_for_roles = payload.get("canonical_columns")
+                    if not isinstance(canonical_for_roles, list):
+                        canonical_for_roles = baseline.get("canonical_columns")
+                    if not isinstance(canonical_for_roles, list):
+                        canonical_for_roles = []
+                    normalized_roles, role_issues = _normalize_column_roles_payload(
+                        column_roles,
+                        canonical_columns=canonical_for_roles,
+                    )
+                    if not normalized_roles:
+                        errors.append(f"{section_id}: column_roles could not be normalized")
+                    for role_issue in role_issues:
+                        role_issue_text = str(role_issue or "").strip().lower()
+                        if (
+                            "must include outcome" in role_issue_text
+                            or "must include pre_decision" in role_issue_text
+                            or "must be an object" in role_issue_text
+                            or "cannot be empty" in role_issue_text
+                        ):
+                            errors.append(f"{section_id}: {role_issue}")
 
                 artifact_requirements = payload.get("artifact_requirements")
                 if not isinstance(artifact_requirements, dict) or not artifact_requirements:
@@ -6939,32 +7276,58 @@ class ExecutionPlannerAgent:
                             f"{section_id}: artifact_requirements.clean_dataset.output_manifest_path must be a file path"
                         )
                     req_cols = clean_dataset.get("required_columns")
-                    if not isinstance(req_cols, list) or not any(isinstance(col, str) and col.strip() for col in req_cols):
-                        errors.append(
-                            f"{section_id}: artifact_requirements.clean_dataset.required_columns must be non-empty list"
-                        )
                     required_cols_clean, required_cols_invalid = _to_clean_str_list(req_cols)
                     if required_cols_invalid:
                         errors.append(
                             f"{section_id}: artifact_requirements.clean_dataset.required_columns must contain only strings"
                         )
+                    selector_tokens_in_required = [
+                        col for col in required_cols_clean if _looks_like_selector_token(col)
+                    ]
+                    if selector_tokens_in_required:
+                        errors.append(
+                            f"{section_id}: required_columns must contain concrete column names only; "
+                            f"use required_feature_selectors for selectors ({selector_tokens_in_required[:6]})"
+                        )
+                    selectors, selector_errors = _extract_clean_dataset_selectors(clean_dataset)
+                    optional_passthrough, optional_errors = _extract_optional_passthrough_columns(clean_dataset)
+                    for selector_error in selector_errors:
+                        errors.append(f"{section_id}: {selector_error}")
+                    for optional_error in optional_errors:
+                        errors.append(f"{section_id}: {optional_error}")
+                    if not required_cols_clean and not selectors and not optional_passthrough:
+                        errors.append(
+                            f"{section_id}: clean_dataset coverage is empty; provide required_columns and/or "
+                            "required_feature_selectors and/or optional_passthrough_columns"
+                        )
                     drop_columns, scale_columns, transform_errors = _extract_clean_dataset_transformations(clean_dataset)
                     for transform_error in transform_errors:
                         errors.append(f"{section_id}: {transform_error}")
                     req_norm = {str(col).strip().lower() for col in required_cols_clean if str(col).strip()}
+                    passthrough_norm = {
+                        str(col).strip().lower() for col in optional_passthrough if str(col).strip()
+                    }
                     drop_norm = {str(col).strip().lower() for col in drop_columns if str(col).strip()}
                     scale_norm = {str(col).strip().lower() for col in scale_columns if str(col).strip()}
-                    if req_norm and drop_norm:
-                        overlap = sorted([col for col in req_norm if col in drop_norm])
+                    coverage_norm = req_norm | passthrough_norm
+                    if coverage_norm and drop_norm:
+                        overlap = sorted([col for col in coverage_norm if col in drop_norm])
                         if overlap:
                             errors.append(
-                                f"{section_id}: column_transformations.drop_columns conflicts with required_columns ({overlap[:8]})"
+                                f"{section_id}: column_transformations.drop_columns conflicts with required/passthrough columns ({overlap[:8]})"
                             )
-                    if req_norm and scale_norm:
-                        outside = sorted([col for col in scale_norm if col not in req_norm])
-                        if outside:
+                    if scale_norm:
+                        uncovered: List[str] = []
+                        for col in sorted(scale_norm):
+                            if col in coverage_norm:
+                                continue
+                            if _column_matches_any_selector(col, selectors):
+                                continue
+                            uncovered.append(col)
+                        if uncovered:
                             errors.append(
-                                f"{section_id}: column_transformations.scale_columns must be subset of required_columns ({outside[:8]})"
+                                f"{section_id}: column_transformations.scale_columns must be covered by "
+                                f"required_columns/optional_passthrough_columns/required_feature_selectors ({uncovered[:8]})"
                             )
 
                 runbook_text = _flatten_text_payload(payload.get("data_engineer_runbook"))
@@ -7066,7 +7429,32 @@ class ExecutionPlannerAgent:
             for key, value in section_payload.items():
                 if value is None:
                     continue
+                if key == "scope":
+                    normalized_scope = _normalize_scope(value)
+                    merged[key] = normalized_scope if normalized_scope in _SCOPE_VALUES else value
+                    continue
+                if key == "column_roles" and isinstance(value, dict):
+                    canonical_for_roles = merged.get("canonical_columns")
+                    if not isinstance(canonical_for_roles, list):
+                        canonical_for_roles = []
+                    normalized_roles, _ = _normalize_column_roles_payload(
+                        value,
+                        canonical_columns=canonical_for_roles,
+                    )
+                    merged[key] = normalized_roles if normalized_roles else value
+                    continue
                 merged[key] = value
+            canonical_for_roles = merged.get("canonical_columns")
+            column_roles = merged.get("column_roles")
+            if isinstance(column_roles, dict):
+                if not isinstance(canonical_for_roles, list):
+                    canonical_for_roles = []
+                normalized_roles, _ = _normalize_column_roles_payload(
+                    column_roles,
+                    canonical_columns=canonical_for_roles,
+                )
+                if normalized_roles:
+                    merged["column_roles"] = normalized_roles
             return merged
 
         def _build_section_prompt(
@@ -7119,14 +7507,96 @@ class ExecutionPlannerAgent:
             previous_parse_feedback: str | None,
             previous_validation_errors: List[str] | None,
         ) -> str:
+            def _section_targeted_actions(messages: List[str] | None) -> str:
+                if not isinstance(messages, list):
+                    return "- Fix structural and semantic issues while preserving unchanged valid keys."
+                actions: List[str] = []
+                seen: set[str] = set()
+
+                def _add(key: str, text: str) -> None:
+                    if key in seen:
+                        return
+                    seen.add(key)
+                    actions.append(f"- {text}")
+
+                for raw_msg in messages:
+                    msg = str(raw_msg or "").strip()
+                    if not msg:
+                        continue
+                    low = msg.lower()
+                    if "missing key" in low:
+                        _add(f"missing:{msg}", f"Add the missing required key exactly once: {msg}")
+                    if "column_roles" in low:
+                        _add(
+                            "roles",
+                            "Use canonical column_roles buckets and include at least outcome + pre_decision coverage.",
+                        )
+                    if "required_outputs" in low:
+                        _add("required_outputs", "Keep required_outputs as artifact file paths only.")
+                    if "required_columns" in low and "selector" in low:
+                        _add(
+                            "required_columns_selector",
+                            "Keep required_columns concrete only; place patterns in required_feature_selectors.",
+                        )
+                    if "scale_columns" in low:
+                        _add(
+                            "scale_coverage",
+                            "Ensure scale_columns are covered by required_columns/passthrough/selectors.",
+                        )
+                    if "drop_columns" in low:
+                        _add(
+                            "drop_conflict",
+                            "Avoid dropping columns that are required or passthrough.",
+                        )
+                    if "clean_dataset" in low and ("output_path" in low or "manifest" in low):
+                        _add(
+                            "clean_paths",
+                            "Set clean_dataset.output_path and output_manifest_path as valid file paths.",
+                        )
+                    if "gate" in low:
+                        _add(
+                            "gates",
+                            "Provide executable gates with consumable identifiers plus severity and params.",
+                        )
+                    if "objective_analysis" in low or "evaluation_spec" in low:
+                        _add(
+                            "objective",
+                            "For ML scope include objective_analysis.problem_type or evaluation_spec.objective_type.",
+                        )
+                    if len(actions) >= 8:
+                        break
+                if not actions:
+                    actions.append("- Fix structural and semantic issues while preserving unchanged valid keys.")
+                return "\n".join(actions)
+
             validation_feedback = "\n".join(f"- {msg}" for msg in (previous_validation_errors or [])) or "None"
             parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
+            targeted_actions = _section_targeted_actions(previous_validation_errors)
+            original_inputs_compact = _compress_text_preserve_ends(
+                original_inputs_text or "",
+                max_chars=18000,
+                head=13000,
+                tail=5000,
+            )
+            current_contract_compact = _compress_text_preserve_ends(
+                json.dumps(current_contract or {}, ensure_ascii=False, indent=2),
+                max_chars=14000,
+                head=10000,
+                tail=4000,
+            )
+            previous_response_compact = _compress_text_preserve_ends(
+                previous_response_text or "",
+                max_chars=12000,
+                head=8000,
+                tail=4000,
+            )
             return (
                 "Repair the section output.\n"
                 f"SECTION: {section_id}\n"
                 f"GOAL: {section_goal}\n"
                 "Return ONLY one JSON object.\n"
                 "No markdown, no comments.\n"
+                "Patch policy: edit only fields required by this SECTION and listed issues; preserve already valid content.\n"
                 f"Required keys: {json.dumps(required_keys)}\n"
                 "Use ORIGINAL INPUTS as source of truth and keep compatibility with CURRENT CONTRACT DRAFT.\n"
                 "Use downstream_consumer_interface and evidence_policy from ORIGINAL INPUTS.\n"
@@ -7145,16 +7615,19 @@ class ExecutionPlannerAgent:
                 "aligned with strategy/evidence so views can request the right visuals.\n\n"
                 "Gate lists must be executable by downstream views: each gate should expose a consumable identifier "
                 "(prefer name) and include severity + params.\n\n"
+                "Targeted fixes:\n"
+                + targeted_actions
+                + "\n\n"
                 "ORIGINAL INPUTS:\n"
-                + (original_inputs_text or "")
+                + original_inputs_compact
                 + "\n\nCURRENT CONTRACT DRAFT:\n"
-                + json.dumps(current_contract or {}, ensure_ascii=False, indent=2)
+                + current_contract_compact
                 + "\n\nValidation issues to fix:\n"
                 + validation_feedback
                 + "\n\nParse diagnostics:\n"
                 + parse_feedback
                 + "\n\nPrevious section response:\n"
-                + (previous_response_text or "")
+                + previous_response_compact
             )
 
         def _compile_contract_by_sections(

@@ -2534,6 +2534,68 @@ def _expand_required_feature_selectors(
     return expanded, issues
 
 
+def _selector_matches_column(selector: Dict[str, Any], column: str) -> bool:
+    """
+    Return True when a selector definition matches a concrete column name.
+
+    This allows semantic coverage checks without requiring a fully enumerated
+    canonical column inventory inside the contract.
+    """
+    if not isinstance(selector, dict) or not isinstance(column, str) or not column:
+        return False
+    selector_type = str(selector.get("type") or "").strip().lower()
+    col = column.strip()
+    if not selector_type or not col:
+        return False
+    try:
+        if selector_type in {"regex", "pattern"}:
+            pattern = str(selector.get("pattern") or "").strip()
+            if not pattern:
+                return False
+            return re.compile(pattern, flags=re.IGNORECASE).match(col) is not None
+        if selector_type == "prefix":
+            prefix = str(selector.get("value") or selector.get("prefix") or "").strip()
+            return bool(prefix) and col.lower().startswith(prefix.lower())
+        if selector_type == "suffix":
+            suffix = str(selector.get("value") or selector.get("suffix") or "").strip()
+            return bool(suffix) and col.lower().endswith(suffix.lower())
+        if selector_type == "contains":
+            token = str(selector.get("value") or "").strip()
+            return bool(token) and token.lower() in col.lower()
+        if selector_type == "list":
+            values, _ = _normalize_nonempty_str_list(selector.get("columns"))
+            return col in set(values)
+        if selector_type == "all_columns_except":
+            excluded, _ = _normalize_nonempty_str_list(selector.get("except_columns"))
+            excluded_norm = {item.lower() for item in excluded}
+            return col.lower() not in excluded_norm
+        if selector_type == "prefix_numeric_range":
+            prefix = str(selector.get("prefix") or "").strip()
+            start = selector.get("start")
+            end = selector.get("end")
+            if not prefix or not isinstance(start, int) or not isinstance(end, int):
+                return False
+            m = re.compile(rf"^{re.escape(prefix)}(\d+)$", flags=re.IGNORECASE).match(col)
+            if not m:
+                return False
+            idx = int(m.group(1))
+            lo = min(start, end)
+            hi = max(start, end)
+            return lo <= idx <= hi
+    except Exception:
+        return False
+    return False
+
+
+def _column_matches_any_selector(column: str, selectors: Any) -> bool:
+    if not isinstance(selectors, list):
+        return False
+    for selector in selectors:
+        if _selector_matches_column(selector, column):
+            return True
+    return False
+
+
 def _collect_ml_required_columns(contract: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     """
     Collect columns the ML stage depends on, using contract-declared semantics only.
@@ -2755,8 +2817,9 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             clean_dataset.get("optional_passthrough_columns")
         )
         canonical_cols, _ = _normalize_nonempty_str_list(canonical_columns if isinstance(canonical_columns, list) else [])
+        required_feature_selectors = clean_dataset.get("required_feature_selectors")
         selector_cols, selector_issues = _expand_required_feature_selectors(
-            clean_dataset.get("required_feature_selectors"),
+            required_feature_selectors,
             canonical_cols,
         )
         if selector_issues:
@@ -2829,13 +2892,20 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                 )
             )
 
-        scale_outside_required = [scale_norm[key] for key in sorted(set(scale_norm) - set(required_norm))]
+        selector_covered_scale = {
+            key
+            for key in scale_norm
+            if _column_matches_any_selector(scale_norm[key], required_feature_selectors)
+        }
+        scale_allowed_norm = set(required_norm) | set(passthrough_norm) | set(selector_norm) | set(selector_covered_scale)
+        scale_outside_required = [scale_norm[key] for key in sorted(set(scale_norm) - scale_allowed_norm)]
         if scale_outside_required:
             issues.append(
                 _strict_issue(
                     "contract.cleaning_transforms_scale_conflict",
                     "error",
-                    "scale_columns must be a subset of clean_dataset.required_columns.",
+                    "scale_columns must be covered by clean_dataset.required_columns/optional_passthrough_columns "
+                    "or required_feature_selectors.",
                     scale_outside_required[:20],
                 )
             )
@@ -2890,7 +2960,12 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                         )
                     )
             ml_required_norm = {col.lower(): col for col in ml_required_cols}
-            coverage_norm = set(required_norm) | set(passthrough_norm) | set(selector_norm)
+            selector_covered_ml = {
+                key
+                for key, col in ml_required_norm.items()
+                if _column_matches_any_selector(col, required_feature_selectors)
+            }
+            coverage_norm = set(required_norm) | set(passthrough_norm) | set(selector_norm) | set(selector_covered_ml)
             missing_ml_cols = [
                 ml_required_norm[key]
                 for key in sorted(set(ml_required_norm) - coverage_norm)
