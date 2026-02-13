@@ -2826,8 +2826,8 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             issues.append(
                 _strict_issue(
                     "contract.clean_dataset_required_feature_selectors",
-                    "warning",
-                    "Some required_feature_selectors entries are invalid/unsupported.",
+                    "error",
+                    "Some required_feature_selectors entries are invalid/unsupported; fail-closed.",
                     selector_issues[:10],
                 )
             )
@@ -2939,23 +2939,17 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
         if requires_ml:
             ml_required_cols, ml_selector_hints = _collect_ml_required_columns(contract)
             if ml_selector_hints:
-                issues.append(
-                    _strict_issue(
-                        "contract.ml_required_selector_hints",
-                        "warning",
-                        "Selector-like ML feature tokens detected in role/feature fields; treated as hints "
-                        "and excluded from literal column coverage checks. Use clean_dataset.required_feature_selectors "
-                        "to declare feature families.",
-                        ml_selector_hints[:25],
-                    )
+                has_declared_selectors = bool(
+                    isinstance(required_feature_selectors, list)
+                    and any(isinstance(item, dict) for item in required_feature_selectors)
                 )
-                if not selector_cols:
+                if not has_declared_selectors:
                     issues.append(
                         _strict_issue(
                             "contract.clean_dataset_selector_hints_unresolved",
-                            "warning",
+                            "error",
                             "Selector-like ML feature hints are present but clean_dataset.required_feature_selectors "
-                            "is empty. Declare selectors explicitly to improve cleaning/ML alignment.",
+                            "is empty. Declare selectors explicitly to improve cleaning/ML alignment (fail-closed).",
                             ml_selector_hints[:25],
                         )
                     )

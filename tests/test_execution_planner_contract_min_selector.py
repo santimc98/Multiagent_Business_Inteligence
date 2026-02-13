@@ -48,6 +48,28 @@ def test_select_relevant_columns_compact() -> None:
     assert contract_min["column_roles"].get("unknown") == []
 
 
+def test_select_relevant_columns_wide_family_uses_compact_projection() -> None:
+    inventory = ["label", "__split"] + [f"pixel_{i}" for i in range(1200)]
+    strategy = {
+        "required_columns": ["label", "__split"],
+        "feature_families": [{"family": "pixel", "selector_hint": "pixel_*"}],
+    }
+    payload = select_relevant_columns(
+        strategy=strategy,
+        business_objective="Clasificar imágenes con píxeles.",
+        domain_expert_critique="",
+        column_inventory=inventory,
+        data_profile_summary="",
+    )
+    relevant = payload["relevant_columns"]
+    assert "label" in relevant
+    assert "__split" in relevant
+    assert payload.get("relevant_columns_truncated") is True
+    assert int(payload.get("relevant_columns_total_count") or 0) > len(relevant)
+    assert int(payload.get("relevant_columns_omitted_count") or 0) >= 1
+    assert "pixel_*" in (payload.get("strategy_feature_family_hints") or [])
+
+
 def test_execution_planner_invalid_json_fallback_uses_single_contract_source() -> None:
     agent = ExecutionPlannerAgent(api_key=None)
     agent.client = DummyClient(

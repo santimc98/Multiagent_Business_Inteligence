@@ -227,6 +227,9 @@ Hard rules:
 - For full_pipeline contracts, clean_dataset coverage must include ML-required columns
   (outcome/decision/model features), either explicitly in required_columns/optional_passthrough_columns
   or through required_feature_selectors.
+- For high-dimensional feature spaces, do not enumerate every feature column in narrative fields.
+  Declare feature families with required_feature_selectors and keep explicit columns as anchors
+  (target/split/ids/critical business fields).
 - Keep contract coherent with strategy + business objective.
 - Treat strategy techniques as advisory hypotheses, not immutable requirements.
 - If strategy wording conflicts with direct data evidence (profile ranges/dtypes/semantics), prioritize data evidence
@@ -1722,6 +1725,39 @@ def _coerce_list(value: Any) -> List[str]:
     return []
 
 
+def _collect_strategy_feature_family_hints(strategy_dict: Dict[str, Any]) -> List[str]:
+    """
+    Collect compact feature-family hints from strategy output.
+
+    Hints are intentionally compact (not full expanded columns) so wide datasets
+    do not explode prompt size.
+    """
+    families_raw = strategy_dict.get("feature_families")
+    if not isinstance(families_raw, list) or not families_raw:
+        return []
+
+    hints: List[str] = []
+
+    def _add(value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        token = value.strip()
+        if not token or token in hints:
+            return
+        hints.append(token)
+
+    for entry in families_raw:
+        if isinstance(entry, str):
+            _add(entry)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        for key in ("selector_hint", "pattern", "family", "name", "description"):
+            _add(entry.get(key))
+
+    return hints
+
+
 def _expand_strategy_feature_families(
     strategy_dict: Dict[str, Any],
     inventory: List[str],
@@ -1924,6 +1960,7 @@ def select_relevant_columns(
         _add_unique(sources[key], col)
 
     strategy_dict = strategy if isinstance(strategy, dict) else {}
+    strategy_feature_family_hints = _collect_strategy_feature_family_hints(strategy_dict)
     required_cols_raw = _coerce_list(strategy_dict.get("required_columns"))
     decision_cols_raw = _coerce_list(
         strategy_dict.get("decision_columns")
@@ -1943,10 +1980,11 @@ def select_relevant_columns(
     decision_cols: List[str] = []
     outcome_cols: List[str] = []
     audit_only_cols: List[str] = []
+    family_cols_expanded = _expand_strategy_feature_families(strategy_dict, inventory)
 
     for col in required_cols_raw:
         _add_source(_resolve_inventory(col), "strategy_required_columns", required_cols)
-    for col in _expand_strategy_feature_families(strategy_dict, inventory):
+    for col in family_cols_expanded:
         _add_source(_resolve_inventory(col), "strategy_feature_families", family_cols)
     for col in decision_cols_raw:
         _add_source(_resolve_inventory(col), "strategy_decision_columns", decision_cols)
@@ -1992,11 +2030,72 @@ def select_relevant_columns(
     for col in audit_only_cols + text_matches + heuristic_cols:
         _add_unique(ordered, col)
 
-    # REMOVED: max_columns = 30 limit
-    # High-dimensional datasets (e.g., MNIST with 784 pixels) must pass through.
-    # The Steward's column_sets.json handles grouping for wide datasets.
-    # Downstream agents (ML Engineer) use column_sets.expand_column_sets() at runtime.
     ordered = list(dict.fromkeys(ordered))
+    total_relevant_count = len(ordered)
+
+    def _int_env(name: str, default: int, *, lo: int, hi: int) -> int:
+        try:
+            value = int(os.getenv(name, str(default)))
+        except Exception:
+            value = default
+        return max(lo, min(hi, value))
+
+    # Adaptive budget for planner prompts: keep anchors explicit while preventing
+    # high-dimensional feature families from ballooning token usage.
+    inventory_count = len(inventory)
+    if inventory_count <= 120:
+        default_budget = 60
+    elif inventory_count <= 500:
+        default_budget = 120
+    else:
+        default_budget = 180
+    max_relevant_columns = _int_env(
+        "EXECUTION_PLANNER_MAX_RELEVANT_COLUMNS",
+        default_budget,
+        lo=25,
+        hi=400,
+    )
+
+    def _even_sample(values: List[str], limit: int) -> List[str]:
+        if limit <= 0 or not values:
+            return []
+        if len(values) <= limit:
+            return values
+        if limit == 1:
+            return [values[0]]
+        idxs = [round(i * (len(values) - 1) / (limit - 1)) for i in range(limit)]
+        sampled: List[str] = []
+        seen_idx: set[int] = set()
+        for idx in idxs:
+            if idx in seen_idx:
+                continue
+            seen_idx.add(idx)
+            sampled.append(values[idx])
+        if len(sampled) < limit:
+            for value in values:
+                if value in sampled:
+                    continue
+                sampled.append(value)
+                if len(sampled) >= limit:
+                    break
+        return sampled[:limit]
+
+    pinned_columns: List[str] = []
+    for col in required_cols + outcome_cols + decision_cols + audit_only_cols + text_matches + heuristic_cols:
+        _add_unique(pinned_columns, col)
+
+    compact_relevant = list(ordered)
+    if len(compact_relevant) > max_relevant_columns:
+        pinned = [col for col in pinned_columns if col in inventory_set]
+        remaining_budget = max(0, max_relevant_columns - len(pinned))
+        pinned_norm = set(pinned)
+        tail_candidates = [col for col in compact_relevant if col not in pinned_norm]
+        sampled_tail = _even_sample(tail_candidates, remaining_budget)
+        compact_relevant = []
+        for col in pinned + sampled_tail:
+            _add_unique(compact_relevant, col)
+        if len(compact_relevant) > max_relevant_columns:
+            compact_relevant = compact_relevant[:max_relevant_columns]
 
     # For high-dimensional datasets, note that column_sets.json provides grouped access
     is_high_dimensional = len(inventory) > 100
@@ -2005,9 +2104,17 @@ def select_relevant_columns(
         if is_high_dimensional
         else "Ignored by default unless promoted by strategy/explicit mention; available via column_inventory."
     )
+    relevant_truncated = len(compact_relevant) < total_relevant_count
+    omitted_count = max(0, total_relevant_count - len(compact_relevant))
 
     return {
-        "relevant_columns": [col for col in ordered if col in inventory_set],
+        "relevant_columns": [col for col in compact_relevant if col in inventory_set],
+        "relevant_columns_total_count": total_relevant_count,
+        "relevant_columns_truncated": relevant_truncated,
+        "relevant_columns_omitted_count": omitted_count,
+        "relevant_columns_compact": compact_column_representation(compact_relevant, max_display=40),
+        "strategy_feature_family_hints": strategy_feature_family_hints,
+        "strategy_feature_family_expanded_count": len(family_cols_expanded),
         "relevant_sources": sources,
         "omitted_columns_policy": omitted_policy,
     }
@@ -6381,6 +6488,14 @@ class ExecutionPlannerAgent:
         relevant_columns = relevant_payload.get("relevant_columns", [])
         relevant_sources = relevant_payload.get("relevant_sources", {})
         omitted_columns_policy = relevant_payload.get("omitted_columns_policy", "")
+        relevant_columns_total_count = int(relevant_payload.get("relevant_columns_total_count") or len(relevant_columns))
+        relevant_columns_truncated = bool(relevant_payload.get("relevant_columns_truncated"))
+        relevant_columns_omitted_count = int(relevant_payload.get("relevant_columns_omitted_count") or 0)
+        relevant_columns_compact = relevant_payload.get("relevant_columns_compact", {})
+        strategy_feature_family_hints = relevant_payload.get("strategy_feature_family_hints", [])
+        strategy_feature_family_expanded_count = int(
+            relevant_payload.get("strategy_feature_family_expanded_count") or 0
+        )
 
         planner_dir = None
         if run_id:
@@ -6572,6 +6687,11 @@ class ExecutionPlannerAgent:
                 except Exception:
                     pass
             issues = validation_result.get("issues")
+            blocking_warning_rules = {
+                # Contract is semantically incomplete for wide-schema alignment.
+                "contract.clean_dataset_selector_hints_unresolved",
+                "contract.clean_dataset_required_feature_selectors",
+            }
             if isinstance(issues, list):
                 for issue in issues:
                     if not isinstance(issue, dict):
@@ -6579,6 +6699,10 @@ class ExecutionPlannerAgent:
                     sev = str(issue.get("severity") or "").lower()
                     if sev in {"error", "fail"}:
                         return False
+                    if sev == "warning":
+                        rule = str(issue.get("rule") or "").strip()
+                        if rule in blocking_warning_rules:
+                            return False
             return True
 
         def _compact_validation_feedback(validation_result: Dict[str, Any] | None, max_issues: int = 10) -> str:
@@ -6940,6 +7064,7 @@ class ExecutionPlannerAgent:
                 "do not leave these decisions only in runbook prose.\n"
                 "For wide feature families, you may declare compact selectors in "
                 "artifact_requirements.clean_dataset.required_feature_selectors (regex/prefix/range/list).\n"
+                "Avoid enumerating massive feature families as explicit lists; keep explicit anchors only.\n"
                 "Never place wildcard selector tokens (e.g., pixel*) inside required_columns.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
@@ -7480,6 +7605,7 @@ class ExecutionPlannerAgent:
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns} explicitly.\n"
                 "For wide feature families, you may use artifact_requirements.clean_dataset.required_feature_selectors "
                 "(regex/prefix/range/list) to avoid lossy explicit enumeration.\n"
+                "Avoid enumerating massive feature families as explicit lists; keep explicit anchors only.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
@@ -7607,6 +7733,7 @@ class ExecutionPlannerAgent:
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns} explicitly.\n"
                 "For wide feature families, you may use artifact_requirements.clean_dataset.required_feature_selectors "
                 "(regex/prefix/range/list) to avoid lossy explicit enumeration.\n"
+                "Avoid enumerating massive feature families as explicit lists; keep explicit anchors only.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
@@ -8018,6 +8145,18 @@ business_objective:
 relevant_columns:
 {json.dumps(relevant_columns, indent=2)}
 
+relevant_columns_total_count:
+{relevant_columns_total_count}
+
+relevant_columns_truncated:
+{json.dumps(relevant_columns_truncated)}
+
+relevant_columns_omitted_count:
+{relevant_columns_omitted_count}
+
+relevant_columns_compact:
+{json.dumps(relevant_columns_compact, indent=2)}
+
 relevant_sources:
 {json.dumps(relevant_sources, indent=2)}
 
@@ -8041,6 +8180,12 @@ column_inventory_compact:
 
 strategy_feature_families:
 {json.dumps(strategy_feature_families, indent=2)}
+
+strategy_feature_family_hints:
+{json.dumps(strategy_feature_family_hints, indent=2)}
+
+strategy_feature_family_expanded_count:
+{strategy_feature_family_expanded_count}
 
 data_profile_summary:
 {data_summary_for_prompt}
