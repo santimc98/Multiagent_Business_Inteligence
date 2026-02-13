@@ -148,6 +148,13 @@ from src.utils.context_pack import build_context_pack, compress_long_lists, summ
 from src.utils.dataset_semantics import summarize_dataset_semantics
 from src.utils.column_sets import summarize_column_sets
 from src.utils.dataset_evidence import read_header, scan_missingness, scan_uniques, sample_rows
+from src.utils.data_atlas import (
+    build_data_atlas,
+    summarize_data_atlas,
+    normalize_evidence_requests,
+    build_default_evidence_requests,
+    validate_steward_semantics,
+)
 from src.utils.sandbox_paths import (
     CANONICAL_RAW_REL,
     CANONICAL_CLEANED_REL,
@@ -1213,14 +1220,67 @@ def _prepend_dataset_semantics_summary(text: str, state: Dict[str, Any]) -> str:
         return text
     summary = state.get("dataset_semantics_summary")
     column_sets_summary = state.get("column_sets_summary")
+    data_atlas_summary = state.get("data_atlas_summary")
     combined = summary or ""
     if column_sets_summary:
         combined = f"{combined}\n{column_sets_summary}" if combined else column_sets_summary
+    if data_atlas_summary:
+        combined = f"{combined}\n{data_atlas_summary}" if combined else data_atlas_summary
     if not combined:
         return text
     if text:
         return f"{combined}\n\n{text}"
     return combined
+
+
+def _resolve_steward_evidence_bundle(
+    csv_path: str,
+    dialect_payload: Dict[str, Any],
+    header_cols: List[str],
+    requested: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    evidence_items: List[Dict[str, Any]] = []
+    for req in requested:
+        if not isinstance(req, dict):
+            continue
+        kind = str(req.get("kind") or "").strip().lower()
+        column = str(req.get("column") or "").strip()
+        if not kind or not column or column not in header_cols:
+            continue
+        try:
+            if kind == "missingness":
+                item = scan_missingness(csv_path, dialect_payload, column)
+                evidence_items.append({"kind": kind, "column": column, "result": item})
+            elif kind == "uniques":
+                max_unique = int(req.get("max_unique") or 20)
+                item = scan_uniques(csv_path, dialect_payload, column, max_unique=max(5, min(max_unique, 100)))
+                evidence_items.append({"kind": kind, "column": column, "result": item})
+            elif kind == "column_profile":
+                miss = scan_missingness(csv_path, dialect_payload, column)
+                uniq = scan_uniques(csv_path, dialect_payload, column, max_unique=20)
+                evidence_items.append(
+                    {
+                        "kind": kind,
+                        "column": column,
+                        "result": {
+                            "missingness": miss,
+                            "uniques": uniq,
+                        },
+                    }
+                )
+        except Exception as err:
+            evidence_items.append(
+                {
+                    "kind": kind,
+                    "column": column,
+                    "error": str(err),
+                }
+            )
+    return {
+        "requested_count": len(requested),
+        "resolved_count": len(evidence_items),
+        "items": evidence_items,
+    }
 
 _ABORT_EVENT = threading.Event()
 
@@ -8474,6 +8534,12 @@ class AgentState(TypedDict):
     ml_execution_profile: Dict[str, Any]
     cleaned_data_summary_min: Dict[str, Any]
     cleaned_data_summary_min_path: str
+    data_atlas: Dict[str, Any]
+    data_atlas_summary: str
+    steward_evidence_bundle: Dict[str, Any]
+    steward_context_quality: Dict[str, Any]
+    steward_context_ready: bool
+    steward_context_error: str
     dataset_semantics: Dict[str, Any]
     dataset_semantics_summary: str
     dataset_training_mask: Dict[str, Any]
@@ -8692,6 +8758,12 @@ def run_steward(state: AgentState) -> AgentState:
     dataset_semantics_summary = ""
     column_sets = {}
     column_sets_summary = ""
+    data_atlas = {}
+    data_atlas_summary = ""
+    steward_evidence_bundle = {}
+    steward_context_quality = {"ready": False, "reasons": ["not_computed"], "warnings": []}
+    steward_context_ready = False
+    steward_context_error = ""
     header_cols = []
     try:
         dialect_payload = {"encoding": encoding, "sep": sep, "decimal": decimal}
@@ -8713,6 +8785,23 @@ def run_steward(state: AgentState) -> AgentState:
                     "columns": header_cols,
                 }
                 state["column_inventory_columns"] = header_cols
+
+        profile_payload = result.get("profile") if isinstance(result, dict) else {}
+        if not isinstance(profile_payload, dict):
+            profile_payload = {}
+        data_atlas = build_data_atlas(
+            dataset_profile=profile_payload,
+            column_inventory=header_cols,
+            column_sets=column_sets if isinstance(column_sets, dict) else {},
+        )
+        data_atlas_summary = summarize_data_atlas(data_atlas, max_columns=48, max_lines=90)
+        try:
+            os.makedirs("data", exist_ok=True)
+            dump_json("data/data_atlas.json", data_atlas)
+            with open("data/data_atlas_summary.txt", "w", encoding="utf-8") as f_atlas:
+                f_atlas.write(data_atlas_summary or "")
+        except Exception as atlas_err:
+            print(f"Warning: failed to persist data_atlas artifacts: {atlas_err}")
 
         header_preview = summarize_long_list(header_cols, head=12, tail=6) if header_cols else {"count": 0, "head": [], "tail": []}
         column_count = len(header_cols)
@@ -8738,6 +8827,7 @@ def run_steward(state: AgentState) -> AgentState:
             "business_objective": state.get("business_objective") if isinstance(state, dict) else "",
             "column_inventory_path": "data/column_inventory.json",
             "column_inventory_preview": header_preview,
+            "data_atlas_summary": data_atlas_summary,
             "sample_rows": sample_payload,
         }
         pass1_result = steward.decide_semantics_pass1(steward_pass1_input)
@@ -8753,6 +8843,26 @@ def run_steward(state: AgentState) -> AgentState:
             split_candidates = []
         if not isinstance(id_candidates, list):
             id_candidates = []
+
+        evidence_requests = normalize_evidence_requests(
+            pass1_result.get("evidence_requests") if isinstance(pass1_result, dict) else [],
+            header_cols,
+            max_items=16,
+        )
+        if not evidence_requests:
+            evidence_requests = build_default_evidence_requests(
+                primary_target=primary_target,
+                split_candidates=split_candidates,
+                id_candidates=id_candidates,
+                header_cols=header_cols,
+                max_items=16,
+            )
+        steward_evidence_bundle = _resolve_steward_evidence_bundle(
+            csv_path=csv_path,
+            dialect_payload=dialect_payload,
+            header_cols=header_cols,
+            requested=evidence_requests,
+        )
 
         target_missingness = {}
         if primary_target:
@@ -8770,8 +8880,10 @@ def run_steward(state: AgentState) -> AgentState:
             "id_candidates": id_candidates,
             "target_missingness": target_missingness,
             "split_candidates_uniques": split_evidence,
+            "evidence_bundle": steward_evidence_bundle,
             "column_inventory_path": "data/column_inventory.json",
             "column_inventory_preview": header_preview,
+            "data_atlas_summary": data_atlas_summary,
         }
         pass2_result = steward.decide_semantics_pass2(steward_pass2_input)
         if not isinstance(pass2_result, dict):
@@ -8807,15 +8919,35 @@ def run_steward(state: AgentState) -> AgentState:
 
         dataset_semantics_summary = summarize_dataset_semantics(dataset_semantics, dataset_training_mask)
         column_sets_summary = summarize_column_sets(column_sets) if column_sets else ""
+        steward_context_quality = validate_steward_semantics(
+            dataset_semantics=dataset_semantics,
+            dataset_training_mask=dataset_training_mask,
+            header_cols=header_cols,
+            target_missingness=target_missingness,
+            column_sets=column_sets,
+        )
+        steward_context_ready = bool(steward_context_quality.get("ready"))
+        if not steward_context_ready:
+            reasons = steward_context_quality.get("reasons") if isinstance(steward_context_quality, dict) else []
+            steward_context_error = f"Steward context quality gate failed: {reasons}"
         try:
             os.makedirs("data", exist_ok=True)
             dump_json("data/dataset_semantics.json", dataset_semantics)
             dump_json("data/dataset_training_mask.json", dataset_training_mask)
             dump_json("data/column_sets.json", column_sets)
+            dump_json("data/steward_evidence_bundle.json", steward_evidence_bundle)
+            dump_json("data/steward_semantics_quality.json", steward_context_quality)
         except Exception as sem_write_err:
             print(f"Warning: failed to persist dataset semantics artifacts: {sem_write_err}")
     except Exception as sem_err:
         print(f"Warning: dataset semantics extraction failed: {sem_err}")
+        steward_context_error = str(sem_err)
+        steward_context_ready = False
+        steward_context_quality = {
+            "ready": False,
+            "reasons": [f"semantics_exception:{sem_err}"],
+            "warnings": [],
+        }
         if header_cols and not column_sets and len(header_cols) > 200:
             try:
                 from src.utils.column_sets import build_column_sets
@@ -8826,6 +8958,12 @@ def run_steward(state: AgentState) -> AgentState:
             except Exception as cs_err:
                 print(f"Warning: failed to build column_sets fallback after semantics error: {cs_err}")
     if isinstance(state, dict):
+        state["data_atlas"] = data_atlas
+        state["data_atlas_summary"] = data_atlas_summary
+        state["steward_evidence_bundle"] = steward_evidence_bundle
+        state["steward_context_quality"] = steward_context_quality
+        state["steward_context_ready"] = steward_context_ready
+        state["steward_context_error"] = steward_context_error
         state["dataset_semantics"] = dataset_semantics
         state["dataset_training_mask"] = dataset_training_mask
         state["dataset_semantics_summary"] = dataset_semantics_summary
@@ -8835,7 +8973,14 @@ def run_steward(state: AgentState) -> AgentState:
     log_run_event(
         run_id,
         "steward_complete",
-        {"summary_len": len(summary or ""), "encoding": encoding, "sep": sep, "decimal": decimal},
+        {
+            "summary_len": len(summary or ""),
+            "encoding": encoding,
+            "sep": sep,
+            "decimal": decimal,
+            "steward_context_ready": bool(steward_context_ready),
+            "steward_context_reasons": (steward_context_quality or {}).get("reasons", []),
+        },
     )
     log_agent_snapshot(
         run_id,
@@ -8855,6 +9000,12 @@ def run_steward(state: AgentState) -> AgentState:
         "dataset_semantics": dataset_semantics,
         "dataset_training_mask": dataset_training_mask,
         "dataset_semantics_summary": dataset_semantics_summary,
+        "data_atlas": data_atlas,
+        "data_atlas_summary": data_atlas_summary,
+        "steward_evidence_bundle": steward_evidence_bundle,
+        "steward_context_quality": steward_context_quality,
+        "steward_context_ready": steward_context_ready,
+        "steward_context_error": steward_context_error,
         "column_sets": column_sets,
         "column_sets_summary": column_sets_summary,
         "iteration_count": 0,
@@ -8889,6 +9040,9 @@ def run_steward(state: AgentState) -> AgentState:
             steward_payload["profile"] = result.get("profile")
         if "dataset_profile" in result:
             steward_payload["dataset_profile"] = result.get("dataset_profile")
+    if not steward_context_ready:
+        steward_payload["error_message"] = steward_context_error or "Steward context quality gate failed."
+        steward_payload["pipeline_aborted_reason"] = "STEWARD_CONTEXT_INVALID"
     steward_payload = _add_workspace_metadata(steward_payload, state, orig_cwd_pre, run_dir)
     _refresh_run_facts_pack(steward_payload)
     return steward_payload
@@ -13988,6 +14142,17 @@ def check_data_success(state: AgentState):
         return "success_cleaning_only"
 
     return "success"
+
+
+def check_steward_context_success(state: AgentState):
+    if bool(state.get("steward_context_ready")):
+        return "success"
+    reason = str(state.get("steward_context_error") or state.get("error_message") or "").strip()
+    if reason:
+        print(f"❌ Steward Context Invalid: {reason}")
+    else:
+        print("❌ Steward Context Invalid: unknown reason")
+    return "failed"
 
 
 def check_execution_planner_success(state: AgentState):
@@ -19132,7 +19297,14 @@ workflow.add_node("generate_pdf", generate_pdf_artifact)
 
 workflow.set_entry_point("steward")
 
-workflow.add_edge("steward", "strategist")
+workflow.add_conditional_edges(
+    "steward",
+    check_steward_context_success,
+    {
+        "success": "strategist",
+        "failed": "translator",
+    }
+)
 workflow.add_edge("strategist", "domain_expert") # Rewire
 workflow.add_edge("domain_expert", "execution_planner")
 workflow.add_conditional_edges(

@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from src.utils.code_extract import extract_code_block
+from src.utils.cleaning_contract_semantics import resolve_required_columns_for_cleaning
 from src.utils.reviewer_llm import init_reviewer_llm
 
 load_dotenv()
@@ -303,10 +304,9 @@ def _review_cleaning_impl(
     gates, contract_source_used, warnings = _merge_cleaning_gates(view)
     gate_names = [gate["name"] for gate in gates]
 
-    required_columns = _resolve_required_columns_for_review(view)
-    column_roles = _coerce_roles(view.get("column_roles"))
-
     manifest = _load_json(cleaning_manifest_path)
+    required_columns = _resolve_required_columns_for_review(view, manifest=manifest)
+    column_roles = _coerce_roles(view.get("column_roles"))
     dialect_in_context = _resolve_dialect(view.get("dialect"))
     dialect_raw = _resolve_dialect(view.get("input_dialect") or view.get("dialect") or dialect_in_context)
     dialect_cleaned = _resolve_dialect(
@@ -1226,20 +1226,15 @@ def _expand_required_feature_selectors_for_review(
     return expanded
 
 
-def _resolve_required_columns_for_review(view: Dict[str, Any]) -> List[str]:
+def _resolve_required_columns_for_review(
+    view: Dict[str, Any],
+    manifest: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     required = view.get("required_columns")
     required_selectors = view.get("required_feature_selectors")
     column_transformations = view.get("column_transformations")
     if not isinstance(column_transformations, dict):
         column_transformations = {}
-
-    drop_columns_raw = (
-        column_transformations.get("drop_columns")
-        if isinstance(column_transformations.get("drop_columns"), list)
-        else []
-    )
-    drop_columns = _list_str(drop_columns_raw)
-    drop_norm = {col.lower() for col in drop_columns if col}
 
     base_required: List[str] = []
     if isinstance(required, list):
@@ -1267,13 +1262,17 @@ def _resolve_required_columns_for_review(view: Dict[str, Any]) -> List[str]:
                 pass
 
     inventory_cols = _load_column_inventory_names("data/column_inventory.json")
-    selector_required = _expand_required_feature_selectors_for_review(required_selectors, inventory_cols)
-    # Contract precedence:
-    # - explicit required_columns are always required
-    # - selector-expanded columns are required unless explicitly dropped by column_transformations.drop_columns
-    selector_required_effective = [col for col in selector_required if col.lower() not in drop_norm]
-    merged = list(dict.fromkeys(base_required + selector_required_effective))
-    return merged
+    resolved = resolve_required_columns_for_cleaning(
+        required_columns=base_required,
+        required_feature_selectors=required_selectors,
+        candidate_columns=inventory_cols,
+        column_transformations=column_transformations,
+        manifest=manifest if isinstance(manifest, dict) else {},
+    )
+    merged = resolved.get("required_columns")
+    if isinstance(merged, list):
+        return [str(col) for col in merged if isinstance(col, str) and col.strip()]
+    return base_required
 
 
 def _coerce_roles(raw: Any) -> Dict[str, List[str]]:

@@ -318,7 +318,8 @@ class DataEngineerAgent:
         *** COLUMN SYNCHRONIZATION RULE (CRITICAL) ***
         - Baseline: your output CSV MUST contain EXACTLY the columns listed in "Required Columns (DE View)".
         - If DE_VIEW_CONTEXT includes required_feature_selectors, expand them against input header and treat
-          expanded columns as additional required columns (unless explicitly dropped by COLUMN_TRANSFORMATIONS_CONTEXT).
+          expanded columns as additional required columns (unless explicitly dropped by COLUMN_TRANSFORMATIONS_CONTEXT
+          via drop_columns or via drop_policy with evidence reported in manifest).
         - If a column exists in raw data but is NOT in required_columns, DISCARD it (do not include in output).
         - Constant columns may or may not be included in required_columns depending on strategy; do not infer constants to override required_columns.
         - Do NOT second-guess the required_columns list; it represents the final output schema after cleaning.
@@ -329,6 +330,8 @@ class DataEngineerAgent:
         *** CONTRACT PRECEDENCE (CRITICAL) ***
         - Priority 1 (binding): HARD cleaning_gates + required_columns.
         - Priority 2 (binding when present): COLUMN_TRANSFORMATIONS_CONTEXT from artifact_requirements.clean_dataset.column_transformations.
+          If drop_policy.allow_selector_drops_when is present, selector-expanded columns may be dropped only when
+          evidence matches allowed reasons and is written to manifest.
         - Priority 3 (advisory): ROLE RUNBOOK narrative.
         - If runbook text conflicts with Priority 1/2, follow Priority 1/2 and record the conflict in manifest.contract_conflicts_resolved.
 
@@ -395,6 +398,8 @@ class DataEngineerAgent:
         - OUTCOME/TARGET COLUMNS MAY HAVE MISSING VALUES. Do NOT fail or impute when outcome values are NaN.
           Only raise an error if NON-NULL outcome values cannot be parsed. Preserve missingness and record null_frac in the manifest.
         - Manifest audit counts: include n_cols_in, n_cols_out, kept_by_selectors_count, dropped_forbidden_count, dropped_constant_count.
+        - If selector drops are performed via drop_policy, persist reason-specific dropped columns
+          (e.g., constant_columns_dropped, all_null_columns_dropped) in manifest for reviewer evidence.
 
         *** GATE CHECKLIST (CONTRACT-DRIVEN) ***
         - Enumerate cleaning_gates by column and requirement (max_null_fraction, allow_nulls, required_columns, etc.).

@@ -141,6 +141,9 @@ _PRESERVE_KEYS = {
     "column_transformations",
     "drop_columns",
     "scale_columns",
+    "drop_policy",
+    "feature_engineering",
+    "dtype_conversion",
     "forbidden_features",
     "reviewer_gates",
     "qa_gates",
@@ -407,12 +410,17 @@ def _resolve_column_transformations(contract_min: Dict[str, Any], contract_full:
     scale_columns = _collect(
         ["scale_columns", "normalize_columns", "standardize_columns", "rescale_columns"]
     )
-    if not (drop_columns or scale_columns):
+    drop_policy = transforms.get("drop_policy")
+    if drop_policy is None and "drop_policy" in clean_cfg:
+        drop_policy = clean_cfg.get("drop_policy")
+    if not (drop_columns or scale_columns or drop_policy is not None):
         return {}
 
     payload = dict(transforms)
     payload["drop_columns"] = drop_columns
     payload["scale_columns"] = scale_columns
+    if drop_policy is not None:
+        payload["drop_policy"] = drop_policy
     return payload
 
 
@@ -1650,6 +1658,8 @@ def build_contract_views_projection(
     column_transformations = clean_cfg.get("column_transformations")
     if not isinstance(column_transformations, dict):
         column_transformations = {}
+    if "drop_policy" not in column_transformations and "drop_policy" in clean_cfg:
+        column_transformations["drop_policy"] = clean_cfg.get("drop_policy")
     if not isinstance(column_transformations.get("drop_columns"), list):
         column_transformations["drop_columns"] = [
             str(c) for c in (clean_cfg.get("drop_columns") or []) if isinstance(c, str) and str(c).strip()
@@ -1667,7 +1677,17 @@ def build_contract_views_projection(
             str(c) for c in column_transformations.get("scale_columns", []) if isinstance(c, str) and str(c).strip()
         ]
     has_column_transformations = bool(
-        column_transformations.get("drop_columns") or column_transformations.get("scale_columns")
+        column_transformations.get("drop_columns")
+        or column_transformations.get("scale_columns")
+        or ("drop_policy" in column_transformations and column_transformations.get("drop_policy") is not None)
+        or (
+            isinstance(column_transformations.get("feature_engineering"), list)
+            and bool(column_transformations.get("feature_engineering"))
+        )
+        or (
+            isinstance(column_transformations.get("dtype_conversion"), list)
+            and bool(column_transformations.get("dtype_conversion"))
+        )
     )
 
     output_path = clean_cfg.get("output_path") or clean_cfg.get("output")

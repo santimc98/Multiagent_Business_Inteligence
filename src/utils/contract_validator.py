@@ -9,6 +9,8 @@ import re
 import copy
 from typing import Any, Dict, List, Tuple, Optional
 
+from src.utils.cleaning_contract_semantics import extract_selector_drop_reasons
+
 
 # File extensions that indicate a path is an artifact file
 FILE_EXTENSIONS = {
@@ -2383,13 +2385,13 @@ def _collect_gate_column_refs(gates: Any, hard_only: bool = True) -> List[str]:
     return list(dict.fromkeys([ref for ref in refs if isinstance(ref, str) and ref.strip()]))
 
 
-def _resolve_cleaning_column_transformations(clean_dataset: Dict[str, Any]) -> Tuple[Dict[str, List[str]], List[str]]:
+def _resolve_cleaning_column_transformations(clean_dataset: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     transform_block = clean_dataset.get("column_transformations")
     issues: List[str] = []
     if transform_block is None:
         transform_block = {}
     if not isinstance(transform_block, dict):
-        return {"drop_columns": [], "scale_columns": []}, [
+        return {"drop_columns": [], "scale_columns": [], "selector_drop_reasons": [], "criteria_drop_directives": []}, [
             "clean_dataset.column_transformations must be an object when present."
         ]
 
@@ -2416,7 +2418,32 @@ def _resolve_cleaning_column_transformations(clean_dataset: Dict[str, Any]) -> T
         issues.append("column_transformations.drop_columns must be list[str].")
     if invalid_scale:
         issues.append("column_transformations.scale_columns must be list[str].")
-    return {"drop_columns": drop_cols, "scale_columns": scale_cols}, issues
+
+    transform_payload = dict(transform_block)
+    if "drop_policy" not in transform_payload and "drop_policy" in clean_dataset:
+        transform_payload["drop_policy"] = clean_dataset.get("drop_policy")
+    selector_drop_reasons, selector_drop_issues = extract_selector_drop_reasons(transform_payload)
+    for issue in selector_drop_issues:
+        issues.append(f"column_transformations.drop_policy: {issue}")
+
+    criteria_drop_directives: List[str] = []
+    feature_engineering = transform_block.get("feature_engineering")
+    if isinstance(feature_engineering, list):
+        for idx, item in enumerate(feature_engineering):
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action") or "").strip().lower()
+            if action not in {"drop", "remove", "exclude"}:
+                continue
+            if any(item.get(key) for key in ("criteria", "condition", "rule", "rationale")):
+                criteria_drop_directives.append(f"feature_engineering[{idx}]")
+
+    return {
+        "drop_columns": drop_cols,
+        "scale_columns": scale_cols,
+        "selector_drop_reasons": selector_drop_reasons,
+        "criteria_drop_directives": criteria_drop_directives,
+    }, issues
 
 
 def _expand_required_feature_selectors(
@@ -2843,6 +2870,12 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             )
         drop_cols = transforms.get("drop_columns") or []
         scale_cols = transforms.get("scale_columns") or []
+        selector_drop_reasons = transforms.get("selector_drop_reasons") or []
+        criteria_drop_directives = transforms.get("criteria_drop_directives") or []
+        has_declared_selectors = bool(
+            isinstance(required_feature_selectors, list)
+            and any(isinstance(item, dict) for item in required_feature_selectors)
+        )
         if invalid_required_cols:
             issues.append(
                 _strict_issue(
@@ -2856,13 +2889,15 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
         runbook_text = _flatten_runbook_text(contract.get("data_engineer_runbook"))
         runbook_has_drop_columns = _has_non_negated_action(runbook_text, _DROP_COLUMN_DIRECTIVE_PATTERN)
         runbook_has_scale_columns = _has_non_negated_action(runbook_text, _SCALE_COLUMN_DIRECTIVE_PATTERN)
-        if runbook_has_drop_columns and not drop_cols:
+        if runbook_has_drop_columns and not (drop_cols or selector_drop_reasons):
             issues.append(
                 _strict_issue(
                     "contract.cleaning_transforms_drop_missing",
                     "error",
-                    "Runbook describes dropping columns but clean_dataset.column_transformations.drop_columns is missing.",
-                    "artifact_requirements.clean_dataset.column_transformations.drop_columns",
+                    "Runbook describes dropping columns but no structured drop declaration was found. "
+                    "Declare clean_dataset.column_transformations.drop_columns and/or "
+                    "clean_dataset.column_transformations.drop_policy.",
+                    "artifact_requirements.clean_dataset.column_transformations",
                 )
             )
         if runbook_has_scale_columns and not scale_cols:
@@ -2872,6 +2907,27 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                     "error",
                     "Runbook describes column scaling/normalization but clean_dataset.column_transformations.scale_columns is missing.",
                     "artifact_requirements.clean_dataset.column_transformations.scale_columns",
+                )
+            )
+        if has_declared_selectors and criteria_drop_directives and not (drop_cols or selector_drop_reasons):
+            issues.append(
+                _strict_issue(
+                    "contract.clean_dataset_selector_drop_policy_missing",
+                    "error",
+                    "clean_dataset declares required_feature_selectors plus criteria-based drop directives, "
+                    "but no structured selector-drop policy exists. Add column_transformations.drop_policy "
+                    "(allow_selector_drops_when) or explicit drop_columns.",
+                    {"criteria_drop_directives": criteria_drop_directives[:10]},
+                )
+            )
+        if selector_drop_reasons and not has_declared_selectors:
+            issues.append(
+                _strict_issue(
+                    "contract.clean_dataset_drop_policy_without_selectors",
+                    "warning",
+                    "column_transformations.drop_policy is present but required_feature_selectors is empty; "
+                    "policy will have no effect.",
+                    selector_drop_reasons,
                 )
             )
 
@@ -2910,6 +2966,37 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                 )
             )
 
+        # Fail-closed semantic guard:
+        # If selector-based drop policy is active, required/passthrough anchors cannot
+        # live inside selector coverage, otherwise they become potentially droppable.
+        if selector_drop_reasons and has_declared_selectors:
+            selector_required_overlap = [
+                required_norm[key] for key in sorted(set(required_norm) & set(selector_norm))
+            ]
+            if selector_required_overlap:
+                issues.append(
+                    _strict_issue(
+                        "contract.clean_dataset_selector_drop_required_conflict",
+                        "error",
+                        "required_columns overlap required_feature_selectors while selector-drop policy is active; "
+                        "required_columns must be non-droppable anchors.",
+                        selector_required_overlap[:25],
+                    )
+                )
+            selector_passthrough_overlap = [
+                passthrough_norm[key] for key in sorted(set(passthrough_norm) & set(selector_norm))
+            ]
+            if selector_passthrough_overlap:
+                issues.append(
+                    _strict_issue(
+                        "contract.clean_dataset_selector_drop_passthrough_conflict",
+                        "error",
+                        "optional_passthrough_columns overlap required_feature_selectors while selector-drop policy is active; "
+                        "passthrough anchors must be non-droppable.",
+                        selector_passthrough_overlap[:25],
+                    )
+                )
+
         hard_gate_cols = _collect_gate_column_refs(contract.get("cleaning_gates"), hard_only=True)
         hard_gate_norm = {col.lower(): col for col in hard_gate_cols}
         gate_missing = [
@@ -2935,14 +3022,23 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                     gate_drop_conflict[:20],
                 )
             )
+        if selector_drop_reasons and has_declared_selectors:
+            gate_selector_conflict = [
+                hard_gate_norm[key] for key in sorted(set(hard_gate_norm) & set(selector_norm))
+            ]
+            if gate_selector_conflict:
+                issues.append(
+                    _strict_issue(
+                        "contract.cleaning_gate_selector_drop_conflict",
+                        "error",
+                        "HARD cleaning gates cannot depend on selector-covered columns when selector-drop policy is active.",
+                        gate_selector_conflict[:25],
+                    )
+                )
 
         if requires_ml:
             ml_required_cols, ml_selector_hints = _collect_ml_required_columns(contract)
             if ml_selector_hints:
-                has_declared_selectors = bool(
-                    isinstance(required_feature_selectors, list)
-                    and any(isinstance(item, dict) for item in required_feature_selectors)
-                )
                 if not has_declared_selectors:
                     issues.append(
                         _strict_issue(

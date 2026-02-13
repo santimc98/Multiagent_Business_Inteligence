@@ -474,6 +474,75 @@ class StewardAgent:
                 return {}
         return {}
 
+    def _build_json_repair_prompt(
+        self,
+        *,
+        task_label: str,
+        required_keys: List[str],
+        raw_output: str,
+        parse_error: str,
+    ) -> str:
+        from src.utils.prompting import render_prompt
+
+        template = """
+You are repairing a broken JSON draft for task: $task_label.
+
+Return ONLY raw JSON. No markdown, no prose, no code fences.
+Preserve all valid fields from the draft; only fix structure/syntax and ensure required keys exist.
+
+Required keys:
+$required_keys
+
+Parse error:
+$parse_error
+
+Broken JSON draft:
+$raw_output
+"""
+        return render_prompt(
+            template,
+            task_label=task_label,
+            required_keys=json.dumps(required_keys, ensure_ascii=True),
+            parse_error=parse_error,
+            raw_output=raw_output or "",
+        )
+
+    def _generate_json_payload(
+        self,
+        *,
+        prompt: str,
+        task_label: str,
+        required_keys: Optional[List[str]] = None,
+        max_attempts: int = 3,
+    ) -> Dict[str, Any]:
+        required_keys = [str(k) for k in (required_keys or []) if k]
+        current_prompt = prompt
+        last_text = ""
+        for attempt in range(max(1, int(max_attempts))):
+            self.last_prompt = current_prompt
+            response = self.model.generate_content(current_prompt)
+            text = (getattr(response, "text", "") or "").strip()
+            self.last_response = text
+            last_text = text
+            parsed = self._parse_json_response(text)
+            has_required = bool(parsed) and all(key in parsed for key in required_keys)
+            if parsed and (not required_keys or has_required):
+                return parsed
+            if attempt >= max(1, int(max_attempts)) - 1:
+                break
+            missing_keys = [key for key in required_keys if key not in parsed]
+            parse_error = "empty_or_invalid_json"
+            if missing_keys:
+                parse_error = f"missing_required_keys:{missing_keys}"
+            current_prompt = self._build_json_repair_prompt(
+                task_label=task_label,
+                required_keys=required_keys,
+                raw_output=text,
+                parse_error=parse_error,
+            )
+        fallback = self._parse_json_response(last_text)
+        return fallback if isinstance(fallback, dict) else {}
+
     def decide_semantics_pass1(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         from src.utils.prompting import render_prompt
 
@@ -484,7 +553,7 @@ class StewardAgent:
         SYSTEM_PROMPT_TEMPLATE = """
 You are the Senior Data Steward.
 
-TASK: Decide dataset semantics for modeling BEFORE computing metrics.
+TASK: Propose semantic hypotheses for modeling and request only the extra evidence you need.
 
 Business objective:
 $business_objective
@@ -494,12 +563,18 @@ $column_inventory_preview
 
 Full column list path: $column_inventory_path
 
+Compact data atlas summary:
+$data_atlas_summary
+
 Sample rows (head/tail/random):
 $sample_rows
 
 RULES:
 - Choose exactly one primary_target (string). Always decide, even if uncertain.
 - split_candidates and id_candidates are optional lists (use [] if none).
+- evidence_requests is REQUIRED. It must be a list (max 12 items) where each item is:
+  {"kind":"missingness"|"uniques"|"column_profile","column":"<exact_column_name>", "max_unique": <int optional for uniques>}
+- evidence_requests must request only columns present in inventory/atlas.
 - notes: 2-6 bullets explaining why (objective + column names). Do NOT invent metrics.
 - Output JSON only. No markdown, no extra text.
 
@@ -510,14 +585,16 @@ $retry_note
             business_objective=payload.get("business_objective", ""),
             column_inventory_preview=json.dumps(payload.get("column_inventory_preview", {}), ensure_ascii=True),
             column_inventory_path=payload.get("column_inventory_path", "data/column_inventory.json"),
+            data_atlas_summary=str(payload.get("data_atlas_summary", "") or ""),
             sample_rows=json.dumps(payload.get("sample_rows", {}), ensure_ascii=True),
             retry_note=retry_note,
         )
-        self.last_prompt = prompt
-        response = self.model.generate_content(prompt)
-        text = (getattr(response, "text", "") or "").strip()
-        self.last_response = text
-        return self._parse_json_response(text)
+        return self._generate_json_payload(
+            prompt=prompt,
+            task_label="steward_semantics_pass1",
+            required_keys=["primary_target", "split_candidates", "id_candidates", "evidence_requests"],
+            max_attempts=3,
+        )
 
     def decide_semantics_pass2(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         from src.utils.prompting import render_prompt
@@ -539,10 +616,16 @@ $target_missingness
 Split candidates (with unique values evidence):
 $split_candidates_uniques
 
+Directed evidence bundle (requested in pass1):
+$evidence_bundle
+
 Column inventory preview (head/tail + count):
 $column_inventory_preview
 
 Full column list path: $column_inventory_path
+
+Compact data atlas summary:
+$data_atlas_summary
 
 OUTPUT REQUIREMENTS (JSON ONLY):
 {
@@ -590,6 +673,7 @@ RULES:
   scoring_rows_rule_secondary: "rows where <target> is missing"
 - If no partial labels, training_rows_rule: "use all rows" and scoring_rows_rule_primary: "all rows".
 - column_sets: do NOT enumerate full column lists. Use selectors above and only list explicit_columns.
+- Use directed evidence_bundle as source-of-truth evidence. If it conflicts with sample rows, prioritize evidence_bundle.
 - Output JSON only. No markdown, no extra text.
 """
         prompt = render_prompt(
@@ -598,14 +682,17 @@ RULES:
             primary_target=payload.get("primary_target", ""),
             target_missingness=json.dumps(payload.get("target_missingness", {}), ensure_ascii=True),
             split_candidates_uniques=json.dumps(payload.get("split_candidates_uniques", []), ensure_ascii=True),
+            evidence_bundle=json.dumps(payload.get("evidence_bundle", {}), ensure_ascii=True),
             column_inventory_preview=json.dumps(payload.get("column_inventory_preview", {}), ensure_ascii=True),
             column_inventory_path=payload.get("column_inventory_path", "data/column_inventory.json"),
+            data_atlas_summary=str(payload.get("data_atlas_summary", "") or ""),
         )
-        self.last_prompt = prompt
-        response = self.model.generate_content(prompt)
-        text = (getattr(response, "text", "") or "").strip()
-        self.last_response = text
-        return self._parse_json_response(text)
+        return self._generate_json_payload(
+            prompt=prompt,
+            task_label="steward_semantics_pass2",
+            required_keys=["dataset_semantics", "dataset_training_mask", "column_sets"],
+            max_attempts=3,
+        )
 
     def _detect_csv_dialect(self, data_path: str, encoding: str) -> Dict[str, str]:
         """

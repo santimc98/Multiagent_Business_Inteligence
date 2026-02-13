@@ -27,6 +27,7 @@ from src.utils.contract_accessors import (
 )
 from src.utils.run_bundle import get_run_dir
 from src.utils.feature_selectors import infer_feature_selectors, compact_column_representation
+from src.utils.cleaning_contract_semantics import extract_selector_drop_reasons
 from src.utils.contract_validator import (
     validate_contract_minimal_readonly,
     normalize_contract_scope,
@@ -203,6 +204,9 @@ Scope-dependent required fields:
     artifact_requirements.clean_dataset.column_transformations with:
     - drop_columns: list[str]
     - scale_columns: list[str]
+    - drop_policy (optional but required for selector-based criteria drops): {
+        "allow_selector_drops_when": list[str]  # e.g. ["constant","all_null","duplicate"]
+      }
     (do not encode these decisions only in free-text runbook)
 - If scope includes ML ("ml_only" or "full_pipeline"):
   - qa_gates: list of gate objects
@@ -259,6 +263,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "artifact_requirements.clean_dataset.required_columns",
             "artifact_requirements.clean_dataset.required_feature_selectors (optional)",
             "artifact_requirements.clean_dataset.column_transformations (optional)",
+            "artifact_requirements.clean_dataset.column_transformations.drop_policy (optional)",
             "cleaning_gates",
             "data_engineer_runbook",
             "outlier_policy (optional)",
@@ -274,6 +279,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "artifact_requirements.clean_dataset.required_columns",
             "artifact_requirements.clean_dataset.required_feature_selectors (optional)",
             "artifact_requirements.clean_dataset.column_transformations (optional)",
+            "artifact_requirements.clean_dataset.column_transformations.drop_policy (optional)",
             "outlier_policy (optional)",
         ],
     },
@@ -1918,6 +1924,7 @@ def select_relevant_columns(
     domain_expert_critique: str,
     column_inventory: List[str] | None,
     data_profile_summary: str | None = None,
+    constant_anchor_avoidance: List[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Deterministically select a compact set of relevant columns for planning.
@@ -1937,6 +1944,12 @@ def select_relevant_columns(
             return name
         norm = _normalize_column_identifier(name)
         return inventory_norm_map.get(norm)
+
+    anchor_avoidance_set: set[str] = set()
+    for raw_col in (constant_anchor_avoidance or []):
+        resolved = _resolve_inventory(str(raw_col))
+        if resolved:
+            anchor_avoidance_set.add(resolved)
 
     sources: Dict[str, List[str]] = {
         "strategy_required_columns": [],
@@ -2019,6 +2032,13 @@ def select_relevant_columns(
                 if regex.search(tokenized):
                     _add_source(col, "heuristic", heuristic_cols)
                     break
+
+    if anchor_avoidance_set:
+        family_cols = [col for col in family_cols if col not in anchor_avoidance_set]
+        text_matches = [col for col in text_matches if col not in anchor_avoidance_set]
+        heuristic_cols = [col for col in heuristic_cols if col not in anchor_avoidance_set]
+        # Keep source trace transparent for planner diagnostics.
+        sources["constant_anchor_avoidance"] = sorted(anchor_avoidance_set)[:80]
 
     ordered: List[str] = []
     for col in required_cols:
@@ -6478,12 +6498,23 @@ class ExecutionPlannerAgent:
         else:
             data_summary_str = str(data_summary)
 
+        constant_anchor_avoidance: List[str] = []
+        if isinstance(data_profile, dict):
+            const_exact = data_profile.get("constant_columns")
+            if isinstance(const_exact, list) and const_exact:
+                constant_anchor_avoidance = [str(c) for c in const_exact if c]
+            else:
+                const_sample = data_profile.get("constant_columns_sample")
+                if isinstance(const_sample, list) and const_sample:
+                    constant_anchor_avoidance = [str(c) for c in const_sample if c]
+
         relevant_payload = select_relevant_columns(
             strategy=strategy,
             business_objective=business_objective,
             domain_expert_critique=domain_expert_critique,
             column_inventory=column_inventory or [],
             data_profile_summary=data_summary_str,
+            constant_anchor_avoidance=constant_anchor_avoidance,
         )
         relevant_columns = relevant_payload.get("relevant_columns", [])
         relevant_sources = relevant_payload.get("relevant_sources", {})
@@ -6969,8 +7000,22 @@ class ExecutionPlannerAgent:
                 "contract.cleaning_transforms_drop_conflict": (
                     "Ensure drop_columns NEVER contains columns listed in clean_dataset.required_columns."
                 ),
+                "contract.clean_dataset_selector_drop_required_conflict": (
+                    "When selector-drop policy is active, keep required_columns outside required_feature_selectors "
+                    "(required columns must be non-droppable anchors)."
+                ),
+                "contract.clean_dataset_selector_drop_passthrough_conflict": (
+                    "When selector-drop policy is active, keep optional_passthrough_columns outside required_feature_selectors."
+                ),
+                "contract.cleaning_gate_selector_drop_conflict": (
+                    "HARD cleaning gates must not depend on selector-covered columns when selector-drop policy is enabled."
+                ),
                 "contract.cleaning_transforms_scale_conflict": (
                     "Ensure scale_columns are covered by required_columns/optional_passthrough_columns or required_feature_selectors."
+                ),
+                "contract.clean_dataset_selector_drop_policy_missing": (
+                    "When using required_feature_selectors with criteria-based drop directives, declare "
+                    "column_transformations.drop_policy.allow_selector_drops_when."
                 ),
                 "contract.clean_dataset_ml_columns_missing": (
                     "Ensure every ML-required column is covered by clean_dataset.required_columns, passthrough, or selectors."
@@ -7060,8 +7105,13 @@ class ExecutionPlannerAgent:
                 "pre_decision, decision, outcome, post_decision_audit_only, identifiers, time_columns, unknown.\n"
                 "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "If cleaning requires dropping/scaling columns, declare them in "
-                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns}; "
+                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy}; "
                 "do not leave these decisions only in runbook prose.\n"
+                "If required_feature_selectors are used and any drop-by-criteria is requested, define "
+                "column_transformations.drop_policy.allow_selector_drops_when with explicit reasons.\n"
+                "If selector-drop policy is active, required_columns and optional_passthrough_columns MUST be non-droppable anchors "
+                "and therefore must not overlap required_feature_selectors.\n"
+                "If selector-drop policy is active, HARD cleaning gates must not rely on selector-covered columns.\n"
                 "For wide feature families, you may declare compact selectors in "
                 "artifact_requirements.clean_dataset.required_feature_selectors (regex/prefix/range/list).\n"
                 "Avoid enumerating massive feature families as explicit lists; keep explicit anchors only.\n"
@@ -7193,12 +7243,14 @@ class ExecutionPlannerAgent:
                 return True
             return False
 
-        def _extract_clean_dataset_transformations(clean_dataset: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
+        def _extract_clean_dataset_transformations(
+            clean_dataset: Dict[str, Any],
+        ) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
             transform_block = clean_dataset.get("column_transformations")
             if transform_block is None:
                 transform_block = {}
             if not isinstance(transform_block, dict):
-                return [], [], ["artifact_requirements.clean_dataset.column_transformations must be an object"]
+                return [], [], [], [], ["artifact_requirements.clean_dataset.column_transformations must be an object"]
 
             def _collect(alias_keys: Tuple[str, ...]) -> Tuple[List[str], bool]:
                 values: List[str] = []
@@ -7223,7 +7275,26 @@ class ExecutionPlannerAgent:
                 errors.append("artifact_requirements.clean_dataset.column_transformations.drop_columns must be list[str]")
             if invalid_scale:
                 errors.append("artifact_requirements.clean_dataset.column_transformations.scale_columns must be list[str]")
-            return drop_columns, scale_columns, errors
+            transform_payload = dict(transform_block)
+            if "drop_policy" not in transform_payload and "drop_policy" in clean_dataset:
+                transform_payload["drop_policy"] = clean_dataset.get("drop_policy")
+            selector_drop_reasons, selector_drop_errors = extract_selector_drop_reasons(transform_payload)
+            for issue in selector_drop_errors:
+                errors.append(f"artifact_requirements.clean_dataset.column_transformations.drop_policy: {issue}")
+
+            criteria_drop_directives: List[str] = []
+            feature_engineering = transform_block.get("feature_engineering")
+            if isinstance(feature_engineering, list):
+                for idx, item in enumerate(feature_engineering):
+                    if not isinstance(item, dict):
+                        continue
+                    action = str(item.get("action") or "").strip().lower()
+                    if action not in {"drop", "remove", "exclude"}:
+                        continue
+                    if any(item.get(key) for key in ("criteria", "condition", "rule", "rationale")):
+                        criteria_drop_directives.append(f"feature_engineering[{idx}]")
+
+            return drop_columns, scale_columns, selector_drop_reasons, criteria_drop_directives, errors
 
         def _extract_clean_dataset_selectors(clean_dataset: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
             raw_selectors = clean_dataset.get("required_feature_selectors")
@@ -7425,7 +7496,13 @@ class ExecutionPlannerAgent:
                             f"{section_id}: clean_dataset coverage is empty; provide required_columns and/or "
                             "required_feature_selectors and/or optional_passthrough_columns"
                         )
-                    drop_columns, scale_columns, transform_errors = _extract_clean_dataset_transformations(clean_dataset)
+                    (
+                        drop_columns,
+                        scale_columns,
+                        selector_drop_reasons,
+                        criteria_drop_directives,
+                        transform_errors,
+                    ) = _extract_clean_dataset_transformations(clean_dataset)
                     for transform_error in transform_errors:
                         errors.append(f"{section_id}: {transform_error}")
                     req_norm = {str(col).strip().lower() for col in required_cols_clean if str(col).strip()}
@@ -7454,17 +7531,24 @@ class ExecutionPlannerAgent:
                                 f"{section_id}: column_transformations.scale_columns must be covered by "
                                 f"required_columns/optional_passthrough_columns/required_feature_selectors ({uncovered[:8]})"
                             )
-
+                    has_declared_selectors = bool(selectors)
+                    if has_declared_selectors and criteria_drop_directives and not (drop_columns or selector_drop_reasons):
+                        errors.append(
+                            f"{section_id}: selectors plus criteria-based drop directives require "
+                            "column_transformations.drop_policy.allow_selector_drops_when "
+                            "(or explicit drop_columns)."
+                        )
                 runbook_text = _flatten_text_payload(payload.get("data_engineer_runbook"))
                 has_drop_directive = _has_non_negated_action(runbook_text, _drop_column_pattern)
                 has_scale_directive = _has_non_negated_action(runbook_text, _scale_column_pattern)
                 if isinstance(clean_dataset, dict):
-                    drop_columns, scale_columns, _ = _extract_clean_dataset_transformations(clean_dataset)
+                    drop_columns, scale_columns, selector_drop_reasons, _, _ = _extract_clean_dataset_transformations(clean_dataset)
                 else:
-                    drop_columns, scale_columns = [], []
-                if has_drop_directive and not drop_columns:
+                    drop_columns, scale_columns, selector_drop_reasons = [], [], []
+                if has_drop_directive and not (drop_columns or selector_drop_reasons):
                     errors.append(
-                        f"{section_id}: runbook indicates column dropping but clean_dataset.column_transformations.drop_columns is missing"
+                        f"{section_id}: runbook indicates column dropping but no structured drop declaration "
+                        "was found (drop_columns/drop_policy)."
                     )
                 if has_scale_directive and not scale_columns:
                     errors.append(
@@ -7602,7 +7686,12 @@ class ExecutionPlannerAgent:
                 "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
                 "If cleaning requires dropping/scaling columns, set "
-                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns} explicitly.\n"
+                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy} explicitly.\n"
+                "If required_feature_selectors are used and any drop-by-criteria is requested, set "
+                "column_transformations.drop_policy.allow_selector_drops_when.\n"
+                "If selector-drop policy is active, required_columns and optional_passthrough_columns must remain "
+                "outside required_feature_selectors (non-droppable anchors).\n"
+                "If selector-drop policy is active, HARD cleaning gates must not depend on selector-covered columns.\n"
                 "For wide feature families, you may use artifact_requirements.clean_dataset.required_feature_selectors "
                 "(regex/prefix/range/list) to avoid lossy explicit enumeration.\n"
                 "Avoid enumerating massive feature families as explicit lists; keep explicit anchors only.\n"
@@ -7674,6 +7763,11 @@ class ExecutionPlannerAgent:
                             "drop_conflict",
                             "Avoid dropping columns that are required or passthrough.",
                         )
+                    if "selector_drop" in low or "selector-covered" in low:
+                        _add(
+                            "selector_drop_conflict",
+                            "When selector-drop policy is active, keep required/passthrough anchors and HARD gate columns outside selector coverage.",
+                        )
                     if "clean_dataset" in low and ("output_path" in low or "manifest" in low):
                         _add(
                             "clean_paths",
@@ -7730,7 +7824,11 @@ class ExecutionPlannerAgent:
                 "Use artifact file paths for required_outputs.\n\n"
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "If cleaning requires dropping/scaling columns, set "
-                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns} explicitly.\n"
+                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy} explicitly.\n"
+                "If required_feature_selectors are used and any drop-by-criteria is requested, set "
+                "column_transformations.drop_policy.allow_selector_drops_when.\n"
+                "If selector-drop policy is active, required/passthrough anchors and HARD gate columns must stay "
+                "outside selector coverage.\n"
                 "For wide feature families, you may use artifact_requirements.clean_dataset.required_feature_selectors "
                 "(regex/prefix/range/list) to avoid lossy explicit enumeration.\n"
                 "Avoid enumerating massive feature families as explicit lists; keep explicit anchors only.\n"
@@ -8092,6 +8190,9 @@ class ExecutionPlannerAgent:
 
         target_candidates: List[Dict[str, Any]] = []
         resolved_target = None
+        potential_constant_anchor_avoidance: List[str] = []
+        potential_constant_anchor_avoidance_source = "none"
+        potential_constant_anchor_avoidance_confidence = "unknown"
         if isinstance(data_profile, dict):
             try:
                 from src.utils.data_profile_compact import compact_data_profile_for_llm
@@ -8099,6 +8200,23 @@ class ExecutionPlannerAgent:
                 target_candidates = compact.get("target_candidates") if isinstance(compact, dict) else []
             except Exception:
                 target_candidates = []
+            # Context guardrail for planner consistency:
+            # Prefer non-constant anchors when selector-drop policy may prune feature families.
+            const_exact = data_profile.get("constant_columns")
+            if isinstance(const_exact, list) and const_exact:
+                potential_constant_anchor_avoidance = [str(c) for c in const_exact if c][:200]
+                potential_constant_anchor_avoidance_source = "constant_columns"
+                potential_constant_anchor_avoidance_confidence = str(
+                    data_profile.get("constant_columns_confidence") or "high_full_or_complete"
+                )
+            else:
+                const_sample = data_profile.get("constant_columns_sample")
+                if isinstance(const_sample, list) and const_sample:
+                    potential_constant_anchor_avoidance = [str(c) for c in const_sample if c][:200]
+                    potential_constant_anchor_avoidance_source = "constant_columns_sample"
+                    potential_constant_anchor_avoidance_confidence = str(
+                        data_profile.get("constant_columns_confidence") or "low_sampled"
+                    )
         if isinstance(target_candidates, list) and target_candidates:
             for item in target_candidates:
                 if not isinstance(item, dict):
@@ -8222,6 +8340,22 @@ evidence_policy:
 
 planner_semantic_resolution_policy:
 {json.dumps(PLANNER_SEMANTIC_RESOLUTION_POLICY_V1, indent=2)}
+
+contract_consistency_guardrails:
+{json.dumps({
+    "required_columns_must_be_non_droppable": True,
+    "if_selector_drop_policy_active_required_and_passthrough_must_not_overlap_selectors": True,
+    "if_selector_drop_policy_active_hard_gates_must_not_depend_on_selector_covered_columns": True,
+}, indent=2)}
+
+potential_constant_anchor_avoidance:
+{json.dumps(potential_constant_anchor_avoidance, indent=2)}
+
+potential_constant_anchor_avoidance_source:
+{json.dumps(potential_constant_anchor_avoidance_source)}
+
+potential_constant_anchor_avoidance_confidence:
+{json.dumps(potential_constant_anchor_avoidance_confidence)}
 
 domain_expert_critique:
 {critique_for_prompt or "None"}

@@ -182,3 +182,83 @@ def test_validate_contract_minimal_readonly_rejects_unresolved_selector_hints():
     assert result.get("accepted") is False
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.clean_dataset_selector_hints_unresolved" in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_selector_drop_required_overlap():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["label", "__split", "pixel0", "pixel1"]
+    contract["column_roles"] = {
+        "pre_decision": ["pixel0", "pixel1"],
+        "decision": [],
+        "outcome": ["label"],
+        "post_decision_audit_only": [],
+        "unknown": [],
+    }
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["label", "__split", "pixel0"]
+    clean_dataset["required_feature_selectors"] = [{"type": "regex", "pattern": "^pixel\\d+$"}]
+    clean_dataset["column_transformations"] = {
+        "drop_policy": {"allow_selector_drops_when": ["constant"]},
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.clean_dataset_selector_drop_required_conflict" in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_selector_drop_passthrough_overlap():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["label", "__split", "pixel0", "pixel1"]
+    contract["column_roles"] = {
+        "pre_decision": ["pixel0", "pixel1"],
+        "decision": [],
+        "outcome": ["label"],
+        "post_decision_audit_only": [],
+        "unknown": [],
+    }
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["label", "__split"]
+    clean_dataset["optional_passthrough_columns"] = ["pixel0"]
+    clean_dataset["required_feature_selectors"] = [{"type": "regex", "pattern": "^pixel\\d+$"}]
+    clean_dataset["column_transformations"] = {
+        "drop_policy": {"allow_selector_drops_when": ["constant"]},
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.clean_dataset_selector_drop_passthrough_conflict" in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_selector_drop_hard_gate_overlap():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["label", "__split", "pixel0", "pixel1"]
+    contract["column_roles"] = {
+        "pre_decision": ["pixel0", "pixel1"],
+        "decision": [],
+        "outcome": ["label"],
+        "post_decision_audit_only": [],
+        "unknown": [],
+    }
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["label", "__split"]
+    clean_dataset["required_feature_selectors"] = [{"type": "regex", "pattern": "^pixel\\d+$"}]
+    clean_dataset["column_transformations"] = {
+        "drop_policy": {"allow_selector_drops_when": ["constant"]},
+    }
+    contract["cleaning_gates"] = [
+        {
+            "name": "pixel_not_null",
+            "severity": "HARD",
+            "params": {"columns": ["pixel0"]},
+        }
+    ]
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_gate_selector_drop_conflict" in rules
