@@ -1107,21 +1107,139 @@ def _list_str(value: Any) -> List[str]:
     return []
 
 
+def _load_column_inventory_names(path: str = "data/column_inventory.json") -> List[str]:
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, list):
+            return [str(col) for col in payload if col]
+        if isinstance(payload, dict):
+            cols = payload.get("columns")
+            if isinstance(cols, list):
+                return [str(col) for col in cols if col]
+    except Exception:
+        return []
+    return []
+
+
+def _expand_required_feature_selectors_for_review(
+    selectors: Any,
+    candidate_columns: List[str],
+) -> List[str]:
+    if not isinstance(selectors, list) or not selectors:
+        return []
+    if not candidate_columns:
+        return []
+
+    candidates = [str(col) for col in candidate_columns if col]
+    expanded: List[str] = []
+
+    def _add_many(items: List[str]) -> None:
+        for item in items:
+            if item and item in candidates and item not in expanded:
+                expanded.append(item)
+
+    for selector in selectors:
+        if not isinstance(selector, dict):
+            continue
+        selector_type = str(selector.get("type") or "").strip().lower()
+        try:
+            if selector_type in {"regex", "pattern"}:
+                pattern = str(selector.get("pattern") or "").strip()
+                if not pattern:
+                    continue
+                regex = re.compile(pattern, flags=re.IGNORECASE)
+                _add_many([col for col in candidates if regex.match(col)])
+                continue
+            if selector_type == "prefix":
+                prefix = str(selector.get("value") or selector.get("prefix") or "").strip().lower()
+                if not prefix:
+                    continue
+                _add_many([col for col in candidates if col.lower().startswith(prefix)])
+                continue
+            if selector_type == "suffix":
+                suffix = str(selector.get("value") or selector.get("suffix") or "").strip().lower()
+                if not suffix:
+                    continue
+                _add_many([col for col in candidates if col.lower().endswith(suffix)])
+                continue
+            if selector_type == "contains":
+                token = str(selector.get("value") or "").strip().lower()
+                if not token:
+                    continue
+                _add_many([col for col in candidates if token in col.lower()])
+                continue
+            if selector_type == "list":
+                cols = selector.get("columns")
+                if isinstance(cols, list):
+                    _add_many([str(col) for col in cols if col])
+                continue
+            if selector_type == "all_columns_except":
+                except_cols = selector.get("except_columns")
+                excluded = {str(col).lower() for col in except_cols if col} if isinstance(except_cols, list) else set()
+                _add_many([col for col in candidates if col.lower() not in excluded])
+                continue
+            if selector_type == "prefix_numeric_range":
+                prefix = str(selector.get("prefix") or "").strip()
+                start = selector.get("start")
+                end = selector.get("end")
+                if not prefix or not isinstance(start, int) or not isinstance(end, int):
+                    continue
+                lo = min(start, end)
+                hi = max(start, end)
+                rx = re.compile(rf"^{re.escape(prefix)}(\d+)$", flags=re.IGNORECASE)
+                matched: List[str] = []
+                for col in candidates:
+                    m = rx.match(col)
+                    if not m:
+                        continue
+                    try:
+                        pos = int(m.group(1))
+                    except Exception:
+                        continue
+                    if lo <= pos <= hi:
+                        matched.append(col)
+                _add_many(matched)
+        except Exception:
+            continue
+
+    return expanded
+
+
 def _resolve_required_columns_for_review(view: Dict[str, Any]) -> List[str]:
     required = view.get("required_columns")
+    required_selectors = view.get("required_feature_selectors")
+    base_required: List[str] = []
     if isinstance(required, list):
-        return _list_str(required)
+        base_required = _list_str(required)
     # If required_columns got compacted (count/head/tail), load from file.
-    path = view.get("required_columns_path") or "data/required_columns.json"
-    if path and os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            if isinstance(payload, list) and payload:
-                return _list_str(payload)
-        except Exception:
-            pass
-    return []
+    if not base_required:
+        path = view.get("required_columns_path") or "data/required_columns.json"
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload, list) and payload:
+                    base_required = _list_str(payload)
+                elif isinstance(payload, dict):
+                    candidates = payload.get("required_columns")
+                    if not isinstance(candidates, list):
+                        candidates = payload.get("columns")
+                    if isinstance(candidates, list) and candidates:
+                        base_required = _list_str(candidates)
+                    if not isinstance(required_selectors, list):
+                        selectors_candidate = payload.get("required_feature_selectors")
+                        if isinstance(selectors_candidate, list):
+                            required_selectors = selectors_candidate
+            except Exception:
+                pass
+
+    inventory_cols = _load_column_inventory_names("data/column_inventory.json")
+    selector_required = _expand_required_feature_selectors_for_review(required_selectors, inventory_cols)
+    merged = list(dict.fromkeys(base_required + selector_required))
+    return merged
 
 
 def _coerce_roles(raw: Any) -> Dict[str, List[str]]:

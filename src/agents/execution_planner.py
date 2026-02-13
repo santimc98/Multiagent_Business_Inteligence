@@ -195,6 +195,8 @@ Scope-dependent required fields:
   - cleaning_gates: list of gate objects
   - data_engineer_runbook: object/list/string with actionable steps
   - artifact_requirements.clean_dataset.required_columns: list[str]
+  - artifact_requirements.clean_dataset.required_feature_selectors (optional): list[object]
+    to represent wide feature families compactly (regex/prefix/range/list/all_columns_except)
   - artifact_requirements.clean_dataset.output_path: file path for cleaned CSV
   - artifact_requirements.clean_dataset.output_manifest_path (or manifest_path): file path for cleaning manifest JSON
   - If any column drop/scaling is requested, declare it explicitly in
@@ -222,6 +224,9 @@ Hard rules:
 - Keep de_view executable from contract alone: include both cleaned output CSV and cleaning manifest JSON paths.
 - Contract precedence for DE must be coherent: HARD cleaning_gates + required_columns + explicit column_transformations
   are binding and must not contradict runbook narrative.
+- For full_pipeline contracts, clean_dataset coverage must include ML-required columns
+  (outcome/decision/model features), either explicitly in required_columns/optional_passthrough_columns
+  or through required_feature_selectors.
 - Keep contract coherent with strategy + business objective.
 - Treat strategy techniques as advisory hypotheses, not immutable requirements.
 - If strategy wording conflicts with direct data evidence (profile ranges/dtypes/semantics), prioritize data evidence
@@ -249,6 +254,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "artifact_requirements.clean_dataset.output_path",
             "artifact_requirements.clean_dataset.output_manifest_path|manifest_path",
             "artifact_requirements.clean_dataset.required_columns",
+            "artifact_requirements.clean_dataset.required_feature_selectors (optional)",
             "artifact_requirements.clean_dataset.column_transformations (optional)",
             "cleaning_gates",
             "data_engineer_runbook",
@@ -263,6 +269,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "artifact_requirements.clean_dataset.output_path",
             "artifact_requirements.clean_dataset.output_manifest_path|manifest_path",
             "artifact_requirements.clean_dataset.required_columns",
+            "artifact_requirements.clean_dataset.required_feature_selectors (optional)",
             "artifact_requirements.clean_dataset.column_transformations (optional)",
             "outlier_policy (optional)",
         ],
@@ -1715,6 +1722,160 @@ def _coerce_list(value: Any) -> List[str]:
     return []
 
 
+def _expand_strategy_feature_families(
+    strategy_dict: Dict[str, Any],
+    inventory: List[str],
+) -> List[str]:
+    """
+    Expand strategist feature-family hints into concrete columns from inventory.
+
+    Universal behavior:
+    - never invent columns
+    - only match against observed column inventory
+    - supports common selector hint shapes (prefix, regex, numeric ranges)
+    """
+    families_raw = strategy_dict.get("feature_families")
+    if not isinstance(families_raw, list) or not families_raw:
+        return []
+    if not inventory:
+        return []
+
+    inventory_set = set(inventory)
+    matched: List[str] = []
+
+    def _add_many(cols: List[str]) -> None:
+        for col in cols:
+            if col in inventory_set and col not in matched:
+                matched.append(col)
+
+    def _match_prefix(prefix: str) -> List[str]:
+        token = str(prefix or "").strip()
+        if not token:
+            return []
+        return [col for col in inventory if col.lower().startswith(token.lower())]
+
+    def _match_regex(pattern: str) -> List[str]:
+        expr = str(pattern or "").strip()
+        if not expr:
+            return []
+        try:
+            regex = re.compile(expr, flags=re.IGNORECASE)
+        except re.error:
+            return []
+        return [col for col in inventory if regex.match(col)]
+
+    def _match_numeric_range(prefix: str, start: int, end: int) -> List[str]:
+        token = str(prefix or "").strip()
+        if not token:
+            return []
+        lo = min(int(start), int(end))
+        hi = max(int(start), int(end))
+        rx = re.compile(rf"^{re.escape(token)}(\d+)$", flags=re.IGNORECASE)
+        out: List[str] = []
+        for col in inventory:
+            m = rx.match(col)
+            if not m:
+                continue
+            try:
+                idx = int(m.group(1))
+            except Exception:
+                continue
+            if lo <= idx <= hi:
+                out.append(col)
+        return out
+
+    generic_tokens = {
+        "feature",
+        "features",
+        "family",
+        "families",
+        "column",
+        "columns",
+        "numeric",
+        "categorical",
+        "all",
+        "input",
+        "inputs",
+    }
+
+    def _extract_family_tokens(text: str) -> List[str]:
+        tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", str(text or ""))
+        out: List[str] = []
+        for token in tokens:
+            key = token.lower()
+            if key in generic_tokens:
+                continue
+            if len(key) <= 1:
+                continue
+            out.append(token)
+        return list(dict.fromkeys(out))
+
+    def _parse_hint(hint: str) -> List[str]:
+        text = str(hint or "").strip()
+        if not text:
+            return []
+        cols: List[str] = []
+
+        # prefix:pixel
+        prefix_match = re.search(r"prefix\s*:\s*([A-Za-z_][A-Za-z0-9_]*)", text, flags=re.IGNORECASE)
+        if prefix_match:
+            cols.extend(_match_prefix(prefix_match.group(1)))
+
+        # pixel[0-783]
+        for m in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\s*-\s*(\d+)\]", text):
+            cols.extend(_match_numeric_range(m.group(1), int(m.group(2)), int(m.group(3))))
+
+        # pixel0-pixel783 / pixel0 to pixel783 / pixel0 to 783
+        range_patterns = [
+            r"([A-Za-z_][A-Za-z0-9_]*)(\d+)\s*(?:to|-)\s*([A-Za-z_][A-Za-z0-9_]*)(\d+)",
+            r"([A-Za-z_][A-Za-z0-9_]*)(\d+)\s*(?:to|-)\s*(\d+)",
+        ]
+        for pattern in range_patterns:
+            for m in re.finditer(pattern, text, flags=re.IGNORECASE):
+                groups = m.groups()
+                if len(groups) == 4:
+                    p1, s1, p2, s2 = groups
+                    if str(p1).lower() != str(p2).lower():
+                        continue
+                    cols.extend(_match_numeric_range(p1, int(s1), int(s2)))
+                elif len(groups) == 3:
+                    p1, s1, s2 = groups
+                    cols.extend(_match_numeric_range(p1, int(s1), int(s2)))
+
+        # Explicit regex-like pattern hints: pattern 'pixel[0-9]+'
+        quoted_patterns = re.findall(r"['\"]([^'\"]+)['\"]", text)
+        for candidate in quoted_patterns:
+            if any(ch in candidate for ch in ("[", "]", "(", ")", "^", "$", "+", "*", "\\", "|")):
+                regex_candidate = candidate
+                # Normalize naive ranges like [0-783] into \d+ (common LLM shorthand)
+                regex_candidate = re.sub(r"\[\d+\s*-\s*\d+\]", r"\\d+", regex_candidate)
+                cols.extend(_match_regex(rf"^{regex_candidate}$"))
+
+        # Fallback family token prefix match
+        if not cols:
+            for token in _extract_family_tokens(text):
+                pref_matches = _match_prefix(token)
+                if pref_matches:
+                    cols.extend(pref_matches)
+                    break
+
+        return list(dict.fromkeys(cols))
+
+    for entry in families_raw:
+        hints: List[str] = []
+        if isinstance(entry, str):
+            hints.append(entry)
+        elif isinstance(entry, dict):
+            for key in ("selector_hint", "family", "name", "pattern", "rationale", "description"):
+                value = entry.get(key)
+                if isinstance(value, str) and value.strip():
+                    hints.append(value.strip())
+        for hint in hints:
+            _add_many(_parse_hint(hint))
+
+    return matched
+
+
 def select_relevant_columns(
     strategy: Dict[str, Any] | None,
     business_objective: str,
@@ -1743,6 +1904,7 @@ def select_relevant_columns(
 
     sources: Dict[str, List[str]] = {
         "strategy_required_columns": [],
+        "strategy_feature_families": [],
         "strategy_decision_columns": [],
         "strategy_outcome_columns": [],
         "strategy_audit_only_columns": [],
@@ -1777,12 +1939,15 @@ def select_relevant_columns(
     audit_only_raw = _coerce_list(strategy_dict.get("audit_only_columns"))
 
     required_cols: List[str] = []
+    family_cols: List[str] = []
     decision_cols: List[str] = []
     outcome_cols: List[str] = []
     audit_only_cols: List[str] = []
 
     for col in required_cols_raw:
         _add_source(_resolve_inventory(col), "strategy_required_columns", required_cols)
+    for col in _expand_strategy_feature_families(strategy_dict, inventory):
+        _add_source(_resolve_inventory(col), "strategy_feature_families", family_cols)
     for col in decision_cols_raw:
         _add_source(_resolve_inventory(col), "strategy_decision_columns", decision_cols)
     for col in outcome_cols_raw:
@@ -1801,7 +1966,7 @@ def select_relevant_columns(
                 _add_source(candidate, "text_mentions", text_matches)
 
     heuristic_cols: List[str] = []
-    if len(set(required_cols + decision_cols + outcome_cols + audit_only_cols + text_matches)) < 4:
+    if len(set(required_cols + family_cols + decision_cols + outcome_cols + audit_only_cols + text_matches)) < 4:
         patterns = [
             (re.compile(r"\b(target|label|outcome|success|converted)\b"), "target_like"),
             (re.compile(r"\b(price|amount|offer|quote|cost)\b"), "decision_like"),
@@ -1819,6 +1984,8 @@ def select_relevant_columns(
 
     ordered: List[str] = []
     for col in required_cols:
+        _add_unique(ordered, col)
+    for col in family_cols:
         _add_unique(ordered, col)
     for col in outcome_cols + decision_cols:
         _add_unique(ordered, col)
@@ -6490,6 +6657,8 @@ class ExecutionPlannerAgent:
                 "If cleaning requires dropping/scaling columns, declare them in "
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns}; "
                 "do not leave these decisions only in runbook prose.\n"
+                "For wide feature families, you may declare compact selectors in "
+                "artifact_requirements.clean_dataset.required_feature_selectors (regex/prefix/range/list).\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scopes, include non-empty evaluation_spec and ensure objective_analysis.problem_type "
@@ -6921,6 +7090,8 @@ class ExecutionPlannerAgent:
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
                 "If cleaning requires dropping/scaling columns, set "
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns} explicitly.\n"
+                "For wide feature families, you may use artifact_requirements.clean_dataset.required_feature_selectors "
+                "(regex/prefix/range/list) to avoid lossy explicit enumeration.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
@@ -6964,6 +7135,8 @@ class ExecutionPlannerAgent:
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
                 "If cleaning requires dropping/scaling columns, set "
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns} explicitly.\n"
+                "For wide feature families, you may use artifact_requirements.clean_dataset.required_feature_selectors "
+                "(regex/prefix/range/list) to avoid lossy explicit enumeration.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
                 "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
@@ -7343,6 +7516,12 @@ class ExecutionPlannerAgent:
         column_inventory_sample = (column_inventory or [])[:25]
         inventory_truncated = column_inventory_count > 50
         column_inventory_payload = column_inventory_sample if inventory_truncated else (column_inventory or [])
+        column_inventory_compact = compact_column_representation(column_inventory or [], max_display=40)
+        strategy_feature_families = []
+        if isinstance(strategy, dict):
+            families_candidate = strategy.get("feature_families")
+            if isinstance(families_candidate, list):
+                strategy_feature_families = families_candidate
         data_summary_for_prompt = _compress_text_preserve_ends(
             data_summary_str,
             max_chars=12000,
@@ -7383,6 +7562,12 @@ column_inventory_truncated:
 
 column_inventory:
 {json.dumps(column_inventory_payload, indent=2)}
+
+column_inventory_compact:
+{json.dumps(column_inventory_compact, indent=2)}
+
+strategy_feature_families:
+{json.dumps(strategy_feature_families, indent=2)}
 
 data_profile_summary:
 {data_summary_for_prompt}

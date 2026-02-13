@@ -316,7 +316,9 @@ class DataEngineerAgent:
           If OUTLIER_POLICY_CONTEXT is empty/disabled, do not invent outlier rules.
 
         *** COLUMN SYNCHRONIZATION RULE (CRITICAL) ***
-        - Your output CSV MUST contain EXACTLY the columns listed in "Required Columns (DE View)" - no more, no less.
+        - Baseline: your output CSV MUST contain EXACTLY the columns listed in "Required Columns (DE View)".
+        - If DE_VIEW_CONTEXT includes required_feature_selectors, expand them against input header and treat
+          expanded columns as additional required columns (unless explicitly dropped by COLUMN_TRANSFORMATIONS_CONTEXT).
         - If a column exists in raw data but is NOT in required_columns, DISCARD it (do not include in output).
         - Constant columns may or may not be included in required_columns depending on strategy; do not infer constants to override required_columns.
         - Do NOT second-guess the required_columns list; it represents the final output schema after cleaning.
@@ -334,7 +336,7 @@ class DataEngineerAgent:
         - Preserve partition/split columns if they exist or are detected in the Dataset Semantics Summary.
         - If you create a partition column (split/fold/bucket), document it in the manifest and do not drop it.
         - For wide datasets, avoid enumerating all columns in code comments or logic. If data/column_sets.json exists, use src.utils.column_sets.expand_column_sets to manage column lists; fall back gracefully if the file is missing.
-        - Note: data/column_sets.json is aligned to required_columns; prefer it for large schemas.
+        - Note: data/column_sets.json is a feature-grouping view over full inventory and may be broader than required_columns anchors.
         - Do NOT drop columns just because they are missing from a truncated list; use selectors + explicit columns from column_sets.json when available.
         - If column_sets.json is present, preserve all columns matched by its selectors plus explicit_columns unless the contract explicitly forbids them.
         - Never assume canonical_columns is the full inventory on wide datasets. Use data/column_inventory.json + data/column_sets.json as source of truth when present.

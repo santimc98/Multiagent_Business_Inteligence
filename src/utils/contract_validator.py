@@ -2396,6 +2396,168 @@ def _resolve_cleaning_column_transformations(clean_dataset: Dict[str, Any]) -> T
     return {"drop_columns": drop_cols, "scale_columns": scale_cols}, issues
 
 
+def _expand_required_feature_selectors(
+    selectors: Any,
+    candidate_columns: List[str],
+) -> Tuple[List[str], List[str]]:
+    """
+    Expand optional clean_dataset.required_feature_selectors into concrete columns.
+    """
+    if selectors is None:
+        return [], []
+    if not isinstance(selectors, list):
+        return [], ["required_feature_selectors must be a list when present."]
+    if not candidate_columns:
+        return [], []
+
+    candidates = [str(col) for col in candidate_columns if isinstance(col, str) and col.strip()]
+    candidate_set = set(candidates)
+    expanded: List[str] = []
+    issues: List[str] = []
+
+    def _add_many(values: List[str]) -> None:
+        for value in values:
+            if value in candidate_set and value not in expanded:
+                expanded.append(value)
+
+    for idx, selector in enumerate(selectors):
+        if not isinstance(selector, dict):
+            issues.append(f"required_feature_selectors[{idx}] must be an object.")
+            continue
+        selector_type = str(selector.get("type") or "").strip().lower()
+        if not selector_type:
+            issues.append(f"required_feature_selectors[{idx}] missing selector type.")
+            continue
+
+        try:
+            if selector_type in {"regex", "pattern"}:
+                pattern = str(selector.get("pattern") or "").strip()
+                if not pattern:
+                    issues.append(f"required_feature_selectors[{idx}] missing regex pattern.")
+                    continue
+                regex = re.compile(pattern, flags=re.IGNORECASE)
+                _add_many([col for col in candidates if regex.match(col)])
+                continue
+
+            if selector_type == "prefix":
+                prefix = str(selector.get("value") or selector.get("prefix") or "").strip()
+                if not prefix:
+                    issues.append(f"required_feature_selectors[{idx}] missing prefix value.")
+                    continue
+                _add_many([col for col in candidates if col.lower().startswith(prefix.lower())])
+                continue
+
+            if selector_type == "suffix":
+                suffix = str(selector.get("value") or selector.get("suffix") or "").strip()
+                if not suffix:
+                    issues.append(f"required_feature_selectors[{idx}] missing suffix value.")
+                    continue
+                _add_many([col for col in candidates if col.lower().endswith(suffix.lower())])
+                continue
+
+            if selector_type == "contains":
+                token = str(selector.get("value") or "").strip()
+                if not token:
+                    issues.append(f"required_feature_selectors[{idx}] missing contains value.")
+                    continue
+                _add_many([col for col in candidates if token.lower() in col.lower()])
+                continue
+
+            if selector_type == "list":
+                values, invalid_values = _normalize_nonempty_str_list(selector.get("columns"))
+                if invalid_values:
+                    issues.append(f"required_feature_selectors[{idx}] list.columns must be list[str].")
+                _add_many([col for col in values if col in candidate_set])
+                continue
+
+            if selector_type == "all_columns_except":
+                excluded, invalid_values = _normalize_nonempty_str_list(selector.get("except_columns"))
+                if invalid_values:
+                    issues.append(f"required_feature_selectors[{idx}] all_columns_except.except_columns must be list[str].")
+                excluded_set = {col.lower() for col in excluded}
+                _add_many([col for col in candidates if col.lower() not in excluded_set])
+                continue
+
+            if selector_type == "prefix_numeric_range":
+                prefix = str(selector.get("prefix") or "").strip()
+                start = selector.get("start")
+                end = selector.get("end")
+                if not prefix or not isinstance(start, int) or not isinstance(end, int):
+                    issues.append(
+                        f"required_feature_selectors[{idx}] prefix_numeric_range requires prefix(str), start(int), end(int)."
+                    )
+                    continue
+                lo = min(start, end)
+                hi = max(start, end)
+                regex = re.compile(rf"^{re.escape(prefix)}(\d+)$", flags=re.IGNORECASE)
+                matched: List[str] = []
+                for col in candidates:
+                    m = regex.match(col)
+                    if not m:
+                        continue
+                    try:
+                        pos = int(m.group(1))
+                    except Exception:
+                        continue
+                    if lo <= pos <= hi:
+                        matched.append(col)
+                _add_many(matched)
+                continue
+
+            issues.append(f"required_feature_selectors[{idx}] unsupported selector type '{selector_type}'.")
+        except Exception as sel_err:
+            issues.append(f"required_feature_selectors[{idx}] expansion error: {sel_err}")
+
+    return expanded, issues
+
+
+def _collect_ml_required_columns(contract: Dict[str, Any]) -> List[str]:
+    """
+    Collect columns the ML stage depends on, using contract-declared semantics only.
+    """
+    if not isinstance(contract, dict):
+        return []
+
+    required: List[str] = []
+
+    def _extend(values: Any) -> None:
+        cols, _ = _normalize_nonempty_str_list(values)
+        for col in cols:
+            if col not in required:
+                required.append(col)
+
+    column_roles = contract.get("column_roles")
+    if isinstance(column_roles, dict):
+        for key in (
+            "pre_decision",
+            "decision",
+            "outcome",
+            "features",
+            "feature",
+            "target",
+            "label",
+        ):
+            _extend(column_roles.get(key))
+
+    _extend(contract.get("decision_columns"))
+    _extend(contract.get("outcome_columns"))
+
+    allowed_feature_sets = contract.get("allowed_feature_sets")
+    if isinstance(allowed_feature_sets, dict):
+        _extend(allowed_feature_sets.get("model_features"))
+        _extend(allowed_feature_sets.get("segmentation_features"))
+
+        forbidden, _ = _normalize_nonempty_str_list(
+            allowed_feature_sets.get("forbidden_for_modeling")
+            or allowed_feature_sets.get("forbidden_features")
+        )
+        if forbidden:
+            forbidden_norm = {col.lower() for col in forbidden}
+            required = [col for col in required if col.lower() not in forbidden_norm]
+
+    return required
+
+
 def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     Minimal, scope-driven contract validation.
@@ -2559,6 +2721,20 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
         passthrough_cols, _ = _normalize_nonempty_str_list(
             clean_dataset.get("optional_passthrough_columns")
         )
+        canonical_cols, _ = _normalize_nonempty_str_list(canonical_columns if isinstance(canonical_columns, list) else [])
+        selector_cols, selector_issues = _expand_required_feature_selectors(
+            clean_dataset.get("required_feature_selectors"),
+            canonical_cols,
+        )
+        if selector_issues:
+            issues.append(
+                _strict_issue(
+                    "contract.clean_dataset_required_feature_selectors",
+                    "warning",
+                    "Some required_feature_selectors entries are invalid/unsupported.",
+                    selector_issues[:10],
+                )
+            )
         transforms, transform_shape_issues = _resolve_cleaning_column_transformations(clean_dataset)
         for msg in transform_shape_issues:
             issues.append(
@@ -2605,6 +2781,7 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
 
         required_norm = {col.lower(): col for col in required_cols}
         passthrough_norm = {col.lower(): col for col in passthrough_cols}
+        selector_norm = {col.lower(): col for col in selector_cols}
         drop_norm = {col.lower(): col for col in drop_cols}
         scale_norm = {col.lower(): col for col in scale_cols}
 
@@ -2634,7 +2811,7 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
         hard_gate_norm = {col.lower(): col for col in hard_gate_cols}
         gate_missing = [
             hard_gate_norm[key]
-            for key in sorted(set(hard_gate_norm) - (set(required_norm) | set(passthrough_norm)))
+            for key in sorted(set(hard_gate_norm) - (set(required_norm) | set(passthrough_norm) | set(selector_norm)))
         ]
         if gate_missing:
             issues.append(
@@ -2655,6 +2832,38 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
                     gate_drop_conflict[:20],
                 )
             )
+
+        if requires_ml:
+            ml_required_cols = _collect_ml_required_columns(contract)
+            ml_required_norm = {col.lower(): col for col in ml_required_cols}
+            coverage_norm = set(required_norm) | set(passthrough_norm) | set(selector_norm)
+            missing_ml_cols = [
+                ml_required_norm[key]
+                for key in sorted(set(ml_required_norm) - coverage_norm)
+            ]
+            if missing_ml_cols:
+                issues.append(
+                    _strict_issue(
+                        "contract.clean_dataset_ml_columns_missing",
+                        "error",
+                        "full_pipeline contract leaves ML-required columns outside clean_dataset coverage "
+                        "(required_columns/optional_passthrough_columns/required_feature_selectors).",
+                        missing_ml_cols[:25],
+                    )
+                )
+            drop_vs_ml = [
+                ml_required_norm[key]
+                for key in sorted(set(ml_required_norm) & set(drop_norm))
+            ]
+            if drop_vs_ml:
+                issues.append(
+                    _strict_issue(
+                        "contract.clean_dataset_drop_ml_columns_conflict",
+                        "error",
+                        "clean_dataset.column_transformations.drop_columns removes ML-required columns.",
+                        drop_vs_ml[:25],
+                    )
+                )
 
     if requires_ml:
         evaluation_spec = contract.get("evaluation_spec")

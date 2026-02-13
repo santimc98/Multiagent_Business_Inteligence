@@ -39,11 +39,13 @@ def _get_decisioning_requirements(contract_full: Dict[str, Any], contract_min: D
 class DEView(TypedDict, total=False):
     role: str
     required_columns: List[str]
+    required_feature_selectors: List[Dict[str, Any]]
     optional_passthrough_columns: List[str]
     column_transformations: Dict[str, Any]
     output_path: str
     output_manifest_path: str
     required_columns_path: str
+    column_sets_path: str
     output_dialect: Dict[str, Any]
     cleaning_gates: List[Dict[str, Any]]
     data_engineer_runbook: Any
@@ -109,6 +111,8 @@ class CleaningView(TypedDict, total=False):
     strategy_title: str
     business_objective: str
     required_columns: List[str]
+    required_feature_selectors: List[Dict[str, Any]]
+    column_sets_path: str
     column_transformations: Dict[str, Any]
     dialect: Dict[str, Any]
     cleaning_gates: List[Dict[str, Any]]
@@ -294,6 +298,26 @@ def _resolve_required_columns(contract_min: Dict[str, Any], contract_full: Dict[
     if canonical:
         return [str(c) for c in canonical if c]
     return []
+
+
+def _resolve_required_feature_selectors(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[Dict[str, Any]]:
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
+    selectors = clean_cfg.get("required_feature_selectors")
+    if not isinstance(selectors, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for item in selectors:
+        if not isinstance(item, dict):
+            continue
+        payload = dict(item)
+        sel_type = payload.get("type")
+        if isinstance(sel_type, str):
+            payload["type"] = sel_type.strip()
+        normalized.append(payload)
+    return normalized
 
 
 def _resolve_passthrough_columns(
@@ -960,6 +984,7 @@ def build_de_view(
     contract_min = contract_min if isinstance(contract_min, dict) else {}
     required_outputs = _resolve_required_outputs(contract_min, contract_full)
     required_columns = _resolve_required_columns(contract_min, contract_full)
+    required_feature_selectors = _resolve_required_feature_selectors(contract_min, contract_full)
     passthrough_columns = _resolve_passthrough_columns(contract_min, contract_full, required_columns)
     column_transformations = _resolve_column_transformations(contract_min, contract_full)
     output_path = _resolve_output_path(contract_min, contract_full, required_outputs)
@@ -973,6 +998,7 @@ def build_de_view(
         "optional_passthrough_columns": passthrough_columns,
         "output_path": output_path or "",
         "required_columns_path": "data/required_columns.json",
+        "column_sets_path": "data/column_sets.json",
         "cleaning_gates": cleaning_gates,
         "data_engineer_runbook": data_engineer_runbook,
         "constraints": {
@@ -985,6 +1011,8 @@ def build_de_view(
             ],
         },
     }
+    if required_feature_selectors:
+        view["required_feature_selectors"] = required_feature_selectors
     if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
         view["outlier_policy"] = outlier_policy
         report_path = _resolve_de_outlier_report_path_from_policy(outlier_policy)
@@ -1431,6 +1459,7 @@ def build_cleaning_view(
     contract_full = contract_full if isinstance(contract_full, dict) else {}
     contract_min = contract_min if isinstance(contract_min, dict) else {}
     required_columns = _resolve_required_columns(contract_min, contract_full)
+    required_feature_selectors = _resolve_required_feature_selectors(contract_min, contract_full)
     column_roles = _resolve_column_roles(contract_min, contract_full)
     allowed_feature_sets = _resolve_allowed_feature_sets(contract_min, contract_full)
     dialect = _resolve_output_dialect(contract_min, contract_full)
@@ -1444,11 +1473,14 @@ def build_cleaning_view(
             contract_full.get("business_objective"), contract_min.get("business_objective")
         ) or "",
         "required_columns": required_columns,
+        "column_sets_path": "data/column_sets.json",
         "dialect": dialect,
         "cleaning_gates": cleaning_gates,
         "column_roles": column_roles,
         "allowed_feature_sets": allowed_feature_sets,
     }
+    if required_feature_selectors:
+        view["required_feature_selectors"] = required_feature_selectors
     if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
         view["outlier_policy"] = outlier_policy
         report_path = _resolve_de_outlier_report_path_from_policy(outlier_policy)
@@ -1602,6 +1634,11 @@ def build_contract_views_projection(
     if not isinstance(de_required_columns, list) or not de_required_columns:
         de_required_columns = list(canonical_columns)
     de_required_columns = [str(c) for c in de_required_columns if c]
+    de_required_feature_selectors = clean_cfg.get("required_feature_selectors")
+    if not isinstance(de_required_feature_selectors, list):
+        de_required_feature_selectors = []
+    else:
+        de_required_feature_selectors = [dict(item) for item in de_required_feature_selectors if isinstance(item, dict)]
     de_passthrough = clean_cfg.get("optional_passthrough_columns")
     if not isinstance(de_passthrough, list):
         de_passthrough = []
@@ -1701,6 +1738,7 @@ def build_contract_views_projection(
         "optional_passthrough_columns": de_passthrough,
         "output_path": output_path,
         "required_columns_path": "data/required_columns.json",
+        "column_sets_path": "data/column_sets.json",
         "cleaning_gates": cleaning_gates if isinstance(cleaning_gates, list) else [],
         "data_engineer_runbook": data_engineer_runbook,
         "constraints": {
@@ -1713,6 +1751,8 @@ def build_contract_views_projection(
             ],
         },
     }
+    if de_required_feature_selectors:
+        de_view["required_feature_selectors"] = de_required_feature_selectors
     if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
         de_view["outlier_policy"] = outlier_policy
         report_path = _resolve_de_outlier_report_path_from_policy(outlier_policy)
@@ -1805,11 +1845,14 @@ def build_contract_views_projection(
         "strategy_title": strategy_title,
         "business_objective": business_objective,
         "required_columns": de_required_columns,
+        "column_sets_path": "data/column_sets.json",
         "dialect": output_dialect if isinstance(output_dialect, dict) else {},
         "cleaning_gates": cleaning_gates if isinstance(cleaning_gates, list) else [],
         "column_roles": column_roles,
         "allowed_feature_sets": allowed_feature_sets,
     }
+    if de_required_feature_selectors:
+        cleaning_view["required_feature_selectors"] = de_required_feature_selectors
     if outlier_policy and outlier_policy.get("apply_stage") in {"data_engineer", "both"}:
         cleaning_view["outlier_policy"] = outlier_policy
         report_path = _resolve_de_outlier_report_path_from_policy(outlier_policy)

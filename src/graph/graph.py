@@ -10878,6 +10878,23 @@ def _sync_required_columns_artifacts(
     try:
         from src.utils.column_sets import build_column_sets, summarize_column_sets
 
+        # Preserve steward/planner feature-family semantics when available.
+        existing_column_sets = state.get("column_sets")
+        if not isinstance(existing_column_sets, dict) or not existing_column_sets:
+            loaded = _load_json_safe("data/column_sets.json")
+            if isinstance(loaded, dict) and loaded:
+                existing_column_sets = loaded
+
+        if isinstance(existing_column_sets, dict) and existing_column_sets:
+            state["column_sets"] = existing_column_sets
+            if not os.path.exists("data/column_sets.json"):
+                dump_json("data/column_sets.json", existing_column_sets)
+            summary = summarize_column_sets(existing_column_sets)
+            if summary:
+                state["column_sets_summary"] = summary
+            return
+
+        # Fallback only when no prior column_sets exist.
         role_map: Dict[str, str] = {}
         if isinstance(contract, dict):
             for col in contract.get("outcome_columns", []) or []:
