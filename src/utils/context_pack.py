@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from src.utils.dataset_size import estimate_rows_fast
 from src.utils.column_sets import summarize_column_sets
+from src.utils.column_sets import summarize_column_manifest
 
 COLUMN_LIST_POINTER = "Full list in data/column_inventory.json; use selectors in data/column_sets.json"
 
@@ -213,6 +214,10 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
     if not isinstance(column_sets, dict) or not column_sets:
         column_sets = _safe_load_json(_first_existing_path(state, os.path.join("data", "column_sets.json")) or "")
     column_sets_summary = summarize_column_sets(column_sets) if isinstance(column_sets, dict) else ""
+    column_manifest = state.get("column_manifest")
+    if not isinstance(column_manifest, dict) or not column_manifest:
+        column_manifest = _safe_load_json(_first_existing_path(state, os.path.join("data", "column_manifest.json")) or "")
+    column_manifest_summary = summarize_column_manifest(column_manifest) if isinstance(column_manifest, dict) else ""
 
     artifacts: Dict[str, Any] = {}
     metrics_path = _first_existing_path(state, os.path.join("data", "metrics.json"))
@@ -273,6 +278,7 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
         "data/dataset_semantics.json",
         "data/dataset_training_mask.json",
         "data/column_sets.json",
+        "data/column_manifest.json",
         "data/column_inventory.json",
         "data/insights.json",
     ]:
@@ -294,6 +300,7 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
         "required_outputs": _summarize_if_long(required_outputs),
         "decisioning_required_columns": _summarize_if_long(decisioning_columns),
         "column_sets_summary": column_sets_summary,
+        "column_manifest_summary": column_manifest_summary,
         "guard_warnings": _limit_list([str(item) for item in guard_warnings if item], max_items=10),
         "artifacts": artifacts,
         "evidence_index": evidence_index,

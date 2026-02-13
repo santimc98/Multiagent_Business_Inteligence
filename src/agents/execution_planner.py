@@ -31,6 +31,7 @@ from src.utils.cleaning_contract_semantics import (
     extract_selector_drop_reasons,
     selector_reference_matches_any,
 )
+from src.utils.column_sets import build_column_manifest, summarize_column_sets
 from src.utils.contract_validator import (
     validate_contract_minimal_readonly,
     normalize_contract_scope,
@@ -4106,6 +4107,8 @@ class ExecutionPlannerAgent:
         data_summary: str = "",
         business_objective: str = "",
         column_inventory: list[str] | None = None,
+        column_sets: Dict[str, Any] | None = None,
+        column_manifest: Dict[str, Any] | None = None,
         output_dialect: Dict[str, str] | None = None,
         env_constraints: Dict[str, Any] | None = None,
         domain_expert_critique: str = "",
@@ -8252,10 +8255,48 @@ class ExecutionPlannerAgent:
                     break
 
         strategy_json = json.dumps(strategy, indent=2)
+        column_sets_payload = column_sets if isinstance(column_sets, dict) else {}
+        column_sets_summary = summarize_column_sets(column_sets_payload) if column_sets_payload else ""
         column_inventory_count = len(column_inventory or [])
+        manifest_payload = column_manifest if isinstance(column_manifest, dict) else {}
+        if not manifest_payload and column_inventory_count > 200:
+            try:
+                manifest_payload = build_column_manifest(
+                    column_inventory or [],
+                    column_sets=column_sets_payload,
+                    roles={},
+                )
+            except Exception:
+                manifest_payload = {}
+        manifest_mode = str(manifest_payload.get("schema_mode") or "")
+        manifest_families = manifest_payload.get("families") if isinstance(manifest_payload.get("families"), list) else []
+        manifest_anchors = manifest_payload.get("anchors") if isinstance(manifest_payload.get("anchors"), list) else []
+        manifest_for_prompt: Dict[str, Any] = {}
+        if isinstance(manifest_payload, dict) and manifest_payload:
+            manifest_for_prompt = dict(manifest_payload)
+            if len(manifest_anchors) > 60:
+                manifest_for_prompt["anchors"] = manifest_anchors[:60]
+                manifest_for_prompt["anchors_truncated"] = True
+                manifest_for_prompt["anchors_total_count"] = len(manifest_anchors)
+            if len(manifest_families) > 12:
+                manifest_for_prompt["families"] = manifest_families[:12]
+                manifest_for_prompt["families_truncated"] = True
+                manifest_for_prompt["families_total_count"] = len(manifest_families)
         column_inventory_sample = (column_inventory or [])[:25]
         inventory_truncated = column_inventory_count > 50
-        column_inventory_payload = column_inventory_sample if inventory_truncated else (column_inventory or [])
+        if manifest_mode == "wide" and manifest_for_prompt:
+            column_inventory_payload = {
+                "mode": "manifest_reference",
+                "total_columns": manifest_for_prompt.get("total_columns", column_inventory_count),
+                "anchors": manifest_for_prompt.get("anchors", []),
+                "families": manifest_for_prompt.get("families", []),
+                "instruction": (
+                    "Use anchors as explicit required columns and required_feature_selectors for dense families. "
+                    "Do not enumerate all family members."
+                ),
+            }
+        else:
+            column_inventory_payload = column_inventory_sample if inventory_truncated else (column_inventory or [])
         column_inventory_compact = compact_column_representation(column_inventory or [], max_display=40)
         strategy_feature_families = []
         if isinstance(strategy, dict):
@@ -8317,6 +8358,21 @@ column_inventory:
 
 column_inventory_compact:
 {json.dumps(column_inventory_compact, indent=2)}
+
+column_manifest:
+{json.dumps(manifest_for_prompt, indent=2)}
+
+column_manifest_mode:
+{json.dumps(manifest_mode or "none")}
+
+column_manifest_family_count:
+{len(manifest_families)}
+
+column_sets:
+{json.dumps(column_sets_payload, indent=2)}
+
+column_sets_summary:
+{column_sets_summary}
 
 strategy_feature_families:
 {json.dumps(strategy_feature_families, indent=2)}

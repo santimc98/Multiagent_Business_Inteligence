@@ -316,19 +316,20 @@ class DataEngineerAgent:
           If OUTLIER_POLICY_CONTEXT is empty/disabled, do not invent outlier rules.
 
         *** COLUMN SYNCHRONIZATION RULE (CRITICAL) ***
-        - Baseline: your output CSV MUST contain EXACTLY the columns listed in "Required Columns (DE View)".
+        - Baseline: your output CSV MUST include all columns listed in "Required Columns (DE View)".
         - If DE_VIEW_CONTEXT includes required_feature_selectors, expand them against input header and treat
           expanded columns as additional required columns (unless explicitly dropped by COLUMN_TRANSFORMATIONS_CONTEXT
           via drop_columns or via drop_policy with evidence reported in manifest).
-        - If a column exists in raw data but is NOT in required_columns, DISCARD it (do not include in output).
+        - required_columns are anchor columns; when selectors are present they are NOT the exhaustive final schema.
+        - If a column exists in raw data but is NOT in required_columns/selectors/optional_passthrough, DISCARD it.
         - Constant columns may or may not be included in required_columns depending on strategy; do not infer constants to override required_columns.
-        - Do NOT second-guess the required_columns list; it represents the final output schema after cleaning.
-        - The authoritative list is stored in data/required_columns.json (array). Use it directly; do NOT infer by counting constants.
+        - Do NOT second-guess required_columns anchors. Resolve selectors to determine full required feature families.
+        - The anchors list is stored in data/required_columns.json (array). Use it directly and combine with selectors.
         - If a required column is missing from the input, raise an error (no fabrication).
         - Optional passthrough columns: include ONLY if present in input AND listed in optional_passthrough.
 
         *** CONTRACT PRECEDENCE (CRITICAL) ***
-        - Priority 1 (binding): HARD cleaning_gates + required_columns.
+        - Priority 1 (binding): HARD cleaning_gates + required_columns + required_feature_selectors.
         - Priority 2 (binding when present): COLUMN_TRANSFORMATIONS_CONTEXT from artifact_requirements.clean_dataset.column_transformations.
           If drop_policy.allow_selector_drops_when is present, selector-expanded columns may be dropped only when
           evidence matches allowed reasons and is written to manifest.
@@ -404,6 +405,7 @@ class DataEngineerAgent:
         *** GATE CHECKLIST (CONTRACT-DRIVEN) ***
         - Enumerate cleaning_gates by column and requirement (max_null_fraction, allow_nulls, required_columns, etc.).
         - Before writing the cleaned output CSV, compute null_fraction for each gated column.
+        - For *_type_cast gates, validate conversion over the full gate scope (column or selector expansion), not only one sampled column.
         - If any HARD gate is violated, raise ValueError with a clear message: "CLEANING_GATE_FAILED: <gate_name> <details>".
         - If a gate references a column that is missing, raise ValueError (do not fabricate columns).
         """

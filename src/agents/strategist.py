@@ -144,11 +144,26 @@ class StrategistAgent:
         self,
         allowed_columns: List[str],
         column_sets: Dict[str, Any],
+        column_manifest: Dict[str, Any],
         *,
         wide_schema_mode: bool,
     ) -> str:
         if not wide_schema_mode:
             return json.dumps(allowed_columns, ensure_ascii=False)
+
+        if isinstance(column_manifest, dict) and column_manifest:
+            payload = {
+                "mode": "wide_schema_column_manifest",
+                "schema_mode": column_manifest.get("schema_mode") or "wide",
+                "total_columns": int(column_manifest.get("total_columns") or len(allowed_columns)),
+                "anchors": column_manifest.get("anchors") if isinstance(column_manifest.get("anchors"), list) else [],
+                "families": column_manifest.get("families") if isinstance(column_manifest.get("families"), list) else [],
+                "instruction": (
+                    "Use anchors as explicit required_columns. "
+                    "For dense families, use feature_families selector hints; do not enumerate all members."
+                ),
+            }
+            return json.dumps(payload, ensure_ascii=False)
 
         families = self._column_families(allowed_columns)
         family_columns = set()
@@ -283,6 +298,7 @@ class StrategistAgent:
         user_request: str,
         column_inventory: Optional[List[str]] = None,
         column_sets: Optional[Dict[str, Any]] = None,
+        column_manifest: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generates a single strategy based on the data summary and user request.
@@ -291,12 +307,14 @@ class StrategistAgent:
         from src.utils.prompting import render_prompt
         allowed_columns = self._normalize_column_inventory(column_inventory)
         column_sets_payload = column_sets if isinstance(column_sets, dict) else {}
+        column_manifest_payload = column_manifest if isinstance(column_manifest, dict) else {}
         wide_schema_threshold = self._get_wide_schema_threshold()
         wide_schema_mode = len(allowed_columns) > wide_schema_threshold
         required_columns_budget = self._get_wide_required_columns_max() if wide_schema_mode else None
         inventory_payload = self._build_inventory_payload(
             allowed_columns,
             column_sets_payload,
+            column_manifest_payload,
             wide_schema_mode=wide_schema_mode,
         )
         wide_schema_guidance = (
@@ -332,6 +350,9 @@ class StrategistAgent:
 
         *** COLUMN SETS (OPTIONAL, MAY BE EMPTY) ***
         $column_sets
+
+        *** COLUMN MANIFEST (OPTIONAL, MAY BE EMPTY) ***
+        $column_manifest
 
         *** SCHEMA MODE GUIDANCE ***
         $wide_schema_guidance
@@ -525,6 +546,7 @@ class StrategistAgent:
             data_summary=data_summary,
             authorized_column_inventory=inventory_payload,
             column_sets=json.dumps(column_sets_payload, ensure_ascii=False),
+            column_manifest=json.dumps(column_manifest_payload, ensure_ascii=False),
             wide_schema_guidance=wide_schema_guidance,
             required_columns_budget_guidance=required_columns_budget_guidance,
             user_request=user_request,

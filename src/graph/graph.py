@@ -68,7 +68,12 @@ from src.utils.cleaning_guards import (
 from src.utils.integrity_audit import run_integrity_audit
 from src.utils.output_contract import check_required_outputs, get_csv_dialect
 from src.utils.cloudrun_launcher import launch_heavy_runner_job, CloudRunLaunchError
-from src.utils.column_sets import expand_column_sets
+from src.utils.column_sets import (
+    expand_column_sets,
+    summarize_column_sets,
+    build_column_manifest,
+    summarize_column_manifest,
+)
 from src.utils.sandbox_deps import (
     check_dependency_precheck,
     get_sandbox_install_packages,
@@ -146,7 +151,6 @@ from src.utils.json_sanitize import dump_json
 from src.utils.run_facts_pack import build_run_facts_pack, format_run_facts_block
 from src.utils.context_pack import build_context_pack, compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
 from src.utils.dataset_semantics import summarize_dataset_semantics
-from src.utils.column_sets import summarize_column_sets
 from src.utils.dataset_evidence import read_header, scan_missingness, scan_uniques, sample_rows
 from src.utils.data_atlas import (
     build_data_atlas,
@@ -1220,10 +1224,13 @@ def _prepend_dataset_semantics_summary(text: str, state: Dict[str, Any]) -> str:
         return text
     summary = state.get("dataset_semantics_summary")
     column_sets_summary = state.get("column_sets_summary")
+    column_manifest_summary = state.get("column_manifest_summary")
     data_atlas_summary = state.get("data_atlas_summary")
     combined = summary or ""
     if column_sets_summary:
         combined = f"{combined}\n{column_sets_summary}" if combined else column_sets_summary
+    if column_manifest_summary:
+        combined = f"{combined}\n{column_manifest_summary}" if combined else column_manifest_summary
     if data_atlas_summary:
         combined = f"{combined}\n{data_atlas_summary}" if combined else data_atlas_summary
     if not combined:
@@ -5608,6 +5615,11 @@ def _infer_de_failure_cause(text: str) -> str:
         return "Type conversion missing; numeric ops executed on string/object data."
     if "invalid error value specified" in lower and "to_numeric" in lower:
         return "Invalid pd.to_numeric(errors=...) argument used; only supported values are accepted by current pandas runtime."
+    if "cleaning_gate_failed" in lower and ("not converted to float" in lower or "not converted to int" in lower):
+        return (
+            "Type-cast gate validation is too strict/order-dependent. Cast explicitly to the requested dtype "
+            "for the full selector set before validating and before any drop/selection steps."
+        )
     if "numpy.bool_" in lower and "not serializable" in lower:
         return "JSON serialization failed due to numpy.bool_ values not handled in _json_default."
     if "json" in lower and "default" in lower:
@@ -5740,11 +5752,46 @@ def _build_de_runtime_diagnosis(error_details: str) -> List[str]:
         lines.append(
             "pd.to_numeric received an unsupported errors= value for this pandas runtime; use a valid option and handle exceptions explicitly."
         )
+    if "cleaning_gate_failed" in lower and ("not converted to float" in lower or "not converted to int" in lower):
+        lines.append(
+            "For *_type_cast gates, cast full selector/column sets explicitly (e.g., astype(float)/astype('Int64')) before gate assertions."
+        )
+        lines.append(
+            "Validate conversion over all required columns (or selector expansion), not only a single sampled column."
+        )
     if "keyerror" in lower and "'score'" in lower:
         lines.append(
             "KeyError on 'Score' suggests conversion metadata was updated before creating a 'Score' entry or the column mapping for Score did not run."
         )
     return lines
+
+
+def _build_de_gate_implementation_hints(cleaning_gates: Any) -> List[str]:
+    if not isinstance(cleaning_gates, list) or not cleaning_gates:
+        return []
+    hints: List[str] = []
+    for gate in cleaning_gates:
+        if not isinstance(gate, dict):
+            continue
+        name = str(gate.get("name") or "").strip()
+        params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+        target_type = str(params.get("target_type") or "").strip().lower()
+        if not target_type:
+            continue
+        ref = str(params.get("column") or params.get("selector") or "gate_scope")
+        if target_type in {"float", "int", "integer", "numeric"}:
+            hints.append(
+                f"{name or 'type_cast_gate'} on {ref}: cast explicitly to {target_type} across the full scope before assertions."
+            )
+    seen = set()
+    deduped: List[str] = []
+    for hint in hints:
+        if hint in seen:
+            continue
+        seen.add(hint)
+        deduped.append(hint)
+    return deduped[:10]
+
 
 def _merge_de_audit_override(base: str, payload: str) -> str:
     base = base or ""
@@ -8544,6 +8591,11 @@ class AgentState(TypedDict):
     dataset_semantics_summary: str
     dataset_training_mask: Dict[str, Any]
     column_inventory: List[str]
+    column_inventory_columns: List[str]
+    column_sets: Dict[str, Any]
+    column_sets_summary: str
+    column_manifest: Dict[str, Any]
+    column_manifest_summary: str
     run_facts_pack: Dict[str, Any]
     run_facts_block: str
     # Reviewer State
@@ -8758,6 +8810,8 @@ def run_steward(state: AgentState) -> AgentState:
     dataset_semantics_summary = ""
     column_sets = {}
     column_sets_summary = ""
+    column_manifest = {}
+    column_manifest_summary = ""
     data_atlas = {}
     data_atlas_summary = ""
     steward_evidence_bundle = {}
@@ -8919,6 +8973,26 @@ def run_steward(state: AgentState) -> AgentState:
 
         dataset_semantics_summary = summarize_dataset_semantics(dataset_semantics, dataset_training_mask)
         column_sets_summary = summarize_column_sets(column_sets) if column_sets else ""
+        try:
+            role_map_for_manifest: Dict[str, str] = {}
+            if primary_target:
+                role_map_for_manifest[str(primary_target)] = "target_candidate"
+            for col in split_candidates:
+                if col:
+                    role_map_for_manifest[str(col)] = "split_candidate"
+            for col in id_candidates:
+                if col:
+                    role_map_for_manifest[str(col)] = "id_like"
+            column_manifest = build_column_manifest(
+                header_cols,
+                column_sets=column_sets if isinstance(column_sets, dict) else {},
+                roles=role_map_for_manifest,
+            )
+            column_manifest_summary = summarize_column_manifest(column_manifest)
+        except Exception as manifest_err:
+            print(f"Warning: failed to build column_manifest: {manifest_err}")
+            column_manifest = {}
+            column_manifest_summary = ""
         steward_context_quality = validate_steward_semantics(
             dataset_semantics=dataset_semantics,
             dataset_training_mask=dataset_training_mask,
@@ -8935,8 +9009,12 @@ def run_steward(state: AgentState) -> AgentState:
             dump_json("data/dataset_semantics.json", dataset_semantics)
             dump_json("data/dataset_training_mask.json", dataset_training_mask)
             dump_json("data/column_sets.json", column_sets)
+            dump_json("data/column_manifest.json", column_manifest)
             dump_json("data/steward_evidence_bundle.json", steward_evidence_bundle)
             dump_json("data/steward_semantics_quality.json", steward_context_quality)
+            if column_manifest_summary:
+                with open("data/column_manifest_summary.txt", "w", encoding="utf-8") as f_manifest_summary:
+                    f_manifest_summary.write(column_manifest_summary)
         except Exception as sem_write_err:
             print(f"Warning: failed to persist dataset semantics artifacts: {sem_write_err}")
     except Exception as sem_err:
@@ -8957,6 +9035,21 @@ def run_steward(state: AgentState) -> AgentState:
                 dump_json("data/column_sets.json", column_sets)
             except Exception as cs_err:
                 print(f"Warning: failed to build column_sets fallback after semantics error: {cs_err}")
+        try:
+            column_manifest = build_column_manifest(
+                header_cols,
+                column_sets=column_sets if isinstance(column_sets, dict) else {},
+                roles={},
+            )
+            column_manifest_summary = summarize_column_manifest(column_manifest)
+            if column_manifest:
+                os.makedirs("data", exist_ok=True)
+                dump_json("data/column_manifest.json", column_manifest)
+                if column_manifest_summary:
+                    with open("data/column_manifest_summary.txt", "w", encoding="utf-8") as f_manifest_summary:
+                        f_manifest_summary.write(column_manifest_summary)
+        except Exception as manifest_err:
+            print(f"Warning: failed to build column_manifest fallback: {manifest_err}")
     if isinstance(state, dict):
         state["data_atlas"] = data_atlas
         state["data_atlas_summary"] = data_atlas_summary
@@ -8969,6 +9062,8 @@ def run_steward(state: AgentState) -> AgentState:
         state["dataset_semantics_summary"] = dataset_semantics_summary
         state["column_sets"] = column_sets
         state["column_sets_summary"] = column_sets_summary
+        state["column_manifest"] = column_manifest
+        state["column_manifest_summary"] = column_manifest_summary
 
     log_run_event(
         run_id,
@@ -9008,6 +9103,8 @@ def run_steward(state: AgentState) -> AgentState:
         "steward_context_error": steward_context_error,
         "column_sets": column_sets,
         "column_sets_summary": column_sets_summary,
+        "column_manifest": column_manifest,
+        "column_manifest_summary": column_manifest_summary,
         "iteration_count": 0,
         "compliance_iterations": 0,
         "metric_iterations": 0,
@@ -9083,11 +9180,15 @@ def run_strategist(state: AgentState) -> AgentState:
     column_sets = state.get("column_sets")
     if not isinstance(column_sets, dict):
         column_sets = {}
+    column_manifest = state.get("column_manifest")
+    if not isinstance(column_manifest, dict) or not column_manifest:
+        column_manifest = _load_json_safe("data/column_manifest.json") or {}
     result = strategist.generate_strategies(
         data_summary,
         user_context,
         column_inventory=column_inventory,
         column_sets=column_sets,
+        column_manifest=column_manifest if isinstance(column_manifest, dict) else {},
     )
     run_id = state.get("run_id")
     if run_id:
@@ -9101,6 +9202,16 @@ def run_strategist(state: AgentState) -> AgentState:
                 "user_context": user_context,
                 "column_inventory_count": len(column_inventory),
                 "column_sets_keys": sorted(list(column_sets.keys()))[:30] if isinstance(column_sets, dict) else [],
+                "column_manifest_mode": (
+                    str(column_manifest.get("schema_mode"))
+                    if isinstance(column_manifest, dict) and column_manifest.get("schema_mode")
+                    else "none"
+                ),
+                "column_manifest_family_count": (
+                    int(column_manifest.get("family_count") or 0)
+                    if isinstance(column_manifest, dict)
+                    else 0
+                ),
             },
         )
     # Defensive handling of strategist result types (Fix for potential crashes)
@@ -11222,6 +11333,12 @@ def run_execution_planner(state: AgentState) -> AgentState:
         column_inventory = header_df.columns.tolist()
     except Exception as inv_err:
         print(f"Warning: failed to read column inventory: {inv_err}")
+    column_sets = state.get("column_sets")
+    if not isinstance(column_sets, dict) or not column_sets:
+        column_sets = _load_json_safe("data/column_sets.json") or {}
+    column_manifest = state.get("column_manifest")
+    if not isinstance(column_manifest, dict) or not column_manifest:
+        column_manifest = _load_json_safe("data/column_manifest.json") or {}
     try:
         # Prepare output_dialect from state (csv dialect detected by steward)
         output_dialect = {
@@ -11244,6 +11361,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
             data_summary=data_summary_for_planner,
             business_objective=business_objective,
             column_inventory=column_inventory,
+            column_sets=column_sets if isinstance(column_sets, dict) else {},
+            column_manifest=column_manifest if isinstance(column_manifest, dict) else {},
             output_dialect=output_dialect,
             env_constraints=env_constraints,
             domain_expert_critique=domain_expert_critique,
@@ -12574,6 +12693,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     diagnosis_lines = _build_de_runtime_diagnosis(runtime_error_text)
                     if diagnosis_lines:
                         payload += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
+                    de_view_for_hints = state.get("de_view") if isinstance(state.get("de_view"), dict) else {}
+                    gate_hints = _build_de_gate_implementation_hints(de_view_for_hints.get("cleaning_gates"))
+                    if gate_hints:
+                        payload += "\nGATE_IMPLEMENTATION_HINTS:\n- " + "\n- ".join(gate_hints)
                     try:
                         required_input = _resolve_required_input_columns(
                             state.get("execution_contract", {}), selected
@@ -13039,6 +13162,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     diagnosis_lines = _build_de_runtime_diagnosis(error_details)
                                     if diagnosis_lines:
                                         override += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
+                                    de_view_for_hints = state.get("de_view") if isinstance(state.get("de_view"), dict) else {}
+                                    gate_hints = _build_de_gate_implementation_hints(de_view_for_hints.get("cleaning_gates"))
+                                    if gate_hints:
+                                        override += "\nGATE_IMPLEMENTATION_HINTS:\n- " + "\n- ".join(gate_hints)
                                     explainer_text = ""
                                     try:
                                         required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)

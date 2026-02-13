@@ -21,6 +21,67 @@ def _collect_explicit_columns(columns: List[str], roles: Dict[str, str] | None) 
     return explicit
 
 
+def _match_selector_columns(
+    columns: List[str],
+    selector: Dict[str, Any],
+    *,
+    excluded: set[str] | None = None,
+) -> List[str]:
+    selector = selector if isinstance(selector, dict) else {}
+    selector_type = str(selector.get("type") or "").strip().lower()
+    excluded_set = excluded if isinstance(excluded, set) else set()
+    if not columns or not selector_type:
+        return []
+
+    matched: List[str] = []
+    if selector_type == "prefix_numeric_range":
+        prefix = str(selector.get("prefix") or "")
+        start = selector.get("start")
+        end = selector.get("end")
+        if prefix and isinstance(start, int) and isinstance(end, int):
+            lo = min(start, end)
+            hi = max(start, end)
+            for col in columns:
+                if col in excluded_set:
+                    continue
+                match = _NUMERIC_SUFFIX_RE.match(col)
+                if not match:
+                    continue
+                if match.group(1) != prefix:
+                    continue
+                idx = int(match.group(2))
+                if lo <= idx <= hi:
+                    matched.append(col)
+    elif selector_type == "regex":
+        pattern = selector.get("pattern")
+        if pattern:
+            try:
+                regex = re.compile(str(pattern))
+            except re.error:
+                return []
+            matched = [col for col in columns if col not in excluded_set and regex.match(col)]
+    elif selector_type == "prefix":
+        token = str(selector.get("value") or selector.get("prefix") or "")
+        if token:
+            matched = [col for col in columns if col not in excluded_set and col.startswith(token)]
+    elif selector_type == "all_numeric_except":
+        excluded_cols = set(_normalize_columns(selector.get("except_columns") or []))
+        excluded_cols |= excluded_set
+        matched = [col for col in columns if col not in excluded_cols]
+    elif selector_type == "all_columns_except":
+        excluded_cols = set(_normalize_columns(selector.get("except_columns") or []))
+        excluded_cols |= excluded_set
+        matched = [col for col in columns if col not in excluded_cols]
+    elif selector_type == "list":
+        listed = _normalize_columns(selector.get("columns") or [])
+        for col in listed:
+            if col in excluded_set:
+                continue
+            if col in columns and col not in matched:
+                matched.append(col)
+    return matched
+
+
 def build_column_sets(
     columns: List[str],
     roles: Dict[str, str] | None = None,
@@ -100,36 +161,7 @@ def expand_column_sets(columns: List[str], sets_spec: Dict[str, Any]) -> Dict[st
         selector = entry.get("selector") if isinstance(entry, dict) else {}
         if not isinstance(selector, dict):
             selector = {}
-        selector_type = selector.get("type")
-        matched: List[str] = []
-
-        if selector_type == "prefix_numeric_range":
-            prefix = str(selector.get("prefix") or "")
-            start = selector.get("start")
-            end = selector.get("end")
-            if prefix and isinstance(start, int) and isinstance(end, int):
-                for col in cols:
-                    if col in explicit_set:
-                        continue
-                    match = _NUMERIC_SUFFIX_RE.match(col)
-                    if not match:
-                        continue
-                    if match.group(1) != prefix:
-                        continue
-                    idx = int(match.group(2))
-                    if start <= idx <= end:
-                        matched.append(col)
-        elif selector_type == "regex":
-            pattern = selector.get("pattern")
-            if pattern:
-                regex = re.compile(str(pattern))
-                matched = [col for col in cols if col not in explicit_set and regex.match(col)]
-        elif selector_type == "all_numeric_except":
-            excluded = set(_normalize_columns(selector.get("except_columns") or [])) | explicit_set
-            matched = [col for col in cols if col not in excluded]
-        elif selector_type == "all_columns_except":
-            excluded = set(_normalize_columns(selector.get("except_columns") or [])) | explicit_set
-            matched = [col for col in cols if col not in excluded]
+        matched = _match_selector_columns(cols, selector, excluded=explicit_set)
 
         for col in matched:
             if col in expanded_seen or col in explicit_set:
@@ -142,6 +174,112 @@ def expand_column_sets(columns: List[str], sets_spec: Dict[str, Any]) -> Dict[st
         "expanded_feature_columns": expanded,
         "debug": debug,
     }
+
+
+def build_column_manifest(
+    columns: List[str],
+    *,
+    column_sets: Dict[str, Any] | None = None,
+    roles: Dict[str, str] | None = None,
+    min_family_size: int = 10,
+) -> Dict[str, Any]:
+    """
+    Build a compact schema manifest that is stable for wide datasets.
+
+    Notes:
+    - This manifest is structural (header-based). It does not infer business roles
+      beyond anchor hints already provided by upstream agents/roles.
+    - It complements (does not replace) contract/view artifacts.
+    """
+    cols = _normalize_columns(columns or [])
+    sets_spec = column_sets if isinstance(column_sets, dict) else {}
+    explicit_from_sets = _normalize_columns(sets_spec.get("explicit_columns") or [])
+    anchors = explicit_from_sets or _collect_explicit_columns(cols, roles)
+    anchor_set = set(anchors)
+
+    families: List[Dict[str, Any]] = []
+    sets_raw = sets_spec.get("sets") if isinstance(sets_spec.get("sets"), list) else []
+    next_family_id = 1
+    for entry in sets_raw:
+        if not isinstance(entry, dict):
+            continue
+        selector = entry.get("selector")
+        if not isinstance(selector, dict):
+            continue
+        matched = _match_selector_columns(cols, selector, excluded=anchor_set)
+        if len(matched) < int(max(1, min_family_size)):
+            continue
+        family_name = str(entry.get("name") or "").strip()
+        if not family_name:
+            family_name = f"family_{next_family_id}"
+            next_family_id += 1
+        family = {
+            "family_id": family_name,
+            "selector": selector,
+            "count": len(matched),
+            "examples": [matched[0], matched[len(matched) // 2], matched[-1]],
+            "role": "feature",
+        }
+        families.append(family)
+
+    schema_mode = "wide" if len(cols) > 200 and bool(families) else "normal"
+    covered = set()
+    for family in families:
+        selector = family.get("selector")
+        covered.update(_match_selector_columns(cols, selector if isinstance(selector, dict) else {}, excluded=anchor_set))
+    leftovers = [col for col in cols if col not in anchor_set and col not in covered]
+
+    return {
+        "schema_mode": schema_mode,
+        "total_columns": len(cols),
+        "anchors": anchors,
+        "families": families,
+        "anchor_count": len(anchors),
+        "family_count": len(families),
+        "covered_family_columns": len(covered),
+        "leftovers_count": len(leftovers),
+        "leftovers_sample": leftovers[:40],
+    }
+
+
+def summarize_column_manifest(column_manifest: Dict[str, Any]) -> str:
+    if not isinstance(column_manifest, dict) or not column_manifest:
+        return ""
+    mode = str(column_manifest.get("schema_mode") or "unknown")
+    total = column_manifest.get("total_columns")
+    anchors = column_manifest.get("anchors") if isinstance(column_manifest.get("anchors"), list) else []
+    families = column_manifest.get("families") if isinstance(column_manifest.get("families"), list) else []
+    lines = ["COLUMN_MANIFEST_SUMMARY:"]
+    lines.append(f"- schema_mode: {mode}")
+    if isinstance(total, int):
+        lines.append(f"- total_columns: {total}")
+    lines.append(f"- anchors_count: {len(anchors)}")
+    if anchors:
+        lines.append(f"- anchors_sample: {anchors[:10]}")
+    lines.append(f"- families_count: {len(families)}")
+    if families:
+        family_bits: List[str] = []
+        for fam in families[:6]:
+            if not isinstance(fam, dict):
+                continue
+            family_id = str(fam.get("family_id") or "family")
+            selector = fam.get("selector") if isinstance(fam.get("selector"), dict) else {}
+            sel_type = str(selector.get("type") or "unknown")
+            count = fam.get("count")
+            if sel_type == "prefix_numeric_range":
+                detail = f"{selector.get('prefix')}{selector.get('start')}..{selector.get('end')}"
+            elif sel_type == "regex":
+                detail = str(selector.get("pattern") or "")
+            else:
+                detail = sel_type
+            count_txt = str(count) if isinstance(count, int) else "?"
+            family_bits.append(f"{family_id}({detail}, count={count_txt})")
+        if family_bits:
+            lines.append(f"- families: {family_bits}")
+    leftovers_count = column_manifest.get("leftovers_count")
+    if isinstance(leftovers_count, int) and leftovers_count > 0:
+        lines.append(f"- leftovers_count: {leftovers_count}")
+    return "\n".join(lines)
 
 
 def summarize_column_sets(column_sets: Dict[str, Any], max_sets: int = 5) -> str:

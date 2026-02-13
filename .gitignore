@@ -109,3 +109,7 @@ data/data_profile.json
 
 # Work directory (runtime artifacts)
 work/
+
+# Local analysis notes
+Solución_csvs_ancho.md
+Solucion_csvs_ancho.md
