@@ -7435,6 +7435,10 @@ domain_expert_critique:
         best_parse_feedback: str | None = None
         best_error_count: Optional[int] = None
         best_warning_count: Optional[int] = None
+        latest_candidate_for_repair: Dict[str, Any] | None = None
+        latest_validation_for_repair: Dict[str, Any] | None = None
+        latest_response_text_for_repair: str | None = None
+        latest_parse_feedback_for_repair: str | None = None
 
         max_quality_rounds = 3
         try:
@@ -7582,6 +7586,10 @@ domain_expert_critique:
                                 ],
                                 "summary": {"error_count": 1, "warning_count": 0},
                             }
+                        latest_candidate_for_repair = parsed
+                        latest_validation_for_repair = validation_result if isinstance(validation_result, dict) else None
+                        latest_response_text_for_repair = response_text
+                        latest_parse_feedback_for_repair = None
                         quality_accepted = _contract_is_accepted(validation_result)
                         if not quality_accepted:
                             primary_rule = None
@@ -7623,6 +7631,8 @@ domain_expert_critique:
                                 best_parse_feedback = None
                     else:
                         parse_feedback = _build_parse_feedback(response_text, parse_error)
+                        latest_response_text_for_repair = response_text
+                        latest_parse_feedback_for_repair = parse_feedback
                         if best_response_text is None:
                             best_response_text = response_text
                             best_parse_feedback = parse_feedback
@@ -7685,11 +7695,31 @@ domain_expert_critique:
                     break
 
                 current_prompt_name = f"prompt_attempt_{quality_round + 1}_repair.txt"
+                repair_contract = (
+                    latest_candidate_for_repair
+                    if isinstance(latest_candidate_for_repair, dict)
+                    else best_candidate
+                )
+                repair_validation = (
+                    latest_validation_for_repair
+                    if isinstance(latest_validation_for_repair, dict)
+                    else best_validation
+                )
+                repair_response_text = (
+                    latest_response_text_for_repair
+                    if isinstance(latest_response_text_for_repair, str)
+                    else best_response_text
+                )
+                repair_parse_feedback = (
+                    latest_parse_feedback_for_repair
+                    if isinstance(latest_parse_feedback_for_repair, str)
+                    else best_parse_feedback
+                )
                 current_prompt = _build_quality_repair_prompt(
-                    previous_contract=best_candidate,
-                    previous_validation=best_validation,
-                    previous_response_text=best_response_text,
-                    previous_parse_feedback=best_parse_feedback,
+                    previous_contract=repair_contract,
+                    previous_validation=repair_validation,
+                    previous_response_text=repair_response_text,
+                    previous_parse_feedback=repair_parse_feedback,
                     original_inputs_text=user_input,
                 )
                 if not round_has_candidate:
