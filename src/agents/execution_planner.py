@@ -6764,7 +6764,10 @@ class ExecutionPlannerAgent:
         def _validate_contract_quality(contract_payload: Dict[str, Any] | None) -> Dict[str, Any]:
             base_result: Dict[str, Any]
             try:
-                base_result = validate_contract_minimal_readonly(copy.deepcopy(contract_payload or {}))
+                base_result = validate_contract_minimal_readonly(
+                    copy.deepcopy(contract_payload or {}),
+                    column_inventory=column_inventory,
+                )
             except Exception as val_err:
                 base_result = {
                     "status": "error",

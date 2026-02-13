@@ -2690,12 +2690,22 @@ def _collect_ml_required_columns(contract: Dict[str, Any]) -> Tuple[List[str], L
     return required, selector_hints
 
 
-def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
+def validate_contract_minimal_readonly(
+    contract: Dict[str, Any],
+    column_inventory: List[str] | None = None,
+) -> Dict[str, Any]:
     """
     Minimal, scope-driven contract validation.
 
     Designed for LLM freedom: validates only the stable interface needed by the
     orchestrator and downstream agents, without enforcing a rigid monolithic schema.
+
+    Args:
+        contract: The execution contract dict to validate.
+        column_inventory: Full column header list from the dataset. When provided,
+            required_feature_selectors are expanded against this list instead of
+            canonical_columns alone (critical for wide-schema datasets where
+            canonical_columns only has anchor columns like ["label", "__split"]).
     """
     issues: List[Dict[str, Any]] = []
 
@@ -2854,10 +2864,19 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             clean_dataset.get("optional_passthrough_columns")
         )
         canonical_cols, _ = _normalize_nonempty_str_list(canonical_columns if isinstance(canonical_columns, list) else [])
+        # Wide-schema fix: canonical_columns may only contain anchor columns
+        # (e.g. ["label","__split"]) while 784 pixel columns are represented by
+        # selectors.  Use the full column_inventory when available so that
+        # prefix_numeric_range / regex selectors actually resolve.
+        _selector_candidates = (
+            [str(c) for c in column_inventory if isinstance(c, str) and c.strip()]
+            if column_inventory
+            else canonical_cols
+        )
         required_feature_selectors = clean_dataset.get("required_feature_selectors")
         selector_cols, selector_issues = _expand_required_feature_selectors(
             required_feature_selectors,
-            canonical_cols,
+            _selector_candidates,
         )
         if selector_issues:
             issues.append(
@@ -3020,9 +3039,25 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
 
         hard_gate_cols = _collect_gate_column_refs(contract.get("cleaning_gates"), hard_only=True)
         hard_gate_norm = {col.lower(): col for col in hard_gate_cols}
+        # Wide-schema: HARD gates may reference selector family tokens
+        # (e.g. "PIXEL_FEATURES") instead of individual columns.  Treat
+        # declared selector names / family_ids as "covered" so they don't
+        # trip the contradiction rule.
+        _selector_family_ids: set[str] = set()
+        if has_declared_selectors and isinstance(required_feature_selectors, list):
+            for _sel in required_feature_selectors:
+                if isinstance(_sel, dict):
+                    for _fkey in ("name", "family_id", "family"):
+                        _fval = _sel.get(_fkey)
+                        if isinstance(_fval, str) and _fval.strip():
+                            _selector_family_ids.add(_fval.strip().lower())
         gate_missing = [
             hard_gate_norm[key]
-            for key in sorted(set(hard_gate_norm) - (set(required_norm) | set(passthrough_norm) | set(selector_norm)))
+            for key in sorted(
+                set(hard_gate_norm)
+                - (set(required_norm) | set(passthrough_norm)
+                   | set(selector_norm) | _selector_family_ids)
+            )
         ]
         if gate_missing:
             issues.append(
