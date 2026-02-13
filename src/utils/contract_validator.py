@@ -2291,6 +2291,29 @@ def _normalize_nonempty_str_list(value: Any) -> Tuple[List[str], List[Any]]:
     return deduped, invalid
 
 
+def _looks_like_selector_token(value: str) -> bool:
+    """
+    Heuristic detector for selector-like feature tokens (wildcards/regex patterns).
+
+    These tokens are valid as family hints but are not concrete column names and
+    must not be validated as literal columns.
+    """
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    if not token:
+        return False
+    if "*" in token or "?" in token:
+        return True
+    if token.startswith("^") or token.endswith("$"):
+        return True
+    if "\\d" in token or "\\w" in token or "\\s" in token:
+        return True
+    if any(ch in token for ch in ("[", "]", "(", ")", "{", "}", "|", "+")):
+        return True
+    return False
+
+
 def _flatten_runbook_text(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -2511,18 +2534,28 @@ def _expand_required_feature_selectors(
     return expanded, issues
 
 
-def _collect_ml_required_columns(contract: Dict[str, Any]) -> List[str]:
+def _collect_ml_required_columns(contract: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     """
     Collect columns the ML stage depends on, using contract-declared semantics only.
+
+    Returns:
+      - concrete_columns: concrete column identifiers
+      - selector_hints: selector-like tokens (e.g., wildcard/regex) that should
+        be represented via clean_dataset.required_feature_selectors
     """
     if not isinstance(contract, dict):
-        return []
+        return [], []
 
     required: List[str] = []
+    selector_hints: List[str] = []
 
     def _extend(values: Any) -> None:
         cols, _ = _normalize_nonempty_str_list(values)
         for col in cols:
+            if _looks_like_selector_token(col):
+                if col not in selector_hints:
+                    selector_hints.append(col)
+                continue
             if col not in required:
                 required.append(col)
 
@@ -2555,7 +2588,7 @@ def _collect_ml_required_columns(contract: Dict[str, Any]) -> List[str]:
             forbidden_norm = {col.lower() for col in forbidden}
             required = [col for col in required if col.lower() not in forbidden_norm]
 
-    return required
+    return required, selector_hints
 
 
 def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -2834,7 +2867,28 @@ def validate_contract_minimal_readonly(contract: Dict[str, Any]) -> Dict[str, An
             )
 
         if requires_ml:
-            ml_required_cols = _collect_ml_required_columns(contract)
+            ml_required_cols, ml_selector_hints = _collect_ml_required_columns(contract)
+            if ml_selector_hints:
+                issues.append(
+                    _strict_issue(
+                        "contract.ml_required_selector_hints",
+                        "warning",
+                        "Selector-like ML feature tokens detected in role/feature fields; treated as hints "
+                        "and excluded from literal column coverage checks. Use clean_dataset.required_feature_selectors "
+                        "to declare feature families.",
+                        ml_selector_hints[:25],
+                    )
+                )
+                if not selector_cols:
+                    issues.append(
+                        _strict_issue(
+                            "contract.clean_dataset_selector_hints_unresolved",
+                            "warning",
+                            "Selector-like ML feature hints are present but clean_dataset.required_feature_selectors "
+                            "is empty. Declare selectors explicitly to improve cleaning/ML alignment.",
+                            ml_selector_hints[:25],
+                        )
+                    )
             ml_required_norm = {col.lower(): col for col in ml_required_cols}
             coverage_norm = set(required_norm) | set(passthrough_norm) | set(selector_norm)
             missing_ml_cols = [
