@@ -17,6 +17,14 @@ from src.utils.senior_protocol import (
     SENIOR_REASONING_PROTOCOL_GENERAL,
 )
 from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
+from src.utils.sandbox_deps import (
+    BASE_ALLOWLIST,
+    EXTENDED_ALLOWLIST,
+    CLOUDRUN_NATIVE_ALLOWLIST,
+    CLOUDRUN_OPTIONAL_ALLOWLIST,
+    BANNED_ALWAYS_ALLOWLIST,
+    check_dependency_precheck,
+)
 
 # NOTE: scan_code_safety referenced by tests as a required safety mechanism.
 # ML code executes in sandbox; keep the reference for integration checks.
@@ -155,6 +163,172 @@ class MLEngineerAgent:
             raise ValueError(f"Unsupported ML_ENGINEER_PROVIDER: {self.provider}")
         self.last_prompt = None
         self.last_response = None
+
+    def _build_runtime_dependency_context(
+        self,
+        required_dependencies: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        required_roots = []
+        for dep in (required_dependencies or []):
+            token = str(dep or "").strip()
+            if not token:
+                continue
+            required_roots.append(token.split(".")[0].lower())
+        required_roots = sorted(list({dep for dep in required_roots if dep}))
+
+        runtime_mode = (
+            os.getenv("RUN_EXECUTION_MODE")
+            or os.getenv("EXECUTION_RUNTIME_MODE")
+            or "cloudrun"
+        ).strip().lower()
+        backend_profile = "local" if runtime_mode == "local" else "cloudrun"
+
+        return {
+            "backend_profile": backend_profile,
+            "runtime_mode": runtime_mode,
+            "required_dependencies": required_roots,
+            "allowlist": {
+                "base": sorted({str(item) for item in BASE_ALLOWLIST if str(item).strip()}),
+                "extended_optional": sorted(
+                    {str(item) for item in EXTENDED_ALLOWLIST if str(item).strip()}
+                ),
+                "cloudrun_native": sorted(
+                    {str(item) for item in CLOUDRUN_NATIVE_ALLOWLIST if str(item).strip()}
+                ),
+                "cloudrun_optional": sorted(
+                    {str(item) for item in CLOUDRUN_OPTIONAL_ALLOWLIST if str(item).strip()}
+                ),
+            },
+            "blocked_always": sorted(
+                {str(item) for item in BANNED_ALWAYS_ALLOWLIST if str(item).strip()}
+            ),
+            "guidance": [
+                "Import only runtime-compatible dependencies.",
+                "When optional dependencies are used, ensure they are contract-declared.",
+                "Prefer robust fallbacks with base stack when optional libs are unavailable.",
+            ],
+        }
+
+    def _build_data_sample_context(
+        self,
+        data_path: str,
+        csv_encoding: str,
+        csv_sep: str,
+        csv_decimal: str,
+        max_rows: int = 5,
+        max_cols: int = 30,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "status": "unavailable",
+            "reason": "data_not_accessible_at_prompt_time",
+            "path": str(data_path or ""),
+        }
+        path = str(data_path or "").strip()
+        if not path or not os.path.exists(path):
+            return payload
+        try:
+            import pandas as pd
+
+            preview = pd.read_csv(
+                path,
+                nrows=max_rows,
+                dtype=str,
+                sep=csv_sep or ",",
+                decimal=csv_decimal or ".",
+                encoding=csv_encoding or "utf-8",
+                low_memory=False,
+            )
+            cols = [str(col) for col in preview.columns.tolist()]
+            shown_cols = cols[:max_cols]
+            payload = {
+                "status": "available",
+                "path": path,
+                "shape_preview": {"rows": int(preview.shape[0]), "cols": int(preview.shape[1])},
+                "preview_columns": shown_cols,
+                "preview_columns_truncated": len(cols) > max_cols,
+                "preview_rows": preview[shown_cols].fillna("<NA>").to_dict(orient="records"),
+                "dtypes_preview": {col: str(dtype) for col, dtype in preview[shown_cols].dtypes.items()},
+                "null_counts_preview": {
+                    col: int(preview[shown_cols][col].isnull().sum()) for col in shown_cols
+                },
+            }
+        except Exception as sample_err:
+            payload = {
+                "status": "unavailable",
+                "reason": f"sample_read_error: {sample_err}",
+                "path": path,
+            }
+        return payload
+
+    def _compact_cleaned_data_summary_for_prompt(
+        self,
+        summary: Dict[str, Any] | None,
+        max_columns: int = 40,
+        max_groups: int = 12,
+    ) -> Dict[str, Any]:
+        if not isinstance(summary, dict):
+            return {}
+        compact = dict(summary)
+        col_summaries = summary.get("column_summaries")
+        if not isinstance(col_summaries, list) or not col_summaries:
+            return compact
+
+        required_cols = summary.get("required_columns")
+        required_set = {str(c).lower() for c in required_cols} if isinstance(required_cols, list) else set()
+        split_col = str(summary.get("split_column") or "").strip().lower()
+
+        prioritized: List[Dict[str, Any]] = []
+        remainder: List[Dict[str, Any]] = []
+        for item in col_summaries:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("column_name") or "").strip()
+            if not name:
+                continue
+            key = name.lower()
+            if key in required_set or (split_col and key == split_col):
+                prioritized.append(item)
+            else:
+                remainder.append(item)
+
+        by_signature: Dict[str, Dict[str, Any]] = {}
+        for item in remainder:
+            dtype_obs = str(item.get("dtype_observed") or "unknown")
+            null_frac = item.get("null_frac")
+            null_token = "unknown"
+            if isinstance(null_frac, (int, float)):
+                null_token = f"{float(null_frac):.6f}"
+            signature = f"{dtype_obs}|{null_token}"
+            bucket = by_signature.setdefault(
+                signature,
+                {
+                    "dtype_observed": dtype_obs,
+                    "null_frac": null_frac,
+                    "count": 0,
+                    "sample_columns": [],
+                },
+            )
+            bucket["count"] += 1
+            if len(bucket["sample_columns"]) < 10:
+                bucket["sample_columns"].append(str(item.get("column_name")))
+
+        groups = sorted(
+            by_signature.values(),
+            key=lambda x: int(x.get("count") or 0),
+            reverse=True,
+        )[:max_groups]
+
+        kept: List[Dict[str, Any]] = prioritized[:max_columns]
+        remaining_slots = max(0, max_columns - len(kept))
+        if remaining_slots > 0:
+            kept.extend(remainder[:remaining_slots])
+
+        compact["column_summaries"] = kept
+        compact["column_summaries_truncated"] = len(col_summaries) > len(kept)
+        compact["column_summaries_omitted_count"] = max(0, len(col_summaries) - len(kept))
+        if groups:
+            compact["family_aggregate"] = groups
+        return compact
 
     def _compact_execution_contract(self, contract: Dict[str, Any] | None) -> Dict[str, Any]:
         """
@@ -1859,6 +2033,21 @@ $strategy_json
         - Respect required outputs exactly as paths and file formats in the contract.
         - Avoid network/shell operations and filesystem discovery scans.
 
+        DTYPE SAFETY PATTERNS
+        - Read CSV with dtype=str first, then convert with pd.to_numeric(errors='coerce') when needed.
+        - For nullable integers, use pandas nullable Int64 instead of plain int64 casts.
+        - Never assume clean target dtype without verifying nullability and domain.
+
+        OUTPUT SAFETY PATTERNS
+        - Ensure parent directories exist before each artifact write.
+        - Use explicit column selections for scored outputs; avoid accidental reorder/mutation.
+        - Serialize JSON with a default handler for numpy/pandas scalar and NaN types.
+
+        WIDE DATASET PATTERNS
+        - Prefer selector/set-based feature handling over manual column enumeration.
+        - Apply vectorized transforms and bounded diagnostics for high-dimensional inputs.
+        - Use aggregated family summaries when many columns share the same profile.
+
         CONTRACT-FIRST EXECUTION MAP (MANDATORY)
         - Before training/inference, build and print CONTRACT_EXECUTION_MAP with:
           target_columns, input_required_columns, training_rows_policy, train_filter,
@@ -1919,11 +2108,12 @@ $strategy_json
         - Strategy: $strategy_title ($analysis_type)
         - ML_VIEW_CONTEXT: $ml_view_context
         - EXECUTION_CONTRACT_CONTEXT: $execution_contract_context
-        - Execution Contract: $execution_contract_json
         - Evaluation Spec: $evaluation_spec_json
         - Required Outputs: $deliverables_json
         - Canonical Columns: $canonical_columns
         - Required Features: $required_columns
+        - Runtime Dependency Context: $runtime_dependency_context_json
+        - Data Sample Context: $data_sample_context_json
         - Plot Spec: $plot_spec_context
         - Visual Requirements: $visual_requirements_context
         - Decisioning Requirements: $decisioning_requirements_context
@@ -1982,7 +2172,28 @@ $strategy_json
         # V4.1: No spec_extraction - removed
         execution_contract_compact = self._compact_execution_contract(execution_contract_input)
         execution_contract_compact = compress_long_lists(execution_contract_compact)[0]
-        ml_view_payload = compress_long_lists(ml_view)[0]
+        ml_view_whitelist = {
+            "required_outputs",
+            "artifact_requirements",
+            "evaluation_spec",
+            "validation_requirements",
+            "qa_gates",
+            "reviewer_gates",
+            "allowed_feature_sets",
+            "leakage_execution_plan",
+            "column_roles",
+            "canonical_columns",
+            "derived_columns",
+            "decisioning_requirements",
+            "visual_requirements",
+            "plot_spec",
+            "ml_engineer_runbook",
+            "iteration_policy",
+        }
+        ml_view_payload = {
+            k: v for k, v in (ml_view or {}).items() if k in ml_view_whitelist and v not in (None, "", [], {})
+        }
+        ml_view_payload = compress_long_lists(ml_view_payload)[0]
         ml_view_json = json.dumps(ml_view_payload, indent=2)
         plot_spec_json = json.dumps(compress_long_lists(ml_view.get("plot_spec", {}))[0], indent=2)
         execution_profile_json = json.dumps(
@@ -2028,6 +2239,26 @@ $strategy_json
             required_columns_payload = summarize_long_list(required_columns_payload)
             required_columns_payload["note"] = COLUMN_LIST_POINTER
 
+        required_dependencies = execution_contract_input.get("required_dependencies")
+        if not isinstance(required_dependencies, list):
+            required_dependencies = []
+        runtime_dependency_context = self._build_runtime_dependency_context(required_dependencies)
+        runtime_dependency_context_json = json.dumps(
+            compress_long_lists(runtime_dependency_context)[0],
+            indent=2,
+        )
+        data_sample_context = self._build_data_sample_context(
+            data_path=data_path,
+            csv_encoding=csv_encoding,
+            csv_sep=csv_sep,
+            csv_decimal=csv_decimal,
+        )
+        data_sample_context_json = json.dumps(
+            compress_long_lists(data_sample_context)[0],
+            indent=2,
+        )
+        cleaned_data_summary_payload = self._compact_cleaned_data_summary_for_prompt(cleaned_data_summary_min or {})
+
         render_kwargs = dict(
             business_objective=business_objective,
             strategy_title=strategy.get('title', 'Unknown'),
@@ -2057,7 +2288,6 @@ $strategy_json
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
-            execution_contract_json=json.dumps(execution_contract_compact, indent=2),
             execution_contract_context=json.dumps(execution_contract_compact, indent=2),
             ml_view_context=ml_view_json,
             plot_spec_context=plot_spec_json,
@@ -2066,8 +2296,10 @@ $strategy_json
             # V4.1: availability_summary removed
             signal_summary_json=json.dumps(compress_long_lists(signal_summary or {})[0], indent=2),
             cleaned_data_summary_min_json=json.dumps(
-                compress_long_lists(cleaned_data_summary_min or {})[0], indent=2
+                compress_long_lists(cleaned_data_summary_payload)[0], indent=2
             ),
+            runtime_dependency_context_json=runtime_dependency_context_json,
+            data_sample_context_json=data_sample_context_json,
             execution_profile_json=execution_profile_json,
             iteration_memory_json=json.dumps(compress_long_lists(iteration_memory or [])[0], indent=2),
             iteration_memory_block=iteration_memory_block or "",
@@ -2115,6 +2347,9 @@ $strategy_json
         FEEDBACK DIGEST:
         $feedback_digest
 
+        RUNTIME ERROR DETAIL:
+        $runtime_error_detail
+
         TARGETED EDIT HINTS:
         $edit_instructions
 
@@ -2154,6 +2389,14 @@ $strategy_json
             digest_prefixes = ("REVIEWER FEEDBACK", "QA TEAM FEEDBACK", "RESULT EVALUATION FEEDBACK", "OUTPUT_CONTRACT_MISSING")
             feedback_digest_items = [f for f in (feedback_history or []) if isinstance(f, str) and f.startswith(digest_prefixes)]
             feedback_digest = "\n".join(feedback_digest_items[-5:])
+            runtime_error_detail = ""
+            runtime_error_payload = gate_ctx.get("runtime_error")
+            if isinstance(runtime_error_payload, dict) and runtime_error_payload:
+                runtime_error_detail = json.dumps(runtime_error_payload, indent=2)
+            else:
+                tail = handoff_payload.get("feedback", {}).get("runtime_error_tail") if isinstance(handoff_payload.get("feedback"), dict) else ""
+                runtime_error_detail = str(tail or gate_ctx.get("traceback") or gate_ctx.get("execution_output_tail") or "").strip()
+            runtime_error_detail = self._truncate_prompt_text(runtime_error_detail, max_len=6000, head_len=4000, tail_len=1500)
             patch_objectives = handoff_payload.get("patch_objectives", [])
             patch_objectives_block = "\n".join([f"- {item}" for item in patch_objectives]) if patch_objectives else "- Resolve reviewer findings."
             must_preserve = handoff_payload.get("must_preserve", [])
@@ -2170,6 +2413,7 @@ $strategy_json
                 fixes_bullets=fixes_bullets,
                 previous_code=previous_code_block,
                 feedback_digest=feedback_digest,
+                runtime_error_detail=runtime_error_detail or "None",
                 edit_instructions=str(gate_ctx.get("edit_instructions", "")),
                 strategy_title=strategy.get('title', 'Unknown'),
                 data_path=data_path
@@ -2364,6 +2608,75 @@ $strategy_json
                     if is_syntax_valid(repaired):
                         code = repaired
                         break
+            dep_check = check_dependency_precheck(
+                code,
+                required_dependencies=required_dependencies,
+                backend_profile=(
+                    "cloudrun"
+                    if str(runtime_dependency_context.get("backend_profile") or "").lower() == "local"
+                    else str(runtime_dependency_context.get("backend_profile") or "e2b")
+                ),
+            )
+            blocked_imports = dep_check.get("blocked") or []
+            banned_imports = dep_check.get("banned") or []
+            if blocked_imports or banned_imports:
+                dep_payload = {
+                    "blocked": blocked_imports,
+                    "banned": banned_imports,
+                    "suggestions": dep_check.get("suggestions") or {},
+                    "backend_profile": dep_check.get("backend_profile"),
+                }
+                dep_fix_system = (
+                    "You are a senior ML engineer. "
+                    "Fix dependency compatibility only. "
+                    "Replace blocked/banned imports with runtime-compatible alternatives. "
+                    "Keep contract outputs and logic intent intact. "
+                    "Return full valid Python code only."
+                )
+                dep_fix_user = (
+                    "DEPENDENCY_PREFLIGHT_FAILED. Patch the script to remove blocked/banned imports.\n"
+                    + json.dumps(dep_payload, indent=2)
+                    + "\n\nCURRENT CODE:\n"
+                    + self._truncate_code_for_patch(code)
+                )
+                repaired_deps = call_with_retries(
+                    lambda: _call_model_with_prompts(
+                        dep_fix_system,
+                        dep_fix_user,
+                        0.0,
+                        self.last_model_used or self.model_name,
+                    ),
+                    max_retries=2,
+                    backoff_factor=2,
+                    initial_delay=1,
+                )
+                repaired_deps = self._clean_code(repaired_deps)
+                if not is_syntax_valid(repaired_deps):
+                    raise RuntimeError(
+                        "ML_DEPENDENCY_PREFLIGHT_FAILED: repaired code invalid syntax after dependency fix."
+                    )
+                dep_check_after = check_dependency_precheck(
+                    repaired_deps,
+                    required_dependencies=required_dependencies,
+                    backend_profile=(
+                        "cloudrun"
+                        if str(runtime_dependency_context.get("backend_profile") or "").lower() == "local"
+                        else str(runtime_dependency_context.get("backend_profile") or "e2b")
+                    ),
+                )
+                if dep_check_after.get("blocked") or dep_check_after.get("banned"):
+                    raise RuntimeError(
+                        "ML_DEPENDENCY_PREFLIGHT_FAILED: "
+                        + json.dumps(
+                            {
+                                "blocked": dep_check_after.get("blocked") or [],
+                                "banned": dep_check_after.get("banned") or [],
+                                "suggestions": dep_check_after.get("suggestions") or {},
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                code = repaired_deps
             completion_issues = self._check_script_completeness(code, required_deliverables)
             if completion_issues:
                 reprompt_context = self._build_incomplete_reprompt_context(

@@ -3,18 +3,21 @@ import re
 import ast
 import json
 import logging
+import csv
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.code_extract import extract_code_block
 from src.utils.senior_protocol import SENIOR_ENGINEERING_PROTOCOL
 from src.utils.contract_accessors import get_cleaning_gates
+from src.utils.cleaning_contract_semantics import expand_required_feature_selectors
 from src.utils.sandbox_deps import (
     BASE_ALLOWLIST,
     EXTENDED_ALLOWLIST,
     CLOUDRUN_NATIVE_ALLOWLIST,
     CLOUDRUN_OPTIONAL_ALLOWLIST,
     BANNED_ALWAYS_ALLOWLIST,
+    check_dependency_precheck,
 )
 from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
 from openai import OpenAI
@@ -220,6 +223,113 @@ class DataEngineerAgent:
         )
         return any(marker in text for marker in repair_markers)
 
+    def _read_csv_header(
+        self,
+        input_path: str,
+        csv_encoding: str,
+        csv_sep: str,
+    ) -> List[str]:
+        path = str(input_path or "").strip()
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding=csv_encoding or "utf-8", errors="replace", newline="") as f_csv:
+                reader = csv.reader(f_csv, delimiter=(csv_sep or ","))
+                header = next(reader, [])
+            return [str(col) for col in header if str(col).strip()]
+        except Exception:
+            return []
+
+    def _build_data_sample_context(
+        self,
+        input_path: str,
+        csv_encoding: str,
+        csv_sep: str,
+        csv_decimal: str,
+        max_rows: int = 5,
+        max_cols: int = 30,
+    ) -> str:
+        payload: Dict[str, Any] = {
+            "status": "unavailable",
+            "reason": "input_not_accessible_at_prompt_time",
+            "path": str(input_path or ""),
+        }
+        path = str(input_path or "").strip()
+        if not path or not os.path.exists(path):
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        try:
+            import pandas as pd  # local-only for prompt context enrichment
+
+            preview = pd.read_csv(
+                path,
+                nrows=max_rows,
+                dtype=str,
+                sep=csv_sep or ",",
+                decimal=csv_decimal or ".",
+                encoding=csv_encoding or "utf-8",
+                low_memory=False,
+            )
+            preview_cols = [str(col) for col in preview.columns.tolist()]
+            truncated = len(preview_cols) > max_cols
+            shown_cols = preview_cols[:max_cols]
+            payload = {
+                "status": "available",
+                "path": path,
+                "shape_preview": {"rows": int(preview.shape[0]), "cols": int(preview.shape[1])},
+                "preview_columns": shown_cols,
+                "preview_columns_truncated": truncated,
+                "preview_rows": preview[shown_cols].fillna("<NA>").to_dict(orient="records"),
+                "dtypes_preview": {col: str(dtype) for col, dtype in preview[shown_cols].dtypes.items()},
+                "null_counts_preview": {
+                    col: int(preview[shown_cols][col].isnull().sum()) for col in shown_cols
+                },
+            }
+        except Exception as sample_err:
+            payload = {
+                "status": "unavailable",
+                "reason": f"sample_read_error: {sample_err}",
+                "path": path,
+            }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _build_selector_expansion_context(
+        self,
+        de_view: Dict[str, Any],
+        input_path: str,
+        csv_encoding: str,
+        csv_sep: str,
+    ) -> str:
+        selectors = de_view.get("required_feature_selectors") if isinstance(de_view, dict) else None
+        if not isinstance(selectors, list) or not selectors:
+            return json.dumps(
+                {"status": "not_requested", "required_feature_selectors": []},
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        header_cols = self._read_csv_header(input_path, csv_encoding, csv_sep)
+        if not header_cols:
+            return json.dumps(
+                {
+                    "status": "unavailable",
+                    "reason": "header_not_accessible_at_prompt_time",
+                    "required_feature_selectors": selectors,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        expanded, issues = expand_required_feature_selectors(selectors, header_cols)
+        summary: Dict[str, Any] = {
+            "status": "available",
+            "header_column_count": len(header_cols),
+            "required_feature_selectors_count": len(selectors),
+            "expanded_required_columns_count": len(expanded),
+            "expanded_required_columns_sample": expanded[:20],
+            "expansion_issues": issues,
+        }
+        return json.dumps(summary, ensure_ascii=False, indent=2)
+
     def generate_cleaning_script(
         self,
         data_audit: str,
@@ -335,6 +445,18 @@ class DataEngineerAgent:
         runtime_dependency_context_json = json.dumps(
             compress_long_lists(runtime_dependency_context)[0], indent=2
         )
+        data_sample_context = self._build_data_sample_context(
+            input_path=input_path,
+            csv_encoding=csv_encoding,
+            csv_sep=csv_sep,
+            csv_decimal=csv_decimal,
+        )
+        selector_expansion_context = self._build_selector_expansion_context(
+            de_view=de_view,
+            input_path=input_path,
+            csv_encoding=csv_encoding,
+            csv_sep=csv_sep,
+        )
         effective_repair_mode = self._detect_repair_mode(data_audit, repair_mode)
         operating_mode = "REPAIR" if effective_repair_mode else "INITIAL"
         repair_notes = (
@@ -370,6 +492,23 @@ class DataEngineerAgent:
         - No pandas private APIs.
         - Use only dependencies allowed by RUNTIME_DEPENDENCY_CONTEXT.
         - Script must parse as valid Python.
+
+        DTYPE SAFETY PATTERNS:
+        - Read raw CSV with dtype=str and convert explicitly where needed.
+        - Use pd.to_numeric(..., errors='coerce') before numeric casts.
+        - Never cast to int/float directly if nulls are possible.
+        - Use pandas nullable Int64 for integer columns that may contain nulls.
+
+        OUTPUT SAFETY PATTERNS:
+        - Create parent directories before each required write path.
+        - Preserve deterministic column order in cleaned output.
+        - Use robust JSON serialization for numpy/pandas scalar types.
+        - Validate required artifacts exist at exact contract paths.
+
+        WIDE DATASET PATTERNS:
+        - Resolve feature selectors against actual header and verify matched_count > 0.
+        - Prefer vectorized transforms over per-column procedural loops.
+        - Do not enumerate huge homogeneous families manually; use selectors/patterns.
 
         SCOPE:
         - Cleaning only (no modeling/scoring/optimization/analytics).
@@ -420,6 +559,8 @@ class DataEngineerAgent:
         - EXECUTION_CONTRACT_CONTEXT (json): $execution_contract_context
         - CLEANING_GATES_CONTEXT (json): $cleaning_gates_context
         - RUNTIME_DEPENDENCY_CONTEXT (json): $runtime_dependency_context
+        - SELECTOR_EXPANSION_CONTEXT (json): $selector_expansion_context
+        - DATA_SAMPLE_CONTEXT (json): $data_sample_context
         - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook
 
         DATA AUDIT:
@@ -461,6 +602,8 @@ class DataEngineerAgent:
             data_engineer_runbook=de_runbook_json,
             cleaning_gates_context=cleaning_gates_json,
             runtime_dependency_context=runtime_dependency_context_json,
+            selector_expansion_context=selector_expansion_context,
+            data_sample_context=data_sample_context,
             senior_engineering_protocol=SENIOR_ENGINEERING_PROTOCOL,
             de_output_path=de_output_path,
             de_manifest_path=de_manifest_path,
@@ -594,6 +737,31 @@ class DataEngineerAgent:
             print("DEBUG: OpenRouter response received.")
 
             code = self._clean_code(content)
+            deps = contract.get("required_dependencies") if isinstance(contract, dict) else None
+            dep_backend = str(runtime_dependency_context.get("backend_profile") or "e2b").lower()
+            if dep_backend == "local":
+                dep_backend = "cloudrun"
+            dep_check = check_dependency_precheck(
+                code,
+                required_dependencies=deps if isinstance(deps, list) else [],
+                backend_profile=dep_backend,
+            )
+            blocked = dep_check.get("blocked") or []
+            banned = dep_check.get("banned") or []
+            if blocked or banned:
+                suggestions = dep_check.get("suggestions") or {}
+                raise ValueError(
+                    "DEPENDENCY_PREFLIGHT_FAILED: "
+                    + json.dumps(
+                        {
+                            "blocked": blocked,
+                            "banned": banned,
+                            "suggestions": suggestions,
+                            "backend_profile": dep_check.get("backend_profile"),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
 
             return injection + code
 
