@@ -96,7 +96,11 @@ def launch_local_runner_job(
         attempt_num = 0
 
     attempt_scope = f"attempt_{attempt_num}" if attempt_num > 0 else "attempt_0"
-    base_dir = os.path.join("runs", str(run_id or "unknown"), "sandbox", "local_runner", stage_scope, attempt_scope)
+    # Use absolute paths because heavy_runner executes from repo_root cwd.
+    # Relative INPUT_URI/CODE_URI can break when orchestrator cwd != repo_root.
+    base_dir = os.path.abspath(
+        os.path.join("runs", str(run_id or "unknown"), "sandbox", "local_runner", stage_scope, attempt_scope)
+    )
     input_dir = os.path.join(base_dir, "input")
     output_dir = os.path.join(base_dir, "output")
     os.makedirs(input_dir, exist_ok=True)
@@ -108,7 +112,7 @@ def launch_local_runner_job(
     if code_text is not None:
         if not data_path:
             raise LocalRunnerLaunchError("data_path is required when code_text is provided")
-        code_uri = os.path.join(input_dir, "ml_script.py")
+        code_uri = os.path.abspath(os.path.join(input_dir, "ml_script.py"))
         with open(code_uri, "w", encoding="utf-8") as f_code:
             f_code.write(code_text or "")
         request_payload["code_uri"] = code_uri
@@ -122,14 +126,14 @@ def launch_local_runner_job(
             rel_path = _normalize_rel_path(item.get("path"))
             if not local_path or not rel_path or not os.path.exists(local_path):
                 continue
-            support_uri = os.path.join(input_dir, "support", rel_path)
+            support_uri = os.path.abspath(os.path.join(input_dir, "support", rel_path))
             _copy_file(local_path, support_uri)
             uploaded_support.append({"uri": support_uri, "path": rel_path})
         if uploaded_support:
             request_payload["support_files"] = uploaded_support
 
     request_payload["output_uri"] = _ensure_trailing_sep(os.path.abspath(output_dir))
-    input_uri = os.path.join(input_dir, "request.json")
+    input_uri = os.path.abspath(os.path.join(input_dir, "request.json"))
     with open(input_uri, "w", encoding="utf-8") as f_req:
         json.dump(request_payload, f_req, indent=2, ensure_ascii=True)
 

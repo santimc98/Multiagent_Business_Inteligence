@@ -10749,6 +10749,21 @@ def _execute_data_engineer_via_heavy_runner(
             "heavy_result": None,
         }
 
+    combined_runner_logs = "\n".join(
+        [
+            str(heavy_result.get("job_error_raw") or ""),
+            str(heavy_result.get("job_error") or ""),
+            str(heavy_result.get("job_stderr") or ""),
+            str(heavy_result.get("job_stdout") or ""),
+        ]
+    )
+    combined_runner_logs_lc = combined_runner_logs.lower()
+    local_input_uri_missing = bool(
+        runtime_mode == "local"
+        and "failed to load input json" in combined_runner_logs_lc
+        and "request.json" in combined_runner_logs_lc
+    )
+
     if run_id:
         log_run_event(
             run_id,
@@ -10761,6 +10776,7 @@ def _execute_data_engineer_via_heavy_runner(
                 "error_present": bool(heavy_result.get("error")),
                 "status_ok": bool(heavy_result.get("status_ok")),
                 "attempt_id": attempt_id,
+                "local_input_uri_missing": local_input_uri_missing,
             },
         )
 
@@ -10829,6 +10845,7 @@ def _execute_data_engineer_via_heavy_runner(
         pass
 
     error_details = ""
+    error_kind_hint = ""
     if not ok:
         err_parts: List[str] = []
         if protocol_mismatch and protocol_mismatch_hint:
@@ -10841,13 +10858,22 @@ def _execute_data_engineer_via_heavy_runner(
             err_parts.append(f"missing_artifacts={missing}")
         if not err_parts:
             err_parts.append(f"status={heavy_result.get('status')}")
-        if protocol_mismatch:
+        if local_input_uri_missing:
+            error_kind_hint = "infra_input_uri_missing"
+            error_details = "LOCAL_RUNNER_INPUT_URI_MISSING: " + " | ".join(err_parts)
+        elif protocol_mismatch:
+            error_kind_hint = "infra_protocol_mismatch"
             error_details = "HEAVY_RUNNER_PROTOCOL_MISMATCH: " + " | ".join(err_parts)
         else:
+            error_kind_hint = "code_or_infra_unknown"
             error_details = "HEAVY_RUNNER_ERROR: " + " | ".join(err_parts)
         error_payload = {
             "stage": "heavy_runner_error",
-            "exception_type": "HeavyRunnerProtocolMismatch" if protocol_mismatch else "HeavyRunnerError",
+            "exception_type": (
+                "LocalRunnerInputUriMissing"
+                if local_input_uri_missing
+                else ("HeavyRunnerProtocolMismatch" if protocol_mismatch else "HeavyRunnerError")
+            ),
             "exception_msg": error_details,
             "traceback": error_details,
             "attempt": attempt_id,
@@ -10868,6 +10894,7 @@ def _execute_data_engineer_via_heavy_runner(
         "unavailable": bool(protocol_mismatch),
         "protocol_mismatch": bool(protocol_mismatch),
         "error_details": error_details,
+        "error_kind_hint": error_kind_hint,
         "heavy_result": heavy_result,
         "outlier_report_path": optional_outlier_report,
         "outlier_report_downloaded": outlier_report_downloaded,
@@ -12718,7 +12745,18 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 )
                 heavy_payload = de_heavy_result.get("heavy_result") if isinstance(de_heavy_result, dict) else {}
                 heavy_script_error = heavy_payload.get("error") if isinstance(heavy_payload, dict) else None
-                heavy_error_kind = "code" if heavy_script_error else "infra"
+                error_kind_hint = str(de_heavy_result.get("error_kind_hint") or "").strip().lower()
+                if error_kind_hint.startswith("infra"):
+                    heavy_error_kind = "infra"
+                elif isinstance(heavy_script_error, dict):
+                    script_error_name = str(heavy_script_error.get("error") or "").strip().lower()
+                    has_trace = bool(
+                        str(heavy_script_error.get("stacktrace") or "").strip()
+                        or str(heavy_script_error.get("traceback") or "").strip()
+                    )
+                    heavy_error_kind = "code" if (has_trace or script_error_name in {"script_execution_failed", "runtime_error"}) else "infra"
+                else:
+                    heavy_error_kind = "code" if heavy_script_error else "infra"
                 runtime_error_text = ""
                 if isinstance(heavy_script_error, dict):
                     runtime_error_text = "\n".join(
@@ -12797,7 +12835,18 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             heavy_script_error = (
                                 heavy_payload.get("error") if isinstance(heavy_payload, dict) else None
                             )
-                            heavy_error_kind = "code" if heavy_script_error else "infra"
+                            error_kind_hint = str(de_heavy_result.get("error_kind_hint") or "").strip().lower()
+                            if error_kind_hint.startswith("infra"):
+                                heavy_error_kind = "infra"
+                            elif isinstance(heavy_script_error, dict):
+                                script_error_name = str(heavy_script_error.get("error") or "").strip().lower()
+                                has_trace = bool(
+                                    str(heavy_script_error.get("stacktrace") or "").strip()
+                                    or str(heavy_script_error.get("traceback") or "").strip()
+                                )
+                                heavy_error_kind = "code" if (has_trace or script_error_name in {"script_execution_failed", "runtime_error"}) else "infra"
+                            else:
+                                heavy_error_kind = "code" if heavy_script_error else "infra"
                             runtime_error_text = ""
                             if isinstance(heavy_script_error, dict):
                                 runtime_error_text = "\n".join(
@@ -12855,7 +12904,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "required_input_columns": required_input,
                             "required_raw_header_map": required_raw_map,
                             "error_snippet": error_snippet,
-                            "runtime_backend": "cloudrun_heavy_runner",
+                            "runtime_backend": "local_runner" if runtime_mode == "local" else "cloudrun_heavy_runner",
                             "runtime_mode": "data_engineer_cleaning",
                         }
                         explainer_text = failure_explainer.explain_data_engineer_failure(
