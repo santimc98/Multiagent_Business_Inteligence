@@ -2456,6 +2456,69 @@ def _resolve_cleaning_column_transformations(clean_dataset: Dict[str, Any]) -> T
     }, issues
 
 
+def _normalize_selector_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Auto-normalise LLM-generated selector variants into the canonical format
+    expected by _expand_required_feature_selectors.
+
+    Handles four common deviations:
+      1. Nested dict:   {"selector": {"type": "regex", "pattern": "..."}}
+         → hoist inner dict, preserve metadata (name/family_id/role).
+      2. String short:  {"selector": "regex:^pixel\\d+$"}
+         → parse into {"type": "regex", "pattern": "^pixel\\d+$"}.
+      3. Wrong key:     {"type": "regex", "selector": "^pixel\\d+$"}
+         → move "selector" value into "pattern".
+      4. prefix short:  {"selector": "prefix:pixel"}
+         → {"type": "prefix", "value": "pixel"}.
+    """
+    out = dict(raw)
+
+    # ── Case 1: nested dict under "selector" key ──────────────────────
+    inner = out.get("selector")
+    if isinstance(inner, dict):
+        # Hoist inner dict fields to top level (inner wins on conflict)
+        metadata = {k: v for k, v in out.items() if k != "selector"}
+        out = {**metadata, **inner}
+        return out
+
+    # ── Case 2 & 4: string shorthand "type:value" ────────────────────
+    if isinstance(inner, str) and ":" in inner:
+        parts = inner.split(":", 1)
+        stype = parts[0].strip().lower()
+        svalue = parts[1].strip() if len(parts) > 1 else ""
+        metadata = {k: v for k, v in out.items() if k != "selector"}
+        if stype in {"regex", "pattern"}:
+            out = {**metadata, "type": "regex", "pattern": svalue}
+        elif stype == "prefix":
+            out = {**metadata, "type": "prefix", "value": svalue}
+        elif stype == "suffix":
+            out = {**metadata, "type": "suffix", "value": svalue}
+        elif stype == "prefix_numeric_range":
+            # Try to parse "pixel0-783" style
+            import re as _re
+            m = _re.match(r"([A-Za-z_]+)(\d+)-(\d+)$", svalue)
+            if m:
+                out = {**metadata, "type": "prefix_numeric_range",
+                       "prefix": m.group(1), "start": int(m.group(2)), "end": int(m.group(3))}
+            else:
+                out = {**metadata, "type": stype, "value": svalue}
+        else:
+            out = {**metadata, "type": stype, "value": svalue}
+        return out
+
+    # ── Case 3: type present but pattern stored in "selector" ─────────
+    if "type" in out and isinstance(inner, str) and inner.strip():
+        stype = str(out.get("type") or "").strip().lower()
+        if stype in {"regex", "pattern"} and not out.get("pattern"):
+            out["pattern"] = inner
+            del out["selector"]
+        elif stype in {"prefix", "suffix"} and not out.get("value"):
+            out["value"] = inner
+            del out["selector"]
+
+    return out
+
+
 def _expand_required_feature_selectors(
     selectors: Any,
     candidate_columns: List[str],
@@ -2484,6 +2547,8 @@ def _expand_required_feature_selectors(
         if not isinstance(selector, dict):
             issues.append(f"required_feature_selectors[{idx}] must be an object.")
             continue
+        # ── Auto-normalise LLM format variants ──
+        selector = _normalize_selector_entry(selector)
         selector_type = str(selector.get("type") or "").strip().lower()
         if not selector_type:
             issues.append(f"required_feature_selectors[{idx}] missing selector type.")

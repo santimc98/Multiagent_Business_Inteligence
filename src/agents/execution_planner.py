@@ -38,6 +38,7 @@ from src.utils.contract_validator import (
     normalize_artifact_requirements,
     is_probably_path,
     is_file_path,
+    _normalize_selector_entry,
 )
 
 load_dotenv()
@@ -7331,6 +7332,8 @@ class ExecutionPlannerAgent:
                         f"artifact_requirements.clean_dataset.required_feature_selectors[{idx}] must be an object"
                     )
                     continue
+                # Auto-normalise LLM format variants (nested dict, string shorthand, etc.)
+                item = _normalize_selector_entry(item)
                 selector_type = str(item.get("type") or "").strip().lower()
                 if not selector_type:
                     errors.append(
