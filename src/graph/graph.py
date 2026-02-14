@@ -12240,6 +12240,34 @@ def run_data_engineer(state: AgentState) -> AgentState:
     # Check if generation failed
     if code.strip().startswith("# Error"):
         print(f"Correction: Data Engineer failed to generate code. Error: {code}")
+        can_retry_generation = not _flag_active_for_run(state, "de_generation_retry_done", run_id)
+        if can_retry_generation:
+            new_state = dict(state)
+            new_state["de_generation_retry_done"] = True
+            if run_id:
+                new_state["de_generation_retry_done_run_id"] = run_id
+            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+            generation_context = {
+                "attempt": attempt_id,
+                "error_message": str(code).strip()[:4000],
+            }
+            raw_excerpt = str(raw_response or "").strip()[:4000]
+            if raw_excerpt:
+                generation_context["raw_response_excerpt"] = raw_excerpt
+            payload = (
+                "GENERATION_FAILURE_CONTEXT:\n"
+                "ENVIRONMENT_FEEDBACK (Please Repair Code Generation):\n"
+                + json.dumps(generation_context, indent=2, ensure_ascii=False)
+            )
+            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "data_engineer_generation_retry",
+                    {"attempt": attempt_id, "reason": "generation_failed"},
+                )
+            print("Generation guard: retrying Data Engineer with generation failure context.")
+            return run_data_engineer(new_state)
         if run_id:
             log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_generation_failed"})
         oc_report = _persist_output_contract_report(state, reason="data_engineer_generation_failed")
