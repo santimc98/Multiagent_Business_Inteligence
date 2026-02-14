@@ -247,18 +247,44 @@ def _review_cleaning_failure(
     warnings: List[str] = []
     hard_failures: List[str] = ["CLEANING_RUNTIME_ERROR"]
 
+    lower_error = error_details.lower()
     if "numpy.ndarray" in error_details and ".str" in error_details:
         required_fixes.append(
             "Avoid assigning np.where results to a Series used with .str; keep a pandas Series "
             "(use Series.where/mask or wrap back into a Series with the original index)."
         )
-    if "KeyError" in error_details:
+    if "keyerror" in lower_error:
         required_fixes.append(
             "Check column name normalization and ensure referenced columns exist before access; "
             "use a normalized header map for matching."
         )
-    if "FileNotFoundError" in error_details:
+    if "filenotfounderror" in lower_error:
         required_fixes.append("Read the input from the provided input_path; avoid hardcoded paths.")
+    if "typeerror" in lower_error and "not supported between" in lower_error:
+        required_fixes.append(
+            "Normalize dtypes before comparisons; convert mixed-type columns with pd.to_numeric(errors='coerce') "
+            "or consistent string casting before conditional logic."
+        )
+    if "valueerror" in lower_error and "could not convert" in lower_error:
+        required_fixes.append(
+            "Apply robust numeric conversion (pd.to_numeric(errors='coerce')) and handle nulls before arithmetic."
+        )
+    if "indexerror" in lower_error:
+        required_fixes.append(
+            "Guard positional indexing with explicit length checks; avoid assuming non-empty arrays/lists."
+        )
+    if "attributeerror" in lower_error and "has no attribute" in lower_error:
+        required_fixes.append(
+            "Verify object type before method access; ensure Series/DataFrame operations match actual object type."
+        )
+    if "memoryerror" in lower_error or "killed" in lower_error or "oom" in lower_error:
+        required_fixes.append(
+            "Reduce memory pressure with chunked processing, narrower dtypes, and avoiding full-data materialization."
+        )
+    if "importerror" in lower_error or "modulenotfounderror" in lower_error:
+        required_fixes.append(
+            "Use dependencies available in runtime allowlist and avoid optional imports not guaranteed by the executor."
+        )
     if not required_fixes:
         required_fixes.append("Fix the runtime error and rerun the cleaning script without changing I/O paths.")
 
@@ -1454,13 +1480,21 @@ def _evaluate_gates_deterministic(
                 if not bool(id_evidence.get("applies_if", True)):
                     warnings.append(f"id_integrity skipped: {id_evidence.get('skip_reason', 'not_applicable')}")
         elif gate_key == "no_semantic_rescale":
-            # DELEGATED TO LLM: Semantic rescale detection requires contextual reasoning
-            # about code + data profile, not brittle threshold-based heuristics.
-            # The LLM will evaluate this gate using the cleaning_code and dataset_profile.
-            issues = []
-            evidence["llm_delegated"] = True
-            evidence["reason"] = "Semantic rescale detection requires LLM contextual reasoning"
-            evaluated = False  # Mark as not deterministically evaluated
+            explicit_patterns = _detect_explicit_rescale_patterns(cleaning_code)
+            if explicit_patterns:
+                issues = [
+                    "Explicit numeric rescaling operations detected in cleaning code "
+                    f"({', '.join(explicit_patterns[:5])})."
+                ]
+                evidence["patterns_found"] = explicit_patterns
+                evidence["deterministic_support"] = "explicit_rescale_patterns"
+                evaluated = True
+            else:
+                # Keep LLM delegation for ambiguous semantic cases while covering explicit ops deterministically.
+                issues = []
+                evidence["llm_delegated"] = True
+                evidence["reason"] = "No explicit rescale patterns found; delegate semantic interpretation to LLM"
+                evaluated = False
         elif gate_key == "no_synthetic_data":
             issues = _check_no_synthetic_data(manifest, cleaning_code=cleaning_code)
         elif gate_key == "row_count_sanity":
@@ -1713,10 +1747,17 @@ def _build_llm_prompt(
     # CONTEXT TRIPLET for LLM reasoning
     # 1. Cleaning Code - what did the engineer actually execute?
     if cleaning_code:
-        # Truncate if too long but preserve key parts
+        # Preserve both beginning and ending context for long scripts.
         max_code_len = 6000
         if len(cleaning_code) > max_code_len:
-            payload["cleaning_code"] = cleaning_code[:max_code_len] + "\n... [TRUNCATED]"
+            half = max_code_len // 2
+            head = cleaning_code[:half]
+            tail = cleaning_code[-half:]
+            payload["cleaning_code"] = (
+                head
+                + "\n... [TRUNCATED_MIDDLE] ...\n"
+                + tail
+            )
         else:
             payload["cleaning_code"] = cleaning_code
 
@@ -2073,6 +2114,29 @@ def _check_required_columns(
     if missing:
         return [f"Missing required columns: {', '.join(missing)}"]
     return []
+
+
+def _detect_explicit_rescale_patterns(cleaning_code: Optional[str]) -> List[str]:
+    if not isinstance(cleaning_code, str) or not cleaning_code.strip():
+        return []
+    lowered = cleaning_code.lower()
+    patterns: List[tuple[str, str]] = [
+        (r"/\s*255(\.0+)?\b", "divide_by_255"),
+        (r"/\s*100(\.0+)?\b", "divide_by_100"),
+        (r"\*\s*0\.00392\b", "multiply_0_00392"),
+        (r"\bminmaxscaler\s*\(", "minmax_scaler"),
+        (r"\bstandardscaler\s*\(", "standard_scaler"),
+        (r"\brobustscaler\s*\(", "robust_scaler"),
+        (r"\bnormalize\s*\(", "normalize_call"),
+    ]
+    found: List[str] = []
+    for pattern, label in patterns:
+        try:
+            if re.search(pattern, lowered):
+                found.append(label)
+        except Exception:
+            continue
+    return found
 
 
 def _check_id_integrity(

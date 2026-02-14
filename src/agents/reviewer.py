@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import ast
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -80,6 +81,124 @@ def apply_reviewer_gate_filter(result: Dict[str, Any], reviewer_gates: List[Any]
             result["feedback"] = "Spec-driven gating: no reviewer gates failed; downgraded to warnings."
     return result
 
+
+def _collect_string_literals(tree: ast.AST | None) -> set[str]:
+    literals: set[str] = set()
+    if tree is None:
+        return literals
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            literals.add(node.value)
+    return literals
+
+
+def _resolve_target_columns(
+    evaluation_spec: Dict[str, Any] | None,
+    reviewer_view: Dict[str, Any] | None,
+) -> List[str]:
+    targets: List[str] = []
+    for block in (reviewer_view, evaluation_spec):
+        if not isinstance(block, dict):
+            continue
+        for key in ("target_column", "target", "primary_target"):
+            value = block.get(key)
+            if isinstance(value, str) and value.strip():
+                targets.append(value.strip())
+        for key in ("target_columns", "outcome_columns"):
+            values = block.get(key)
+            if isinstance(values, list):
+                targets.extend(str(v).strip() for v in values if str(v).strip())
+        roles = block.get("column_roles")
+        if isinstance(roles, dict):
+            for key in ("outcome", "target"):
+                values = roles.get(key)
+                if isinstance(values, list):
+                    targets.extend(str(v).strip() for v in values if str(v).strip())
+    dedup: List[str] = []
+    seen: set[str] = set()
+    for t in targets:
+        if not t:
+            continue
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(t)
+    return dedup
+
+
+def _deterministic_reviewer_prechecks(
+    code: str,
+    evaluation_spec: Dict[str, Any] | None,
+    reviewer_view: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    output = {
+        "hard_failures": [],
+        "failed_gates": [],
+        "required_fixes": [],
+        "warnings": [],
+    }
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError as err:
+        msg = f"Syntax error detected before reviewer LLM step: {err}"
+        output["hard_failures"].append("reviewer_syntax_validity")
+        output["failed_gates"].append("reviewer_syntax_validity")
+        output["required_fixes"].append(
+            "Fix Python syntax errors before requesting review."
+        )
+        output["warnings"].append(msg)
+        return output
+
+    literals = _collect_string_literals(tree)
+    lowered = (code or "").lower()
+
+    if "pd.read_csv(" not in lowered and ".read_csv(" not in lowered:
+        output["warnings"].append(
+            "Deterministic precheck: pandas.read_csv not detected; verify dataset loading path and method."
+        )
+
+    required_outputs: List[str] = []
+    for block in (reviewer_view, evaluation_spec):
+        if not isinstance(block, dict):
+            continue
+        values = block.get("required_outputs")
+        if isinstance(values, list):
+            required_outputs.extend(str(v) for v in values if str(v).strip())
+        verification = block.get("verification")
+        if isinstance(verification, dict):
+            v = verification.get("required_outputs")
+            if isinstance(v, list):
+                required_outputs.extend(str(x) for x in v if str(x).strip())
+    required_outputs = list(dict.fromkeys(required_outputs))
+    if required_outputs:
+        mentioned = 0
+        for path in required_outputs:
+            if path in literals or path.lower() in lowered:
+                mentioned += 1
+        if mentioned == 0:
+            output["warnings"].append(
+                "Deterministic precheck: none of the required output paths appear in code literals; verify artifact writes."
+            )
+
+    targets = _resolve_target_columns(evaluation_spec, reviewer_view)
+    if targets:
+        mentions_target = any((target in literals) or (target.lower() in lowered) for target in targets)
+        if not mentions_target:
+            output["warnings"].append(
+                "Deterministic precheck: target/outcome columns are not explicitly referenced; verify feature/label mapping."
+            )
+    return output
+
+
+def _truncate_exec_output(text: str, max_len: int = 8000) -> str:
+    value = str(text or "")
+    if len(value) <= max_len:
+        return value
+    head_len = max_len // 2
+    tail_len = max_len - head_len
+    return value[:head_len] + "\n...[TRUNCATED_MIDDLE]...\n" + value[-tail_len:]
+
 class ReviewerAgent:
     def __init__(self, api_key: str = None):
         """
@@ -117,6 +236,19 @@ class ReviewerAgent:
         from src.utils.prompting import render_prompt
 
         reviewer_view = reviewer_view or {}
+        deterministic_prechecks = _deterministic_reviewer_prechecks(code, evaluation_spec, reviewer_view)
+        hard_prechecks = [str(x) for x in (deterministic_prechecks.get("hard_failures") or []) if x]
+        precheck_warnings = [str(x) for x in (deterministic_prechecks.get("warnings") or []) if x]
+        if hard_prechecks:
+            return {
+                "status": "REJECTED",
+                "feedback": "Reviewer deterministic precheck failed before LLM review.",
+                "failed_gates": [str(x) for x in (deterministic_prechecks.get("failed_gates") or []) if x],
+                "required_fixes": [str(x) for x in (deterministic_prechecks.get("required_fixes") or []) if x],
+                "hard_failures": hard_prechecks,
+                "warnings": precheck_warnings,
+            }
+
         eval_spec_json = json.dumps(evaluation_spec or {}, indent=2)
         reviewer_gates = []
         if isinstance(evaluation_spec, dict):
@@ -149,6 +281,7 @@ class ReviewerAgent:
             )
         if not isinstance(execution_diagnostics, dict):
             execution_diagnostics = {}
+        deterministic_prechecks_json = json.dumps(deterministic_prechecks, indent=2)
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Technical Lead and Security Auditor.
@@ -165,6 +298,7 @@ class ReviewerAgent:
         - Allowed Columns (if provided): $allowed_columns_json
         - Expected Metrics (if provided): $expected_metrics_json
         - Execution Diagnostics (JSON): $execution_diagnostics_json
+        - Deterministic Prechecks (JSON): $deterministic_prechecks_json
         
         ### CRITERIA FOR APPROVAL (QUALITY FIRST PRINCIPLES)
 
@@ -228,6 +362,7 @@ class ReviewerAgent:
             allowed_columns_json=json.dumps(allowed_columns, indent=2),
             expected_metrics_json=json.dumps(expected_metrics, indent=2),
             execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2),
+            deterministic_prechecks_json=deterministic_prechecks_json,
             output_format_instructions=output_format_instructions,
             senior_evidence_rule=SENIOR_EVIDENCE_RULE,
         )
@@ -243,10 +378,12 @@ class ReviewerAgent:
 
         if not self.client or self.provider == "none":
             return {
-                "status": "APPROVE_WITH_WARNINGS",
-                "feedback": "Reviewer LLM disabled; continuing with deterministic evidence only.",
-                "failed_gates": [],
-                "required_fixes": [],
+                "status": "REJECTED",
+                "feedback": "Reviewer LLM unavailable; fail-closed policy prevents approval without review.",
+                "failed_gates": ["LLM_REVIEW_UNAVAILABLE"],
+                "required_fixes": ["Retry when reviewer LLM is available."],
+                "hard_failures": ["LLM_REVIEW_UNAVAILABLE"],
+                "warnings": precheck_warnings,
             }
 
         try:
@@ -277,19 +414,31 @@ class ReviewerAgent:
                     result[field] = val
 
             result = apply_reviewer_gate_filter(result, reviewer_gates)
+            if precheck_warnings:
+                warning_block = "\n".join(f"- {item}" for item in precheck_warnings)
+                existing_feedback = str(result.get("feedback") or "").strip()
+                appended = (
+                    f"{existing_feedback}\nDeterministic precheck warnings:\n{warning_block}"
+                    if existing_feedback
+                    else f"Deterministic precheck warnings:\n{warning_block}"
+                )
+                result["feedback"] = appended
+                if str(result.get("status") or "").upper() == "APPROVED":
+                    result["status"] = "APPROVE_WITH_WARNINGS"
             return result
 
         except Exception as e:
-            # Fail-open: rely on deterministic gates for blocking.
             print(f"Reviewer API Error: {e}")
             return {
-                "status": "APPROVE_WITH_WARNINGS",
+                "status": "REJECTED",
                 "feedback": (
                     f"Reviewer unavailable (API error: {e}). "
-                    "Continuing with deterministic evidence only."
+                    "Fail-closed policy requires retry with reviewer LLM available."
                 ),
-                "failed_gates": [],
-                "required_fixes": [],
+                "failed_gates": ["LLM_REVIEW_UNAVAILABLE"],
+                "required_fixes": ["Retry when reviewer LLM is available."],
+                "hard_failures": ["LLM_REVIEW_UNAVAILABLE"],
+                "warnings": precheck_warnings,
             }
 
     def _clean_json(self, text: str) -> str:
@@ -376,8 +525,8 @@ class ReviewerAgent:
         }
         """
 
-        # Truncate Output for Token Safety
-        truncated_output = execution_output[-4000:] if len(execution_output) > 4000 else execution_output
+        # Truncate with head+tail for better context preservation.
+        truncated_output = _truncate_exec_output(execution_output, max_len=8000)
 
         from src.utils.prompting import render_prompt
         

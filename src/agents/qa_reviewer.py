@@ -49,7 +49,8 @@ _CONTRACT_FALLBACK_WARNING = "CONTRACT_BROKEN_FALLBACK: qa_gates missing; please
 
 CONTRACT_BROKEN_FALLBACK_GATES = [
     {"name": "security_sandbox", "severity": "HARD", "params": {}},
-    {"name": "must_read_input_csv", "severity": "SOFT", "params": {}},
+    {"name": "must_read_input_csv", "severity": "HARD", "params": {}},
+    {"name": "no_synthetic_data", "severity": "HARD", "params": {}},
 ]
 
 

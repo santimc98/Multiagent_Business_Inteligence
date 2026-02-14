@@ -2,7 +2,7 @@ from src.agents.reviewer import ReviewerAgent
 from types import SimpleNamespace
 
 
-def test_reviewer_fail_open(monkeypatch):
+def test_reviewer_fail_closed(monkeypatch):
     monkeypatch.setenv("MIMO_API_KEY", "test-key")
     reviewer = ReviewerAgent(api_key="test-key")
 
@@ -18,8 +18,9 @@ def test_reviewer_fail_open(monkeypatch):
 
     reviewer.client = DummyClient()
     result = reviewer.review_code("print('ok')")
-    assert result.get("status") == "APPROVE_WITH_WARNINGS"
+    assert result.get("status") == "REJECTED"
     assert "Reviewer unavailable" in result.get("feedback", "")
+    assert "LLM_REVIEW_UNAVAILABLE" in (result.get("hard_failures") or [])
 
 
 def test_reviewer_evaluate_results_parses_wrapped_json(monkeypatch):

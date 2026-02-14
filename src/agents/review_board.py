@@ -80,7 +80,8 @@ class ReviewBoardAgent:
                 content = response.choices[0].message.content
             self.last_response = content
             parsed = json.loads(self._clean_json(content))
-            return self._normalize(parsed, context)
+            normalized = self._normalize(parsed, context)
+            return self._apply_conflict_reconciliation(normalized, context)
         except Exception:
             return self._fallback(context)
 
@@ -101,6 +102,27 @@ class ReviewBoardAgent:
             if isinstance(hf, list):
                 hard_failures.extend(str(x) for x in hf if x)
 
+        reviewer_status = str(reviewer.get("status", "")).upper()
+        qa_status = str(qa.get("status", "")).upper()
+        status_conflict = (
+            (reviewer_status in {"APPROVED", "APPROVE_WITH_WARNINGS"} and qa_status in {"REJECTED", "NEEDS_IMPROVEMENT"})
+            or (qa_status in {"APPROVED", "APPROVE_WITH_WARNINGS"} and reviewer_status in {"REJECTED", "NEEDS_IMPROVEMENT"})
+        )
+
+        required_actions: List[str] = []
+        for payload in (reviewer, qa, evaluator):
+            fixes = payload.get("required_fixes")
+            if not isinstance(fixes, list):
+                continue
+            for fix in fixes:
+                text = str(fix).strip()
+                if text and text not in required_actions:
+                    required_actions.append(text)
+                if len(required_actions) >= 12:
+                    break
+            if len(required_actions) >= 12:
+                break
+
         if hard_failures:
             status = "REJECTED" if runtime.get("runtime_fix_terminal") else "NEEDS_IMPROVEMENT"
         elif "NEEDS_IMPROVEMENT" in statuses or "REJECTED" in statuses:
@@ -109,11 +131,27 @@ class ReviewBoardAgent:
             status = "APPROVE_WITH_WARNINGS"
         else:
             status = "APPROVED"
+
+        failed_areas: List[str] = []
+        if hard_failures:
+            failed_areas.append("qa_gates")
+        if status_conflict:
+            failed_areas.append("cross_reviewer_conflict")
+        if status in {"NEEDS_IMPROVEMENT", "REJECTED"} and "results_quality" not in failed_areas:
+            failed_areas.append("results_quality")
+
+        if status in {"NEEDS_IMPROVEMENT", "REJECTED"} and not required_actions:
+            required_actions.append("Apply reviewer-required fixes and rerun.")
+
+        summary = "Fallback board verdict from reviewer packets."
+        if status_conflict:
+            summary += " Conflict detected between reviewer and qa_reviewer verdicts."
+
         return {
             "status": status,
-            "summary": "Fallback board verdict from reviewer packets.",
-            "failed_areas": ["qa_gates"] if hard_failures else [],
-            "required_actions": ["Apply reviewer-required fixes and rerun."] if status in {"NEEDS_IMPROVEMENT", "REJECTED"} else [],
+            "summary": summary,
+            "failed_areas": failed_areas,
+            "required_actions": required_actions,
             "confidence": "medium",
             "evidence": [],
         }
@@ -133,6 +171,42 @@ class ReviewBoardAgent:
             "confidence": str(payload.get("confidence", "medium")).lower() if payload.get("confidence") else "medium",
             "evidence": evidence if isinstance(evidence, list) else [],
         }
+
+    def _apply_conflict_reconciliation(self, verdict: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        packet = dict(verdict or {})
+        qa = context.get("qa_reviewer") if isinstance(context.get("qa_reviewer"), dict) else {}
+        reviewer = context.get("reviewer") if isinstance(context.get("reviewer"), dict) else {}
+        reviewer_status = str(reviewer.get("status", "")).upper()
+        qa_status = str(qa.get("status", "")).upper()
+        conflict = (
+            (reviewer_status in {"APPROVED", "APPROVE_WITH_WARNINGS"} and qa_status in {"REJECTED", "NEEDS_IMPROVEMENT"})
+            or (qa_status in {"APPROVED", "APPROVE_WITH_WARNINGS"} and reviewer_status in {"REJECTED", "NEEDS_IMPROVEMENT"})
+        )
+        if not conflict:
+            return packet
+
+        failed_areas = packet.get("failed_areas")
+        if not isinstance(failed_areas, list):
+            failed_areas = []
+        if "cross_reviewer_conflict" not in failed_areas:
+            failed_areas.append("cross_reviewer_conflict")
+        packet["failed_areas"] = failed_areas
+
+        required_actions = packet.get("required_actions")
+        if not isinstance(required_actions, list):
+            required_actions = []
+        action = "Reconcile Reviewer vs QA findings and rerun after conflict resolution."
+        if action not in required_actions:
+            required_actions.append(action)
+        packet["required_actions"] = required_actions
+
+        status = str(packet.get("status", "")).upper()
+        if status == "APPROVED":
+            packet["status"] = "APPROVE_WITH_WARNINGS"
+        summary = str(packet.get("summary", "")).strip()
+        conflict_note = "Conflict detected between reviewer and qa_reviewer packets."
+        packet["summary"] = f"{summary} {conflict_note}".strip() if summary else conflict_note
+        return packet
 
     def _clean_json(self, text: str) -> str:
         text = re.sub(r"```json", "", text)

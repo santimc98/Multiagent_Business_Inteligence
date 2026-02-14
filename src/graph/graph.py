@@ -5805,6 +5805,43 @@ def _merge_de_audit_override(base: str, payload: str) -> str:
         return f"{base}\n\n{payload}"
     return payload
 
+
+def _format_gate_failure_evidence(
+    gate_results: Any,
+    max_items: int = 6,
+    max_evidence_len: int = 260,
+) -> str:
+    if not isinstance(gate_results, list):
+        return ""
+    lines: List[str] = []
+    for gate in gate_results:
+        if not isinstance(gate, dict):
+            continue
+        passed = gate.get("passed")
+        issues = gate.get("issues") if isinstance(gate.get("issues"), list) else []
+        if passed is not False and not issues:
+            continue
+        name = str(gate.get("name") or "unknown_gate")
+        severity = str(gate.get("severity") or "UNKNOWN")
+        issue_text = "; ".join(str(x) for x in issues[:2]) if issues else "Gate reported as failed."
+        evidence = gate.get("evidence")
+        evidence_text = ""
+        if isinstance(evidence, dict):
+            compact = json.dumps(evidence, ensure_ascii=True)
+            evidence_text = compact if len(compact) <= max_evidence_len else compact[: max_evidence_len - 3] + "..."
+        elif evidence:
+            compact = str(evidence)
+            evidence_text = compact if len(compact) <= max_evidence_len else compact[: max_evidence_len - 3] + "..."
+        line = f"- Gate: {name} ({severity}) | Issue: {issue_text}"
+        if evidence_text:
+            line += f" | Evidence: {evidence_text}"
+        lines.append(line)
+        if len(lines) >= max_items:
+            break
+    if not lines:
+        return ""
+    return "GATE_FAILURE_EVIDENCE:\n" + "\n".join(lines)
+
 def _read_csv_header(csv_path: str, encoding: str, sep: str) -> List[str]:
     try:
         import csv
@@ -7943,6 +7980,53 @@ def _normalize_handoff_items(values: Any, max_items: int = 10, max_len: int = 18
             break
     return out
 
+
+def _merge_reviewer_qa_findings(
+    gate_context: Dict[str, Any] | None,
+    review_result: Dict[str, Any] | None,
+    qa_result: Dict[str, Any] | None,
+) -> Dict[str, List[str]]:
+    gate_context = gate_context if isinstance(gate_context, dict) else {}
+    review_result = review_result if isinstance(review_result, dict) else {}
+    qa_result = qa_result if isinstance(qa_result, dict) else {}
+
+    failed_gates: List[str] = []
+    required_fixes: List[str] = []
+    hard_failures: List[str] = []
+
+    for source in (
+        gate_context.get("failed_gates"),
+        review_result.get("failed_gates"),
+        qa_result.get("failed_gates"),
+    ):
+        for item in _normalize_handoff_items(source, max_items=25, max_len=220):
+            if item not in failed_gates:
+                failed_gates.append(item)
+
+    for source in (
+        gate_context.get("required_fixes"),
+        review_result.get("required_fixes"),
+        qa_result.get("required_fixes"),
+    ):
+        for item in _normalize_handoff_items(source, max_items=25, max_len=500):
+            if item not in required_fixes:
+                required_fixes.append(item)
+
+    for source in (
+        gate_context.get("hard_failures"),
+        review_result.get("hard_failures"),
+        qa_result.get("hard_failures"),
+    ):
+        for item in _normalize_handoff_items(source, max_items=20, max_len=240):
+            if item not in hard_failures:
+                hard_failures.append(item)
+
+    return {
+        "failed_gates": failed_gates[:20],
+        "required_fixes": required_fixes[:20],
+        "hard_failures": hard_failures[:15],
+    }
+
 def _extract_metric_target_hint(evaluation_spec: Dict[str, Any] | None, contract: Dict[str, Any] | None) -> tuple[float | None, str]:
     sources: List[tuple[str, Dict[str, Any]]] = []
     if isinstance(evaluation_spec, dict):
@@ -8015,23 +8099,24 @@ def _build_iteration_handoff(
             if len(missing_outputs) >= 15:
                 break
 
-    failed_gates = _normalize_handoff_items(gate_context.get("failed_gates"), max_items=15)
-    required_fixes = _normalize_handoff_items(gate_context.get("required_fixes"), max_items=15, max_len=240)
-    hard_failures = _normalize_handoff_items(
+    merged_findings = _merge_reviewer_qa_findings(gate_context, review_result, qa_result)
+    failed_gates = merged_findings.get("failed_gates") or []
+    required_fixes = merged_findings.get("required_fixes") or []
+    hard_failures = merged_findings.get("hard_failures") or _normalize_handoff_items(
         gate_context.get("hard_failures") or state.get("hard_failures"),
         max_items=10,
-        max_len=200,
+        max_len=240,
     )
 
     runtime_tail = _truncate_handoff_text(
         state.get("last_runtime_error_tail") or state.get("execution_output"),
-        max_len=360,
+        max_len=520,
     )
     reviewer_feedback = _truncate_handoff_text(
         review_result.get("feedback") or gate_context.get("feedback") or state.get("review_feedback"),
-        max_len=520,
+        max_len=1200,
     )
-    qa_feedback = _truncate_handoff_text(qa_result.get("feedback"), max_len=360)
+    qa_feedback = _truncate_handoff_text(qa_result.get("feedback"), max_len=900)
 
     metric_snapshot = state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {}
     metric_name = str(metric_snapshot.get("primary_metric_name") or "")
@@ -12888,6 +12973,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     if gate_hints:
                         payload += "\nGATE_IMPLEMENTATION_HINTS:\n- " + "\n- ".join(gate_hints)
                     try:
+                        runtime_record = {
+                            "agent": "data_engineer",
+                            "status": "RUNTIME_ERROR",
+                            "source": "heavy_runner_code",
+                            "error_tail": runtime_error_text[-1200:],
+                            "root_cause": failure_cause if 'failure_cause' in locals() else "",
+                            "diagnosis": diagnosis_lines if 'diagnosis_lines' in locals() else [],
+                            "required_fixes": gate_hints if gate_hints else [],
+                        }
+                        payload += "\n\nITERATION_FEEDBACK_RECORD_JSON:\n" + json.dumps(runtime_record, ensure_ascii=True)
+                    except Exception:
+                        pass
+                    try:
                         required_input = _resolve_required_input_columns(
                             state.get("execution_contract", {}), selected
                         )
@@ -13356,6 +13454,22 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     gate_hints = _build_de_gate_implementation_hints(de_view_for_hints.get("cleaning_gates"))
                                     if gate_hints:
                                         override += "\nGATE_IMPLEMENTATION_HINTS:\n- " + "\n- ".join(gate_hints)
+                                    try:
+                                        runtime_record = {
+                                            "agent": "data_engineer",
+                                            "status": "RUNTIME_ERROR",
+                                            "source": "sandbox_execute",
+                                            "error_tail": error_details[-1200:],
+                                            "root_cause": failure_cause if 'failure_cause' in locals() else "",
+                                            "diagnosis": diagnosis_lines if 'diagnosis_lines' in locals() else [],
+                                            "required_fixes": gate_hints if gate_hints else [],
+                                        }
+                                        override += (
+                                            "\n\nITERATION_FEEDBACK_RECORD_JSON:\n"
+                                            + json.dumps(runtime_record, ensure_ascii=True)
+                                        )
+                                    except Exception:
+                                        pass
                                     explainer_text = ""
                                     try:
                                         required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
@@ -14118,7 +14232,28 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 fixes_text = ""
                                 if isinstance(fixes, list) and fixes:
                                     fixes_text = "\nREQUIRED_FIXES:\n- " + "\n- ".join(str(item) for item in fixes)
+                                evidence_text = _format_gate_failure_evidence(review_result.get("gate_results"))
                                 payload = "CLEANING_REVIEWER_ALERT:\n" + str(review_result.get("feedback", "")).strip() + fixes_text
+                                if evidence_text:
+                                    payload += "\n\n" + evidence_text
+                                try:
+                                    feedback_record = {
+                                        "agent": "cleaning_reviewer",
+                                        "status": "REJECTED",
+                                        "failed_gates": [
+                                            str(item) for item in (review_result.get("failed_checks") or []) if item
+                                        ],
+                                        "required_fixes": [str(item) for item in (fixes or []) if item],
+                                        "hard_failures": [
+                                            str(item) for item in (review_result.get("hard_failures") or []) if item
+                                        ],
+                                    }
+                                    payload += (
+                                        "\n\nITERATION_FEEDBACK_RECORD_JSON:\n"
+                                        + json.dumps(feedback_record, ensure_ascii=True)
+                                    )
+                                except Exception:
+                                    pass
                                 new_state = dict(state)
                                 new_state["cleaning_reviewer_retry_done"] = True
                                 new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
@@ -18722,14 +18857,14 @@ def run_review_board(state: AgentState) -> AgentState:
             if area not in merged_failed:
                 merged_failed.append(area)
         handoff_quality["failed_gates"] = merged_failed[:15]
-    handoff_quality["required_fixes"] = _normalize_handoff_items(current_required, max_items=15, max_len=240)
+    handoff_quality["required_fixes"] = _normalize_handoff_items(current_required, max_items=15, max_len=500)
     handoff_quality["hard_failures"] = _normalize_handoff_items(
         gate_context.get("hard_failures") or handoff_quality.get("hard_failures"),
         max_items=10,
         max_len=200,
     )
-    patch_objectives = _normalize_handoff_items(iteration_handoff.get("patch_objectives"), max_items=8, max_len=260)
-    for action in _normalize_handoff_items(required_actions, max_items=8, max_len=240):
+    patch_objectives = _normalize_handoff_items(iteration_handoff.get("patch_objectives"), max_items=8, max_len=420)
+    for action in _normalize_handoff_items(required_actions, max_items=8, max_len=500):
         if action not in patch_objectives:
             patch_objectives.append(action)
         if len(patch_objectives) >= 8:
@@ -18741,7 +18876,7 @@ def run_review_board(state: AgentState) -> AgentState:
         "status": board_status,
         "summary": board_summary,
         "failed_areas": _normalize_handoff_items(failed_areas, max_items=12, max_len=200),
-        "required_actions": _normalize_handoff_items(required_actions, max_items=12, max_len=220),
+        "required_actions": _normalize_handoff_items(required_actions, max_items=12, max_len=500),
         "confidence": confidence,
     }
     iteration_handoff["quality_focus"] = handoff_quality
