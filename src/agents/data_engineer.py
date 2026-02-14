@@ -57,12 +57,12 @@ class DataEngineerAgent:
             os.getenv("DATA_ENGINEER_PRIMARY_MODEL")
             or os.getenv("OPENROUTER_DE_PRIMARY_MODEL")
             or os.getenv("DEEPSEEK_DE_PRIMARY_MODEL")
-            or "minimax/minimax-m2.5"
+            or "moonshotai/kimi-k2.5"
         )
         self.fallback_model_name = (
             os.getenv("DATA_ENGINEER_FALLBACK_MODEL")
             or os.getenv("OPENROUTER_DE_FALLBACK_MODEL")
-            or "moonshotai/kimi-k2.5"
+            or "minimax/minimax-m2.5"
         )
 
         self.last_prompt = None
