@@ -19,6 +19,7 @@ import ast
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -28,7 +29,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from google.cloud import storage
+try:
+    from google.cloud import storage
+except Exception:
+    storage = None  # type: ignore[assignment]
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 
@@ -270,8 +274,10 @@ def _normalize_output_uri(uri: str) -> str:
     return uri if uri.endswith("/") else uri + "/"
 
 
-def _gcs_client() -> storage.Client:
+def _gcs_client() -> Any:
     """Get GCS client instance."""
+    if storage is None:
+        raise RuntimeError("google-cloud-storage is required for gs:// URIs but is not installed")
     return storage.Client()
 
 
@@ -321,7 +327,7 @@ def _write_file_output(local_path: str, output_uri: str, filename: str) -> None:
     os.makedirs(output_uri, exist_ok=True)
     dest = os.path.join(output_uri, filename)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    os.replace(local_path, dest)
+    shutil.copy2(local_path, dest)
 
 
 def _load_input_json(input_uri: str) -> Dict[str, Any]:

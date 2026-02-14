@@ -124,8 +124,16 @@ class DataEngineerAgent:
 
         pandas_spec = pinned_specs.get("pandas", "unbounded")
 
+        runtime_mode = (
+            os.getenv("RUN_EXECUTION_MODE")
+            or os.getenv("EXECUTION_RUNTIME_MODE")
+            or "cloudrun"
+        ).strip().lower()
+        backend_profile = "local" if runtime_mode == "local" else "cloudrun"
+
         return {
-            "backend_profile": "cloudrun",
+            "backend_profile": backend_profile,
+            "runtime_mode": runtime_mode,
             "allowlist": {
                 "base": sorted({str(item) for item in BASE_ALLOWLIST if str(item).strip()}),
                 "extended_optional": sorted(
@@ -149,6 +157,7 @@ class DataEngineerAgent:
                 "Import only allowlisted roots.",
                 "Use stable public APIs compatible with version_hints.",
                 "Avoid deprecated kwargs/behaviors when equivalent safe idioms exist.",
+                "Keep script portable across local and cloudrun runner modes.",
             ],
         }
 

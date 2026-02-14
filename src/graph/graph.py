@@ -68,6 +68,7 @@ from src.utils.cleaning_guards import (
 from src.utils.integrity_audit import run_integrity_audit
 from src.utils.output_contract import check_required_outputs, get_csv_dialect
 from src.utils.cloudrun_launcher import launch_heavy_runner_job, CloudRunLaunchError
+from src.utils.local_runner_launcher import launch_local_runner_job, LocalRunnerLaunchError
 from src.utils.column_sets import (
     expand_column_sets,
     summarize_column_sets,
@@ -9366,7 +9367,46 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _get_execution_runtime_mode() -> str:
+    raw = (
+        os.getenv("RUN_EXECUTION_MODE")
+        or os.getenv("EXECUTION_RUNTIME_MODE")
+        or os.getenv("CODE_EXECUTION_RUNTIME")
+        or "cloudrun"
+    )
+    mode = str(raw).strip().lower()
+    if mode in {"local", "cloudrun"}:
+        return mode
+    return "cloudrun"
+
+
 def _get_heavy_runner_config() -> Dict[str, Any] | None:
+    runtime_mode = _get_execution_runtime_mode()
+    if runtime_mode == "local":
+        timeout_raw = (
+            os.getenv("LOCAL_RUNNER_SCRIPT_TIMEOUT_SECONDS")
+            or os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS")
+        )
+        script_timeout_seconds = None
+        if timeout_raw is not None:
+            try:
+                parsed = int(str(timeout_raw).strip())
+                if parsed > 0:
+                    script_timeout_seconds = parsed
+            except Exception:
+                script_timeout_seconds = None
+        return {
+            "mode": "local",
+            "job": "local_runner",
+            "region": "local",
+            "bucket": "local",
+            "project": "local",
+            "input_prefix": "inputs",
+            "output_prefix": "outputs",
+            "dataset_prefix": "datasets",
+            "script_timeout_seconds": script_timeout_seconds,
+        }
+
     if not _env_flag("HEAVY_RUNNER_ENABLED", False):
         return None
     job = os.getenv("HEAVY_RUNNER_JOB")
@@ -9384,6 +9424,7 @@ def _get_heavy_runner_config() -> Dict[str, Any] | None:
         except Exception:
             script_timeout_seconds = None
     return {
+        "mode": "cloudrun",
         "job": job,
         "region": region,
         "bucket": bucket,
@@ -9644,9 +9685,23 @@ def _estimate_heavy_script_timeout(
     margin_seconds = _safe_int(os.getenv("HEAVY_RUNNER_TIMEOUT_MARGIN_SECONDS"), 900)
     estimated = int(round(raw_estimate * margin_multiplier)) + max(0, margin_seconds)
 
-    default_min = 1200 if stage_norm == "data_engineer" else 2400
-    min_timeout = _safe_int(os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MIN_SECONDS"), default_min)
-    max_timeout = _safe_int(os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MAX_SECONDS"), 7200)
+    runtime_mode = _get_execution_runtime_mode()
+    if runtime_mode == "local":
+        default_min = 1800 if stage_norm == "data_engineer" else 3600
+        min_timeout = _safe_int(
+            os.getenv("LOCAL_RUNNER_SCRIPT_TIMEOUT_MIN_SECONDS")
+            or os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MIN_SECONDS"),
+            default_min,
+        )
+        max_timeout = _safe_int(
+            os.getenv("LOCAL_RUNNER_SCRIPT_TIMEOUT_MAX_SECONDS")
+            or os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MAX_SECONDS"),
+            43200,
+        )
+    else:
+        default_min = 1200 if stage_norm == "data_engineer" else 2400
+        min_timeout = _safe_int(os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MIN_SECONDS"), default_min)
+        max_timeout = _safe_int(os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MAX_SECONDS"), 7200)
     if max_timeout <= 0:
         max_timeout = 7200
     if min_timeout <= 0:
@@ -10044,6 +10099,7 @@ def _should_use_heavy_runner(
 
 def _resolve_ml_backend_selection(state: Dict[str, Any]) -> Dict[str, Any]:
     heavy_cfg = _get_heavy_runner_config()
+    runtime_mode = _get_execution_runtime_mode()
     contract, _contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     required_deps = contract.get("required_dependencies", []) if isinstance(contract, dict) else []
     heavy_deps_required = requires_cloudrun_backend(required_deps)
@@ -10058,7 +10114,9 @@ def _resolve_ml_backend_selection(state: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data_profile, dict):
         data_profile = {}
     use_heavy = bool(heavy_cfg)
-    if heavy_cfg:
+    if runtime_mode == "local" and heavy_cfg:
+        reason = "local_runner_mode"
+    elif heavy_cfg:
         reason = "cloudrun_only_mode"
     elif heavy_deps_from_code:
         reason = "cloudrun_required_by_script_imports_but_unavailable"
@@ -10066,9 +10124,10 @@ def _resolve_ml_backend_selection(state: Dict[str, Any]) -> Dict[str, Any]:
         reason = "cloudrun_required_by_dependencies_but_unavailable"
     else:
         reason = "cloudrun_config_missing"
-    backend_profile = "cloudrun"
+    backend_profile = "local" if runtime_mode == "local" else "cloudrun"
     return {
         "heavy_cfg": heavy_cfg,
+        "runtime_mode": runtime_mode,
         "use_heavy": bool(use_heavy),
         "reason": reason,
         "backend_profile": backend_profile,
@@ -10136,6 +10195,27 @@ def _read_memory_env_hint(*names: str) -> float | None:
     return None
 
 
+def _estimate_local_host_memory_gb() -> float | None:
+    try:
+        import psutil  # type: ignore
+
+        total = float(psutil.virtual_memory().total)
+        if total > 0:
+            return round(total / float(1024 ** 3), 3)
+    except Exception:
+        pass
+    try:
+        if hasattr(os, "sysconf"):
+            page_size = float(os.sysconf("SC_PAGE_SIZE"))
+            phys_pages = float(os.sysconf("SC_PHYS_PAGES"))
+            total = page_size * phys_pages
+            if total > 0:
+                return round(total / float(1024 ** 3), 3)
+    except Exception:
+        pass
+    return None
+
+
 def _build_ml_execution_profile_for_prompt(
     state: Dict[str, Any],
     *,
@@ -10149,6 +10229,7 @@ def _build_ml_execution_profile_for_prompt(
     state = state if isinstance(state, dict) else {}
     backend_selection = _resolve_ml_backend_selection(state)
     heavy_cfg = backend_selection.get("heavy_cfg") if isinstance(backend_selection.get("heavy_cfg"), dict) else {}
+    runtime_mode = str(backend_selection.get("runtime_mode") or _get_execution_runtime_mode())
     hints = state.get("dataset_scale_hints") if isinstance(state.get("dataset_scale_hints"), dict) else {}
     timeout_decision = _estimate_heavy_script_timeout(
         stage="ml_engineer",
@@ -10157,7 +10238,7 @@ def _build_ml_execution_profile_for_prompt(
         ml_plan=ml_plan if isinstance(ml_plan, dict) else None,
         configured_timeout_seconds=heavy_cfg.get("script_timeout_seconds") if isinstance(heavy_cfg, dict) else None,
     )
-    backend = "cloudrun" if bool(backend_selection.get("use_heavy")) else "e2b"
+    backend = "local" if runtime_mode == "local" else ("cloudrun" if bool(backend_selection.get("use_heavy")) else "e2b")
     cpu_hint = _read_int_env_hint(
         "HEAVY_RUNNER_CPU_HINT",
         "HEAVY_RUNNER_CPU",
@@ -10172,7 +10253,13 @@ def _build_ml_execution_profile_for_prompt(
         "CLOUD_RUN_MEMORY",
     )
     resource_source = "env_hints"
-    if backend == "cloudrun":
+    if backend == "local":
+        if cpu_hint is None:
+            cpu_hint = os.cpu_count() or None
+        if memory_gb_hint is None:
+            memory_gb_hint = _estimate_local_host_memory_gb()
+        resource_source = "local_host"
+    elif backend == "cloudrun":
         # Keep infrastructure context actionable even when env hints are absent.
         # Defaults match heavy-runner deploy defaults and remain advisory-only.
         if cpu_hint is None:
@@ -10544,6 +10631,7 @@ def _execute_data_engineer_via_heavy_runner(
     attempt_id: int,
     reason: str,
 ) -> Dict[str, Any]:
+    runtime_mode = _get_execution_runtime_mode()
     _, _, required_artifacts = _resolve_de_output_artifacts(state)
     optional_outlier_report = _resolve_de_outlier_report_path(state)
     optional_download_artifacts: List[str] = []
@@ -10605,6 +10693,7 @@ def _execute_data_engineer_via_heavy_runner(
             "heavy_runner_request",
             {
                 "mode": request.get("mode"),
+                "runtime_mode": runtime_mode,
                 "reason": reason,
                 "attempt_id": attempt_id,
                 "download_keys": list(download_map.keys()),
@@ -10617,14 +10706,16 @@ def _execute_data_engineer_via_heavy_runner(
         )
         log_run_event(run_id, "heavy_runner_start", {"step": "data_engineer", "reason": reason})
 
+    launch_fn = launch_local_runner_job if runtime_mode == "local" else launch_heavy_runner_job
+    launch_exc = (LocalRunnerLaunchError,) if runtime_mode == "local" else (CloudRunLaunchError,)
     try:
-        heavy_result = launch_heavy_runner_job(
+        heavy_result = launch_fn(
             run_id=run_id or "unknown",
             request=request,
             dataset_path=csv_path,
-            bucket=heavy_cfg["bucket"],
-            job=heavy_cfg["job"],
-            region=heavy_cfg["region"],
+            bucket=heavy_cfg.get("bucket", "local"),
+            job=heavy_cfg.get("job", "local_runner"),
+            region=heavy_cfg.get("region", "local"),
             project=heavy_cfg.get("project"),
             input_prefix=heavy_cfg.get("input_prefix", "inputs"),
             output_prefix=heavy_cfg.get("output_prefix", "outputs"),
@@ -10637,19 +10728,24 @@ def _execute_data_engineer_via_heavy_runner(
             attempt_id=attempt_id,
             stage_namespace="data_engineer",
         )
-    except CloudRunLaunchError as exc:
+    except launch_exc as exc:
         msg = str(exc)
-        unavailable = "Required CLI not found" in msg
+        unavailable = ("Required CLI not found" in msg) if runtime_mode != "local" else False
         if run_id:
             log_run_event(
                 run_id,
                 "heavy_runner_failed",
-                {"step": "data_engineer", "error": msg, "unavailable": unavailable},
+                {
+                    "step": "data_engineer",
+                    "error": msg,
+                    "unavailable": unavailable,
+                    "runtime_mode": runtime_mode,
+                },
             )
         return {
             "ok": False,
             "unavailable": unavailable,
-            "error_details": f"HEAVY_RUNNER_ERROR: {msg}",
+            "error_details": f"{'LOCAL_RUNNER_ERROR' if runtime_mode == 'local' else 'HEAVY_RUNNER_ERROR'}: {msg}",
             "heavy_result": None,
         }
 
@@ -11874,17 +11970,22 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if scale_flag in {"medium", "large"} or file_mb >= 50 or est_rows >= 200_000 or n_cols >= 500:
             memory_guard_active = True
     state["de_memory_guard_active"] = memory_guard_active
+    runtime_mode = _get_execution_runtime_mode()
     de_heavy_cfg = _get_heavy_runner_config()
     de_use_heavy_runner = bool(de_heavy_cfg)
-    de_heavy_reason = "cloudrun_only_mode" if de_heavy_cfg else "cloudrun_config_missing"
+    if runtime_mode == "local" and de_heavy_cfg:
+        de_heavy_reason = "local_runner_mode"
+    else:
+        de_heavy_reason = "cloudrun_only_mode" if de_heavy_cfg else "cloudrun_config_missing"
     if run_id:
         try:
             log_run_event(
                 run_id,
                 "data_engineer_backend_selection",
                 {
-                    "backend": "heavy_runner",
+                    "backend": "local_runner" if runtime_mode == "local" else "heavy_runner",
                     "reason": de_heavy_reason,
+                    "runtime_mode": runtime_mode,
                     "cloudrun_available": bool(de_heavy_cfg),
                     "dataset_scale": {
                         "scale": dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else None,
@@ -12521,26 +12622,36 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 return {"cleaning_code": code, "cleaned_data_preview": "Error: Plan Failed", "error_message": msg, "budget_counters": counters}
         else:
             if not de_heavy_cfg:
-                msg = (
-                    "CLOUDRUN_REQUIRED: Data Engineer execution is configured for Cloud Run only, "
-                    "but heavy runner configuration is missing."
-                )
+                if runtime_mode == "local":
+                    msg = "LOCAL_RUNNER_REQUIRED: local execution mode enabled but local runner configuration is unavailable."
+                    abort_reason = "data_engineer_local_runner_config_missing"
+                    preview_text = "Error: Local Runner Required"
+                else:
+                    msg = (
+                        "CLOUDRUN_REQUIRED: Data Engineer execution is configured for Cloud Run only, "
+                        "but heavy runner configuration is missing."
+                    )
+                    abort_reason = "data_engineer_cloudrun_config_missing"
+                    preview_text = "Error: Cloud Run Required"
                 if run_id:
                     log_run_event(
                         run_id,
                         "pipeline_aborted_reason",
-                        {"reason": "data_engineer_cloudrun_config_missing"},
+                        {"reason": abort_reason},
                     )
                 return {
                     "cleaning_code": code,
-                    "cleaned_data_preview": "Error: Cloud Run Required",
+                    "cleaned_data_preview": preview_text,
                     "error_message": msg,
-                    "pipeline_aborted_reason": "data_engineer_cloudrun_config_missing",
+                    "pipeline_aborted_reason": abort_reason,
                     "data_engineer_failed": True,
                     "budget_counters": counters,
                 }
 
-            print(f"    Backend: Cloud Run Heavy Runner (DE, reason={de_heavy_reason})")
+            if runtime_mode == "local":
+                print(f"    Backend: Local Runner (DE, reason={de_heavy_reason})")
+            else:
+                print(f"    Backend: Cloud Run Heavy Runner (DE, reason={de_heavy_reason})")
             de_heavy_result = _execute_data_engineer_via_heavy_runner(
                 state=state,
                 code=code,
@@ -15720,6 +15831,7 @@ def execute_code(state: AgentState) -> AgentState:
     visuals_missing = False
     contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     backend_selection = _resolve_ml_backend_selection(state if isinstance(state, dict) else {})
+    runtime_mode = str(backend_selection.get("runtime_mode") or _get_execution_runtime_mode())
     heavy_cfg = backend_selection.get("heavy_cfg")
     use_heavy = bool(backend_selection.get("use_heavy"))
     heavy_reason = str(backend_selection.get("reason") or "unknown")
@@ -15736,15 +15848,22 @@ def execute_code(state: AgentState) -> AgentState:
         else {}
     )
     if not heavy_cfg or not use_heavy:
-        msg = (
-            "CLOUDRUN_REQUIRED: ML execution is configured for Cloud Run only, "
-            "but heavy runner configuration is missing/unavailable."
-        )
+        if runtime_mode == "local":
+            msg = "LOCAL_RUNNER_REQUIRED: ML execution is configured for local runner, but local runner config is missing/unavailable."
+        else:
+            msg = (
+                "CLOUDRUN_REQUIRED: ML execution is configured for Cloud Run only, "
+                "but heavy runner configuration is missing/unavailable."
+            )
         if run_id:
             log_run_event(
                 run_id,
                 "execution_backend_unavailable",
-                {"backend": "heavy_runner", "reason": heavy_reason},
+                {
+                    "backend": "local_runner" if runtime_mode == "local" else "heavy_runner",
+                    "reason": heavy_reason,
+                    "runtime_mode": runtime_mode,
+                },
             )
         return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
 
@@ -15793,6 +15912,7 @@ def execute_code(state: AgentState) -> AgentState:
                 "execution_backend_selection",
                 {
                     "backend": "heavy_runner",
+                    "runtime_mode": runtime_mode,
                     "reason": heavy_reason,
                     "dataset_scale": {
                         "scale": hints.get("scale"),
@@ -15805,7 +15925,10 @@ def execute_code(state: AgentState) -> AgentState:
                 },
             )
         if use_heavy:
-            print(f"    Backend: Cloud Run Heavy Runner (reason={heavy_reason})")
+            if runtime_mode == "local":
+                print(f"    Backend: Local Runner (reason={heavy_reason})")
+            else:
+                print(f"    Backend: Cloud Run Heavy Runner (reason={heavy_reason})")
             dialect = _resolve_artifact_gate_dialect(state, contract)
             csv_sep = dialect["sep"]
             csv_decimal = dialect["decimal"]
@@ -16026,8 +16149,9 @@ def execute_code(state: AgentState) -> AgentState:
                     "heavy_runner_request",
                     {
                         "mode": "execute_code",
-                        "gcloud_bin": os.getenv("HEAVY_RUNNER_GCLOUD_BIN") or "PATH",
-                        "gsutil_bin": os.getenv("HEAVY_RUNNER_GSUTIL_BIN") or "PATH",
+                        "runtime_mode": runtime_mode,
+                        "gcloud_bin": (os.getenv("HEAVY_RUNNER_GCLOUD_BIN") or "PATH") if runtime_mode != "local" else "local",
+                        "gsutil_bin": (os.getenv("HEAVY_RUNNER_GSUTIL_BIN") or "PATH") if runtime_mode != "local" else "local",
                         "target_col": target_col,
                         "feature_count": len(feature_cols or []),
                         "problem_type": problem_type,
@@ -16048,14 +16172,16 @@ def execute_code(state: AgentState) -> AgentState:
                 )
             if run_id:
                 log_run_event(run_id, "heavy_runner_start", {"reason": heavy_reason})
+            launch_fn = launch_local_runner_job if runtime_mode == "local" else launch_heavy_runner_job
+            launch_exc = (LocalRunnerLaunchError,) if runtime_mode == "local" else (CloudRunLaunchError,)
             try:
-                heavy_result = launch_heavy_runner_job(
+                heavy_result = launch_fn(
                     run_id=run_id or "unknown",
                     request=request,
                     dataset_path=local_csv,
-                    bucket=heavy_cfg["bucket"],
-                    job=heavy_cfg["job"],
-                    region=heavy_cfg["region"],
+                    bucket=heavy_cfg.get("bucket", "local"),
+                    job=heavy_cfg.get("job", "local_runner"),
+                    region=heavy_cfg.get("region", "local"),
                     project=heavy_cfg.get("project"),
                     input_prefix=heavy_cfg.get("input_prefix", "inputs"),
                     output_prefix=heavy_cfg.get("output_prefix", "outputs"),
@@ -16068,10 +16194,14 @@ def execute_code(state: AgentState) -> AgentState:
                     attempt_id=attempt_id,
                     stage_namespace="ml_engineer",
                 )
-            except CloudRunLaunchError as exc:
+            except launch_exc as exc:
                 if run_id:
-                    log_run_event(run_id, "heavy_runner_failed", {"error": str(exc)})
-                output = f"HEAVY_RUNNER_ERROR: {exc}"
+                    log_run_event(
+                        run_id,
+                        "heavy_runner_failed",
+                        {"error": str(exc), "runtime_mode": runtime_mode},
+                    )
+                output = f"{'LOCAL_RUNNER_ERROR' if runtime_mode == 'local' else 'HEAVY_RUNNER_ERROR'}: {exc}"
                 return _finalize_heavy_execution(
                     state=state,
                     output=output,
