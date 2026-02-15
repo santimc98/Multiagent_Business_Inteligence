@@ -2636,6 +2636,42 @@ def _expand_required_feature_selectors(
     return expanded, issues
 
 
+def _normalize_column_dtype_targets(raw: Any) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, dict):
+        return {}, ["column_dtype_targets must be an object mapping key -> {target_dtype,...}."]
+    normalized: Dict[str, Dict[str, Any]] = {}
+    issues: List[str] = []
+    for key, value in raw.items():
+        col_key = str(key or "").strip()
+        if not col_key:
+            issues.append("column_dtype_targets contains an empty key.")
+            continue
+        if not isinstance(value, dict):
+            issues.append(f"column_dtype_targets['{col_key}'] must be an object.")
+            continue
+        target_dtype = str(value.get("target_dtype") or "").strip()
+        if not target_dtype:
+            issues.append(f"column_dtype_targets['{col_key}'] missing target_dtype.")
+            continue
+        payload: Dict[str, Any] = {"target_dtype": target_dtype}
+        if "nullable" in value:
+            payload["nullable"] = value.get("nullable")
+        if "role" in value and value.get("role") not in (None, ""):
+            payload["role"] = value.get("role")
+        if "source" in value and value.get("source") not in (None, ""):
+            payload["source"] = value.get("source")
+        if "matched_count" in value:
+            payload["matched_count"] = value.get("matched_count")
+        if isinstance(value.get("matched_sample"), list):
+            payload["matched_sample"] = [
+                str(item) for item in value.get("matched_sample", []) if str(item).strip()
+            ][:20]
+        normalized[col_key] = payload
+    return normalized, issues
+
+
 def _selector_matches_column(selector: Dict[str, Any], column: str) -> bool:
     """
     Return True when a selector definition matches a concrete column name.
@@ -2895,6 +2931,34 @@ def validate_contract_minimal_readonly(
 
     requires_cleaning = scope in {"cleaning_only", "full_pipeline"}
     requires_ml = scope in {"ml_only", "full_pipeline"}
+    artifact_requirements = contract.get("artifact_requirements")
+    clean_dataset_cfg = {}
+    if isinstance(artifact_requirements, dict):
+        candidate = artifact_requirements.get("clean_dataset")
+        if isinstance(candidate, dict):
+            clean_dataset_cfg = candidate
+    raw_dtype_targets = contract.get("column_dtype_targets")
+    if raw_dtype_targets in (None, {}) and isinstance(clean_dataset_cfg.get("column_dtype_targets"), dict):
+        raw_dtype_targets = clean_dataset_cfg.get("column_dtype_targets")
+    column_dtype_targets, dtype_issues = _normalize_column_dtype_targets(raw_dtype_targets)
+    for msg in dtype_issues:
+        issues.append(
+            _strict_issue(
+                "contract.column_dtype_targets",
+                "error",
+                msg,
+                raw_dtype_targets,
+            )
+        )
+    if (requires_cleaning or requires_ml) and not column_dtype_targets:
+        issues.append(
+            _strict_issue(
+                "contract.column_dtype_targets_missing",
+                "error",
+                "column_dtype_targets missing/empty for active scope; fail-closed to reduce dtype drift between DE and ML.",
+                raw_dtype_targets,
+            )
+        )
 
     if requires_cleaning:
         if not _gate_list_valid(contract.get("cleaning_gates")):
@@ -2916,7 +2980,6 @@ def validate_contract_minimal_readonly(
                 )
             )
 
-        artifact_requirements = contract.get("artifact_requirements")
         clean_dataset = {}
         if isinstance(artifact_requirements, dict):
             candidate = artifact_requirements.get("clean_dataset")
@@ -3099,6 +3162,35 @@ def validate_contract_minimal_readonly(
                         "optional_passthrough_columns overlap required_feature_selectors while selector-drop policy is active; "
                         "passthrough anchors must be non-droppable.",
                         selector_passthrough_overlap[:25],
+                    )
+                )
+
+        if column_dtype_targets:
+            anchor_refs = list(dict.fromkeys(required_cols + passthrough_cols))
+            role_bucket_names = ("outcome", "decision", "identifiers", "time_columns")
+            column_roles = contract.get("column_roles")
+            if isinstance(column_roles, dict):
+                for bucket in role_bucket_names:
+                    values = column_roles.get(bucket)
+                    if isinstance(values, list):
+                        for col in values:
+                            col_name = str(col or "").strip()
+                            if col_name and col_name not in anchor_refs:
+                                anchor_refs.append(col_name)
+            dtype_keys_norm = {str(k).strip().lower() for k in column_dtype_targets.keys() if str(k).strip()}
+            selector_present = any(str(k).strip().lower().startswith("selector:") for k in column_dtype_targets.keys())
+            uncovered_dtype_anchors = [
+                col
+                for col in anchor_refs
+                if col and str(col).strip().lower() not in dtype_keys_norm
+            ]
+            if uncovered_dtype_anchors and not selector_present:
+                issues.append(
+                    _strict_issue(
+                        "contract.column_dtype_targets_anchor_missing",
+                        "warning",
+                        "column_dtype_targets should cover anchor columns (required/passthrough/role anchors) or provide selector-level dtype targets.",
+                        uncovered_dtype_anchors[:25],
                     )
                 )
 

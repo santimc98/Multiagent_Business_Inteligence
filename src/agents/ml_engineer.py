@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from datetime import datetime
 from typing import Dict, Any, List
 from dotenv import load_dotenv
@@ -330,6 +331,7 @@ class MLEngineerAgent:
             "strategy_title",
             "business_objective",
             "canonical_columns",  # V4.1: replaces required_columns/data_requirements
+            "column_dtype_targets",
             "required_outputs",
             "objective_analysis",
             "evaluation_spec",
@@ -339,7 +341,6 @@ class MLEngineerAgent:
             "business_alignment",
             "feature_semantics",
             "business_sanity_checks",
-            "column_roles",
             "column_roles",
             # V4.1: availability_summary removed
             "required_dependencies",
@@ -791,8 +792,124 @@ class MLEngineerAgent:
             safe_head = max_len - safe_tail
         return text[:safe_head] + "\n...[TRUNCATED]...\n" + text[-safe_tail:]
 
+    def _serialize_json_for_prompt(
+        self,
+        payload: Any,
+        *,
+        max_chars: int = 8000,
+        max_str_len: int = 900,
+        max_list_items: int = 60,
+    ) -> str:
+        from src.utils.context_pack import compress_long_lists
+        from src.utils.contract_views import trim_to_budget
+
+        compact = compress_long_lists(payload or {})[0]
+        trimmed = trim_to_budget(
+            compact,
+            max_chars=max_chars,
+            max_str_len=max_str_len,
+            max_list_items=max_list_items,
+        )
+        text = json.dumps(trimmed, ensure_ascii=False, separators=(",", ":"))
+        if len(text) > max_chars:
+            text = self._truncate_prompt_text(
+                text,
+                max_len=max_chars,
+                head_len=int(max_chars * 0.65),
+                tail_len=int(max_chars * 0.25),
+            )
+        return text
+
+    def _shrink_prompt_blob(self, value: Any, max_chars: int) -> str:
+        if not isinstance(value, str):
+            return self._serialize_json_for_prompt(value, max_chars=max_chars)
+        text = value.strip()
+        if len(text) <= max_chars:
+            return text
+        try:
+            as_json = json.loads(text)
+            return self._serialize_json_for_prompt(as_json, max_chars=max_chars)
+        except Exception:
+            return self._truncate_prompt_text(
+                text,
+                max_len=max_chars,
+                head_len=int(max_chars * 0.65),
+                tail_len=int(max_chars * 0.25),
+            )
+
+    def _build_system_prompt_with_budget(
+        self,
+        template: str,
+        render_kwargs: Dict[str, Any],
+        *,
+        ml_view: Dict[str, Any] | None = None,
+        execution_contract: Dict[str, Any] | None = None,
+        max_chars: int = 50000,
+    ) -> tuple[str, Dict[str, Any], Dict[str, Any]]:
+        kwargs = dict(render_kwargs or {})
+        prompt = self._build_system_prompt(
+            template,
+            kwargs,
+            ml_view=ml_view,
+            execution_contract=execution_contract,
+        )
+        if len(prompt) <= max_chars:
+            return prompt, kwargs, {"prompt_chars": len(prompt), "budget_applied": False}
+
+        shrink_plan = [
+            ("data_audit_context", 4000),
+            ("iteration_memory_json", 3000),
+            ("iteration_memory_block", 2500),
+            ("signal_summary_json", 2500),
+            ("cleaned_data_summary_min_json", 3500),
+            ("feature_semantics_json", 3000),
+            ("business_sanity_checks_json", 2500),
+            ("alignment_requirements_json", 2000),
+            ("execution_contract_context", 9000),
+            ("ml_view_context", 8000),
+        ]
+        for key, budget in shrink_plan:
+            if key not in kwargs:
+                continue
+            kwargs[key] = self._shrink_prompt_blob(kwargs.get(key), budget)
+            prompt = self._build_system_prompt(
+                template,
+                kwargs,
+                ml_view=ml_view,
+                execution_contract=execution_contract,
+            )
+            if len(prompt) <= max_chars:
+                return prompt, kwargs, {"prompt_chars": len(prompt), "budget_applied": True}
+
+        return prompt, kwargs, {"prompt_chars": len(prompt), "budget_applied": True}
+
     def _truncate_code_for_patch(self, code: str, max_len: int = 12000) -> str:
         return self._truncate_prompt_text(code or "", max_len=max_len, head_len=7000, tail_len=4000)
+
+    def _extract_error_snippet_from_traceback(
+        self,
+        code: str,
+        traceback_text: str,
+        *,
+        context_lines: int = 10,
+    ) -> str:
+        if not code or not traceback_text:
+            return ""
+        try:
+            matches = re.findall(r'line\s+(\d+)', str(traceback_text))
+            if not matches:
+                return ""
+            line_num = int(matches[-1])
+            lines = str(code).splitlines()
+            start = max(line_num - context_lines - 1, 0)
+            end = min(line_num + context_lines, len(lines))
+            snippet_lines: List[str] = []
+            for idx in range(start, end):
+                prefix = ">>" if (idx + 1) == line_num else "  "
+                snippet_lines.append(f"{prefix} {idx + 1}: {lines[idx]}")
+            return "\n".join(snippet_lines)
+        except Exception:
+            return ""
 
     def _check_script_completeness(self, code: str, required_paths: List[str]) -> List[str]:
         """
@@ -1429,14 +1546,27 @@ $strategy_json
             result["notes"] = ["Agent not initialized; cannot call LLM. Using fallback defaults."]
             return result
 
-        from src.utils.context_pack import compress_long_lists
-
         # Prepare context
         try:
             render_kwargs = {
-                "data_profile_json": json.dumps(compress_long_lists(profile)[0], indent=2),
-                "execution_contract_json": json.dumps(self._compact_execution_contract(contract), indent=2),
-                "strategy_json": json.dumps(strategy_dict, indent=2),
+                "data_profile_json": self._serialize_json_for_prompt(
+                    profile,
+                    max_chars=12000,
+                    max_str_len=700,
+                    max_list_items=60,
+                ),
+                "execution_contract_json": self._serialize_json_for_prompt(
+                    self._compact_execution_contract(contract),
+                    max_chars=8000,
+                    max_str_len=600,
+                    max_list_items=60,
+                ),
+                "strategy_json": self._serialize_json_for_prompt(
+                    strategy_dict,
+                    max_chars=4000,
+                    max_str_len=600,
+                    max_list_items=60,
+                ),
                 "business_objective": business_objective,
             }
         except Exception as render_err:
@@ -2001,6 +2131,7 @@ $strategy_json
         - Read CSV with dtype=str first, then convert with pd.to_numeric(errors='coerce') when needed.
         - For nullable integers, use pandas nullable Int64 instead of plain int64 casts.
         - Never assume clean target dtype without verifying nullability and domain.
+        - Enforce column_dtype_targets when present (column-level and selector-family targets).
 
         OUTPUT SAFETY PATTERNS
         - Ensure parent directories exist before each artifact write.
@@ -2088,6 +2219,7 @@ $strategy_json
         - Business Sanity Checks: $business_sanity_checks_json
         - Signal Summary: $signal_summary_json
         - Cleaned Data Summary (advisory): $cleaned_data_summary_min_json
+        - Column Dtype Targets: $column_dtype_targets_json
         - Execution Profile Context: $execution_profile_json
         - Iteration Memory: $iteration_memory_json
         - Iteration Memory (compact): $iteration_memory_block
@@ -2123,15 +2255,22 @@ $strategy_json
         if required_outputs:
             deliverables = [{"path": path, "required": True} for path in required_outputs if path]
         required_deliverables = [item.get("path") for item in deliverables if item.get("required") and item.get("path")]
-        deliverables_json = json.dumps(compress_long_lists(deliverables)[0], indent=2)
+        deliverables_json = self._serialize_json_for_prompt(
+            deliverables,
+            max_chars=4500,
+            max_str_len=400,
+            max_list_items=80,
+        )
         
         # V4.1: Use ml_engineer_runbook directly, no legacy role_runbooks
         ml_runbook_source = execution_contract_input.get("ml_engineer_runbook")
         if not isinstance(ml_runbook_source, dict):
             ml_runbook_source = ml_view.get("ml_engineer_runbook") if isinstance(ml_view.get("ml_engineer_runbook"), dict) else {}
-        ml_runbook_json = json.dumps(
-            compress_long_lists(ml_runbook_source)[0],
-            indent=2,
+        ml_runbook_json = self._serialize_json_for_prompt(
+            ml_runbook_source,
+            max_chars=5000,
+            max_str_len=600,
+            max_list_items=120,
         )
         # V4.1: No spec_extraction - removed
         execution_contract_compact = self._compact_execution_contract(execution_contract_input)
@@ -2158,18 +2297,32 @@ $strategy_json
             k: v for k, v in (ml_view or {}).items() if k in ml_view_whitelist and v not in (None, "", [], {})
         }
         ml_view_payload = compress_long_lists(ml_view_payload)[0]
-        ml_view_json = json.dumps(ml_view_payload, indent=2)
-        plot_spec_json = json.dumps(compress_long_lists(ml_view.get("plot_spec", {}))[0], indent=2)
-        execution_profile_json = json.dumps(
-            compress_long_lists(execution_profile or {})[0],
-            indent=2,
+        ml_view_json = self._serialize_json_for_prompt(
+            ml_view_payload,
+            max_chars=11000,
+            max_str_len=700,
+            max_list_items=100,
+        )
+        plot_spec_json = self._serialize_json_for_prompt(
+            ml_view.get("plot_spec", {}),
+            max_chars=3500,
+            max_str_len=500,
+            max_list_items=80,
+        )
+        execution_profile_json = self._serialize_json_for_prompt(
+            execution_profile or {},
+            max_chars=2500,
+            max_str_len=400,
+            max_list_items=60,
         )
         evaluation_spec_source = execution_contract_input.get("evaluation_spec")
         if not isinstance(evaluation_spec_source, dict):
             evaluation_spec_source = ml_view.get("evaluation_spec") if isinstance(ml_view.get("evaluation_spec"), dict) else {}
-        evaluation_spec_json = json.dumps(
-            compress_long_lists(evaluation_spec_source)[0],
-            indent=2,
+        evaluation_spec_json = self._serialize_json_for_prompt(
+            evaluation_spec_source,
+            max_chars=4500,
+            max_str_len=500,
+            max_list_items=80,
         )
         canonical_columns_source = (
             execution_contract_compact.get("canonical_columns")
@@ -2207,9 +2360,11 @@ $strategy_json
         if not isinstance(required_dependencies, list):
             required_dependencies = []
         runtime_dependency_context = self._build_runtime_dependency_context(required_dependencies)
-        runtime_dependency_context_json = json.dumps(
-            compress_long_lists(runtime_dependency_context)[0],
-            indent=2,
+        runtime_dependency_context_json = self._serialize_json_for_prompt(
+            runtime_dependency_context,
+            max_chars=4500,
+            max_str_len=500,
+            max_list_items=120,
         )
         data_sample_context = self._build_data_sample_context(
             data_path=data_path,
@@ -2217,11 +2372,18 @@ $strategy_json
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
         )
-        data_sample_context_json = json.dumps(
-            compress_long_lists(data_sample_context)[0],
-            indent=2,
+        data_sample_context_json = self._serialize_json_for_prompt(
+            data_sample_context,
+            max_chars=7000,
+            max_str_len=600,
+            max_list_items=60,
         )
         cleaned_data_summary_payload = self._compact_cleaned_data_summary_for_prompt(cleaned_data_summary_min or {})
+        column_dtype_targets = ml_view.get("column_dtype_targets")
+        if not isinstance(column_dtype_targets, dict) or not column_dtype_targets:
+            column_dtype_targets = execution_contract_input.get("column_dtype_targets")
+        if not isinstance(column_dtype_targets, dict):
+            column_dtype_targets = {}
 
         render_kwargs = dict(
             business_objective=business_objective,
@@ -2230,52 +2392,102 @@ $strategy_json
             hypothesis=strategy.get('hypothesis', 'N/A'),
             required_columns=json.dumps(required_columns_payload),
             deliverables_json=deliverables_json,
-            canonical_columns=json.dumps(canonical_columns_source),
-            business_alignment_json=json.dumps(
-                compress_long_lists(execution_contract_input.get("business_alignment", {}))[0],
-                indent=2,
+            canonical_columns=self._serialize_json_for_prompt(
+                canonical_columns_source,
+                max_chars=5000,
+                max_str_len=400,
+                max_list_items=120,
             ),
-            alignment_requirements_json=json.dumps(
-                compress_long_lists(execution_contract_input.get("alignment_requirements", []))[0],
-                indent=2,
+            business_alignment_json=self._serialize_json_for_prompt(
+                execution_contract_input.get("business_alignment", {}),
+                max_chars=3000,
+                max_str_len=400,
+                max_list_items=60,
             ),
-            feature_semantics_json=json.dumps(
-                compress_long_lists(execution_contract_input.get("feature_semantics", []))[0],
-                indent=2,
+            alignment_requirements_json=self._serialize_json_for_prompt(
+                execution_contract_input.get("alignment_requirements", []),
+                max_chars=3000,
+                max_str_len=400,
+                max_list_items=60,
             ),
-            business_sanity_checks_json=json.dumps(
-                compress_long_lists(execution_contract_input.get("business_sanity_checks", []))[0],
-                indent=2,
+            feature_semantics_json=self._serialize_json_for_prompt(
+                execution_contract_input.get("feature_semantics", []),
+                max_chars=3500,
+                max_str_len=400,
+                max_list_items=60,
+            ),
+            business_sanity_checks_json=self._serialize_json_for_prompt(
+                execution_contract_input.get("business_sanity_checks", []),
+                max_chars=3000,
+                max_str_len=400,
+                max_list_items=60,
             ),
             data_path=data_path,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
-            execution_contract_context=json.dumps(execution_contract_compact, indent=2),
+            execution_contract_context=self._serialize_json_for_prompt(
+                execution_contract_compact,
+                max_chars=12000,
+                max_str_len=700,
+                max_list_items=120,
+            ),
             ml_view_context=ml_view_json,
             plot_spec_context=plot_spec_json,
             evaluation_spec_json=evaluation_spec_json,
             ml_engineer_runbook=ml_runbook_json,
             # V4.1: availability_summary removed
-            signal_summary_json=json.dumps(compress_long_lists(signal_summary or {})[0], indent=2),
-            cleaned_data_summary_min_json=json.dumps(
-                compress_long_lists(cleaned_data_summary_payload)[0], indent=2
+            signal_summary_json=self._serialize_json_for_prompt(
+                signal_summary or {},
+                max_chars=3000,
+                max_str_len=400,
+                max_list_items=60,
+            ),
+            cleaned_data_summary_min_json=self._serialize_json_for_prompt(
+                cleaned_data_summary_payload,
+                max_chars=5000,
+                max_str_len=500,
+                max_list_items=80,
+            ),
+            column_dtype_targets_json=self._serialize_json_for_prompt(
+                column_dtype_targets,
+                max_chars=5000,
+                max_str_len=500,
+                max_list_items=120,
             ),
             runtime_dependency_context_json=runtime_dependency_context_json,
             data_sample_context_json=data_sample_context_json,
             execution_profile_json=execution_profile_json,
-            iteration_memory_json=json.dumps(compress_long_lists(iteration_memory or [])[0], indent=2),
+            iteration_memory_json=self._serialize_json_for_prompt(
+                iteration_memory or [],
+                max_chars=4000,
+                max_str_len=400,
+                max_list_items=40,
+            ),
             iteration_memory_block=iteration_memory_block or "",
             dataset_scale=dataset_scale,
         )
         # Safe Rendering for System Prompt
-        system_prompt = self._build_system_prompt(
+        system_prompt, render_kwargs, prompt_budget_meta = self._build_system_prompt_with_budget(
             SYSTEM_PROMPT_TEMPLATE,
             render_kwargs,
             ml_view=ml_view,
             execution_contract=execution_contract_input,
         )
+        if isinstance(prompt_budget_meta, dict):
+            prompt_chars = int(prompt_budget_meta.get("prompt_chars") or 0)
+            budget_applied = bool(prompt_budget_meta.get("budget_applied"))
+            print(
+                "ML_PROMPT_BUDGET: "
+                + json.dumps(
+                    {
+                        "prompt_chars": prompt_chars,
+                        "budget_chars": 50000,
+                        "budget_applied": budget_applied,
+                    }
+                )
+            )
         
         # USER TEMPLATES (Static)
         USER_FIRSTPASS_TEMPLATE = """
@@ -2360,6 +2572,9 @@ $strategy_json
             else:
                 tail = handoff_payload.get("feedback", {}).get("runtime_error_tail") if isinstance(handoff_payload.get("feedback"), dict) else ""
                 runtime_error_detail = str(tail or gate_ctx.get("traceback") or gate_ctx.get("execution_output_tail") or "").strip()
+            error_snippet = self._extract_error_snippet_from_traceback(previous_code or "", runtime_error_detail, context_lines=10)
+            if error_snippet:
+                runtime_error_detail = runtime_error_detail + "\n\nERROR_SNIPPET:\n" + error_snippet
             runtime_error_detail = self._truncate_prompt_text(runtime_error_detail, max_len=6000, head_len=4000, tail_len=1500)
             patch_objectives = handoff_payload.get("patch_objectives", [])
             patch_objectives_block = "\n".join([f"- {item}" for item in patch_objectives]) if patch_objectives else "- Resolve reviewer findings."

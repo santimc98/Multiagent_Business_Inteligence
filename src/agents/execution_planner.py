@@ -30,6 +30,7 @@ from src.utils.feature_selectors import infer_feature_selectors, compact_column_
 from src.utils.cleaning_contract_semantics import (
     extract_selector_drop_reasons,
     selector_reference_matches_any,
+    expand_required_feature_selectors,
 )
 from src.utils.column_sets import build_column_manifest, summarize_column_sets
 from src.utils.contract_validator import (
@@ -42,6 +43,9 @@ from src.utils.contract_validator import (
 )
 
 load_dotenv()
+
+
+_API_KEY_SENTINEL = object()
 
 
 _QA_SEVERITIES = {"HARD", "SOFT"}
@@ -190,6 +194,7 @@ Minimal contract interface:
 - canonical_columns: list[str]
 - required_outputs: list[str] file paths
 - column_roles: object mapping role -> list[str]
+- column_dtype_targets: object mapping concrete columns and/or selector families to target dtype contracts
 - artifact_requirements: object
 - iteration_policy: object with practical retry/iteration limits (small, numeric, and actionable)
 - outlier_policy (optional): object for robust outlier handling when strategy/data justify it.
@@ -205,6 +210,8 @@ Scope-dependent required fields:
     to represent wide feature families compactly (regex/prefix/range/list/all_columns_except)
   - artifact_requirements.clean_dataset.output_path: file path for cleaned CSV
   - artifact_requirements.clean_dataset.output_manifest_path (or manifest_path): file path for cleaning manifest JSON
+  - column_dtype_targets must include explicit dtype targets for anchor columns
+    (target/split/identifier/time/decision) and selector-level dtype targets for wide families when applicable.
   - If any column drop/scaling is requested, declare it explicitly in
     artifact_requirements.clean_dataset.column_transformations with:
     - drop_columns: list[str]
@@ -220,6 +227,7 @@ Scope-dependent required fields:
   - ml_engineer_runbook: object/list/string with actionable steps
   - evaluation_spec: non-empty object for ML execution/review context
   - objective_analysis.problem_type OR evaluation_spec.objective_type must be present
+  - column_dtype_targets must be coherent with evaluation/training expectations (nullable targets where labels can be missing).
 
 Gate object contract (for cleaning_gates / qa_gates / reviewer_gates):
 - preferred shape: {"name": string, "severity": "HARD"|"SOFT", "params": object}
@@ -269,6 +277,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "artifact_requirements.clean_dataset.required_feature_selectors (optional)",
             "artifact_requirements.clean_dataset.column_transformations (optional)",
             "artifact_requirements.clean_dataset.column_transformations.drop_policy (optional)",
+            "column_dtype_targets",
             "cleaning_gates",
             "data_engineer_runbook",
             "outlier_policy (optional)",
@@ -297,6 +306,7 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
             "qa_gates",
             "reviewer_gates",
             "required_outputs",
+            "column_dtype_targets",
         ],
         "objective_context_required": [
             "objective_analysis.problem_type|evaluation_spec.objective_type",
@@ -2145,6 +2155,182 @@ def select_relevant_columns(
     }
 
 
+def _normalize_dtype_target(
+    raw_dtype: str,
+    *,
+    missing_frac: float | None = None,
+    role_hint: str = "",
+) -> str:
+    dtype = str(raw_dtype or "").strip().lower()
+    role = str(role_hint or "").strip().lower()
+    has_missing = isinstance(missing_frac, (int, float)) and float(missing_frac) > 0.0
+
+    if role == "time_columns":
+        return "datetime64[ns]"
+    if role == "identifiers":
+        return "object"
+    if "datetime" in dtype or "date" in dtype or "time" in dtype:
+        return "datetime64[ns]"
+    if "bool" in dtype:
+        return "boolean"
+    if "int" in dtype:
+        return "Int64" if has_missing else "int64"
+    if any(tok in dtype for tok in ("float", "double", "number", "numeric", "decimal")):
+        return "float64"
+    if role in {"outcome", "decision"} and has_missing and not dtype:
+        return "float64"
+    if dtype in {"category", "categorical", "object", "string", "str"}:
+        return "object"
+    return "preserve"
+
+
+def _selector_key_for_dtype_targets(selector: Dict[str, Any]) -> str:
+    if not isinstance(selector, dict):
+        return "selector:unknown"
+    stype = str(selector.get("type") or "").strip().lower()
+    if stype == "regex":
+        pattern = str(selector.get("pattern") or "").strip()
+        return f"selector:regex:{pattern}" if pattern else "selector:regex"
+    if stype in {"prefix", "suffix", "contains"}:
+        token = str(selector.get(stype) or selector.get("value") or "").strip()
+        return f"selector:{stype}:{token}" if token else f"selector:{stype}"
+    if stype == "prefix_numeric_range":
+        prefix = str(selector.get("prefix") or "").strip()
+        start = selector.get("start")
+        end = selector.get("end")
+        if prefix and isinstance(start, int) and isinstance(end, int):
+            return f"selector:prefix_numeric_range:{prefix}[{start}:{end}]"
+        return "selector:prefix_numeric_range"
+    if stype == "list":
+        cols = selector.get("columns")
+        if isinstance(cols, list) and cols:
+            return f"selector:list:{len(cols)}"
+        return "selector:list"
+    if stype == "all_columns_except":
+        cols = selector.get("except_columns")
+        if isinstance(cols, list) and cols:
+            return f"selector:all_columns_except:{len(cols)}"
+        return "selector:all_columns_except"
+    family = selector.get("family_id") or selector.get("name") or selector.get("family")
+    if family:
+        return f"selector:family:{str(family).strip()}"
+    return "selector:unknown"
+
+
+def _infer_column_dtype_targets(
+    *,
+    canonical_columns: List[str],
+    column_roles: Dict[str, Any],
+    data_profile: Dict[str, Any] | None,
+    clean_dataset_cfg: Dict[str, Any] | None,
+    column_inventory: List[str] | None,
+) -> Dict[str, Dict[str, Any]]:
+    profile = data_profile if isinstance(data_profile, dict) else {}
+    clean_cfg = clean_dataset_cfg if isinstance(clean_dataset_cfg, dict) else {}
+    inventory = [str(c) for c in (column_inventory or []) if str(c).strip()]
+    inventory_set = set(inventory)
+    dtypes = profile.get("dtypes")
+    if not isinstance(dtypes, dict):
+        dtypes = {}
+    missingness = profile.get("missingness")
+    if not isinstance(missingness, dict):
+        missingness = {}
+
+    role_map: Dict[str, str] = {}
+    if isinstance(column_roles, dict):
+        for role_name, values in column_roles.items():
+            if not isinstance(values, list):
+                continue
+            role_key = str(role_name or "").strip()
+            for col in values:
+                col_name = str(col or "").strip()
+                if col_name:
+                    role_map[col_name] = role_key
+
+    required_cols = _coerce_list(clean_cfg.get("required_columns"))
+    passthrough_cols = _coerce_list(clean_cfg.get("optional_passthrough_columns"))
+    anchor_cols: List[str] = []
+    for col in required_cols + passthrough_cols:
+        if col and col not in anchor_cols:
+            anchor_cols.append(str(col))
+    for role_name in ("outcome", "decision", "identifiers", "time_columns"):
+        for col in _coerce_list(column_roles.get(role_name) if isinstance(column_roles, dict) else []):
+            if col and col not in anchor_cols:
+                anchor_cols.append(str(col))
+
+    canonical_list = [str(col) for col in (canonical_columns or []) if str(col).strip()]
+    use_full_canonical = len(canonical_list) <= 160
+    explicit_cols = canonical_list if use_full_canonical else anchor_cols
+    if not explicit_cols:
+        explicit_cols = canonical_list[:120]
+    explicit_cols = list(dict.fromkeys([col for col in explicit_cols if col]))
+
+    dtype_targets: Dict[str, Dict[str, Any]] = {}
+    for col in explicit_cols:
+        if inventory_set and col not in inventory_set:
+            continue
+        role_hint = role_map.get(col, "")
+        miss_frac = missingness.get(col)
+        try:
+            miss_val = float(miss_frac) if miss_frac is not None else None
+        except Exception:
+            miss_val = None
+        target_dtype = _normalize_dtype_target(
+            str(dtypes.get(col) or ""),
+            missing_frac=miss_val,
+            role_hint=role_hint,
+        )
+        dtype_targets[col] = {
+            "target_dtype": target_dtype,
+            "nullable": bool(miss_val and miss_val > 0.0),
+            "role": role_hint or "unknown",
+            "source": "data_profile",
+        }
+
+    selectors_raw = clean_cfg.get("required_feature_selectors")
+    selectors = [item for item in selectors_raw if isinstance(item, dict)] if isinstance(selectors_raw, list) else []
+    if selectors:
+        selector_cols, selector_issues = expand_required_feature_selectors(selectors, inventory or canonical_list)
+        selector_issues = selector_issues or []
+        observed_targets: List[str] = []
+        for col in selector_cols[:600]:
+            role_hint = role_map.get(col, "")
+            miss_frac = missingness.get(col)
+            try:
+                miss_val = float(miss_frac) if miss_frac is not None else None
+            except Exception:
+                miss_val = None
+            observed_targets.append(
+                _normalize_dtype_target(
+                    str(dtypes.get(col) or ""),
+                    missing_frac=miss_val,
+                    role_hint=role_hint,
+                )
+            )
+        selector_dtype = "preserve"
+        if observed_targets:
+            counts: Dict[str, int] = {}
+            for item in observed_targets:
+                counts[item] = counts.get(item, 0) + 1
+            selector_dtype = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+
+        for selector in selectors:
+            key = _selector_key_for_dtype_targets(selector)
+            entry = {
+                "target_dtype": selector_dtype,
+                "nullable": "preserve",
+                "source": "selector_family",
+            }
+            if selector_cols:
+                entry["matched_count"] = int(len(selector_cols))
+                entry["matched_sample"] = selector_cols[:12]
+            if selector_issues:
+                entry["selector_issues"] = selector_issues[:6]
+            dtype_targets[key] = entry
+
+    return dtype_targets
+
+
 def build_contract_min(
     full_contract_or_partial: Dict[str, Any] | None,
     strategy: Dict[str, Any] | None,
@@ -2583,11 +2769,26 @@ def build_contract_min(
         if col not in dropped_constant_columns
     ]
 
+    clean_dataset_cfg_for_dtypes = {
+        "required_columns": clean_dataset_required_columns,
+        "required_feature_selectors": feature_selectors if isinstance(feature_selectors, list) else [],
+        "optional_passthrough_columns": [],
+    }
+    column_dtype_targets = _infer_column_dtype_targets(
+        canonical_columns=canonical_columns,
+        column_roles=column_roles,
+        data_profile=data_profile if isinstance(data_profile, dict) else {},
+        clean_dataset_cfg=clean_dataset_cfg_for_dtypes,
+        column_inventory=inventory,
+    )
+
     artifact_requirements = {
         "clean_dataset": {
             "required_columns": clean_dataset_required_columns,
             "output_path": "data/cleaned_data.csv",
             "excluded_constant_columns": dropped_constant_columns if dropped_constant_columns else [],
+            "required_feature_selectors": feature_selectors if isinstance(feature_selectors, list) else [],
+            "column_dtype_targets": column_dtype_targets,
         },
         "metrics": {"required": True, "path": "data/metrics.json"},
         "alignment_check": {"required": True, "path": "data/alignment_check.json"},
@@ -2729,6 +2930,7 @@ def build_contract_min(
         "omitted_columns_policy": omitted_columns_policy,
         "reporting_policy": reporting_policy or {},
         "decisioning_requirements": decisioning_requirements,
+        "column_dtype_targets": column_dtype_targets,
     }
     if prep_reqs_min:
         contract_min["preprocessing_requirements"] = prep_reqs_min
@@ -2771,7 +2973,7 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
         "artifact_requirements", "qa_gates", "cleaning_gates", "reviewer_gates",
         "data_engineer_runbook", "ml_engineer_runbook",
         "available_columns", "canonical_columns", "derived_columns",
-        "required_outputs", "iteration_policy", "unknowns",
+        "required_outputs", "iteration_policy", "column_dtype_targets", "unknowns",
         "assumptions", "notes_for_engineers"
     ]
 
@@ -4055,8 +4257,14 @@ class ExecutionPlannerAgent:
     Falls back to heuristic contract if the model call fails.
     """
 
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+    def __init__(self, api_key: Any = _API_KEY_SENTINEL):
+        # Explicit `api_key=None` means "disable external LLM client" (used by tests/fallback paths).
+        # Omitting the argument keeps env-based resolution for runtime behavior.
+        if api_key is _API_KEY_SENTINEL:
+            resolved_api_key = os.getenv("GOOGLE_API_KEY")
+        else:
+            resolved_api_key = api_key
+        self.api_key = str(resolved_api_key).strip() if resolved_api_key not in (None, "") else None
         self._generation_config = {
             "temperature": 0.0,
             "top_p": 0.9,
@@ -8215,7 +8423,7 @@ class ExecutionPlannerAgent:
 
         target_candidates: List[Dict[str, Any]] = []
         if not self.client:
-            contract = {}
+            contract = _fallback("Planner client unavailable; using deterministic V4.1 fallback.")
             self.last_contract_min = None
             return _finalize_and_persist(contract, where="execution_planner:no_client", llm_success=False)
 

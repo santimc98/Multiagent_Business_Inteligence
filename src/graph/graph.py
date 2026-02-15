@@ -5893,6 +5893,15 @@ def _build_de_runtime_diagnosis(error_details: str) -> List[str]:
     return lines
 
 
+def _tail_lines(text: str, n: int = 20) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return "\n".join(lines[-max(1, int(n)):])
+
+
 def _build_de_gate_implementation_hints(cleaning_gates: Any) -> List[str]:
     if not isinstance(cleaning_gates, list) or not cleaning_gates:
         return []
@@ -11019,7 +11028,10 @@ def _build_ml_execution_profile_for_prompt(
         ml_plan=ml_plan if isinstance(ml_plan, dict) else None,
         configured_timeout_seconds=heavy_cfg.get("script_timeout_seconds") if isinstance(heavy_cfg, dict) else None,
     )
-    backend = "local" if runtime_mode == "local" else ("cloudrun" if bool(backend_selection.get("use_heavy")) else "e2b")
+    # Keep backend taxonomy stable for downstream prompts/tests:
+    # local runner mirrors heavy/cloudrun semantics (same artifact contract),
+    # so expose backend as cloudrun and carry runtime_mode separately.
+    backend = "cloudrun" if runtime_mode == "local" else ("cloudrun" if bool(backend_selection.get("use_heavy")) else "e2b")
     cpu_hint = _read_int_env_hint(
         "HEAVY_RUNNER_CPU_HINT",
         "HEAVY_RUNNER_CPU",
@@ -11034,7 +11046,7 @@ def _build_ml_execution_profile_for_prompt(
         "CLOUD_RUN_MEMORY",
     )
     resource_source = "env_hints"
-    if backend == "local":
+    if runtime_mode == "local":
         if cpu_hint is None:
             cpu_hint = os.cpu_count() or None
         if memory_gb_hint is None:
@@ -11071,6 +11083,7 @@ def _build_ml_execution_profile_for_prompt(
         resource_source = "env_hints_or_unknown"
     return {
         "backend": backend,
+        "runtime_mode": runtime_mode,
         "selection_reason": str(backend_selection.get("reason") or "unknown"),
         "dataset_scale": str(hints.get("scale") or state.get("dataset_scale") or "unknown"),
         "dataset_estimate": {
@@ -11906,7 +11919,7 @@ def _flag_active_for_run(state: Dict[str, Any], flag: str, run_id: Optional[str]
     return flag_run == run_id
 
 
-def _extract_error_snippet(code: str, error_details: str, *, context_lines: int = 5) -> str:
+def _extract_error_snippet(code: str, error_details: str, *, context_lines: int = 10) -> str:
     if not code or not error_details:
         return ""
     try:
@@ -13753,7 +13766,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     new_state["execution_error_message"] = runtime_error_text[-4000:]
                     base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                     error_snippet = _extract_error_snippet(code, runtime_error_text)
+                    traceback_tail = _tail_lines(runtime_error_text, 20)
                     payload = "RUNTIME_ERROR_CONTEXT:\n" + runtime_error_text[-3000:]
+                    if traceback_tail:
+                        payload += "\n\nTRACEBACK_TAIL_20:\n" + traceback_tail
                     if error_snippet:
                         payload += "\n\nERROR_SNIPPET:\n" + error_snippet
                     failure_cause = _infer_de_failure_cause(runtime_error_text)
@@ -14280,9 +14296,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 new_state["execution_error_message"] = error_details[-4000:]
                                 if reviewer_done:
                                     new_state["de_runtime_reviewer_done"] = True
-                                    if run_id:
-                                        new_state["de_runtime_reviewer_done_run_id"] = run_id
+                                if run_id:
+                                    new_state["de_runtime_reviewer_done_run_id"] = run_id
+                                error_snippet = _extract_error_snippet(code, error_details)
                                 payload = "RUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
+                                traceback_tail = _tail_lines(error_details, 20)
+                                if traceback_tail:
+                                    payload += "\n\nTRACEBACK_TAIL_20:\n" + traceback_tail
+                                if error_snippet:
+                                    payload += "\n\nERROR_SNIPPET:\n" + error_snippet
                                 try:
                                     if reviewer_payload:
                                         payload += "\n\n" + reviewer_payload

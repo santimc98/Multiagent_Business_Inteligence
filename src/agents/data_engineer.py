@@ -182,7 +182,7 @@ class DataEngineerAgent:
         de_view = de_view if isinstance(de_view, dict) else {}
         focus: Dict[str, Any] = {}
 
-        for key in ("scope", "required_outputs", "column_roles", "outlier_policy"):
+        for key in ("scope", "required_outputs", "column_roles", "outlier_policy", "column_dtype_targets"):
             value = contract.get(key)
             if value not in (None, "", [], {}):
                 focus[key] = value
@@ -203,6 +203,7 @@ class DataEngineerAgent:
                 "output_manifest_path",
                 "cleaning_gates",
                 "column_transformations",
+                "column_dtype_targets",
             ):
                 value = de_view.get(key)
                 if value not in (None, "", [], {}):
@@ -447,6 +448,15 @@ class DataEngineerAgent:
             compress_long_lists(column_transformations)[0],
             indent=2,
         )
+        column_dtype_targets = de_view.get("column_dtype_targets")
+        if not isinstance(column_dtype_targets, dict) or not column_dtype_targets:
+            column_dtype_targets = contract.get("column_dtype_targets")
+        if not isinstance(column_dtype_targets, dict):
+            column_dtype_targets = {}
+        column_dtype_targets_json = json.dumps(
+            compress_long_lists(column_dtype_targets)[0],
+            indent=2,
+        )
         runtime_dependency_context = self._build_runtime_dependency_context()
         runtime_dependency_context_json = json.dumps(
             compress_long_lists(runtime_dependency_context)[0], indent=2
@@ -533,6 +543,8 @@ class DataEngineerAgent:
         - required_columns are anchor columns.
         - Expand required_feature_selectors against input header; expanded columns are required unless
           explicitly dropped by COLUMN_TRANSFORMATIONS_CONTEXT + allowed drop_policy evidence.
+        - Enforce COLUMN_DTYPE_TARGETS_CONTEXT when provided. For selector-level dtype targets, apply casts
+          over the matched family with null-safe conversions.
         - Keep optional passthrough columns only if listed and present.
         - Missing required columns -> fail fast with ValueError.
         - Never fabricate columns.
@@ -562,6 +574,7 @@ class DataEngineerAgent:
         - DE_VIEW_CONTEXT (json): $de_view_context
         - OUTLIER_POLICY_CONTEXT (json): $outlier_policy_context
         - COLUMN_TRANSFORMATIONS_CONTEXT (json): $column_transformations_context
+        - COLUMN_DTYPE_TARGETS_CONTEXT (json): $column_dtype_targets_context
         - EXECUTION_CONTRACT_CONTEXT (json): $execution_contract_context
         - CLEANING_GATES_CONTEXT (json): $cleaning_gates_context
         - RUNTIME_DEPENDENCY_CONTEXT (json): $runtime_dependency_context
@@ -605,6 +618,7 @@ class DataEngineerAgent:
             de_view_context=de_view_json,
             outlier_policy_context=outlier_policy_json,
             column_transformations_context=column_transformations_json,
+            column_dtype_targets_context=column_dtype_targets_json,
             data_engineer_runbook=de_runbook_json,
             cleaning_gates_context=cleaning_gates_json,
             runtime_dependency_context=runtime_dependency_context_json,
@@ -671,6 +685,7 @@ class DataEngineerAgent:
             [
                 "import os",
                 "import json",
+                "import re",
                 "from datetime import date, datetime",
                 "try:",
                 "    import numpy as np",
@@ -682,6 +697,97 @@ class DataEngineerAgent:
                 "    pd = None",
                 "",
                 "os.makedirs('data', exist_ok=True)",
+                f"_REQUIRED_OUTPUT_PATHS = {json.dumps([p for p in [de_output_path, de_manifest_path, outlier_report_path] if p], ensure_ascii=False)}",
+                "",
+                "def _ensure_parent_dir(path):",
+                "    if not isinstance(path, str) or not path.strip():",
+                "        return",
+                "    parent = os.path.dirname(path)",
+                "    if parent:",
+                "        os.makedirs(parent, exist_ok=True)",
+                "",
+                "for _required_path in _REQUIRED_OUTPUT_PATHS:",
+                "    _ensure_parent_dir(_required_path)",
+                "",
+                "def _safe_load_json(path, default=None):",
+                "    if default is None:",
+                "        default = {}",
+                "    try:",
+                "        if not os.path.exists(path):",
+                "            return default",
+                "        with open(path, 'r', encoding='utf-8') as _f:",
+                "            payload = json.load(_f)",
+                "        return payload if isinstance(payload, type(default)) else payload",
+                "    except Exception:",
+                "        return default",
+                "",
+                "def _load_manifest_output_dialect(manifest_path='data/cleaning_manifest.json'):",
+                "    payload = _safe_load_json(manifest_path, default={})",
+                "    if not isinstance(payload, dict):",
+                "        return {}",
+                "    out = payload.get('output_dialect')",
+                "    return out if isinstance(out, dict) else {}",
+                "",
+                "def _load_column_sets(path='data/column_sets.json'):",
+                "    payload = _safe_load_json(path, default={})",
+                "    return payload if isinstance(payload, dict) else {}",
+                "",
+                "def _expand_selector_columns(columns, selectors):",
+                "    if not isinstance(columns, list) or not isinstance(selectors, list):",
+                "        return []",
+                "    matched = []",
+                "    for sel in selectors:",
+                "        if not isinstance(sel, dict):",
+                "            continue",
+                "        stype = str(sel.get('type') or '').strip().lower()",
+                "        if stype in ('regex', 'pattern'):",
+                "            pattern = str(sel.get('pattern') or '').strip()",
+                "            if not pattern:",
+                "                continue",
+                "            try:",
+                "                rgx = re.compile(pattern, flags=re.IGNORECASE)",
+                "            except Exception:",
+                "                continue",
+                "            for col in columns:",
+                "                if isinstance(col, str) and rgx.match(col) and col not in matched:",
+                "                    matched.append(col)",
+                "        elif stype == 'prefix':",
+                "            prefix = str(sel.get('value') or sel.get('prefix') or '').strip().lower()",
+                "            if not prefix:",
+                "                continue",
+                "            for col in columns:",
+                "                if isinstance(col, str) and col.lower().startswith(prefix) and col not in matched:",
+                "                    matched.append(col)",
+                "        elif stype == 'suffix':",
+                "            suffix = str(sel.get('value') or sel.get('suffix') or '').strip().lower()",
+                "            if not suffix:",
+                "                continue",
+                "            for col in columns:",
+                "                if isinstance(col, str) and col.lower().endswith(suffix) and col not in matched:",
+                "                    matched.append(col)",
+                "        elif stype == 'contains':",
+                "            token = str(sel.get('value') or '').strip().lower()",
+                "            if not token:",
+                "                continue",
+                "            for col in columns:",
+                "                if isinstance(col, str) and token in col.lower() and col not in matched:",
+                "                    matched.append(col)",
+                "        elif stype == 'list':",
+                "            vals = sel.get('columns')",
+                "            if isinstance(vals, list):",
+                "                for col in vals:",
+                "                    if isinstance(col, str) and col in columns and col not in matched:",
+                "                        matched.append(col)",
+                "    return matched",
+                "",
+                "def _log_decision(msg, payload=None):",
+                "    try:",
+                "        entry = {'message': str(msg)}",
+                "        if payload is not None:",
+                "            entry['payload'] = _to_jsonable(payload)",
+                "        print('DE_DECISION_LOG::' + json.dumps(entry, ensure_ascii=False))",
+                "    except Exception:",
+                "        pass",
                 "",
                 "def _to_jsonable(value):",
                 "    if value is None:",

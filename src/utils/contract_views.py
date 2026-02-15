@@ -41,6 +41,7 @@ class DEView(TypedDict, total=False):
     required_columns: List[str]
     required_feature_selectors: List[Dict[str, Any]]
     optional_passthrough_columns: List[str]
+    column_dtype_targets: Dict[str, Dict[str, Any]]
     column_transformations: Dict[str, Any]
     output_path: str
     output_manifest_path: str
@@ -66,6 +67,7 @@ class MLView(TypedDict, total=False):
     identifier_columns: List[str]
     allowed_feature_sets: Dict[str, Any]
     forbidden_features: List[str]
+    column_dtype_targets: Dict[str, Dict[str, Any]]
     required_outputs: List[str]
     validation_requirements: Dict[str, Any]
     evaluation_spec: Dict[str, Any]
@@ -137,6 +139,7 @@ _PRESERVE_KEYS = {
     "required_columns",
     "optional_passthrough_columns",
     "required_feature_selectors",
+    "column_dtype_targets",
     "required_outputs",
     "column_transformations",
     "drop_columns",
@@ -422,6 +425,65 @@ def _resolve_column_transformations(contract_min: Dict[str, Any], contract_full:
     if drop_policy is not None:
         payload["drop_policy"] = drop_policy
     return payload
+
+
+def _resolve_column_dtype_targets(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    for source in (contract_min, contract_full):
+        if not isinstance(source, dict):
+            continue
+        targets = source.get("column_dtype_targets")
+        if isinstance(targets, dict) and targets:
+            normalized: Dict[str, Dict[str, Any]] = {}
+            for key, value in targets.items():
+                col = str(key or "").strip()
+                if not col or not isinstance(value, dict):
+                    continue
+                target_dtype = str(value.get("target_dtype") or "").strip()
+                if not target_dtype:
+                    continue
+                payload = {
+                    "target_dtype": target_dtype,
+                }
+                if "nullable" in value:
+                    payload["nullable"] = value.get("nullable")
+                if "role" in value:
+                    payload["role"] = value.get("role")
+                if "source" in value:
+                    payload["source"] = value.get("source")
+                if "matched_count" in value:
+                    payload["matched_count"] = value.get("matched_count")
+                if isinstance(value.get("matched_sample"), list) and value.get("matched_sample"):
+                    payload["matched_sample"] = [
+                        str(item) for item in value.get("matched_sample", []) if str(item).strip()
+                    ][:20]
+                normalized[col] = payload
+            if normalized:
+                return normalized
+
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
+    targets = clean_cfg.get("column_dtype_targets")
+    if isinstance(targets, dict) and targets:
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for key, value in targets.items():
+            col = str(key or "").strip()
+            if not col or not isinstance(value, dict):
+                continue
+            target_dtype = str(value.get("target_dtype") or "").strip()
+            if not target_dtype:
+                continue
+            payload = {"target_dtype": target_dtype}
+            if "nullable" in value:
+                payload["nullable"] = value.get("nullable")
+            if "role" in value:
+                payload["role"] = value.get("role")
+            if "source" in value:
+                payload["source"] = value.get("source")
+            normalized[col] = payload
+        return normalized
+    return {}
 
 
 def _normalize_artifact_index(entries: Any) -> List[Dict[str, Any]]:
@@ -999,6 +1061,7 @@ def build_de_view(
     required_feature_selectors = _resolve_required_feature_selectors(contract_min, contract_full)
     passthrough_columns = _resolve_passthrough_columns(contract_min, contract_full, required_columns)
     column_transformations = _resolve_column_transformations(contract_min, contract_full)
+    column_dtype_targets = _resolve_column_dtype_targets({}, contract_full)
     output_path = _resolve_output_path(contract_min, contract_full, required_outputs)
     manifest_path = _resolve_manifest_path(contract_min, contract_full, required_outputs)
     cleaning_gates = _resolve_cleaning_gates(contract_min, contract_full)
@@ -1032,6 +1095,8 @@ def build_de_view(
             view["outlier_report_path"] = report_path
     if column_transformations:
         view["column_transformations"] = column_transformations
+    if column_dtype_targets:
+        view["column_dtype_targets"] = column_dtype_targets
     if manifest_path:
         view["output_manifest_path"] = manifest_path
     output_dialect = _resolve_output_dialect(contract_min, contract_full)
@@ -1207,6 +1272,7 @@ def build_ml_view(
     validation = _resolve_validation_requirements(contract_min, contract_full)
     case_rules = _resolve_case_rules(contract_full)
     outlier_policy = _resolve_outlier_policy(contract_min, contract_full)
+    column_dtype_targets = _resolve_column_dtype_targets({}, contract_full)
 
     artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
         contract_full.get("artifact_requirements")
@@ -1253,6 +1319,7 @@ def build_ml_view(
         "identifier_columns": strict_ids + candidate_ids,
         "allowed_feature_sets": allowed_sets,
         "forbidden_features": final_forbidden,
+        "column_dtype_targets": column_dtype_targets,
         "required_outputs": required_outputs,
         "validation_requirements": validation,
     }
@@ -1725,6 +1792,8 @@ def build_contract_views_projection(
     if scored_rows_schema:
         artifact_payload["scored_rows_schema"] = scored_rows_schema
 
+    column_dtype_targets = _resolve_column_dtype_targets({}, contract_full)
+
     strategy_title = str(contract_full.get("strategy_title") or "")
     business_objective = str(contract_full.get("business_objective") or "")
     reviewer_gates = get_reviewer_gates(contract_full)
@@ -1784,6 +1853,8 @@ def build_contract_views_projection(
             de_view["outlier_report_path"] = report_path
     if has_column_transformations:
         de_view["column_transformations"] = column_transformations
+    if column_dtype_targets:
+        de_view["column_dtype_targets"] = column_dtype_targets
     if manifest_path:
         de_view["output_manifest_path"] = manifest_path
     output_dialect = contract_full.get("output_dialect")
@@ -1802,6 +1873,7 @@ def build_contract_views_projection(
         "identifier_columns": id_columns,
         "allowed_feature_sets": allowed_feature_sets,
         "forbidden_features": forbidden_features,
+        "column_dtype_targets": column_dtype_targets,
         "required_outputs": required_outputs,
         "validation_requirements": validation_requirements,
         "evaluation_spec": evaluation_spec,
