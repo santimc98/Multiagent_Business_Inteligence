@@ -432,6 +432,12 @@ class MLEngineerAgent:
         gate_context: Dict[str, Any] | None,
         max_blocks: int = 2,
     ) -> str:
+        if isinstance(gate_context, dict) and isinstance(gate_context.get("feedback_record"), dict):
+            try:
+                payload = json.dumps(gate_context.get("feedback_record"), indent=2, ensure_ascii=True)
+                return "LATEST_ITERATION_FEEDBACK_RECORD_JSON:\n" + payload
+            except Exception:
+                pass
         blocks: List[str] = []
         if isinstance(gate_context, dict):
             feedback = gate_context.get("feedback")
@@ -465,6 +471,32 @@ class MLEngineerAgent:
             if text in out:
                 continue
             out.append(text)
+            if len(out) >= max_items:
+                break
+        return out
+
+    def _normalize_handoff_evidence(
+        self,
+        values: Any,
+        max_items: int = 8,
+    ) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        if not isinstance(values, list):
+            return out
+        for item in values:
+            claim = ""
+            source = "missing"
+            if isinstance(item, dict):
+                claim = str(item.get("claim") or "").strip()
+                source = str(item.get("source") or "missing").strip() or "missing"
+            else:
+                claim = str(item or "").strip()
+            if not claim:
+                continue
+            normalized = {"claim": claim[:260], "source": source[:220]}
+            if normalized in out:
+                continue
+            out.append(normalized)
             if len(out) >= max_items:
                 break
         return out
@@ -503,6 +535,12 @@ class MLEngineerAgent:
             max_items=8,
             max_len=180,
         )
+        evidence_focus = self._normalize_handoff_evidence(
+            quality_focus.get("evidence")
+            or feedback.get("evidence")
+            or gate_context.get("evidence"),
+            max_items=10,
+        )
         must_preserve = self._normalize_handoff_items(raw.get("must_preserve"), max_items=8, max_len=220)
         if not must_preserve and present_outputs:
             must_preserve = [f"Preserve generation for {path}" for path in present_outputs[:6]]
@@ -536,11 +574,13 @@ class MLEngineerAgent:
                 "failed_gates": failed_gates,
                 "required_fixes": required_fixes,
                 "hard_failures": hard_failures,
+                "evidence": evidence_focus,
             },
             "feedback": {
                 "reviewer": str(feedback.get("reviewer") or gate_context.get("feedback") or "").strip(),
                 "qa": str(feedback.get("qa") or "").strip(),
                 "runtime_error_tail": str(feedback.get("runtime_error_tail") or "").strip(),
+                "evidence": evidence_focus,
             },
             "must_preserve": must_preserve[:8],
             "patch_objectives": patch_objectives[:8],

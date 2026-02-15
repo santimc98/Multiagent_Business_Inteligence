@@ -49,10 +49,11 @@ class ReviewBoardAgent:
             "=== EVIDENCE RULE ===\n"
             f"{SENIOR_EVIDENCE_RULE}\n\n"
             "Decision policy:\n"
-            "1) If there are unresolved hard failures with high confidence, return REJECTED.\n"
-            "2) If fixes are required but resolvable in next iteration, return NEEDS_IMPROVEMENT.\n"
-            "3) If results are usable but with caveats, return APPROVE_WITH_WARNINGS.\n"
+            "1) If unresolved hard failures exist (runtime hard blockers, QA hard failures, deterministic blockers), return REJECTED.\n"
+            "2) If hard blockers are absent but contract/spec fixes are required, return NEEDS_IMPROVEMENT.\n"
+            "3) If only advisory/optimization items remain, return APPROVE_WITH_WARNINGS.\n"
             "4) If all critical areas pass, return APPROVED.\n"
+            "5) Use progress_tracker when available: if performance regressed and blockers remain unresolved, avoid optimistic approval.\n"
             "Do not invent evidence.\n\n"
             "Evidence policy:\n"
             "- Prefer deterministic_facts entries when available.\n"
@@ -81,15 +82,33 @@ class ReviewBoardAgent:
             self.last_response = content
             parsed = json.loads(self._clean_json(content))
             normalized = self._normalize(parsed, context)
-            return self._apply_conflict_reconciliation(normalized, context)
+            normalized = self._apply_conflict_reconciliation(normalized, context)
+            return self._apply_progress_policy(normalized, context)
         except Exception:
             return self._fallback(context)
+
+    def _collect_required_actions(self, payload: Dict[str, Any]) -> List[str]:
+        actions: List[str] = []
+        if not isinstance(payload, dict):
+            return actions
+        for key in ("required_actions", "required_fixes"):
+            values = payload.get(key)
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                text = str(item).strip()
+                if text and text not in actions:
+                    actions.append(text)
+                if len(actions) >= 20:
+                    return actions
+        return actions
 
     def _fallback(self, context: Dict[str, Any]) -> Dict[str, Any]:
         qa = context.get("qa_reviewer") if isinstance(context.get("qa_reviewer"), dict) else {}
         reviewer = context.get("reviewer") if isinstance(context.get("reviewer"), dict) else {}
         evaluator = context.get("result_evaluator") if isinstance(context.get("result_evaluator"), dict) else {}
         runtime = context.get("runtime") if isinstance(context.get("runtime"), dict) else {}
+        progress = context.get("progress_tracker") if isinstance(context.get("progress_tracker"), dict) else {}
 
         statuses = [
             str(qa.get("status", "")).upper(),
@@ -111,16 +130,12 @@ class ReviewBoardAgent:
 
         required_actions: List[str] = []
         for payload in (reviewer, qa, evaluator):
-            fixes = payload.get("required_fixes")
-            if not isinstance(fixes, list):
-                continue
-            for fix in fixes:
-                text = str(fix).strip()
-                if text and text not in required_actions:
-                    required_actions.append(text)
-                if len(required_actions) >= 12:
+            for action in self._collect_required_actions(payload):
+                if action not in required_actions:
+                    required_actions.append(action)
+                if len(required_actions) >= 20:
                     break
-            if len(required_actions) >= 12:
+            if len(required_actions) >= 20:
                 break
 
         if hard_failures:
@@ -139,13 +154,30 @@ class ReviewBoardAgent:
             failed_areas.append("cross_reviewer_conflict")
         if status in {"NEEDS_IMPROVEMENT", "REJECTED"} and "results_quality" not in failed_areas:
             failed_areas.append("results_quality")
+        if isinstance(progress, dict) and progress.get("available") and progress.get("improved") is False:
+            if "progress_regression" not in failed_areas:
+                failed_areas.append("progress_regression")
 
         if status in {"NEEDS_IMPROVEMENT", "REJECTED"} and not required_actions:
             required_actions.append("Apply reviewer-required fixes and rerun.")
+        if isinstance(progress, dict) and progress.get("available") and progress.get("improved") is False:
+            action = (
+                "Investigate regression in primary metric and keep previous successful artifacts/logic stable while patching blockers."
+            )
+            if action not in required_actions:
+                required_actions.append(action)
 
         summary = "Fallback board verdict from reviewer packets."
         if status_conflict:
             summary += " Conflict detected between reviewer and qa_reviewer verdicts."
+        if isinstance(progress, dict) and progress.get("available"):
+            metric_name = str(progress.get("metric_name") or "metric")
+            delta = progress.get("delta")
+            try:
+                delta_txt = f"{float(delta):.6g}"
+            except Exception:
+                delta_txt = str(delta)
+            summary += f" Progress tracker: {metric_name} delta={delta_txt}."
 
         return {
             "status": status,
@@ -206,6 +238,43 @@ class ReviewBoardAgent:
         summary = str(packet.get("summary", "")).strip()
         conflict_note = "Conflict detected between reviewer and qa_reviewer packets."
         packet["summary"] = f"{summary} {conflict_note}".strip() if summary else conflict_note
+        return packet
+
+    def _apply_progress_policy(self, verdict: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        packet = dict(verdict or {})
+        progress = context.get("progress_tracker") if isinstance(context.get("progress_tracker"), dict) else {}
+        if not isinstance(progress, dict) or not progress.get("available"):
+            return packet
+        metric_name = str(progress.get("metric_name") or "metric")
+        delta = progress.get("delta")
+        try:
+            delta_txt = f"{float(delta):.6g}"
+        except Exception:
+            delta_txt = str(delta)
+        improved = progress.get("improved")
+
+        failed_areas = packet.get("failed_areas")
+        if not isinstance(failed_areas, list):
+            failed_areas = []
+        required_actions = packet.get("required_actions")
+        if not isinstance(required_actions, list):
+            required_actions = []
+
+        if improved is False and str(packet.get("status", "")).upper() == "APPROVED":
+            packet["status"] = "APPROVE_WITH_WARNINGS"
+            if "progress_regression" not in failed_areas:
+                failed_areas.append("progress_regression")
+            action = (
+                f"Review regression in {metric_name} (delta={delta_txt}) before final approval."
+            )
+            if action not in required_actions:
+                required_actions.append(action)
+
+        summary = str(packet.get("summary") or "").strip()
+        progress_note = f"Progress tracker: {metric_name} delta={delta_txt}, improved={bool(improved)}."
+        packet["summary"] = f"{summary} {progress_note}".strip() if summary else progress_note
+        packet["failed_areas"] = failed_areas
+        packet["required_actions"] = required_actions
         return packet
 
     def _clean_json(self, text: str) -> str:

@@ -5925,11 +5925,72 @@ def _merge_de_audit_override(base: str, payload: str) -> str:
     payload = payload or ""
     if not payload:
         return base
-    if payload in base:
-        return base
-    if base:
-        return f"{base}\n\n{payload}"
-    return payload
+
+    max_blocks = 12
+    max_chars = 16000
+
+    def _split_blocks(text: str) -> List[str]:
+        chunks = re.split(r"\n\s*\n", str(text or "").strip())
+        out: List[str] = []
+        for raw in chunks:
+            block = str(raw or "").strip()
+            if block:
+                out.append(block)
+        return out
+
+    def _block_key(block: str) -> str:
+        first = ""
+        for line in block.splitlines():
+            token = str(line or "").strip()
+            if token:
+                first = token
+                break
+        if first:
+            first = re.sub(r"\s+", " ", first).strip()
+            if ":" in first:
+                first = first.split(":", 1)[0].strip()
+            normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", first).strip("_").lower()
+            if normalized:
+                return normalized
+        digest = hashlib.sha1(block.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return f"block_{digest}"
+
+    ordered_keys: List[str] = []
+    by_key: Dict[str, str] = {}
+    for block in _split_blocks(base):
+        key = _block_key(block)
+        if key in by_key:
+            by_key[key] = block
+            continue
+        ordered_keys.append(key)
+        by_key[key] = block
+    for block in _split_blocks(payload):
+        key = _block_key(block)
+        if key in by_key:
+            by_key[key] = block
+        else:
+            ordered_keys.append(key)
+            by_key[key] = block
+
+    if len(ordered_keys) > max_blocks:
+        ordered_keys = ordered_keys[-max_blocks:]
+
+    blocks: List[str] = [by_key[key] for key in ordered_keys if key in by_key and by_key[key].strip()]
+    merged = "\n\n".join(blocks)
+    if len(merged) <= max_chars:
+        return merged
+
+    # Enforce a bounded prompt context without dropping the most recent blocks.
+    trimmed: List[str] = []
+    total = 0
+    for block in reversed(blocks):
+        addition = len(block) + (2 if trimmed else 0)
+        if trimmed and total + addition > max_chars:
+            break
+        trimmed.append(block)
+        total += addition
+    trimmed = list(reversed(trimmed))
+    return "\n\n".join(trimmed)
 
 
 def _format_gate_failure_evidence(
@@ -7811,6 +7872,140 @@ def _append_feedback_history(state: Dict[str, Any], message: str) -> None:
         history.append(message)
     state["feedback_history"] = history
 
+
+def _normalize_feedback_record_payload(record: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(record, dict):
+        return {}
+    normalized = {
+        "agent": str(record.get("agent") or "unknown"),
+        "source": str(record.get("source") or "unknown"),
+        "status": str(record.get("status") or "UNKNOWN"),
+        "iteration": int(record.get("iteration") or 0),
+        "feedback": str(record.get("feedback") or ""),
+        "failed_gates": [str(x) for x in (record.get("failed_gates") or []) if x],
+        "required_fixes": [str(x) for x in (record.get("required_fixes") or []) if x],
+        "hard_failures": [str(x) for x in (record.get("hard_failures") or []) if x],
+        "runtime_error_tail": str(record.get("runtime_error_tail") or ""),
+        "evidence": _normalize_handoff_evidence(record.get("evidence"), max_items=10),
+    }
+    normalized["failed_gates"] = list(dict.fromkeys(normalized["failed_gates"]))[:20]
+    normalized["required_fixes"] = list(dict.fromkeys(normalized["required_fixes"]))[:20]
+    normalized["hard_failures"] = list(dict.fromkeys(normalized["hard_failures"]))[:15]
+    if len(normalized["feedback"]) > 2400:
+        normalized["feedback"] = normalized["feedback"][:2400]
+    if len(normalized["runtime_error_tail"]) > 1400:
+        normalized["runtime_error_tail"] = normalized["runtime_error_tail"][:1400]
+    return normalized
+
+
+def _build_latest_feedback_record_block(record: Dict[str, Any] | None) -> str:
+    normalized = _normalize_feedback_record_payload(record)
+    if not normalized:
+        return ""
+    return "LATEST_ITERATION_FEEDBACK_RECORD_JSON:\n" + json.dumps(normalized, ensure_ascii=True, indent=2)
+
+
+def _set_latest_feedback_record(
+    state: Dict[str, Any],
+    *,
+    agent: str,
+    source: str,
+    status: str,
+    iteration: int,
+    feedback: str = "",
+    failed_gates: List[str] | None = None,
+    required_fixes: List[str] | None = None,
+    hard_failures: List[str] | None = None,
+    runtime_error_tail: str = "",
+    evidence: List[Dict[str, str]] | None = None,
+) -> Dict[str, Any]:
+    record = _normalize_feedback_record_payload(
+        {
+            "agent": agent,
+            "source": source,
+            "status": status,
+            "iteration": iteration,
+            "feedback": feedback,
+            "failed_gates": failed_gates or [],
+            "required_fixes": required_fixes or [],
+            "hard_failures": hard_failures or [],
+            "runtime_error_tail": runtime_error_tail,
+            "evidence": evidence or [],
+        }
+    )
+    if not record:
+        return {}
+    key = "data_engineer_feedback_record" if str(agent).lower() == "data_engineer" else "ml_feedback_record"
+    state[key] = record
+    return record
+
+
+def _build_review_progress_tracker(state: Dict[str, Any] | None) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    tracker: Dict[str, Any] = {"available": False}
+    metric_history = state.get("metric_history")
+    if not isinstance(metric_history, list) or len(metric_history) < 2:
+        return tracker
+    last_two = [item for item in metric_history if isinstance(item, dict)][-2:]
+    if len(last_two) < 2:
+        return tracker
+    prev, curr = last_two[0], last_two[1]
+    prev_name = str(prev.get("primary_metric_name") or "")
+    curr_name = str(curr.get("primary_metric_name") or "")
+    prev_val = prev.get("primary_metric_value")
+    curr_val = curr.get("primary_metric_value")
+    if not (prev_name and curr_name and prev_name == curr_name and _is_number(prev_val) and _is_number(curr_val)):
+        return tracker
+    higher_is_better = _metric_higher_is_better(curr_name)
+    delta = float(curr_val) - float(prev_val)
+    improved = delta > 0 if higher_is_better else delta < 0
+    tracker.update(
+        {
+            "available": True,
+            "metric_name": curr_name,
+            "previous_value": float(prev_val),
+            "current_value": float(curr_val),
+            "delta": delta,
+            "higher_is_better": higher_is_better,
+            "improved": bool(improved),
+        }
+    )
+    return tracker
+
+
+def _merge_de_override_with_feedback_record(
+    new_state: Dict[str, Any],
+    *,
+    base_override: str,
+    payload: str,
+    source: str,
+    status: str,
+    iteration: int,
+    feedback: str,
+    failed_gates: List[str] | None = None,
+    required_fixes: List[str] | None = None,
+    hard_failures: List[str] | None = None,
+    runtime_error_tail: str = "",
+    evidence: List[Dict[str, str]] | None = None,
+) -> None:
+    merged = _merge_de_audit_override(base_override, payload)
+    de_record = _set_latest_feedback_record(
+        new_state,
+        agent="data_engineer",
+        source=source,
+        status=status,
+        iteration=int(iteration or 0),
+        feedback=str(feedback or ""),
+        failed_gates=[str(x) for x in (failed_gates or []) if str(x).strip()],
+        required_fixes=[str(x) for x in (required_fixes or []) if str(x).strip()],
+        hard_failures=[str(x) for x in (hard_failures or []) if str(x).strip()],
+        runtime_error_tail=str(runtime_error_tail or "")[:1400],
+        evidence=_normalize_handoff_evidence(evidence, max_items=8),
+    )
+    if de_record:
+        merged = _merge_de_audit_override(merged, _build_latest_feedback_record_block(de_record))
+    new_state["data_engineer_audit_override"] = merged
+
 def _normalize_reason_tags(text: str, failed_gates: List[str] | None = None) -> List[str]:
     tags: List[str] = []
     lower = str(text or "").lower()
@@ -8107,18 +8302,44 @@ def _normalize_handoff_items(values: Any, max_items: int = 10, max_len: int = 18
     return out
 
 
+def _normalize_handoff_evidence(values: Any, max_items: int = 10) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    if not isinstance(values, list):
+        return out
+    for value in values:
+        claim = ""
+        source = "missing"
+        if isinstance(value, dict):
+            claim = _truncate_handoff_text(value.get("claim"), max_len=260)
+            source = _truncate_handoff_text(value.get("source") or "missing", max_len=220) or "missing"
+        else:
+            claim = _truncate_handoff_text(value, max_len=260)
+        if not claim:
+            continue
+        item = {"claim": claim, "source": source}
+        if item in out:
+            continue
+        out.append(item)
+        if len(out) >= max_items:
+            break
+    return out
+
+
 def _merge_reviewer_qa_findings(
     gate_context: Dict[str, Any] | None,
     review_result: Dict[str, Any] | None,
     qa_result: Dict[str, Any] | None,
-) -> Dict[str, List[str]]:
+    eval_result: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     gate_context = gate_context if isinstance(gate_context, dict) else {}
     review_result = review_result if isinstance(review_result, dict) else {}
     qa_result = qa_result if isinstance(qa_result, dict) else {}
+    eval_result = eval_result if isinstance(eval_result, dict) else {}
 
     failed_gates: List[str] = []
     required_fixes: List[str] = []
     hard_failures: List[str] = []
+    evidence: List[Dict[str, str]] = []
 
     for source in (
         gate_context.get("failed_gates"),
@@ -8142,15 +8363,27 @@ def _merge_reviewer_qa_findings(
         gate_context.get("hard_failures"),
         review_result.get("hard_failures"),
         qa_result.get("hard_failures"),
+        eval_result.get("hard_failures"),
     ):
         for item in _normalize_handoff_items(source, max_items=20, max_len=240):
             if item not in hard_failures:
                 hard_failures.append(item)
 
+    for source in (
+        gate_context.get("evidence"),
+        review_result.get("evidence"),
+        qa_result.get("evidence"),
+        eval_result.get("evidence"),
+    ):
+        for item in _normalize_handoff_evidence(source, max_items=12):
+            if item not in evidence:
+                evidence.append(item)
+
     return {
         "failed_gates": failed_gates[:20],
         "required_fixes": required_fixes[:20],
         "hard_failures": hard_failures[:15],
+        "evidence": evidence[:12],
     }
 
 def _extract_metric_target_hint(evaluation_spec: Dict[str, Any] | None, contract: Dict[str, Any] | None) -> tuple[float | None, str]:
@@ -8199,6 +8432,7 @@ def _build_iteration_handoff(
     oc_report: Dict[str, Any] | None,
     review_result: Dict[str, Any] | None,
     qa_result: Dict[str, Any] | None,
+    eval_result: Dict[str, Any] | None = None,
     evaluation_spec: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     state = state if isinstance(state, dict) else {}
@@ -8206,6 +8440,7 @@ def _build_iteration_handoff(
     oc_report = oc_report if isinstance(oc_report, dict) else {}
     review_result = review_result if isinstance(review_result, dict) else {}
     qa_result = qa_result if isinstance(qa_result, dict) else {}
+    eval_result = eval_result if isinstance(eval_result, dict) else {}
     contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
     iteration_count = int(state.get("iteration_count", 0) or 0)
     next_iteration = iteration_count + 1
@@ -8225,7 +8460,7 @@ def _build_iteration_handoff(
             if len(missing_outputs) >= 15:
                 break
 
-    merged_findings = _merge_reviewer_qa_findings(gate_context, review_result, qa_result)
+    merged_findings = _merge_reviewer_qa_findings(gate_context, review_result, qa_result, eval_result)
     failed_gates = merged_findings.get("failed_gates") or []
     required_fixes = merged_findings.get("required_fixes") or []
     hard_failures = merged_findings.get("hard_failures") or _normalize_handoff_items(
@@ -8233,6 +8468,7 @@ def _build_iteration_handoff(
         max_items=10,
         max_len=240,
     )
+    evidence_focus = merged_findings.get("evidence") or []
 
     runtime_tail = _truncate_handoff_text(
         state.get("last_runtime_error_tail") or state.get("execution_output"),
@@ -8352,6 +8588,7 @@ def _build_iteration_handoff(
             "failed_gates": failed_gates,
             "required_fixes": required_fixes,
             "hard_failures": hard_failures,
+            "evidence": evidence_focus,
         },
         "metric_focus": {
             "primary_metric": metric_name or None,
@@ -8366,6 +8603,7 @@ def _build_iteration_handoff(
             "reviewer": reviewer_feedback,
             "qa": qa_feedback,
             "runtime_error_tail": runtime_tail,
+            "evidence": evidence_focus,
         },
         "must_preserve": must_preserve[:8],
         "patch_objectives": patch_objectives[:8],
@@ -8844,7 +9082,9 @@ class AgentState(TypedDict):
     runtime_fix_terminal: bool
     last_runtime_error_tail: str # Added for Runtime Error Visibility
     data_engineer_audit_override: str
+    data_engineer_feedback_record: Dict[str, Any]
     ml_engineer_audit_override: str
+    ml_feedback_record: Dict[str, Any]
     leakage_audit_summary: str
     ml_skipped_reason: str
     execution_contract: Dict[str, Any]
@@ -12445,12 +12685,18 @@ def run_data_engineer(state: AgentState) -> AgentState:
     input_dialect = {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal}
     leakage_audit_summary = state.get("leakage_audit_summary", "")
     minimal_context_mode = _minimal_agent_context_enabled()
+    latest_de_feedback_record = state.get("data_engineer_feedback_record")
+    latest_de_feedback_block = _build_latest_feedback_record_block(latest_de_feedback_record)
     if minimal_context_mode:
         feedback_context = _build_agent_feedback_context(state if isinstance(state, dict) else {}, "data_engineer")
-        persisted_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
+        persisted_override = state.get("data_summary", "")
         data_engineer_audit_override = _merge_de_audit_override(feedback_context, persisted_override)
+        if latest_de_feedback_block:
+            data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, latest_de_feedback_block)
     else:
-        data_engineer_audit_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
+        data_engineer_audit_override = state.get("data_summary", "")
+        if latest_de_feedback_block:
+            data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, latest_de_feedback_block)
     dataset_scale_hints = state.get("dataset_scale_hints")
     if not isinstance(dataset_scale_hints, dict) or not dataset_scale_hints:
         dataset_scale_hints = {}
@@ -12827,7 +13073,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "ENVIRONMENT_FEEDBACK (Please Repair Code Generation):\n"
                 + json.dumps(generation_context, indent=2, ensure_ascii=False)
             )
-            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+            _merge_de_override_with_feedback_record(
+                new_state,
+                base_override=base_override,
+                payload=payload,
+                source="generation",
+                status="REJECTED",
+                iteration=int(attempt_id),
+                feedback="Data Engineer failed to generate runnable cleaning code.",
+                failed_gates=["generation_failed"],
+                required_fixes=["Regenerate valid Python cleaning script using contract context."],
+                runtime_error_tail=str(code or "")[:1200],
+                evidence=[{"claim": "Code generation returned error-prefixed output.", "source": "data_engineer_response"}],
+            )
             if run_id:
                 log_run_event(
                     run_id,
@@ -12904,7 +13162,20 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "ENVIRONMENT_FEEDBACK (Please Adjust Code):\n"
                 + json.dumps(context_payload, indent=2, ensure_ascii=False)
             )
-            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+            _merge_de_override_with_feedback_record(
+                new_state,
+                base_override=base_override,
+                payload=payload,
+                source="static_scan",
+                status="REJECTED",
+                iteration=int(attempt_id),
+                feedback="Static safety scan blocked generated cleaning code.",
+                failed_gates=["static_scan_failed"],
+                required_fixes=["Remove forbidden operations/imports and regenerate safe cleaning code."],
+                hard_failures=["static_scan_failed"],
+                runtime_error_tail=str(violations)[:1200],
+                evidence=[{"claim": f"Static scan violations: {violations}", "source": "static_scan"}],
+            )
             if run_id:
                 log_run_event(run_id, "static_scan_retry", {"attempt": attempt_id, "violations": violations})
             print("Static scan guard: retrying Data Engineer with violation context.")
@@ -12943,9 +13214,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
             if not state.get("de_preflight_retry_done"):
                 new_state = dict(state)
                 new_state["de_preflight_retry_done"] = True
-                override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                payload = "PREFLIGHT_ERROR_CONTEXT:\n" + msg
                 try:
-                    override += "\n\nPREFLIGHT_ERROR_CONTEXT:\n" + msg
                     explainer_text = ""
                     try:
                         required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
@@ -12972,7 +13242,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         print(f"Warning: failure explainer failed: {explainer_err}")
                         explainer_text = ""
                     if explainer_text:
-                        override += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                        payload += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
                         try:
                             os.makedirs("artifacts", exist_ok=True)
                             with open(
@@ -12985,7 +13255,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             print(f"Warning: failed to persist data_engineer_preflight_explainer.txt: {exp_err}")
                 except Exception:
                     pass
-                new_state["data_engineer_audit_override"] = override
+                _merge_de_override_with_feedback_record(
+                    new_state,
+                    base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
+                    payload=payload,
+                    source="preflight",
+                    status="REJECTED",
+                    iteration=int(attempt_id),
+                    feedback=str(msg),
+                    failed_gates=["data_engineer_preflight"],
+                    required_fixes=[str(item) for item in preflight_issues if str(item).strip()],
+                    runtime_error_tail=str(msg),
+                    evidence=[{"claim": "Data engineer preflight checks failed.", "source": "data_engineer_preflight"}],
+                )
                 print("Preflight guard: retrying Data Engineer with explainer context.")
                 return run_data_engineer(new_state)
             if run_id:
@@ -13011,16 +13293,34 @@ def run_data_engineer(state: AgentState) -> AgentState:
             if not state.get("de_undefined_retry_done"):
                 new_state = dict(state)
                 new_state["de_undefined_retry_done"] = True
-                override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                payload = (
+                    "UNDEFINED_NAME_GUARD:\n"
+                    "Ensure every referenced name is defined in the same scope. "
+                    "Avoid using variables created inside helper functions in outer scopes. "
+                    "Do not inline JSON literals (null/true/false) into Python code."
+                )
                 try:
-                    override += (
-                        "\n\nUNDEFINED_NAME_GUARD: Ensure every referenced name is defined in the same scope. "
-                        "Avoid using variables created inside helper functions in outer scopes. "
-                        "Do not inline JSON literals (null/true/false) into Python code."
-                    )
+                    if undefined:
+                        payload += "\nUNDEFINED_NAMES:\n- " + "\n- ".join(str(item) for item in undefined if str(item).strip())
                 except Exception:
                     pass
-                new_state["data_engineer_audit_override"] = override
+                _merge_de_override_with_feedback_record(
+                    new_state,
+                    base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
+                    payload=payload,
+                    source="static_precheck_undefined",
+                    status="REJECTED",
+                    iteration=int(attempt_id),
+                    feedback=str(msg),
+                    failed_gates=["static_precheck_undefined"],
+                    required_fixes=[
+                        "Define every referenced variable in scope before use.",
+                        "Avoid JSON literals in Python script bodies.",
+                    ],
+                    hard_failures=["static_precheck_undefined"],
+                    runtime_error_tail=str(msg),
+                    evidence=[{"claim": "Undefined names detected by static precheck.", "source": "static_precheck"}],
+                )
                 print("Undefined name guard triggered: retrying Data Engineer with safety instructions.")
                 return run_data_engineer(new_state)
             fh = list(state.get("feedback_history", []))
@@ -13043,17 +13343,30 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if not state.get("de_json_literal_retry_done"):
             new_state = dict(state)
             new_state["de_json_literal_retry_done"] = True
-            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-            try:
-                override += (
-                    "\n\nCONTRACT_LITERAL_GUARD: Do not inline raw JSON into Python code. "
-                    "JSON literals like null/true/false are invalid identifiers in Python. "
-                    "If you need the execution contract, read it from data/execution_contract.json "
-                    "or use Python-native values."
-                )
-            except Exception:
-                pass
-            new_state["data_engineer_audit_override"] = override
+            payload = (
+                "CONTRACT_LITERAL_GUARD:\n"
+                "Do not inline raw JSON into Python code. "
+                "JSON literals like null/true/false are invalid identifiers in Python. "
+                "If you need the execution contract, read it from data/execution_contract.json "
+                "or use Python-native values."
+            )
+            _merge_de_override_with_feedback_record(
+                new_state,
+                base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
+                payload=payload,
+                source="json_literal_guard",
+                status="REJECTED",
+                iteration=int(attempt_id),
+                feedback="JSON literals detected in generated Python script.",
+                failed_gates=["json_literals_in_python"],
+                required_fixes=[
+                    "Remove JSON literals null/true/false from Python code.",
+                    "Load contract data from files and convert to Python-native values.",
+                ],
+                hard_failures=["json_literals_in_python"],
+                runtime_error_tail="JSON literal guard triggered.",
+                evidence=[{"claim": "Raw JSON literals found in script.", "source": "data_engineer_script"}],
+            )
             print("Contract literal guard triggered: retrying Data Engineer with safety instructions.")
             return run_data_engineer(new_state)
         if run_id:
@@ -13074,12 +13387,28 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if not state.get("de_manifest_retry_done"):
             new_state = dict(state)
             new_state["de_manifest_retry_done"] = True
-            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-            try:
-                override += "\n\nMANIFEST_JSON_SAFETY: ensure json.dump(manifest, ..., default=_json_default) to handle numpy/pandas types."
-            except Exception:
-                pass
-            new_state["data_engineer_audit_override"] = override
+            payload = (
+                "MANIFEST_JSON_SAFETY:\n"
+                "Ensure json.dump(manifest, ..., default=_json_default) "
+                "to handle numpy/pandas scalar types safely."
+            )
+            _merge_de_override_with_feedback_record(
+                new_state,
+                base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
+                payload=payload,
+                source="manifest_json_guard",
+                status="REJECTED",
+                iteration=int(attempt_id),
+                feedback="Manifest serialization guard failed.",
+                failed_gates=["manifest_json_default_missing"],
+                required_fixes=[
+                    "Serialize manifest using json.dump(..., default=_json_default).",
+                    "Avoid raw numpy/pandas scalars in manifest payload.",
+                ],
+                hard_failures=["manifest_json_default_missing"],
+                runtime_error_tail="Manifest JSON guard triggered.",
+                evidence=[{"claim": "Manifest dump missing default serializer.", "source": "data_engineer_script"}],
+            )
             print("Manifest JSON guard triggered: retrying Data Engineer with safety instructions.")
             return run_data_engineer(new_state)
         else:
@@ -13143,12 +13472,21 @@ def run_data_engineer(state: AgentState) -> AgentState:
             new_state = dict(state)
             new_state["de_dialect_retry_done"] = True
             new_state["de_dialect_autopatched"] = True  # Mark that autopatch was attempted
-            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-            try:
-                override += "\n\nDIALECT_GUARD:\n" + "\n".join(dialect_issues)
-            except Exception:
-                pass
-            new_state["data_engineer_audit_override"] = override
+            payload = "DIALECT_GUARD:\n" + "\n".join(str(item) for item in dialect_issues if str(item).strip())
+            _merge_de_override_with_feedback_record(
+                new_state,
+                base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
+                payload=payload,
+                source="dialect_guard",
+                status="REJECTED",
+                iteration=int(attempt_id),
+                feedback="CSV dialect compliance failed in generated cleaning code.",
+                failed_gates=["dialect_loading_missing"],
+                required_fixes=list(dialect_issues),
+                hard_failures=["dialect_loading_missing"],
+                runtime_error_tail="\n".join(dialect_issues)[:1400],
+                evidence=[{"claim": "Dialect guard found missing/wrong read_csv dialect parameters.", "source": "dialect_guard"}],
+            )
             print("⚠️ DIALECT_GUARD: retrying Data Engineer with enforced dialect instructions.")
             return run_data_engineer(new_state)
         else:
@@ -13482,8 +13820,24 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 )
                     except Exception as explainer_err:
                         print(f"Warning: heavy-runner DE failure explainer failed: {explainer_err}")
-                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(
-                        base_override, payload
+                    _merge_de_override_with_feedback_record(
+                        new_state,
+                        base_override=base_override,
+                        payload=payload,
+                        source="runtime_heavy_runner_code",
+                        status="REJECTED",
+                        iteration=int(attempt_id),
+                        feedback="Data Engineer runtime failure detected in heavy runner execution.",
+                        failed_gates=["runtime_failure"],
+                        required_fixes=[str(item) for item in (gate_hints or []) if str(item).strip()],
+                        hard_failures=["runtime_failure"],
+                        runtime_error_tail=str(runtime_error_text or "")[-1400:],
+                        evidence=[
+                            {
+                                "claim": "Heavy runner reported runtime code error.",
+                                "source": "heavy_runner_error",
+                            }
+                        ],
                     )
                     print("Runtime error guard (heavy runner code): retrying Data Engineer with error context.")
                     if run_id:
@@ -13734,46 +14088,79 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
                                 new_state = dict(state)
                                 new_state["de_missing_derived_retry_done"] = True
-                                override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                                try:
-                                    override += (
-                                        "\n\nDERIVED_COLUMN_MISSING_GUARD: "
-                                        f"{derived_cols} are derived. Do not treat them as required input columns. "
-                                        "Only enforce source='input' columns after canonicalization; derive the rest."
-                                    )
-                                except Exception:
-                                    pass
-                                new_state["data_engineer_audit_override"] = override
+                                payload = (
+                                    "DERIVED_COLUMN_MISSING_GUARD:\n"
+                                    f"{derived_cols} are derived. Do not treat them as required input columns. "
+                                    "Only enforce source='input' columns after canonicalization; derive the rest."
+                                )
+                                _merge_de_override_with_feedback_record(
+                                    new_state,
+                                    base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
+                                    payload=payload,
+                                    source="derived_column_missing_guard",
+                                    status="REJECTED",
+                                    iteration=int(attempt_id),
+                                    feedback="Derived columns were treated as mandatory raw input columns.",
+                                    failed_gates=["derived_columns_as_required_input"],
+                                    required_fixes=[
+                                        "Treat derived columns as computed outputs, not mandatory raw input columns.",
+                                        "Validate required input columns only from source='input' scope.",
+                                    ],
+                                    runtime_error_tail=str(error_details or "")[-1400:],
+                                    evidence=[{"claim": "Missing required columns error referenced derived columns.", "source": "runtime_error"}],
+                                )
                                 print("Derived column missing guard: retrying Data Engineer with derived-column guidance.")
                                 return run_data_engineer(new_state)
                         if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
                                 new_state = dict(state)
                                 new_state["de_actual_column_guard_retry_done"] = True
-                                override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                                try:
-                                    override += (
-                                        "\n\nVALIDATION_PRINT_GUARD: Use actual = str(result.get('actual_column') or 'MISSING') "
-                                        "before slicing; do not subscript None."
-                                    )
-                                except Exception:
-                                    pass
-                                new_state["data_engineer_audit_override"] = override
+                                payload = (
+                                    "VALIDATION_PRINT_GUARD:\n"
+                                    "Use actual = str(result.get('actual_column') or 'MISSING') "
+                                    "before slicing; do not subscript None."
+                                )
+                                _merge_de_override_with_feedback_record(
+                                    new_state,
+                                    base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
+                                    payload=payload,
+                                    source="validation_print_guard",
+                                    status="REJECTED",
+                                    iteration=int(attempt_id),
+                                    feedback="Validation formatting attempted to subscript None actual_column.",
+                                    failed_gates=["none_safe_validation_formatting"],
+                                    required_fixes=[
+                                        "Guard actual_column extraction with None-safe conversion before slicing.",
+                                    ],
+                                    runtime_error_tail=str(error_details or "")[-1400:],
+                                    evidence=[{"claim": "NoneType actual_column formatting issue detected.", "source": "runtime_error"}],
+                                )
                                 print("Validation print guard: retrying Data Engineer with None-safe formatting.")
                                 return run_data_engineer(new_state)
                         if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
                                 if not state.get("de_dtype_guard_retry_done"):
                                     new_state = dict(state)
                                     new_state["de_dtype_guard_retry_done"] = True
-                                    override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                                    try:
-                                        override += (
-                                            "\n\nDUPLICATE_COLUMN_GUARD: When reading dtype, handle duplicate column labels. "
-                                            "Use series = df[actual_col]; if isinstance(series, pd.DataFrame), "
-                                            "use series = series.iloc[:, 0] and log a warning."
-                                        )
-                                    except Exception:
-                                        pass
-                                    new_state["data_engineer_audit_override"] = override
+                                    payload = (
+                                        "DUPLICATE_COLUMN_GUARD:\n"
+                                        "When reading dtype, handle duplicate column labels. "
+                                        "Use series = df[actual_col]; if isinstance(series, pd.DataFrame), "
+                                        "use series = series.iloc[:, 0] and log a warning."
+                                    )
+                                    _merge_de_override_with_feedback_record(
+                                        new_state,
+                                        base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
+                                        payload=payload,
+                                        source="duplicate_column_dtype_guard",
+                                        status="REJECTED",
+                                        iteration=int(attempt_id),
+                                        feedback="Duplicate-column dtype handling guard triggered.",
+                                        failed_gates=["duplicate_column_dtype_handling"],
+                                        required_fixes=[
+                                            "Handle duplicate-label DataFrame returns before dtype checks.",
+                                        ],
+                                        runtime_error_tail=str(error_details or "")[-1400:],
+                                        evidence=[{"claim": "AttributeError DataFrame has no dtype in validation path.", "source": "runtime_error"}],
+                                    )
                                     print("Duplicate column dtype guard: retrying Data Engineer.")
                                     return run_data_engineer(new_state)
                         error_snippet = _extract_error_snippet(code, error_details)
@@ -13895,21 +14282,20 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     new_state["de_runtime_reviewer_done"] = True
                                     if run_id:
                                         new_state["de_runtime_reviewer_done_run_id"] = run_id
-                                override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                                payload = "RUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
                                 try:
-                                    override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
                                     if reviewer_payload:
-                                        override += "\n\n" + reviewer_payload
+                                        payload += "\n\n" + reviewer_payload
                                     failure_cause = _infer_de_failure_cause(error_details)
                                     if failure_cause:
-                                        override += "\nWHY_IT_HAPPENED: " + failure_cause
+                                        payload += "\nWHY_IT_HAPPENED: " + failure_cause
                                     diagnosis_lines = _build_de_runtime_diagnosis(error_details)
                                     if diagnosis_lines:
-                                        override += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
+                                        payload += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
                                     de_view_for_hints = state.get("de_view") if isinstance(state.get("de_view"), dict) else {}
                                     gate_hints = _build_de_gate_implementation_hints(de_view_for_hints.get("cleaning_gates"))
                                     if gate_hints:
-                                        override += "\nGATE_IMPLEMENTATION_HINTS:\n- " + "\n- ".join(gate_hints)
+                                        payload += "\nGATE_IMPLEMENTATION_HINTS:\n- " + "\n- ".join(gate_hints)
                                     try:
                                         runtime_record = {
                                             "agent": "data_engineer",
@@ -13920,7 +14306,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             "diagnosis": diagnosis_lines if 'diagnosis_lines' in locals() else [],
                                             "required_fixes": gate_hints if gate_hints else [],
                                         }
-                                        override += (
+                                        payload += (
                                             "\n\nITERATION_FEEDBACK_RECORD_JSON:\n"
                                             + json.dumps(runtime_record, ensure_ascii=True)
                                         )
@@ -13952,7 +14338,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         print(f"Warning: failure explainer failed: {explainer_err}")
                                         explainer_text = ""
                                     if explainer_text:
-                                        override += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                                        payload += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
                                         try:
                                             os.makedirs("artifacts", exist_ok=True)
                                             with open(
@@ -13965,7 +14351,25 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
                                 except Exception:
                                     pass
-                                new_state["data_engineer_audit_override"] = override
+                                _merge_de_override_with_feedback_record(
+                                    new_state,
+                                    base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
+                                    payload=payload,
+                                    source="runtime_sandbox_execute",
+                                    status="REJECTED",
+                                    iteration=int(attempt_id),
+                                    feedback="Data Engineer runtime failure detected in sandbox execution.",
+                                    failed_gates=["runtime_failure"],
+                                    required_fixes=[str(item) for item in (gate_hints or []) if str(item).strip()],
+                                    hard_failures=["runtime_failure"],
+                                    runtime_error_tail=str(error_details or "")[-1400:],
+                                    evidence=[
+                                        {
+                                            "claim": "Sandbox execution returned traceback/runtime error.",
+                                            "source": "sandbox_error",
+                                        }
+                                    ],
+                                )
                                 print("Runtime error guard: retrying Data Engineer with error context.")
                                 if run_id:
                                     log_run_event(run_id, "data_engineer_runtime_retry", {"attempt": attempt_id})
@@ -14054,7 +14458,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         new_state["de_manifest_guard_retry_done"] = True
                         base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                         payload = "MANIFEST_ALERTS:\n" + "\n".join(f"- {alert}" for alert in manifest_alerts)
-                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                        _merge_de_override_with_feedback_record(
+                            new_state,
+                            base_override=base_override,
+                            payload=payload,
+                            source="manifest_alerts",
+                            status="REJECTED",
+                            iteration=int(attempt_id),
+                            feedback="Manifest consistency alerts require a cleaning-script retry.",
+                            failed_gates=["manifest_alerts_detected"],
+                            required_fixes=[str(item) for item in manifest_alerts if str(item).strip()],
+                            runtime_error_tail="\n".join(str(item) for item in manifest_alerts)[:1400],
+                            evidence=[{"claim": "Manifest alert(s) detected after DE execution.", "source": "cleaning_manifest.json"}],
+                        )
                         print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
                         return run_data_engineer(new_state)
 
@@ -14165,7 +14581,22 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     f_exp.write(explainer_text.strip())
                             except Exception as exp_err:
                                 print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
-                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                        _merge_de_override_with_feedback_record(
+                            new_state,
+                            base_override=base_override,
+                            payload=payload,
+                            source="row_drop_guard",
+                            status="REJECTED",
+                            iteration=int(attempt_id),
+                            feedback="Detected excessive row loss likely caused by destructive conversions.",
+                            failed_gates=["row_drop_sanity_failed"],
+                            required_fixes=[
+                                "Avoid destructive conversions that remove too many rows.",
+                                "Use contract-aligned null/typing handling and preserve row integrity.",
+                            ],
+                            runtime_error_tail=json.dumps(row_drop_summary, ensure_ascii=True)[:1400],
+                            evidence=[{"claim": "Row drop summary exceeded guard threshold.", "source": "cleaning_manifest.json#row_counts"}],
+                        )
                         print("ROW_DROP_GUARD: retrying Data Engineer with recovery context.")
                         return run_data_engineer(new_state)
 
@@ -14267,7 +14698,23 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         "RUNTIME_ERROR_CONTEXT: Sandbox process was killed (likely OOM / exit code 137). "
                         "Switch to chunked processing and avoid full-column stats over the entire dataset."
                     )
-                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                    _merge_de_override_with_feedback_record(
+                        new_state,
+                        base_override=base_override,
+                        payload=payload,
+                        source="oom_guard",
+                        status="REJECTED",
+                        iteration=int(attempt_id),
+                        feedback="OOM-like runtime failure detected during DE execution.",
+                        failed_gates=["oom_runtime_failure"],
+                        required_fixes=[
+                            "Use chunked/streaming processing for large datasets.",
+                            "Avoid full-table expensive operations that exceed memory budget.",
+                        ],
+                        hard_failures=["oom_runtime_failure"],
+                        runtime_error_tail=str(err_details or "")[-1400:],
+                        evidence=[{"claim": "Exception pattern indicates memory pressure/OOM.", "source": "runtime_exception"}],
+                    )
                     print("OOM guard: retrying Data Engineer with chunked processing guidance.")
                     return run_data_engineer(new_state)
                 if not _flag_active_for_run(state, "de_runtime_retry_done", run_id):
@@ -14286,7 +14733,23 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         + "- After replace(..., np.nan), do not assume the dtype is still string; re-cast before .str.*.\n"
                         + "- Apply this rule universally for any CSV/objective (no hardcoded columns)."
                     )
-                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                    _merge_de_override_with_feedback_record(
+                        new_state,
+                        base_override=base_override,
+                        payload=payload,
+                        source="runtime_exception",
+                        status="REJECTED",
+                        iteration=int(attempt_id),
+                        feedback="Unhandled runtime exception detected during DE execution.",
+                        failed_gates=["runtime_exception"],
+                        required_fixes=[
+                            "Fix runtime exception and keep data typing robust before string operations.",
+                            "Preserve contract-required outputs after patch.",
+                        ],
+                        hard_failures=["runtime_exception"],
+                        runtime_error_tail=str(err_details or "")[-1400:],
+                        evidence=[{"claim": "Runtime exception captured in sandbox exception handler.", "source": "runtime_exception"}],
+                    )
                     print("Runtime exception guard: retrying Data Engineer with exception context.")
                     if run_id:
                         log_run_event(run_id, "data_engineer_runtime_retry", {"attempt": attempt_id, "source": "exception"})
@@ -14712,7 +15175,43 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     pass
                                 new_state = dict(state)
                                 new_state["cleaning_reviewer_retry_done"] = True
-                                new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                                failed_checks = [str(item) for item in (review_result.get("failed_checks") or []) if item]
+                                hard_failures = [str(item) for item in (review_result.get("hard_failures") or []) if item]
+                                required_fix_items = [str(item) for item in (fixes or []) if item]
+                                gate_evidence_items: List[Dict[str, str]] = []
+                                gate_results = review_result.get("gate_results")
+                                if isinstance(gate_results, list):
+                                    for gate in gate_results:
+                                        if not isinstance(gate, dict):
+                                            continue
+                                        if gate.get("passed") is True:
+                                            continue
+                                        gate_name = str(gate.get("name") or "unknown_gate")
+                                        issues = gate.get("issues") if isinstance(gate.get("issues"), list) else []
+                                        issue_text = "; ".join(str(x) for x in issues[:2]) if issues else "Gate failed."
+                                        gate_evidence_items.append(
+                                            {
+                                                "claim": f"Gate {gate_name} failed: {issue_text}",
+                                                "source": "cleaning_reviewer_report.json#gate_results",
+                                            }
+                                        )
+                                        if len(gate_evidence_items) >= 8:
+                                            break
+                                _merge_de_override_with_feedback_record(
+                                    new_state,
+                                    base_override=base_override,
+                                    payload=payload,
+                                    source="cleaning_reviewer_reject",
+                                    status="REJECTED",
+                                    iteration=int(attempt_id),
+                                    feedback=str(review_result.get("feedback") or "Cleaning reviewer rejected cleaned output."),
+                                    failed_gates=failed_checks,
+                                    required_fixes=required_fix_items,
+                                    hard_failures=hard_failures,
+                                    runtime_error_tail=str(review_result.get("feedback") or "")[-1400:],
+                                    evidence=gate_evidence_items
+                                    or [{"claim": "Cleaning reviewer rejected DE output.", "source": "cleaning_reviewer_report.json"}],
+                                )
                                 print("Cleaning reviewer rejected output: retrying Data Engineer with guidance.")
                                 return run_data_engineer(new_state)
                             if run_id:
@@ -14836,7 +15335,23 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         issue_text = str(issues)
                     base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                     payload = "INTEGRITY_AUDIT_ISSUES:\n" + issue_text
-                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                    integrity_failed = [str(item.get("issue") or item.get("name") or "integrity_issue") for item in critical if isinstance(item, dict)]
+                    _merge_de_override_with_feedback_record(
+                        new_state,
+                        base_override=base_override,
+                        payload=payload,
+                        source="integrity_audit",
+                        status="REJECTED",
+                        iteration=int(attempt_id),
+                        feedback="Integrity audit detected critical post-cleaning issues.",
+                        failed_gates=list(dict.fromkeys(integrity_failed))[:12],
+                        required_fixes=[
+                            "Resolve integrity audit critical issues without violating contract-required columns/gates.",
+                        ],
+                        hard_failures=list(dict.fromkeys(integrity_failed))[:12],
+                        runtime_error_tail=issue_text[:1400],
+                        evidence=[{"claim": "Critical integrity audit findings detected.", "source": "data/integrity_audit_report.json"}],
+                    )
                     print("⚠️ INTEGRITY_AUDIT: triggering Data Engineer retry with issues context.")
                     return run_data_engineer(new_state)
             except Exception as audit_err:
@@ -15172,6 +15687,8 @@ def run_engineer(state: AgentState) -> AgentState:
     leakage_summary = state.get("leakage_audit_summary", "")
     dataset_semantics_summary = state.get("dataset_semantics_summary")
     ml_audit_override = state.get("ml_engineer_audit_override", "")
+    latest_ml_feedback_record = state.get("ml_feedback_record")
+    latest_ml_feedback_block = _build_latest_feedback_record_block(latest_ml_feedback_record)
     context_pack = ""
     if not minimal_context_mode:
         data_audit_context = _strip_run_facts_blocks(str(state.get('data_summary', '') or ""))
@@ -15184,9 +15701,13 @@ def run_engineer(state: AgentState) -> AgentState:
             )
         if ml_audit_override:
             data_audit_context = _merge_de_audit_override(data_audit_context, ml_audit_override)
+        if latest_ml_feedback_block:
+            data_audit_context = _merge_de_audit_override(data_audit_context, latest_ml_feedback_block)
         context_pack = build_context_pack("ml_engineer", state if isinstance(state, dict) else {})
         if context_pack:
             data_audit_context = _merge_de_audit_override(context_pack, data_audit_context)
+    elif latest_ml_feedback_block:
+        data_audit_context = _merge_de_audit_override(data_audit_context, latest_ml_feedback_block)
     business_objective = state.get('business_objective', '')
     csv_encoding = state.get('csv_encoding', 'utf-8') # Pass real encoding
     csv_sep = state.get('csv_sep', ',')
@@ -18137,6 +18658,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "failed_gates": ["runtime_failure"],
             "required_fixes": ["Fix runtime failure and regenerate required artifacts."],
             "retry_worth_it": not runtime_terminal,
+            "hard_failures": ["runtime_failure"],
+            "evidence": [{"claim": "Runtime failure marker detected in execution output.", "source": "execution_output_tail"}],
         }
     else:
         eval_result = reviewer.evaluate_results(
@@ -18166,6 +18689,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     "result_evaluator_evidence_override",
                     {"reason": "llm_missing_evidence_false_positive"},
                 )
+        if not isinstance(eval_result.get("evidence"), list):
+            eval_result = dict(eval_result or {})
+            eval_result["evidence"] = []
 
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
@@ -18618,6 +19144,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 if isinstance(reviewer_view, dict):
                     reviewer_view = dict(reviewer_view)
                     reviewer_view["execution_diagnostics"] = review_diagnostics
+                    ml_data_path_for_review = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
+                    if ml_data_path_for_review:
+                        reviewer_view["ml_data_path"] = ml_data_path_for_review
                     reviewer_view = compress_long_lists(reviewer_view)[0]
                 review_result = reviewer.review_code(
                     code,
@@ -18747,9 +19276,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 execution_output_for_review, business_objective, strategy_context, evaluation_spec_final
             )
             if isinstance(re_eval, dict) and re_eval.get("status"):
-                status = re_eval.get("status", status)
-                feedback = re_eval.get("feedback", feedback)
-                retry_worth_it = re_eval.get("retry_worth_it", retry_worth_it)
+                eval_result = dict(re_eval)
+                status = eval_result.get("status", status)
+                feedback = eval_result.get("feedback", feedback)
+                retry_worth_it = eval_result.get("retry_worth_it", retry_worth_it)
                 new_history.append("REVIEWER_REEVAL: Final verdict computed with governance context.")
                 if post_audit_summary:
                     feedback = f"{feedback}\n{post_audit_summary}" if feedback else post_audit_summary
@@ -18822,10 +19352,38 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "failed_gates": failed_gates,
         "required_fixes": required_fixes,
     }
+    gate_evidence: List[Dict[str, str]] = []
+    for source in (
+        eval_result.get("evidence") if isinstance(eval_result, dict) else None,
+        review_result.get("evidence") if isinstance(review_result, dict) else None,
+        qa_result.get("evidence") if isinstance(qa_result, dict) else None,
+    ):
+        for item in _normalize_handoff_evidence(source, max_items=12):
+            if item not in gate_evidence:
+                gate_evidence.append(item)
+    if gate_evidence:
+        gate_context["evidence"] = gate_evidence[:12]
+    ml_feedback_record = _set_latest_feedback_record(
+        state,
+        agent="ml_engineer",
+        source=gate_source,
+        status=status,
+        iteration=int(iter_id),
+        feedback=str(feedback or ""),
+        failed_gates=failed_gates,
+        required_fixes=required_fixes,
+        hard_failures=[],
+        runtime_error_tail=str(state.get("last_runtime_error_tail") or state.get("execution_output") or "")[-1200:],
+        evidence=gate_evidence[:12],
+    )
+    if ml_feedback_record:
+        gate_context["feedback_record"] = ml_feedback_record
     existing_hard_failures = [str(h) for h in (state.get("hard_failures") or []) if h]
     merged_hard_failures = list(dict.fromkeys(existing_hard_failures + qa_hard_failures))
     if merged_hard_failures:
         gate_context["hard_failures"] = merged_hard_failures
+        if isinstance(gate_context.get("feedback_record"), dict):
+            gate_context["feedback_record"]["hard_failures"] = list(merged_hard_failures[:15])
     fix_block = _build_fix_instructions(required_fixes)
     if fix_block:
         gate_context["edit_instructions"] = fix_block
@@ -18837,6 +19395,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         oc_report=oc_report,
         review_result=review_result,
         qa_result=qa_result,
+        eval_result=eval_result,
         evaluation_spec=evaluation_spec_for_review if isinstance(evaluation_spec_for_review, dict) else {},
     )
 
@@ -18913,6 +19472,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "hard_qa_retry_count": hard_qa_retry_count,
         "iteration_handoff": iteration_handoff,
     }
+    if isinstance(gate_context.get("feedback_record"), dict):
+        result_state["ml_feedback_record"] = gate_context.get("feedback_record")
     if merged_hard_failures:
         result_state["hard_failures"] = merged_hard_failures
     if qa_summary:
@@ -19030,6 +19591,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "failed_gates": [str(g) for g in (eval_result.get("failed_gates") or []) if g],
         "required_fixes": [str(fx) for fx in (eval_result.get("required_fixes") or []) if fx],
         "retry_worth_it": bool(retry_worth_it) if retry_worth_it is not None else None,
+        "evidence": _normalize_handoff_evidence(eval_result.get("evidence"), max_items=8),
     }
     reviewer_packet = {
         "status": str(review_result.get("status") or "SKIPPED"),
@@ -19037,6 +19599,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "failed_gates": [str(g) for g in (review_result.get("failed_gates") or []) if g],
         "required_fixes": [str(fx) for fx in (review_result.get("required_fixes") or []) if fx],
         "hard_failures": [str(h) for h in (review_result.get("hard_failures") or []) if h],
+        "evidence": _normalize_handoff_evidence(review_result.get("evidence"), max_items=8),
     }
     qa_packet = qa_summary or {
         "status": str(qa_result.get("status") or "SKIPPED"),
@@ -19044,7 +19607,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "failed_gates": [str(g) for g in (qa_result.get("failed_gates") or []) if g],
         "required_fixes": [str(fx) for fx in (qa_result.get("required_fixes") or []) if fx],
         "hard_failures": [str(h) for h in (qa_result.get("hard_failures") or []) if h],
+        "evidence": _normalize_handoff_evidence(qa_result.get("evidence"), max_items=8),
     }
+    if isinstance(qa_packet, dict) and not isinstance(qa_packet.get("evidence"), list):
+        qa_packet = dict(qa_packet)
+        qa_packet["evidence"] = _normalize_handoff_evidence(qa_result.get("evidence"), max_items=8)
     reviewer_packet, qa_packet, cross_review_notes = _harmonize_review_packets_with_final_eval(
         reviewer_packet,
         qa_packet,
@@ -19324,6 +19891,7 @@ def run_review_board(state: AgentState) -> AgentState:
     if not isinstance(deterministic_facts, dict) or not deterministic_facts:
         deterministic_facts = _build_review_board_facts(state if isinstance(state, dict) else {})
     board_context["deterministic_facts"] = deterministic_facts
+    board_context["progress_tracker"] = _build_review_progress_tracker(state if isinstance(state, dict) else {})
     board_context["review_verdict_before_board"] = state.get("review_verdict")
     board_context["review_feedback_before_board"] = state.get("review_feedback")
 
@@ -19419,6 +19987,21 @@ def run_review_board(state: AgentState) -> AgentState:
         "required_actions": required_actions,
         "confidence": confidence,
     }
+    board_feedback_record = _set_latest_feedback_record(
+        state,
+        agent="ml_engineer",
+        source="review_board",
+        status=final_status,
+        iteration=int(state.get("iteration_count", 0) or 0),
+        feedback=str(board_summary or ""),
+        failed_gates=[str(x) for x in failed_areas if x],
+        required_fixes=[str(x) for x in required_actions if x],
+        hard_failures=[str(x) for x in (gate_context.get("hard_failures") or []) if x],
+        runtime_error_tail=str((board_context.get("runtime") or {}).get("status") or ""),
+        evidence=_normalize_handoff_evidence(evidence, max_items=8),
+    )
+    if board_feedback_record:
+        gate_context["feedback_record"] = board_feedback_record
     if deterministic_blockers:
         board_hard_failures = [str(x) for x in (gate_context.get("hard_failures") or []) if x]
         for blocker in deterministic_blockers:
@@ -19470,6 +20053,10 @@ def run_review_board(state: AgentState) -> AgentState:
         max_items=10,
         max_len=200,
     )
+    handoff_quality["evidence"] = _normalize_handoff_evidence(
+        evidence or handoff_quality.get("evidence"),
+        max_items=10,
+    )
     patch_objectives = _normalize_handoff_items(iteration_handoff.get("patch_objectives"), max_items=8, max_len=420)
     for action in _normalize_handoff_items(required_actions, max_items=8, max_len=500):
         if action not in patch_objectives:
@@ -19485,6 +20072,7 @@ def run_review_board(state: AgentState) -> AgentState:
         "failed_areas": _normalize_handoff_items(failed_areas, max_items=12, max_len=200),
         "required_actions": _normalize_handoff_items(required_actions, max_items=12, max_len=500),
         "confidence": confidence,
+        "evidence": _normalize_handoff_evidence(evidence, max_items=8),
     }
     iteration_handoff["quality_focus"] = handoff_quality
     iteration_handoff["patch_objectives"] = patch_objectives
@@ -19541,6 +20129,8 @@ def run_review_board(state: AgentState) -> AgentState:
         "last_gate_context": gate_context,
         "iteration_handoff": iteration_handoff,
     }
+    if board_feedback_record:
+        result["ml_feedback_record"] = board_feedback_record
     # Iteration counter guard:
     # - run_result_evaluator already increments iteration_count when it returns NEEDS_IMPROVEMENT.
     # - if review_board escalates a non-NEEDS_IMPROVEMENT status to NEEDS_IMPROVEMENT,

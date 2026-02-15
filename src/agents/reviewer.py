@@ -153,10 +153,15 @@ def _deterministic_reviewer_prechecks(
     literals = _collect_string_literals(tree)
     lowered = (code or "").lower()
 
-    if "pd.read_csv(" not in lowered and ".read_csv(" not in lowered:
-        output["warnings"].append(
-            "Deterministic precheck: pandas.read_csv not detected; verify dataset loading path and method."
-        )
+    expected_data_paths: List[str] = []
+    for block in (reviewer_view, evaluation_spec):
+        if not isinstance(block, dict):
+            continue
+        for key in ("ml_data_path", "data_path", "input_path"):
+            value = block.get(key)
+            if isinstance(value, str) and value.strip():
+                expected_data_paths.append(value.strip())
+    expected_data_paths = list(dict.fromkeys(expected_data_paths))
 
     required_outputs: List[str] = []
     for block in (reviewer_view, evaluation_spec):
@@ -171,24 +176,168 @@ def _deterministic_reviewer_prechecks(
             if isinstance(v, list):
                 required_outputs.extend(str(x) for x in v if str(x).strip())
     required_outputs = list(dict.fromkeys(required_outputs))
+    targets = _resolve_target_columns(evaluation_spec, reviewer_view)
+    strict_data_loading = bool(expected_data_paths or required_outputs or targets)
+
+    has_read_csv = ("pd.read_csv(" in lowered) or (".read_csv(" in lowered)
+    if not has_read_csv:
+        if strict_data_loading:
+            output["hard_failures"].append("reviewer_data_loading_missing")
+            output["failed_gates"].append("reviewer_data_loading_missing")
+            output["required_fixes"].append(
+                "Load the cleaned input dataset explicitly with pandas.read_csv before feature/label preparation."
+            )
+        output["warnings"].append(
+            "Deterministic precheck: pandas.read_csv not detected."
+        )
+
+    if expected_data_paths:
+        expected_mentions = 0
+        for path in expected_data_paths:
+            base = os.path.basename(path)
+            if path in literals or path.lower() in lowered or (base and (base in literals or base.lower() in lowered)):
+                expected_mentions += 1
+                break
+        if expected_mentions == 0:
+            output["hard_failures"].append("reviewer_input_path_binding")
+            output["failed_gates"].append("reviewer_input_path_binding")
+            output["required_fixes"].append(
+                "Bind dataset loading to the contract-provided input path (or its basename) to ensure path traceability."
+            )
+
     if required_outputs:
         mentioned = 0
         for path in required_outputs:
             if path in literals or path.lower() in lowered:
                 mentioned += 1
         if mentioned == 0:
+            output["hard_failures"].append("reviewer_required_outputs_traceability")
+            output["failed_gates"].append("reviewer_required_outputs_traceability")
+            output["required_fixes"].append(
+                "Write required artifacts at the exact contract output paths."
+            )
             output["warnings"].append(
-                "Deterministic precheck: none of the required output paths appear in code literals; verify artifact writes."
+                "Deterministic precheck: none of the required output paths appear in code literals."
             )
 
-    targets = _resolve_target_columns(evaluation_spec, reviewer_view)
     if targets:
         mentions_target = any((target in literals) or (target.lower() in lowered) for target in targets)
         if not mentions_target:
-            output["warnings"].append(
-                "Deterministic precheck: target/outcome columns are not explicitly referenced; verify feature/label mapping."
+            output["hard_failures"].append("reviewer_target_binding_missing")
+            output["failed_gates"].append("reviewer_target_binding_missing")
+            output["required_fixes"].append(
+                "Reference and bind contract target/outcome columns explicitly in label preparation and evaluation logic."
             )
+            output["warnings"].append(
+                "Deterministic precheck: target/outcome columns are not explicitly referenced."
+            )
+    # De-duplicate lists to avoid repeated guidance.
+    output["hard_failures"] = list(dict.fromkeys([str(x) for x in output.get("hard_failures", []) if str(x).strip()]))
+    output["failed_gates"] = list(dict.fromkeys([str(x) for x in output.get("failed_gates", []) if str(x).strip()]))
+    output["required_fixes"] = list(dict.fromkeys([str(x) for x in output.get("required_fixes", []) if str(x).strip()]))
     return output
+
+
+def _normalize_evidence_items(values: Any, max_items: int = 8) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    if not isinstance(values, list):
+        return out
+    for item in values:
+        claim = ""
+        source = "missing"
+        if isinstance(item, dict):
+            claim = str(item.get("claim") or "").strip()
+            source = str(item.get("source") or "missing").strip() or "missing"
+        else:
+            claim = str(item or "").strip()
+        if not claim:
+            continue
+        normalized = {"claim": claim, "source": source}
+        if normalized in out:
+            continue
+        out.append(normalized)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _extract_execution_diagnostics(
+    reviewer_view: Dict[str, Any] | None,
+    evaluation_spec: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    diagnostics = (
+        reviewer_view.get("execution_diagnostics")
+        if isinstance(reviewer_view, dict)
+        else None
+    )
+    if not isinstance(diagnostics, dict):
+        diagnostics = (
+            evaluation_spec.get("execution_diagnostics")
+            if isinstance(evaluation_spec, dict)
+            else {}
+        )
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    return diagnostics
+
+
+def _deterministic_diagnostics_blockers(execution_diagnostics: Dict[str, Any] | None) -> Dict[str, Any]:
+    execution_diagnostics = execution_diagnostics if isinstance(execution_diagnostics, dict) else {}
+    blockers = [str(x) for x in (execution_diagnostics.get("hard_blockers") or []) if x]
+    output_missing = [
+        str(x) for x in (execution_diagnostics.get("output_contract_missing") or []) if str(x).strip()
+    ]
+    runtime_status = str(execution_diagnostics.get("runtime_status") or "").strip().upper()
+    overall_status = str(execution_diagnostics.get("output_contract_overall_status") or "").strip().lower()
+
+    hard_failures: List[str] = []
+    failed_gates: List[str] = []
+    required_fixes: List[str] = []
+    evidence: List[Dict[str, str]] = []
+
+    def _add_failure(name: str) -> None:
+        if name not in hard_failures:
+            hard_failures.append(name)
+        if name not in failed_gates:
+            failed_gates.append(name)
+
+    for blocker in blockers:
+        _add_failure(blocker)
+
+    if runtime_status == "FAILED_RUNTIME":
+        _add_failure("runtime_failure")
+        required_fixes.append("Fix runtime failure before requesting reviewer approval.")
+        evidence.append({"claim": "Runtime status is FAILED_RUNTIME.", "source": "execution_diagnostics#runtime_status"})
+
+    if overall_status == "error":
+        _add_failure("output_contract_error")
+        required_fixes.append("Resolve output contract validation errors and regenerate artifacts.")
+        evidence.append(
+            {
+                "claim": "Output contract status is error.",
+                "source": "execution_diagnostics#output_contract_overall_status",
+            }
+        )
+
+    if output_missing:
+        _add_failure("contract_required_artifacts_missing")
+        for path in output_missing[:8]:
+            fix = f"Generate required artifact at path: {path}"
+            if fix not in required_fixes:
+                required_fixes.append(fix)
+            evidence.append(
+                {
+                    "claim": f"Required output missing: {path}",
+                    "source": "execution_diagnostics#output_contract_missing",
+                }
+            )
+
+    return {
+        "hard_failures": hard_failures,
+        "failed_gates": failed_gates,
+        "required_fixes": required_fixes,
+        "evidence": evidence[:8],
+    }
 
 
 def _truncate_exec_output(text: str, max_len: int = 8000) -> str:
@@ -236,9 +385,21 @@ class ReviewerAgent:
         from src.utils.prompting import render_prompt
 
         reviewer_view = reviewer_view or {}
+        execution_diagnostics = _extract_execution_diagnostics(reviewer_view, evaluation_spec)
         deterministic_prechecks = _deterministic_reviewer_prechecks(code, evaluation_spec, reviewer_view)
         hard_prechecks = [str(x) for x in (deterministic_prechecks.get("hard_failures") or []) if x]
         precheck_warnings = [str(x) for x in (deterministic_prechecks.get("warnings") or []) if x]
+        diagnostics_blockers = _deterministic_diagnostics_blockers(execution_diagnostics)
+        if diagnostics_blockers.get("hard_failures"):
+            return {
+                "status": "REJECTED",
+                "feedback": "Reviewer deterministic diagnostics detected blocking execution/output issues.",
+                "failed_gates": diagnostics_blockers.get("failed_gates") or [],
+                "required_fixes": diagnostics_blockers.get("required_fixes") or [],
+                "hard_failures": diagnostics_blockers.get("hard_failures") or [],
+                "warnings": precheck_warnings,
+                "evidence": diagnostics_blockers.get("evidence") or [],
+            }
         if hard_prechecks:
             return {
                 "status": "REJECTED",
@@ -247,6 +408,7 @@ class ReviewerAgent:
                 "required_fixes": [str(x) for x in (deterministic_prechecks.get("required_fixes") or []) if x],
                 "hard_failures": hard_prechecks,
                 "warnings": precheck_warnings,
+                "evidence": [],
             }
 
         eval_spec_json = json.dumps(evaluation_spec or {}, indent=2)
@@ -268,19 +430,6 @@ class ReviewerAgent:
         strategy_summary = reviewer_view.get("strategy_summary") or strategy_context
         objective_type = reviewer_view.get("objective_type") or analysis_type
         expected_metrics = reviewer_view.get("expected_metrics") or []
-        execution_diagnostics = (
-            reviewer_view.get("execution_diagnostics")
-            if isinstance(reviewer_view, dict)
-            else None
-        )
-        if not isinstance(execution_diagnostics, dict):
-            execution_diagnostics = (
-                evaluation_spec.get("execution_diagnostics")
-                if isinstance(evaluation_spec, dict)
-                else {}
-            )
-        if not isinstance(execution_diagnostics, dict):
-            execution_diagnostics = {}
         deterministic_prechecks_json = json.dumps(deterministic_prechecks, indent=2)
 
         SYSTEM_PROMPT_TEMPLATE = """
@@ -412,6 +561,7 @@ class ReviewerAgent:
                     result[field] = []
                 else:
                     result[field] = val
+            result["evidence"] = _normalize_evidence_items(result.get("evidence"), max_items=8)
 
             result = apply_reviewer_gate_filter(result, reviewer_gates)
             if precheck_warnings:
@@ -439,6 +589,7 @@ class ReviewerAgent:
                 "required_fixes": ["Retry when reviewer LLM is available."],
                 "hard_failures": ["LLM_REVIEW_UNAVAILABLE"],
                 "warnings": precheck_warnings,
+                "evidence": [{"claim": "Reviewer API call failed.", "source": "missing"}],
             }
 
     def _clean_json(self, text: str) -> str:
@@ -599,13 +750,10 @@ class ReviewerAgent:
         self.last_prompt = system_prompt + "\n\nEvaluate results."
 
         if not self.client or self.provider == "none":
-            return {
-                "status": "APPROVE_WITH_WARNINGS",
-                "feedback": "Reviewer LLM disabled; continuing with deterministic evidence only.",
-                "failed_gates": [],
-                "required_fixes": [],
-                "retry_worth_it": False,
-            }
+            return self._deterministic_eval_fallback(
+                execution_output=execution_output,
+                reason="LLM unavailable",
+            )
 
         try:
             if self.provider == "gemini":
@@ -630,18 +778,99 @@ class ReviewerAgent:
             if "failed_gates" not in result: result["failed_gates"] = []
             if "required_fixes" not in result: result["required_fixes"] = []
             if "retry_worth_it" not in result: result["retry_worth_it"] = True
+            result["evidence"] = _normalize_evidence_items(result.get("evidence"), max_items=8)
             
             return result
             
         except Exception as e:
             print(f"Reviewer Evaluation Error: {e}")
+            return self._deterministic_eval_fallback(
+                execution_output=execution_output,
+                reason=f"LLM error: {e}",
+            )
+
+    def _deterministic_eval_fallback(self, execution_output: str, reason: str) -> Dict[str, Any]:
+        output = str(execution_output or "")
+        lower = output.lower()
+        if "traceback (most recent call last)" in lower or "execution error" in lower:
+            return {
+                "status": "NEEDS_IMPROVEMENT",
+                "feedback": (
+                    "Deterministic fallback: runtime failure detected while reviewer LLM was unavailable. "
+                    f"Reason: {reason}"
+                ),
+                "failed_gates": ["runtime_failure", "LLM_EVAL_UNAVAILABLE"],
+                "required_fixes": [
+                    "Fix runtime failure and rerun execution.",
+                    "Retry reviewer evaluation when LLM is available.",
+                ],
+                "retry_worth_it": True,
+                "hard_failures": ["runtime_failure"],
+                "evidence": [{"claim": "Runtime failure marker detected.", "source": "execution_output_tail"}],
+            }
+
+        missing_required = None
+        has_metrics = False
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("output_contract_missing_required="):
+                try:
+                    missing_required = int(line.split("=", 1)[1].strip())
+                except Exception:
+                    missing_required = None
+            elif line.startswith("metrics="):
+                metric_blob = line.split("=", 1)[1].strip()
+                has_metrics = bool(metric_blob)
+
+        if isinstance(missing_required, int) and missing_required > 0:
+            return {
+                "status": "NEEDS_IMPROVEMENT",
+                "feedback": (
+                    "Deterministic fallback: missing required contract artifacts while reviewer LLM is unavailable. "
+                    f"Reason: {reason}"
+                ),
+                "failed_gates": ["contract_required_artifacts_missing", "LLM_EVAL_UNAVAILABLE"],
+                "required_fixes": [
+                    "Generate all contract-required artifacts before requesting approval.",
+                    "Retry reviewer evaluation when LLM is available.",
+                ],
+                "retry_worth_it": True,
+                "hard_failures": ["contract_required_artifacts_missing"],
+                "evidence": [
+                    {
+                        "claim": f"output_contract_missing_required={missing_required}",
+                        "source": "deterministic_evidence#output_contract_missing_required",
+                    }
+                ],
+            }
+
+        if has_metrics and (missing_required == 0 or missing_required is None):
             return {
                 "status": "APPROVE_WITH_WARNINGS",
                 "feedback": (
-                    f"Evaluation skipped due to error: {e}. "
-                    "Continuing with deterministic evidence only."
+                    "Deterministic fallback: reviewer LLM unavailable but deterministic evidence indicates "
+                    "metrics and no missing required outputs."
                 ),
-                "failed_gates": [],
-                "required_fixes": [],
-                "retry_worth_it": False
+                "failed_gates": ["LLM_EVAL_UNAVAILABLE"],
+                "required_fixes": ["Retry reviewer evaluation with LLM available for full semantic audit."],
+                "retry_worth_it": False,
+                "evidence": [{"claim": "metrics summary present in deterministic evidence.", "source": "deterministic_evidence#metrics"}],
             }
+
+        return {
+            "status": "NEEDS_IMPROVEMENT",
+            "feedback": (
+                "Deterministic fallback: insufficient structured evidence to approve while reviewer LLM is unavailable. "
+                f"Reason: {reason}"
+            ),
+            "failed_gates": ["LLM_EVAL_UNAVAILABLE", "insufficient_deterministic_evidence"],
+            "required_fixes": [
+                "Ensure metrics and required outputs are generated and persisted.",
+                "Retry reviewer evaluation when LLM is available.",
+            ],
+            "retry_worth_it": True,
+            "hard_failures": ["LLM_EVAL_UNAVAILABLE"],
+            "evidence": [{"claim": "No conclusive deterministic evidence for approval.", "source": "missing"}],
+        }
