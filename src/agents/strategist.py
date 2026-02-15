@@ -1293,6 +1293,52 @@ $payload_json
         validation_strategy = primary.get("validation_strategy", "cross_validation")
         validation_rationale = primary.get("validation_rationale", "Default cross-validation for general applicability.")
 
+        target_columns: List[str] = []
+
+        def _add_targets(values: Any) -> None:
+            if isinstance(values, str):
+                candidate = values.strip()
+                if candidate and candidate not in target_columns:
+                    target_columns.append(candidate)
+                return
+            if isinstance(values, list):
+                for item in values:
+                    if not isinstance(item, str):
+                        continue
+                    candidate = item.strip()
+                    if candidate and candidate not in target_columns:
+                        target_columns.append(candidate)
+
+        _add_targets(primary.get("target_columns"))
+        _add_targets(primary.get("target_column"))
+        _add_targets(primary.get("outcome_columns"))
+        _add_targets(primary.get("outcome_column"))
+        _add_targets(primary.get("label_columns"))
+        _add_targets(primary.get("label_column"))
+
+        if not target_columns:
+            summary_text = str(data_summary or "")
+            for pattern in (
+                r'"primary_target"\s*:\s*"([^"]+)"',
+                r"'primary_target'\s*:\s*'([^']+)'",
+                r"\bprimary_target\s*[:=]\s*[\"']?([A-Za-z0-9_.-]+)",
+                r"\btarget_column\s*[:=]\s*[\"']?([A-Za-z0-9_.-]+)",
+            ):
+                match = re.search(pattern, summary_text, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                candidate = str(match.group(1) or "").strip()
+                if candidate and candidate not in target_columns:
+                    target_columns.append(candidate)
+                    break
+
+        if not target_columns:
+            required_names = self._extract_required_column_names(primary if isinstance(primary, dict) else {})
+            for name in required_names:
+                if re.search(r"(?i)(^target$|^label$|^y$|target|label|outcome)", str(name)):
+                    target_columns.append(str(name))
+                    break
+
         # Extract new context-aware fields from LLM output
         feasibility_analysis = primary.get("feasibility_analysis", {})
         if not feasibility_analysis:
@@ -1318,6 +1364,7 @@ $payload_json
         evaluation_plan = {
             "objective_type": objective_type,
             "metrics": metrics,
+            "target_columns": target_columns,
             "validation": {
                 "strategy": validation_strategy,
                 "rationale": validation_rationale,
@@ -1347,6 +1394,7 @@ $payload_json
 
         return {
             "objective_type": objective_type,
+            "target_columns": target_columns,
             "evaluation_plan": evaluation_plan,
             "leakage_risks": leakage_risks,
             "recommended_artifacts": recommended_artifacts,

@@ -69,6 +69,27 @@ class TestStrategistNormalization:
         assert validation["invalid_count"] == 2
         assert len(validation["invalid_details"]) == 2
 
+    def test_build_strategy_spec_includes_target_columns(self):
+        payload = {
+            "strategies": [
+                {
+                    "title": "Churn Plan",
+                    "objective_type": "predictive",
+                    "target_columns": ["churn_flag"],
+                    "required_columns": ["customer_id", "churn_flag"],
+                }
+            ]
+        }
+
+        spec = self.agent._build_strategy_spec_from_llm(
+            payload,
+            data_summary='{"primary_target":"churn_flag"}',
+            user_request="Predict churn",
+        )
+
+        assert spec.get("target_columns") == ["churn_flag"]
+        assert (spec.get("evaluation_plan") or {}).get("target_columns") == ["churn_flag"]
+
     @patch.dict("os.environ", {"STRATEGIST_COLUMN_REPAIR_ATTEMPTS": "1"})
     def test_generate_strategies_repairs_required_columns_with_inventory(self):
         initial = {

@@ -1,4 +1,4 @@
-﻿from src.agents.execution_planner import _compress_text_preserve_ends
+﻿from src.agents.execution_planner import _compress_text_preserve_ends, MINIMAL_CONTRACT_COMPILER_PROMPT
 
 
 def test_compress_text_preserve_ends_keeps_tail():
@@ -11,3 +11,9 @@ def test_compress_text_preserve_ends_keeps_tail():
     assert "Accuracy" in compressed
     assert "..." in compressed
     assert len(compressed) <= 60 + len("\n...\n")
+
+
+def test_minimal_contract_prompt_defines_column_roles_semantics():
+    prompt = MINIMAL_CONTRACT_COMPILER_PROMPT
+    assert "Role definitions (ML execution context)" in prompt
+    assert "outcome MUST contain only the target" in prompt

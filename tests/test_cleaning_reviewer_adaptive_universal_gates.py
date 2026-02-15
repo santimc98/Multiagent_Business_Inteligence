@@ -110,3 +110,62 @@ def test_row_count_sanity_skips_when_drop_matches_label_null_listwise_pattern():
     evidence = gate_entry.get("evidence") or {}
     assert evidence.get("applies_if") is False
     assert evidence.get("skip_reason") == "drop_explained_by_label_null_listwise_removal"
+
+
+def test_feature_coverage_sanity_flags_missing_features_against_inventory(monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.cleaning_reviewer._load_column_inventory_names",
+        lambda path="data/column_inventory.json": [
+            "id",
+            "target",
+            "is_train",
+            "age",
+            "bp",
+            "cholesterol",
+            "max_hr",
+        ],
+    )
+
+    df = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "target": [1, 0, 1, 0],
+            "is_train": [1, 1, 0, 0],
+        }
+    )
+    gates = [
+        {
+            "name": "feature_coverage_sanity",
+            "severity": "SOFT",
+            "params": {"min_feature_count": 3, "check_against": "data_atlas"},
+        }
+    ]
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=["id", "target", "is_train"],
+        cleaned_header=list(df.columns),
+        cleaned_csv_path="data/cleaned_data.csv",
+        sample_str=df.astype(str),
+        sample_infer=df,
+        manifest={},
+        raw_sample=None,
+        column_roles={
+            "identifiers": ["id"],
+            "outcome": ["target"],
+            "split_columns": ["is_train"],
+        },
+        allowed_feature_sets={"model_features": ["age", "bp", "cholesterol", "max_hr"]},
+        dataset_profile={"dataset_semantics": {"primary_target": "target", "split_candidates": ["is_train"]}},
+    )
+
+    assert result["status"] == "APPROVE_WITH_WARNINGS"
+    assert "feature_coverage_sanity" in result.get("failed_checks", [])
+    gate_entry = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "feature_coverage_sanity"
+    )
+    evidence = gate_entry.get("evidence") or {}
+    assert evidence.get("cleaned_feature_count") == 0
+    assert evidence.get("source_feature_count", 0) >= 3

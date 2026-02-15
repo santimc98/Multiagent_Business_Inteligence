@@ -1034,11 +1034,24 @@ def _trim_value(
     return obj
 
 
-def trim_to_budget(obj: Any, max_chars: int) -> Any:
+def trim_to_budget(
+    obj: Any,
+    max_chars: int,
+    max_str_len: int = 1200,
+    max_list_items: int = 25,
+) -> Any:
     if obj is None:
         return obj
-    max_str_len = 1200
-    max_list_items = 25
+    try:
+        max_str_len = int(max_str_len)
+    except Exception:
+        max_str_len = 1200
+    try:
+        max_list_items = int(max_list_items)
+    except Exception:
+        max_list_items = 25
+    max_str_len = max(200, max_str_len)
+    max_list_items = max(8, max_list_items)
     for _ in range(4):
         trimmed = _trim_value(obj, max_str_len, max_list_items, _PRESERVE_KEYS, [])
         payload = json.dumps(trimmed, ensure_ascii=True, sort_keys=True)

@@ -498,6 +498,21 @@ def test_trim_to_budget_preserves_required_fields():
     assert trimmed.get("gates") == ["gate_a"]
 
 
+def test_trim_to_budget_accepts_optional_limits():
+    payload = {
+        "long_text": "x" * 8000,
+        "items": list(range(500)),
+    }
+    trimmed = trim_to_budget(
+        payload,
+        max_chars=700,
+        max_str_len=280,
+        max_list_items=9,
+    )
+    assert len(json.dumps(trimmed, ensure_ascii=True)) <= 700
+    assert isinstance(trimmed, dict)
+
+
 def test_persist_views_writes_files(tmp_path):
     views = {
         "de_view": {"role": "data_engineer"},

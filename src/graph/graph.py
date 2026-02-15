@@ -9007,6 +9007,9 @@ class AgentState(TypedDict):
     backend_memory_estimate: Dict[str, Any]
     sandbox_retry_count: int
     max_sandbox_retries: int
+    ml_engineer_host_crash: bool
+    ml_engineer_host_crash_count: int
+    max_ml_engineer_host_retries: int
     ml_call_refund_pending: bool
     execution_call_refund_pending: bool
     artifact_content_issues: List[str]
@@ -16252,6 +16255,9 @@ def run_engineer(state: AgentState) -> AgentState:
             "csv_decimal": csv_decimal,
             "csv_encoding": csv_encoding,
             "error_message": "",
+            "ml_engineer_host_crash": False,
+            "ml_engineer_host_crash_count": 0,
+            "max_ml_engineer_host_retries": int(state.get("max_ml_engineer_host_retries", 1)),
             "ml_call_refund_pending": False,
             "execution_call_refund_pending": False,
             "ml_context_snapshot": {
@@ -16302,16 +16308,30 @@ def run_engineer(state: AgentState) -> AgentState:
                 f_crash.write(trace_text)
         except Exception as artifact_err:
             print(f"Warning: failed to persist ml_engineer_host_crash.txt: {artifact_err}")
+        host_crash_count = int(state.get("ml_engineer_host_crash_count", 0) or 0) + 1
+        max_host_retries = int(state.get("max_ml_engineer_host_retries", 1) or 1)
         return {
             "error_message": msg,
             "generated_code": "# Generation Failed",
             "execution_output": msg,
             "budget_counters": counters,
             "ml_engineer_attempt": ml_attempt,
+            "ml_engineer_host_crash": True,
+            "ml_engineer_host_crash_count": host_crash_count,
+            "max_ml_engineer_host_retries": max_host_retries,
         }
 
 def check_engineer_success(state: AgentState):
     if state.get("error_message"):
+        if bool(state.get("ml_engineer_host_crash")):
+            crash_count = int(state.get("ml_engineer_host_crash_count", 0) or 0)
+            max_retries = int(state.get("max_ml_engineer_host_retries", 1) or 1)
+            if crash_count <= max_retries:
+                print(
+                    "ML Engineer host crash detected. "
+                    f"Retrying code generation ({crash_count}/{max_retries})."
+                )
+                return "retry_host_crash"
         return "failed"
     return "success"
 
@@ -21014,6 +21034,7 @@ workflow.add_conditional_edges(
     check_engineer_success,
     {
         "success": "execute_code",
+        "retry_host_crash": "engineer",
         "failed": "translator"
     }
 )

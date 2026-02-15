@@ -34,6 +34,11 @@ def _base_full_pipeline_contract():
             "reports/performance_metrics.json",
             "outputs/risk_scores_and_decisions.csv",
         ],
+        "column_dtype_targets": {
+            "id": {"target_dtype": "string"},
+            "feature_a": {"target_dtype": "float64"},
+            "target": {"target_dtype": "float64", "nullable": True},
+        },
         "cleaning_gates": ["schema_integrity"],
         "data_engineer_runbook": {"steps": ["load", "clean", "persist"]},
         "qa_gates": ["metric_threshold"],
@@ -314,3 +319,73 @@ def test_validate_contract_minimal_readonly_rejects_unresolved_scale_selector_re
     assert result.get("accepted") is False
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.cleaning_transforms_scale_conflict" in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_low_canonical_coverage_without_selectors():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["id", "target"]
+    inventory = ["id", "target", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"]
+
+    result = validate_contract_minimal_readonly(contract, column_inventory=inventory)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.canonical_columns_coverage" in rules
+
+
+def test_validate_contract_minimal_readonly_allows_low_canonical_coverage_when_selectors_cover_inventory():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["label", "__split"]
+    contract["column_roles"] = {
+        "pre_decision": ["pixel*"],
+        "decision": [],
+        "outcome": ["label"],
+        "post_decision_audit_only": [],
+        "unknown": [],
+    }
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["label", "__split"]
+    clean_dataset["required_feature_selectors"] = [{"type": "regex", "pattern": "^pixel\\d+$"}]
+    inventory = ["label", "__split", "pixel0", "pixel1", "pixel2", "pixel3", "pixel4"]
+
+    result = validate_contract_minimal_readonly(contract, column_inventory=inventory)
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.canonical_columns_coverage" not in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_unexpected_outcome_columns_against_steward_targets():
+    contract = _base_full_pipeline_contract()
+    contract["outcome_columns"] = ["target", "feature_a"]
+    contract["column_roles"]["outcome"] = ["target", "feature_a"]
+
+    result = validate_contract_minimal_readonly(
+        contract,
+        steward_semantics={"primary_target": "target", "split_candidates": [], "id_candidates": ["id"]},
+    )
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.outcome_columns_sanity" in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_model_features_with_only_structural_columns():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["id", "__split", "target"]
+    contract["column_roles"] = {
+        "pre_decision": ["id", "__split"],
+        "decision": [],
+        "outcome": ["target"],
+        "post_decision_audit_only": [],
+        "identifiers": ["id", "__split"],
+    }
+    contract["allowed_feature_sets"] = {"model_features": ["id", "__split"]}
+
+    result = validate_contract_minimal_readonly(
+        contract,
+        steward_semantics={"primary_target": "target", "split_candidates": ["__split"], "id_candidates": ["id"]},
+    )
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.model_features_empty" in rules

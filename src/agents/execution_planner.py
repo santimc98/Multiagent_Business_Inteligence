@@ -201,6 +201,16 @@ Minimal contract interface:
 - canonical_columns: list[str]
 - required_outputs: list[str] file paths
 - column_roles: object mapping role -> list[str]
+  Role definitions (ML execution context):
+  - outcome: ONLY the target variable(s) the model predicts (usually one column).
+    Do NOT include ordinary features here even if they are binary/categorical.
+  - pre_decision: ALL model input features available before prediction/decision.
+    Includes numeric, categorical, binary, and engineered predictor inputs.
+  - decision: Decision/action output columns emitted by policy/model (often empty in contract stage).
+  - identifiers: Entity keys/ids used for joins/traceability (non-predictive).
+  - post_decision_audit_only: Columns used only for post-hoc analysis/compliance.
+  CRITICAL: In predictive tasks, outcome MUST contain only the target column(s).
+  Non-target attributes belong to pre_decision, not outcomes.
 - column_dtype_targets: object mapping column -> dtype spec.
   Each value MUST be an object with key "target_dtype" (NOT "type").
 - artifact_requirements: object
@@ -850,6 +860,14 @@ def _build_default_cleaning_gates() -> List[Dict[str, Any]]:
             "name": "row_count_sanity",
             "severity": "SOFT",
             "params": {"max_drop_pct": 5.0, "max_dup_increase_pct": 1.0},
+        },
+        {
+            "name": "feature_coverage_sanity",
+            "severity": "SOFT",
+            "params": {
+                "min_feature_count": 3,
+                "check_against": "data_atlas",
+            },
         },
     ]
 
@@ -7388,10 +7406,16 @@ class ExecutionPlannerAgent:
         def _validate_contract_quality(contract_payload: Dict[str, Any] | None) -> Dict[str, Any]:
             payload_for_validation = _apply_deterministic_repairs(contract_payload if isinstance(contract_payload, dict) else {})
             base_result: Dict[str, Any]
+            steward_semantics_payload: Dict[str, Any] = {}
+            if isinstance(data_profile, dict):
+                semantics_candidate = data_profile.get("dataset_semantics")
+                if isinstance(semantics_candidate, dict) and semantics_candidate:
+                    steward_semantics_payload = semantics_candidate
             try:
                 base_result = validate_contract_minimal_readonly(
                     copy.deepcopy(payload_for_validation or {}),
                     column_inventory=column_inventory,
+                    steward_semantics=steward_semantics_payload,
                 )
             except Exception as val_err:
                 base_result = {
@@ -7406,6 +7430,135 @@ class ExecutionPlannerAgent:
                     ],
                     "summary": {"error_count": 1, "warning_count": 0},
                 }
+
+            if not isinstance(base_result, dict):
+                return {
+                    "status": "error",
+                    "accepted": False,
+                    "issues": [
+                        {
+                            "severity": "error",
+                            "rule": "contract_validation_result_invalid",
+                            "message": "Contract validator returned an invalid result payload.",
+                        }
+                    ],
+                    "summary": {"error_count": 1, "warning_count": 0},
+                }
+
+            try:
+                deterministic_comparison = build_contract_min(
+                    full_contract_or_partial=copy.deepcopy(payload_for_validation or {}),
+                    strategy=strategy if isinstance(strategy, dict) else {},
+                    column_inventory=column_inventory or [],
+                    relevant_columns=relevant_columns,
+                    target_candidates=target_candidates if isinstance(target_candidates, list) else [],
+                    data_profile=data_profile if isinstance(data_profile, dict) else {},
+                    business_objective_hint=business_objective,
+                )
+            except Exception:
+                deterministic_comparison = {}
+
+            if isinstance(deterministic_comparison, dict) and deterministic_comparison:
+                def _as_lower_set(values: Any) -> set[str]:
+                    if not isinstance(values, list):
+                        return set()
+                    out: set[str] = set()
+                    for item in values:
+                        text = str(item or "").strip()
+                        if text:
+                            out.add(text.lower())
+                    return out
+
+                def _extract_model_features(payload: Dict[str, Any]) -> set[str]:
+                    if not isinstance(payload, dict):
+                        return set()
+                    allowed = payload.get("allowed_feature_sets")
+                    if not isinstance(allowed, dict):
+                        return set()
+                    return _as_lower_set(allowed.get("model_features"))
+
+                llm_outcomes = _as_lower_set(payload_for_validation.get("outcome_columns"))
+                min_outcomes = _as_lower_set(deterministic_comparison.get("outcome_columns"))
+                if not llm_outcomes and isinstance(payload_for_validation.get("column_roles"), dict):
+                    llm_outcomes = _as_lower_set((payload_for_validation.get("column_roles") or {}).get("outcome"))
+                if not min_outcomes and isinstance(deterministic_comparison.get("column_roles"), dict):
+                    min_outcomes = _as_lower_set((deterministic_comparison.get("column_roles") or {}).get("outcome"))
+
+                llm_model_features = _extract_model_features(payload_for_validation)
+                min_model_features = _extract_model_features(deterministic_comparison)
+
+                outcome_union = llm_outcomes | min_outcomes
+                outcome_diff = llm_outcomes ^ min_outcomes
+                outcome_divergence = float(len(outcome_diff) / max(1, len(outcome_union)))
+
+                model_union = llm_model_features | min_model_features
+                model_diff = llm_model_features ^ min_model_features
+                model_divergence = float(len(model_diff) / max(1, len(model_union))) if model_union else 0.0
+
+                extra_issues: List[Dict[str, Any]] = []
+                severe_outcome_divergence = (
+                    bool(outcome_union)
+                    and (
+                        len(outcome_diff) >= 4
+                        or (len(outcome_diff) >= 2 and outcome_divergence >= 0.6)
+                    )
+                )
+                if severe_outcome_divergence:
+                    extra_issues.append(
+                        {
+                            "rule": "contract.llm_min_contract_divergence",
+                            "severity": "error",
+                            "message": (
+                                "LLM contract diverges materially from deterministic scaffold on outcome semantics. "
+                                "Repair outcome_columns/column_roles/model_features using strategy + steward evidence."
+                            ),
+                            "item": {
+                                "outcome_divergence_ratio": round(outcome_divergence, 4),
+                                "llm_only_outcomes": sorted(llm_outcomes - min_outcomes)[:20],
+                                "deterministic_only_outcomes": sorted(min_outcomes - llm_outcomes)[:20],
+                                "model_feature_divergence_ratio": round(model_divergence, 4),
+                            },
+                        }
+                    )
+                elif bool(outcome_union) and outcome_divergence >= 0.34:
+                    extra_issues.append(
+                        {
+                            "rule": "contract.llm_min_contract_divergence",
+                            "severity": "warning",
+                            "message": (
+                                "LLM contract shows moderate divergence from deterministic scaffold; "
+                                "verify outcome/model feature semantics."
+                            ),
+                            "item": {
+                                "outcome_divergence_ratio": round(outcome_divergence, 4),
+                                "model_feature_divergence_ratio": round(model_divergence, 4),
+                            },
+                        }
+                    )
+
+                if extra_issues:
+                    issues = base_result.get("issues")
+                    if not isinstance(issues, list):
+                        issues = []
+                    issues.extend(extra_issues)
+                    error_count = sum(
+                        1 for issue in issues
+                        if str((issue or {}).get("severity") or "").lower() in {"error", "fail"}
+                    )
+                    warning_count = sum(
+                        1 for issue in issues
+                        if str((issue or {}).get("severity") or "").lower() == "warning"
+                    )
+                    base_result["issues"] = issues
+                    base_result["status"] = "error" if error_count > 0 else ("warning" if warning_count > 0 else "ok")
+                    base_result["accepted"] = error_count == 0
+                    summary = base_result.get("summary")
+                    if not isinstance(summary, dict):
+                        summary = {}
+                    summary["error_count"] = error_count
+                    summary["warning_count"] = warning_count
+                    base_result["summary"] = summary
+
             return base_result
 
         _ROLE_BUCKETS = (
@@ -7666,6 +7819,21 @@ class ExecutionPlannerAgent:
                 ),
                 "contract.clean_dataset_drop_ml_columns_conflict": (
                     "Do not drop columns needed by ML stage."
+                ),
+                "contract.canonical_columns_coverage": (
+                    "Increase effective canonical coverage of column_inventory: include missing anchor columns "
+                    "and/or declare required_feature_selectors so coverage reflects real feature families."
+                ),
+                "contract.outcome_columns_sanity": (
+                    "Set outcome columns to target column(s) only; move non-target fields into pre_decision."
+                ),
+                "contract.model_features_empty": (
+                    "Ensure allowed_feature_sets.model_features contains useful modeling features, "
+                    "not only split/id structural columns."
+                ),
+                "contract.llm_min_contract_divergence": (
+                    "Reduce large semantic divergence versus deterministic scaffold: align outcome_columns, "
+                    "column_roles, and model_features with evidence from strategy + steward semantics."
                 ),
                 "contract.role_ontology": (
                     "Use canonical column_roles buckets only: pre_decision, decision, outcome, post_decision_audit_only, identifiers, time_columns, unknown."

@@ -1,457 +1,561 @@
-# AUDITORÍA: Execution Planner — Run 6a51bf4f (Heart Disease Kaggle)
-## Análisis Forense de Fallo + Assessment de Robustez
+# Auditoría Forense — Run 2089eda7
+## Heart Disease Binary Classification (900K rows, 16 cols)
 
-**Fecha:** 2026-02-15  
-**Run ID:** 6a51bf4f  
-**Dataset:** 900K filas, 16 columnas, clasificación binaria (Heart Disease)  
-**Resultado:** `pipeline_aborted:execution_contract_invalid` — 32 minutos gastados, 7 intentos LLM, 0 contratos válidos  
-
----
-
-## DIAGNÓSTICO: QUÉ PASÓ EXACTAMENTE
-
-### Timeline de la Run
-
-```
-16:17:55  run_init (csv: business_input.csv, 900K rows × 16 cols)
-16:17:55  steward_start
-16:18:58  steward_complete ✅ (encoding=utf-8, sep=",", decimal=".")
-16:20:04  execution_planner_start (strategy="Native Categorical GBM Ensemble")
-          │
-          ├── Sectional Compiler:
-          │   ├── core section round 1: FAIL (canonical_columns dict instead of list)
-          │   ├── core section round 2: OK ✅
-          │   ├── cleaning_contract round 1: FAIL (required_feature_selectors format)
-          │   └── cleaning_contract round 2: FAIL (selectors missing "type" key)
-          │       → Sectional compiler abandoned
-          │
-          ├── Full-Contract Quality Gate (3 rounds max):
-          │   ├── Attempt 1: FAIL — column_dtype_targets uses "type" not "target_dtype"
-          │   ├── Attempt 2: FAIL — JSON truncated (MAX_TOKENS), can't parse
-          │   └── Attempt 3: FAIL — SAME ERROR: "type" not "target_dtype" 
-          │
-          └── Result: contract = {} (empty), llm_success = false
-          
-16:52:59  pipeline_aborted_reason: execution_contract_invalid
-16:53:33  run_finalize: NO_GO
-```
-
-**32 minutos y 7 llamadas LLM para producir un contrato vacío `{}`.**
+**Run ID**: `2089eda7`
+**Dataset**: `business_input.csv` — 900,000 rows × 16 columnas (todas typed como `object`)
+**Objetivo**: Clasificación binaria — predecir `target` (Heart Disease), maximizar ROC-AUC con Stratified K-Fold sobre `is_train=1`, generar `submission.csv` con `[id, Heart Disease]` probabilidades.
+**Resultado**: `NO_GO` — pipeline abortado, 0 métricas, 0 predicciones.
 
 ---
 
-## ROOT CAUSE #1 (CRITICAL): Schema Mismatch — `"type"` vs `"target_dtype"`
+## 1. Resumen Ejecutivo
 
-### El Problema
+La run falló por **2 causas raíz independientes** que se refuerzan mutuamente:
 
-El validador (`contract_validator.py:2654`) espera:
+| # | Causa Raíz | Tipo | Agente Responsable | Impacto |
+|---|-----------|------|-------------------|---------|
+| **RC-1** | `trim_to_budget()` recibe keyword arg que no acepta | Bug de código | ml_engineer.py ↔ contract_views.py | Hard crash: ML engineer no genera código, ML plan vacío |
+| **RC-2** | Planner clasifica 7 features como "outcome" y elimina 6 features | Error de razonamiento LLM | Execution Planner | Contrato envenenado: modelo tendría 0 features útiles |
+
+**Ambas causas deben corregirse.** Si solo se corrige RC-1, el ML engineer ejecutaría con `model_features: ["is_train"]` y `forbidden_features: [todas las features reales]` → modelo basura. Si solo se corrige RC-2, el crash de código impide cualquier ejecución.
+
+---
+
+## 2. Timeline de la Run
+
+```
+18:03:xx  Steward          ✅  Análisis correcto: target="target", 13 features, id, is_train
+18:04:xx  Strategist       ✅  Strategy "predictive", ROC-AUC, K-Fold, CatBoost fallback
+18:05:xx  Domain Expert    ✅  Critique generada
+18:06:xx  Execution Planner ⚠️  Contrato ACEPTADO (llm_success=true) pero con errores lógicos graves
+18:07:xx  Data Engineer    ✅  Código ejecuta en 8.42s, exit_code=0 — pero sigue contrato envenenado
+18:07:xx  Cleaning Reviewer ✅  APPROVED — valida compliance, no detecta contrato incorrecto
+18:08:xx  ML Plan          ❌  CRASH: trim_to_budget() → plan vacío (source="render_error")
+18:08:xx  ML Engineer      ❌  CRASH: mismo error → ml_engineer_host_crash.txt
+18:08:xx  → route "failed" → Translator (fallback determinístico)
+18:09:xx  Run finalize: NO_GO — missing scored_rows.csv, metrics.json, alignment_check.json
+```
+
+---
+
+## 3. Evaluación por Agente
+
+### 3.1 Steward — ✅ Excelente (95/100)
+
+El Steward identificó correctamente:
+
+- `target` como variable dependiente binaria (1=Presence, 0=Absence)
+- `is_train` como columna de partición (70/30 split)
+- `id` como identificador único
+- 13 features clínicas (6 continuas + 7 categóricas)
+- Todas las columnas tipadas como "object" (requieren conversión numérica)
+- Target nulls (30%) alineados con `is_train=0`
+
+**dataset_semantics.json** — impecable:
+```json
+{
+  "primary_target": "target",
+  "split_candidates": ["is_train"],
+  "id_candidates": ["id"],
+  "notes": ["Categorical variables should be treated as discrete features."]
+}
+```
+
+**column_manifest** — correcto:
+```
+schema_mode: normal | total_columns: 16
+anchors: [id, target, is_train]
+families: [PREDICTOR_FEATURES(all_columns_except, count=13, role=feature)]
+```
+
+**Señal clave que downstream ignoró**: El Steward dice explícitamente "*Categorical variables are provided as numeric encodings and should be treated as discrete features*". Esta información llegó al Planner pero fue ignorada.
+
+### 3.2 Strategist — ✅ Bueno (80/100)
+
+- `objective_type: "predictive"` ✅
+- Métricas: ROC-AUC, LogLoss, PR-AUC ✅
+- Validación: Stratified K-Fold (K=5) ✅
+- Fallback chain: CatBoost + LightGBM → Single CatBoost → Logistic Regression ✅
+- Feasibility analysis: correcto (486K train rows, 13 features, high power) ✅
+
+**Nota**: El strategy spec no incluye lista explícita de `target_columns` ni `feature_columns`. Esto deja al Planner con libertad excesiva para interpretar roles.
+
+### 3.3 Execution Planner — ❌ Fallo Crítico (25/100)
+
+**El contrato fue aceptado por el validador** (`llm_success: true`, 0 errors, 1 warning). Esto confirma que los fixes del P0 anterior funcionaron: `column_dtype_targets` ahora tiene el formato correcto con `target_dtype`.
+
+**Sin embargo, el contrato tiene errores lógicos catastróficos** que el validador no detecta:
+
+#### Error 1: 6 features eliminadas de `canonical_columns`
+
+| Columna eliminada | Tipo | Importancia clínica |
+|-------------------|------|-------------------|
+| `age` | Continua | Factor de riesgo primario |
+| `bp` | Continua | Presión arterial |
+| `cholesterol` | Continua | Factor lipídico clave |
+| `max_hr` | Continua | Frecuencia cardíaca máxima |
+| `st_depression` | Continua | Hallazgo EKG (alta señal) |
+| `thallium` | Categórica (3 vals) | Test de perfusión (muy predictiva) |
+
+El dataset tiene 16 columnas. El contrato solo incluye 10 en `canonical_columns`. Las 6 columnas continuas más importantes para predicción cardíaca fueron eliminadas silenciosamente.
+
+#### Error 2: 7 features clasificadas como "outcome"
 
 ```json
-"column_dtype_targets": {
-  "age": {"target_dtype": "float64", "nullable": false}
+"column_roles": {
+  "pre_decision": ["is_train"],           // ← única "feature" → inútil
+  "outcome": [
+    "target",              // ← CORRECTO: es el target
+    "sex",                 // ← INCORRECTO: es feature
+    "chest_pain_type",     // ← INCORRECTO: es feature
+    "fbs_over_120",        // ← INCORRECTO: es feature
+    "ekg_results",         // ← INCORRECTO: es feature
+    "exercise_angina",     // ← INCORRECTO: es feature
+    "slope_of_st",         // ← INCORRECTO: es feature
+    "num_vessels_fluro"    // ← INCORRECTO: es feature
+  ],
+  "identifiers": ["id"]
 }
 ```
 
-Pero el LLM genera consistentemente:
+**Consecuencia directa** — `allowed_feature_sets` se derivó automáticamente:
+```json
+"model_features":     ["is_train"],     // ← solo el split column
+"forbidden_features": ["target", "sex", "chest_pain_type", ...]  // ← TODAS las features reales
+```
+
+#### Error 3: `evaluation_spec` vacío
 
 ```json
-"column_dtype_targets": {
-  "age": {"type": "float64"}
-}
+"evaluation_spec": { "objective_type": "predictive" }
 ```
 
-El LLM usa `"type"` porque es el nombre estándar en JSON Schema. El validador espera `"target_dtype"` que es un nombre custom.
+Sin metric, sin CV strategy, sin split column. El ML engineer no sabría qué optimizar.
 
-### Por qué el LLM no lo corrige en 3 intentos
+#### Análisis de por qué el LLM falló
 
-**Prompt inicial** (línea ~19): dice solamente:
+El Planner recibió toda la información correcta:
+- Steward summary con `primary_target: "target"` y features correctamente categorizadas
+- Column manifest con `PREDICTOR_FEATURES(count=13, role=feature)`
+- Strategy spec con ROC-AUC y K-Fold
+
+**Patrón del error**: El LLM trató toda columna categórica/binaria como "outcome" (confusión semántica entre "resultado de observación médica" y "variable objetivo a predecir"). Las 6 columnas continuas no se incluyeron en ninguna categoría.
+
+**Causa del prompt**: La especificación del contrato dice únicamente:
 ```
-column_dtype_targets: object mapping concrete columns and/or 
-selector families to target dtype contracts
+- column_roles: object mapping role -> list[str]
 ```
 
-No da ningún ejemplo JSON. No dice que la key debe ser `"target_dtype"`.
+Sin definición de qué significa cada rol:
+- `outcome` = **solo** la(s) variable(s) target que el modelo predice
+- `pre_decision` = features disponibles para el modelo
+- `decision` = la predicción del modelo
 
-**Repair prompt** (attempt 2 y 3): dice:
-```
-- Resolve `contract.column_dtype_targets`: column_dtype_targets['id'] missing target_dtype.
-```
+Esta ambigüedad permite interpretaciones incorrectas. En un contexto médico, "sex" y "chest_pain_type" *son* "outcomes de observación" — pero en ML, son *features*.
 
-Esto dice "missing target_dtype" pero no muestra el formato correcto. El LLM interpreta esto como "el objeto necesita un campo más" en vez de "el campo `type` debería llamarse `target_dtype`".
+### 3.4 Data Engineer — ✅ Correcto pero envenenado (N/A)
 
-### Evidencia: El LLM Progresa Pero No Llega
-
-| Attempt | Formato producido | Error del validador |
-|---------|-------------------|---------------------|
-| 1 | `"age": "float64"` (string plano) | "must be an object" |
-| 2 | (JSON truncado — MAX_TOKENS) | Parse error |
-| 3 | `"age": {"type": "float64"}` (objeto) | "missing target_dtype" |
-
-El LLM SÍ aprende entre intento 1→3: pasa de string plano a objeto. Pero nunca le dicen que la key debe ser `"target_dtype"` en vez de `"type"`.
-
-### Ironía: Existe Código Determinístico que Genera el Formato Correcto
-
-`execution_planner.py:2220` — `_infer_column_dtype_targets()` genera:
-
+El DE generó código correcto que sigue el contrato al pie de la letra:
 ```python
-dtype_targets[col] = {
-    "target_dtype": target_dtype,   # ← CORRECTO
-    "nullable": bool(miss_val and miss_val > 0.0),
-    "role": role_hint or "unknown",
-    "source": "data_profile",
-}
+REQUIRED_COLUMNS = [
+    "id", "target", "is_train", "sex", "chest_pain_type",
+    "fbs_over_120", "ekg_results", "exercise_angina",
+    "slope_of_st", "num_vessels_fluro"
+]
+df = df[REQUIRED_COLUMNS].copy()  # ← 6 features eliminadas
 ```
 
-Esta función es llamada desde `build_contract_min()` (línea 2777), que produce un contrato determinístico completo con `column_dtype_targets` perfectos. **Pero `build_contract_min()` NUNCA se invoca** — es código muerto en este contexto.
+- Ejecutó en 8.42 segundos ✅
+- 900,000 rows → 900,000 rows (0% drop) ✅
+- Conversiones de tipo correctas (object → float64/int64) ✅
+- Gates: `required_columns_present` ✅, `id_integrity` ✅, `no_semantic_rescale` ✅
 
----
+**El DE no tiene culpa.** Su trabajo es ejecutar el contrato, no cuestionar si el contrato es correcto. El contrato dice 10 columnas, el DE produce 10 columnas.
 
-## ROOT CAUSE #2: Sectional Compiler Falla en `required_feature_selectors`
+### 3.5 Cleaning Reviewer — ⚠️ Aprobó contrato envenenado (50/100)
 
-### Qué pasó
-
-- Round 1: LLM genera selectors sin el formato esperado → `"must be list[object]"`
-- Round 2: LLM genera objetos pero sin campo `"type"` en cada selector → `"selectors[0] is missing type"`
-
-El prompt para la sección cleaning_contract tampoco da un ejemplo concreto del formato de selector.
-
-### Consecuencia
-
-El sectional compiler produce una "mitad" del contrato (core OK, cleaning FAIL). Como cleaning_contract falla, el sectional result no se acepta, y el sistema cae a full-contract mode. Pero el full-contract mode también falla por el mismo tipo de problema (formatos no documentados).
-
----
-
-## ROOT CAUSE #3: Sin Fallback Determinístico Cuando LLM Falla
-
-### Qué pasa cuando 7 intentos fallan
-
-```python
-# execution_planner.py:9020
-contract = {}          # ← Contrato VACÍO
-llm_success = False
+```json
+{"status": "APPROVED", "feedback": "all gates passed"}
 ```
 
-El sistema NO usa el `build_contract_min()` disponible como fallback. Simplemente persiste `{}`, que luego se valida con 22 errores, y la pipeline se aborta.
+El reviewer verificó:
+- ✅ `required_columns_present` — las 10 columnas del contrato están presentes
+- ✅ `id_integrity` — id sin notación científica
+- ✅ `no_semantic_rescale` — sin símbolos de porcentaje
 
-**Costo real:** 32 minutos de compute, ~450K tokens consumidos (7 llamadas × ~65K tokens/llamada), resultado = nada.
+**Deficiencia arquitectónica**: El reviewer valida *compliance con el contrato*, no *correctness del contrato*. No tiene un gate que compare las columnas del contrato contra el data atlas o steward output. Si el contrato dice "solo 10 columnas", el reviewer aprueba 10 columnas sin cuestionar.
 
-### Lo que debería pasar
-
-Si el LLM no logra producir un contrato válido después de N intentos, el sistema debería:
-
-1. Tomar el mejor candidato (el de attempt 3, que tiene 17 errores pero contenido válido)
-2. Aplicar reparaciones determinísticas para errores conocidos (como `"type"` → `"target_dtype"`)
-3. Rellenar campos faltantes desde `build_contract_min()` 
-4. Validar el resultado reparado
-5. Si pasa → usarlo. Si no → fallar con diagnóstico útil.
-
----
-
-## ROOT CAUSE #4: Attempt 2 Truncado (MAX_TOKENS)
-
-### Qué pasó
+### 3.6 ML Plan — ❌ Crash (0/100)
 
 ```json
 {
-  "attempt_index": 2,
-  "finish_reason": "2",           // ← MAX_OUTPUT_TOKENS
-  "response_char_len": 8335,      // ← Respuesta cortada
-  "had_json_parse_error": true,
-  "parse_error_message": "unterminated string literal (detected at line 341)"
+  "plan_source": "render_error",
+  "primary_metric": "unspecified",
+  "cv_policy": {"strategy": "unspecified"},
+  "notes": ["Failed to render prompt context: trim_to_budget() got an unexpected keyword argument 'max_str_len'"]
 }
 ```
 
-El full-contract JSON es ~6-8KB. Con un prompt de ~31K chars, el modelo genera ~8K chars de respuesta y se trunca a mitad del JSON. Esto desperdicia 1 de los 3 intentos disponibles.
+El ML plan se genera antes del ML engineer code. Cuando `_serialize_json_for_prompt()` intentó comprimir el contexto para el prompt, llamó a `trim_to_budget()` con `max_str_len=700` — argumento que no existe en la función. El plan cayó a defaults vacíos.
 
-### Causa
+### 3.7 ML Engineer — ❌ Hard Crash (0/100)
 
-El `max_output_tokens` del modelo está configurado demasiado bajo para generar un contrato completo. O el prompt es demasiado largo y reduce el espacio disponible para la respuesta.
+```
+TypeError: trim_to_budget() got an unexpected keyword argument 'max_str_len'
+  at ml_engineer.py:807 → _serialize_json_for_prompt
+  at ml_engineer.py:2258 → generate_code
+  at graph.py:16184 → run_engineer
+```
+
+El crash ocurre **antes de generar código**. El ML engineer nunca llegó a llamar al LLM. Los 23 sitios en `ml_engineer.py` que pasan `max_str_len` a `trim_to_budget` están todos rotos.
+
+**Post-crash routing**: `graph.py` → `check_engineer_success` → `"failed"` → `"translator"`. No hay retry para crashes de código (solo para fallos de sandbox).
+
+### 3.8 Translator — ⚠️ Fallback determinístico (40/100)
+
+```markdown
+# Reporte Ejecutivo (Fallback Determinístico)
+## Decisión Ejecutiva: GO_WITH_LIMITATIONS
+```
+
+El translator también habría hit el `trim_to_budget` bug al serializar contexto, así que cayó al fallback determinístico. El reporte dice "GO_WITH_LIMITATIONS" cuando el `run_summary` dice "NO_GO" — inconsistencia notada en el reporte (`Decision Reconciliation Note`).
 
 ---
 
-## ROOT CAUSE #5: Repair Prompt No Incluye Ejemplos de Formato Correcto
+## 4. Root Cause Analysis
 
-### `_build_targeted_repair_actions()` — Sin Acción para `column_dtype_targets`
+### RC-1: Bug de código — `trim_to_budget()` signature mismatch
 
+**Definición de la función** (`contract_views.py:1037`):
 ```python
-rule_to_action = {
-    "contract.cleaning_transforms_drop_conflict": "Ensure drop_columns...",
-    "contract.clean_dataset_selector_drop_required_conflict": "When selector-drop...",
-    # ... 10 reglas más ...
-    # ❌ NO HAY ENTRADA PARA "contract.column_dtype_targets"
-}
+def trim_to_budget(obj: Any, max_chars: int) -> Any:
+    max_str_len = 1200       # ← variable INTERNA
+    max_list_items = 25      # ← variable INTERNA
+    for _ in range(4):
+        trimmed = _trim_value(obj, max_str_len, max_list_items, ...)
+        if len(json.dumps(trimmed)) <= max_chars:
+            return trimmed
+        max_str_len = max(200, int(max_str_len * 0.7))
+        max_list_items = max(8, int(max_list_items * 0.7))
 ```
 
-Cuando el rule es `contract.column_dtype_targets`, cae al fallback genérico:
+**Llamada del ml_engineer** (`ml_engineer.py:807`):
 ```python
-actions.append(f"- Resolve `{rule}`: {msg}")
+trimmed = trim_to_budget(
+    compact,
+    max_chars=max_chars,      # ✅ acepta
+    max_str_len=max_str_len,  # ❌ TypeError: unexpected keyword
+    max_list_items=max_list_items,  # ❌ TypeError
+)
 ```
 
-Que produce:
-```
-- Resolve `contract.column_dtype_targets`: column_dtype_targets['id'] missing target_dtype.
+**23 call sites afectados** en ml_engineer.py: líneas 810, 1555, 1561, 1567, 2261, 2272, 2303, 2309, 2315, 2324, 2366, 2378, 2398, 2404, 2410, 2416, 2422, 2433, 2444, 2450, 2456, 2465.
+
+**Alcance del impacto**: Solo `ml_engineer.py` importa `trim_to_budget` directamente. Los otros consumidores llaman la función internamente dentro de `contract_views.py` donde siempre se usa con la signature correcta de 2 args.
+
+**Fix** (opción A — recomendada, 5 minutos):
+
+Actualizar `trim_to_budget` para aceptar los kwargs:
+```python
+def trim_to_budget(
+    obj: Any,
+    max_chars: int,
+    max_str_len: int = 1200,
+    max_list_items: int = 25,
+) -> Any:
 ```
 
-Sin ejemplo concreto del formato esperado.
+**Fix** (opción B — más invasiva):
+Actualizar los 23 call sites en ml_engineer.py para pasar solo `max_chars`.
+
+### RC-2: Planner column role misclassification
+
+**Información recibida por el Planner** (correcta):
+
+| Fuente | Dato | Correcto |
+|--------|------|----------|
+| Steward | `primary_target: "target"` | ✅ |
+| Steward | "Categorical variables should be treated as discrete features" | ✅ |
+| Column manifest | `PREDICTOR_FEATURES(count=13, role=feature)` | ✅ |
+| Column inventory | 16 columnas listadas | ✅ |
+| Strategy | ROC-AUC, K-Fold, CatBoost | ✅ |
+
+**Contrato generado por el LLM** (incorrecto):
+
+| Campo | Valor generado | Valor correcto |
+|-------|---------------|----------------|
+| `canonical_columns` | 10 columnas | 16 columnas |
+| `outcome_columns` | 8 columnas | 1 (`target`) |
+| `model_features` | `["is_train"]` | 13 features |
+| `forbidden_features` | 8 columnas (todas las features) | `["target"]` |
+
+**¿Por qué `build_contract_min()` no salvó la situación?**
+
+La función determinística `build_contract_min()` habría generado roles correctos:
+```python
+# build_contract_min (línea ~2780)
+outcome_cols = _resolve_candidate_targets()  # → ["target"] solamente
+pre_decision = [col for col in canonical_columns if col not in assigned]  # → 13 features
+```
+
+Pero `build_contract_min()` no se usa como validación/comparación contra el contrato LLM. El contrato LLM fue aceptado (0 errores de formato) y se persistió tal cual.
+
+### RC-3 (Arquitectónico): Validación de correctness ausente
+
+El sistema tiene validación de **formato** pero no de **semántica**:
+
+| Qué se valida | ¿Existe? | Ejemplo |
+|---------------|----------|---------|
+| column_dtype_targets tiene "target_dtype" | ✅ | (fix anterior P0) |
+| canonical_columns es lista de strings | ✅ | |
+| column_roles es dict con listas | ✅ | |
+| canonical_columns cubre todas las columnas del inventario | ❌ | 6 features faltantes |
+| outcome_columns ⊆ target candidates del steward | ❌ | 7 features clasificadas como outcome |
+| model_features tiene al menos 1 feature real | ❌ | Solo "is_train" |
+| Contrato LLM ≈ build_contract_min (cross-check) | ❌ | Divergencia total |
 
 ---
 
-## MEJORAS PRIORIZADAS
+## 5. Cascada de Daño
 
-### P0 — Hotfix Inmediato (15 minutos)
+```
+                    ┌──────────────────┐
+                    │  Steward (✅)     │
+                    │  16 cols, target  │
+                    │  = "target" only  │
+                    └────────┬─────────┘
+                             │ información correcta
+                    ┌────────▼─────────┐
+                    │  Planner (❌)     │
+                    │  Clasifica mal   │──── RC-2: 7 features → "outcome"
+                    │  Elimina 6 cols  │──── RC-2: 6 features eliminadas
+                    └────────┬─────────┘
+                             │ contrato envenenado
+              ┌──────────────┼──────────────┐
+              │              │              │
+     ┌────────▼───────┐  ┌──▼────────┐  ┌──▼────────────┐
+     │  DE (✅ código  │  │ Reviewer   │  │ ML Plan (❌)  │
+     │  ❌ resultado) │  │ (⚠️ aprueba│  │ trim_to_budget│── RC-1
+     │  10 cols output│  │  envenen.) │  │ crash → vacío │
+     └────────────────┘  └───────────┘  └──────┬────────┘
+                                               │
+                                        ┌──────▼────────┐
+                                        │ ML Engineer   │
+                                        │ (❌ crash)    │── RC-1
+                                        │ 0 código      │
+                                        └──────┬────────┘
+                                               │ "failed"
+                                        ┌──────▼────────┐
+                                        │ Translator    │
+                                        │ (⚠️ fallback) │
+                                        │ GO_WITH_LIMIT │
+                                        └───────────────┘
+```
 
-**P0-1: Agregar ejemplo de `column_dtype_targets` al prompt**
+---
 
-En la descripción del schema del prompt (línea ~19 de execution_planner.py), cambiar:
+## 6. Fixes Priorizados
 
+### P0 — Hotfix inmediato (10 min)
+
+**P0-1: Fix `trim_to_budget` signature**
+
+En `contract_views.py`, actualizar la función para aceptar los kwargs que ml_engineer ya envía:
+
+```python
+# ANTES (línea 1037)
+def trim_to_budget(obj: Any, max_chars: int) -> Any:
+    max_str_len = 1200
+    max_list_items = 25
+
+# DESPUÉS
+def trim_to_budget(
+    obj: Any,
+    max_chars: int,
+    max_str_len: int = 1200,
+    max_list_items: int = 25,
+) -> Any:
+```
+
+Esto desbloquea: ML Plan, ML Engineer, Translator. **Impacto: 100% de la run puede avanzar.**
+
+### P1 — Fixes de contrato (30 min)
+
+**P1-1: Añadir definiciones de roles al prompt del Planner**
+
+En `MINIMAL_CONTRACT_COMPILER_PROMPT` (línea ~203), cambiar:
 ```
 ANTES:
-- column_dtype_targets: object mapping concrete columns and/or selector families 
-  to target dtype contracts
+- column_roles: object mapping role -> list[str]
 
 DESPUÉS:
-- column_dtype_targets: object mapping column name -> dtype spec.
-  Each value MUST be an object with key "target_dtype" (not "type").
-  Example: {"age": {"target_dtype": "float64", "nullable": false}, 
-            "sex": {"target_dtype": "string"}}
+- column_roles: object mapping role -> list[str]
+  Role definitions (ML context):
+  - "outcome": ONLY the target variable(s) that the model predicts. Usually 1 column.
+    Do NOT include features here even if they are binary or categorical.
+  - "pre_decision": ALL feature columns available for modeling. This includes
+    numerical, categorical, binary features — anything the model can use as input.
+  - "decision": The model's prediction output column(s) (usually empty in contract).
+  - "identifiers": ID/key columns (no predictive value).
+  - "post_decision_audit_only": Columns used only for post-hoc analysis.
+
+  CRITICAL: In a predictive task, outcome = ONLY the target. All other columns
+  (sex, age, chest_pain_type, etc.) are pre_decision features, NOT outcomes.
 ```
 
-**P0-2: Agregar acción de repair para `column_dtype_targets`**
+**P1-2: Añadir validación de canonical_columns coverage**
 
-En `_build_targeted_repair_actions()`, agregar al `rule_to_action`:
+En `contract_validator.py`, agregar regla:
+```python
+# Verificar que canonical_columns cubre al menos 80% del inventory
+inventory_set = set(column_inventory or [])
+canonical_set = set(contract.get("canonical_columns", []))
+coverage = len(canonical_set & inventory_set) / max(len(inventory_set), 1)
+if coverage < 0.8:
+    issues.append({
+        "rule": "contract.canonical_columns_coverage",
+        "severity": "error",
+        "message": f"canonical_columns covers only {coverage:.0%} of column inventory. "
+                   f"Missing: {sorted(inventory_set - canonical_set)[:10]}"
+    })
+```
+
+**P1-3: Validar que outcome_columns ⊆ steward target candidates**
 
 ```python
-"contract.column_dtype_targets": (
-    "Each column_dtype_targets entry must be an object with key 'target_dtype' "
-    "(NOT 'type'). Example: {\"target_dtype\": \"float64\", \"nullable\": false}. "
-    "Replace all {\"type\": X} with {\"target_dtype\": X}."
-),
+steward_targets = set(steward_semantics.get("primary_target", []))
+# ... add split_candidates, id_candidates
+outcome_set = set(contract.get("outcome_columns", []))
+unexpected_outcomes = outcome_set - steward_targets - {"target"}
+if unexpected_outcomes:
+    issues.append({
+        "rule": "contract.outcome_columns_sanity",
+        "severity": "error",
+        "message": f"outcome_columns contains non-target columns: {sorted(unexpected_outcomes)}. "
+                   f"These are likely features, not outcomes."
+    })
 ```
 
----
+### P2 — Cross-validation determinístico (2h)
 
-### P1 — Reparación Determinística Post-LLM (1-2h)
+**P2-1: Comparar contrato LLM vs `build_contract_min()`**
 
-**P1-1: `_deterministic_repair_column_dtype_targets()`**
-
-Cuando el validador reporta "missing target_dtype" y el entry tiene `"type"`, rename determinístico:
-
+Después de que el LLM genera el contrato, ejecutar `build_contract_min()` y comparar campos clave:
 ```python
-def _deterministic_repair_column_dtype_targets(contract: dict) -> dict:
-    """Fix common LLM format error: 'type' -> 'target_dtype'"""
-    targets = contract.get("column_dtype_targets")
-    if not isinstance(targets, dict):
-        return contract
-    
-    repaired = {}
-    for col, spec in targets.items():
-        if isinstance(spec, str):
-            # Flat string → wrap in object
-            repaired[col] = {"target_dtype": spec}
-        elif isinstance(spec, dict):
-            if "target_dtype" not in spec and "type" in spec:
-                # Wrong key name → rename
-                new_spec = dict(spec)
-                new_spec["target_dtype"] = new_spec.pop("type")
-                repaired[col] = new_spec
-            elif "target_dtype" not in spec and "dtype" in spec:
-                new_spec = dict(spec)
-                new_spec["target_dtype"] = new_spec.pop("dtype")
-                repaired[col] = new_spec
-            else:
-                repaired[col] = spec
-        else:
-            repaired[col] = {"target_dtype": "preserve"}
-    
-    contract["column_dtype_targets"] = repaired
-    return contract
+llm_contract = ... # contrato del LLM
+min_contract = build_contract_min(...)
+
+# Comparar roles
+llm_outcomes = set(llm_contract.get("outcome_columns", []))
+min_outcomes = set(min_contract.get("outcome_columns", []))
+
+if llm_outcomes != min_outcomes:
+    divergence = {
+        "llm_only": sorted(llm_outcomes - min_outcomes),
+        "min_only": sorted(min_outcomes - llm_outcomes),
+    }
+    # Si la divergencia es grande (>3 columnas), rechazar contrato LLM
+    if len(divergence["llm_only"]) > 3:
+        # Use build_contract_min roles as authoritative
+        contract["outcome_columns"] = min_contract["outcome_columns"]
+        contract["column_roles"] = min_contract["column_roles"]
 ```
 
-Aplicar ANTES de la validación de calidad, en cada attempt.
+**P2-2: Gate de sanidad en Cleaning Reviewer**
 
-**P1-2: Fallback a `build_contract_min()` cuando LLM falla**
-
-Cuando todos los intentos fallan y hay un `best_candidate`:
-
+Añadir gate `feature_coverage_sanity`:
 ```python
-if contract is None or contract == {}:
-    # Try deterministic repairs on best candidate
-    if best_candidate and isinstance(best_candidate, dict):
-        repaired = _deterministic_repair(best_candidate)
-        validation = _validate_contract_quality(copy.deepcopy(repaired))
-        if _contract_is_accepted(validation):
-            contract = repaired
-            llm_success = True  # or "deterministic_repair"
-    
-    # If still failing, try contract_min as base
-    if contract is None or contract == {}:
-        try:
-            contract_min = build_contract_min(
-                contract=best_candidate or {},
-                strategy=strategy,
-                business_objective=business_objective,
-                canonical_columns=column_inventory or [],
-                column_roles=best_candidate.get("column_roles", {}) if best_candidate else {},
-                data_profile=data_profile,
-                ...
-            )
-            validation = _validate_contract_quality(copy.deepcopy(contract_min))
-            if _contract_is_accepted(validation):
-                contract = contract_min
-                llm_success = True  # "deterministic_fallback"
-        except Exception:
-            pass
-```
-
-**P1-3: Aumentar `max_output_tokens` para contract generation**
-
-El contrato completo necesita ~2000-3000 tokens. Si el prompt consume 10K tokens y el modelo tiene un context de ~75K, debería haber espacio de sobra. Verificar que `max_output_tokens` esté configurado a al menos 4000.
-
----
-
-### P2 — Robustez Estructural (medio día)
-
-**P2-1: Batería de reparaciones determinísticas pre-validación**
-
-Crear `_apply_deterministic_repairs(contract)` que aplique fixes conocidos:
-
-```python
-def _apply_deterministic_repairs(contract: dict) -> dict:
-    """Apply known deterministic fixes before quality validation."""
-    contract = _deterministic_repair_column_dtype_targets(contract)
-    contract = _deterministic_repair_scope(contract)
-    contract = _deterministic_repair_gate_format(contract)
-    contract = _deterministic_repair_required_feature_selectors(contract)
-    return contract
-```
-
-Para cada campo problemático, si la estructura es "casi correcta" (renaming, wrapping), reparar determinísticamente en vez de gastar otra llamada LLM.
-
-**P2-2: Schema examples embebidos en prompt para cada campo complejo**
-
-Para cada campo que tiene formato no-obvio, agregar un ejemplo inline:
-
-```
-- column_dtype_targets: {col: {"target_dtype": "float64", "nullable": false}}
-- cleaning_gates: [{"name": "no_nulls_target", "severity": "HARD", "params": {"column": "target"}}]
-- required_feature_selectors: [{"type": "prefix", "value": "feature_", "match_mode": "startswith"}]
-```
-
-**P2-3: Rescue del sectional compiler parcial**
-
-Cuando el sectional compiler produce secciones parciales (core OK, cleaning FAIL), en vez de abandonar:
-
-1. Tomar la sección exitosa (core)
-2. Rellenar la sección fallida desde `build_contract_min()`
-3. Merge y validar
-
----
-
-### P3 — Senior Robustness (1-2 días)
-
-**P3-1: Contract schema registry con validación y ejemplos**
-
-Crear un archivo `contract_schema.py` que defina:
-
-```python
-CONTRACT_FIELD_SCHEMAS = {
-    "column_dtype_targets": {
-        "type": "dict[str, dict]",
-        "required_keys_per_entry": ["target_dtype"],
-        "example": {"age": {"target_dtype": "float64", "nullable": false}},
-        "common_errors": {
-            "type_instead_of_target_dtype": {
-                "detect": lambda v: "type" in v and "target_dtype" not in v,
-                "fix": lambda v: {**v, "target_dtype": v.pop("type")},
-            },
-        },
-    },
-    "cleaning_gates": {
-        "type": "list[dict]",
-        "required_keys_per_entry": ["name", "severity"],
-        "example": [{"name": "gate_1", "severity": "HARD", "params": {}}],
-    },
-    # ... etc
+{
+    "name": "feature_coverage_sanity",
+    "severity": "SOFT",
+    "params": {
+        "min_feature_count": 3,
+        "check_against": "data_atlas"
+    }
 }
 ```
+El gate verifica que el cleaned_data.csv tiene al menos N features (excluyendo id, target, split columns). Si el dataset original tiene 13 features y el limpiado tiene 0 features, algo está muy mal.
 
-Esto centraliza:
-- Formato esperado (para documentación y prompt)
-- Ejemplo JSON (para inyectar en prompts)
-- Errores comunes + reparación automática
-- Validación tipada
+### P3 — Robustez estructural (1 día)
 
-**P3-2: Token budget para contract generation**
+**P3-1: model_features mínimo gate**
 
-Medir tokens del prompt y ajustar `max_output_tokens` dinámicamente:
-
+Validación que `model_features` tenga al menos 1 columna que no sea split/id:
 ```python
-prompt_tokens = estimate_tokens(full_prompt)
-available_tokens = MODEL_CONTEXT_LIMIT - prompt_tokens
-max_output = min(available_tokens - 500, 4000)  # Safety margin
+model_feats = set(contract.get("allowed_feature_sets", {}).get("model_features", []))
+structural_cols = set(steward_semantics.get("split_candidates", [])) | set(steward_semantics.get("id_candidates", []))
+useful_feats = model_feats - structural_cols
+if not useful_feats:
+    issues.append({
+        "rule": "contract.model_features_empty",
+        "severity": "error",
+        "message": "model_features contains only structural columns (split/id). No useful features for modeling."
+    })
 ```
 
-Esto previene truncaciones como la del attempt 2.
+**P3-2: Retry para crashes de código (no solo de sandbox)**
 
-**P3-3: Progressive contract construction**
+Actualmente, un host crash en ML engineer → route directo a translator. Agregar retry:
+```python
+except TypeError as e:
+    if ml_attempt < max_attempts:
+        # Log the crash, fix the call if possible, retry
+        ...
+    else:
+        # Persist crash and route to translator
+```
 
-En vez de pedir el contrato completo en 1 sola llamada, construir incrementalmente:
+**P3-3: Strategy spec debe incluir target_columns explícitamente**
 
-1. **Pass 1** (determinístico): Generar esqueleto desde data_profile + strategy + business_objective
-   - scope, canonical_columns, column_roles, column_dtype_targets, required_outputs → todo determinístico
-2. **Pass 2** (LLM): Solo pedir los campos que requieren juicio:
-   - cleaning_gates, qa_gates, runbooks, iteration_policy, evaluation_spec
-3. **Merge**: Combinar pass 1 + pass 2 + validar
-
-Beneficio: el 60-70% del contrato se genera determinísticamente (sin errores de formato). El LLM solo se ocupa de lo que requiere razonamiento.
-
----
-
-## ANÁLISIS DE COSTES DE LA FALLA
-
-| Recurso | Gastado | Producido |
-|---------|---------|-----------|
-| Tiempo | 32 min | 0 (pipeline aborted) |
-| LLM calls | 7 (4 sectional + 3 full) | 0 contratos válidos |
-| Tokens | ~450K total | Nada útil |
-| Steward work | 1 min (válido) | Desperdiciado |
-| Strategy work | 1 min (válido) | Desperdiciado |
-
-**Con P0 (15 min de dev):** La run habría producido un contrato válido en attempt 3. El LLM generó contenido correcto excepto por el nombre de una key JSON.
-
-**Con P1 (2h de dev):** Cualquier run futura con errores de formato sería reparada automáticamente.
+El Strategist debería emitir `target_columns: ["target"]` en su spec. Esto daría al Planner una señal redundante que podría cruzar contra la steward info.
 
 ---
 
-## ASSESSMENT COMPARATIVO: Planner vs Otros Agentes
+## 7. Análisis Comparativo: Run 6a51bf4f vs 2089eda7
 
-| Dimensión | Execution Planner | Steward | Strategist |
-|-----------|------------------|---------|------------|
-| Líneas de código | 9138 | ~2700 | 1016 |
-| Complejidad | ★★★★★ | ★★★☆☆ | ★★☆☆☆ |
-| Deterministic fallback | ❌ Dead code | ✅ 2-pass | ✅ Single strategy |
-| Schema documentation | ❌ Vague | N/A | N/A |
-| Auto-repair | ❌ None | ★★★☆☆ | ★★★★☆ |
-| Error feedback quality | ★★☆☆☆ | ★★★☆☆ | ★★★★☆ |
-| Token efficiency | ★★☆☆☆ | ★★★★☆ | ★★★★★ |
+| Dimensión | Run 6a51bf4f (anterior) | Run 2089eda7 (actual) |
+|-----------|------------------------|----------------------|
+| Steward | ✅ | ✅ |
+| Strategy | ✅ | ✅ |
+| Planner formato | ❌ `"type"` vs `"target_dtype"` | ✅ (fix P0 funcionó) |
+| Planner lógica | No evaluable (crash formato) | ❌ column roles incorrectos |
+| Data Engineer | No ejecutó | ✅ código, ❌ resultado (envenenado) |
+| ML Engineer | No ejecutó | ❌ crash `trim_to_budget` |
+| Duración | 32 min (7 intentos LLM) | ~6 min |
+| Tokens gastados | ~450K | ~150K |
+| Resultado | `{}` contrato vacío | Contrato aceptado pero envenenado |
 
-**El Planner es el agente más complejo (9138 líneas) pero el menos resiliente.**
+**Progreso**: El fix P0 anterior eliminó el bloqueo de formato. El Planner ahora produce contratos válidos sintácticamente. Pero la validación semántica sigue ausente — el contrato pasa todas las gates de formato pero tiene errores lógicos que destruyen la run.
 
 ---
 
-## CONCLUSIÓN
+## 8. Respuesta a la Pregunta Central
 
-La falla de esta run se reduce a un **single point of failure trivial**: el LLM escribe `"type"` donde el validador espera `"target_dtype"`. Un rename de key JSON. Esto causó:
+> ¿Es un fallo arquitectónico del sistema o un mal razonamiento de los agentes que intoxicó la run?
 
-- 7 llamadas LLM desperdiciadas
-- 32 minutos perdidos
-- Pipeline completa abortada
-- 0 resultados para el usuario
+**Es ambos, pero con clara jerarquía:**
 
-Pero el Planner ya tiene el código para generar `column_dtype_targets` correctos: `_infer_column_dtype_targets()` produce el formato perfecto. Solo que nunca se usa como fallback.
+**1. El error primario es del Planner LLM** (razonamiento). El LLM tuvo toda la información correcta (steward, manifest, strategy) y generó un contrato con column roles catastróficamente incorrectos. Es un error de razonamiento del LLM: confundió "outcome" médico con "outcome" de ML.
 
-**La fix más urgente (P0) toma 15 minutos** y previene esta categoría de fallo: agregar un ejemplo de formato al prompt y un targeted repair action. 
+**2. El sistema amplifica el error en lugar de contenerlo** (arquitectura). No hay ningún check que diga "el contrato dice 0 features útiles, eso no puede estar bien". El cleaning reviewer aprueba. La integrity audit pasa. El run_facts_pack muestra `target_columns: []`. Nadie levanta la alarma.
 
-**La fix estructural (P1) toma 2 horas** y hace al Planner resiliente a cualquier error de formato conocido: reparación determinística pre-validación + fallback a `build_contract_min()`.
+**3. El bug de código es independiente y bloquea toda la pipeline** (`trim_to_budget` signature). Incluso un contrato perfecto habría crasheado en ML engineer.
 
-El patrón arquitectónico subyacente es que el Planner trata al LLM como la **única fuente de verdad** para el contrato, cuando el 60-70% del contrato puede generarse determinísticamente desde los datos del Steward. El LLM solo debería aportar juicio (gates, runbooks, policy), no formato estructural.
+**Metáfora**: El Planner escribió una receta que dice "usar solo agua como ingrediente para hacer un pastel". El Reviewer verificó que el agua es potable y aprobó. El Chef intentó encender el horno pero se electrocutó (bug de código) antes de descubrir que la receta es imposible.
+
+---
+
+## 9. Costo de la Run
+
+| Recurso | Valor | Desperdiciado |
+|---------|-------|---------------|
+| Tiempo total | ~6 min | 100% |
+| LLM calls (steward) | 1 | ✅ pero resultado ignorado |
+| LLM calls (strategy) | 1 | ✅ pero resultado ignorado |
+| LLM calls (planner) | 1 | Contrato con errores lógicos |
+| LLM calls (DE) | 1 | Código correcto, resultado inútil |
+| DE sandbox | 8.42s | 900K rows procesados para nada |
+| ML calls | 0 (crash) | — |
+
+**Con P0 (10 min de desarrollo)**: La run habría llegado a ML engineer sin crash.
+**Con P0+P1 (40 min de desarrollo)**: La run habría usado las 13 features correctas, generado modelo y predicciones.

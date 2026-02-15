@@ -2794,6 +2794,7 @@ def _collect_ml_required_columns(contract: Dict[str, Any]) -> Tuple[List[str], L
 def validate_contract_minimal_readonly(
     contract: Dict[str, Any],
     column_inventory: List[str] | None = None,
+    steward_semantics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Minimal, scope-driven contract validation.
@@ -2807,6 +2808,8 @@ def validate_contract_minimal_readonly(
             required_feature_selectors are expanded against this list instead of
             canonical_columns alone (critical for wide-schema datasets where
             canonical_columns only has anchor columns like ["label", "__split"]).
+        steward_semantics: Optional steward-derived semantic hints (e.g., primary_target,
+            split_candidates, id_candidates) used for semantic sanity checks.
     """
     issues: List[Dict[str, Any]] = []
 
@@ -2825,6 +2828,142 @@ def validate_contract_minimal_readonly(
             "issues": issues,
             "summary": {"error_count": 1, "warning_count": 0},
         }
+
+    steward_semantics = steward_semantics if isinstance(steward_semantics, dict) else {}
+
+    def _collect_target_candidates() -> List[str]:
+        candidates: List[str] = []
+
+        def _extend(values: Any) -> None:
+            cleaned, _ = _normalize_nonempty_str_list(values)
+            for col in cleaned:
+                if col not in candidates:
+                    candidates.append(col)
+
+        def _extend_from_object(obj: Any, keys: Tuple[str, ...]) -> None:
+            if not isinstance(obj, dict):
+                return
+            for key in keys:
+                _extend(obj.get(key))
+
+        _extend(steward_semantics.get("primary_target"))
+        _extend(steward_semantics.get("primary_targets"))
+        _extend(steward_semantics.get("target_column"))
+        _extend(steward_semantics.get("target_columns"))
+
+        _extend(contract.get("target_column"))
+        _extend(contract.get("target_columns"))
+
+        objective_analysis = contract.get("objective_analysis")
+        _extend_from_object(
+            objective_analysis,
+            (
+                "primary_target",
+                "primary_targets",
+                "target_column",
+                "target_columns",
+                "label_column",
+                "label_columns",
+            ),
+        )
+
+        evaluation_spec = contract.get("evaluation_spec")
+        _extend_from_object(
+            evaluation_spec,
+            (
+                "primary_target",
+                "primary_targets",
+                "target_column",
+                "target_columns",
+                "label_column",
+                "label_columns",
+            ),
+        )
+        if isinstance(evaluation_spec, dict):
+            eval_params = evaluation_spec.get("params")
+            _extend_from_object(
+                eval_params,
+                (
+                    "primary_target",
+                    "primary_targets",
+                    "target_column",
+                    "target_columns",
+                    "label_column",
+                    "label_columns",
+                ),
+            )
+
+        validation_requirements = contract.get("validation_requirements")
+        _extend_from_object(
+            validation_requirements,
+            (
+                "primary_target",
+                "primary_targets",
+                "target_column",
+                "target_columns",
+                "label_column",
+                "label_columns",
+            ),
+        )
+        if isinstance(validation_requirements, dict):
+            vr_params = validation_requirements.get("params")
+            _extend_from_object(
+                vr_params,
+                (
+                    "primary_target",
+                    "primary_targets",
+                    "target_column",
+                    "target_columns",
+                    "label_column",
+                    "label_columns",
+                ),
+            )
+
+        return candidates
+
+    def _collect_outcome_columns() -> List[str]:
+        outcomes: List[str] = []
+
+        def _extend(values: Any) -> None:
+            cleaned, _ = _normalize_nonempty_str_list(values)
+            for col in cleaned:
+                if col not in outcomes:
+                    outcomes.append(col)
+
+        _extend(contract.get("outcome_columns"))
+        column_roles = contract.get("column_roles")
+        if isinstance(column_roles, dict):
+            _extend(column_roles.get("outcome"))
+            _extend(column_roles.get("target"))
+            _extend(column_roles.get("label"))
+        return outcomes
+
+    def _collect_structural_columns() -> List[str]:
+        structural: List[str] = []
+
+        def _extend(values: Any) -> None:
+            cleaned, _ = _normalize_nonempty_str_list(values)
+            for col in cleaned:
+                if col not in structural:
+                    structural.append(col)
+
+        _extend(steward_semantics.get("split_candidates"))
+        _extend(steward_semantics.get("id_candidates"))
+        _extend(steward_semantics.get("identifier_columns"))
+
+        column_roles = contract.get("column_roles")
+        if isinstance(column_roles, dict):
+            _extend(column_roles.get("identifiers"))
+            _extend(column_roles.get("id"))
+            _extend(column_roles.get("time_columns"))
+
+        evaluation_spec = contract.get("evaluation_spec")
+        if isinstance(evaluation_spec, dict):
+            _extend(evaluation_spec.get("split_column"))
+            _extend(evaluation_spec.get("split_columns"))
+            _extend(evaluation_spec.get("fold_column"))
+
+        return structural
 
     scope_raw = contract.get("scope")
     scope = normalize_contract_scope(scope_raw)
@@ -2903,6 +3042,43 @@ def validate_contract_minimal_readonly(
                 canonical_columns,
             )
         )
+    else:
+        inventory_cols, _ = _normalize_nonempty_str_list(column_inventory if isinstance(column_inventory, list) else [])
+        canonical_cols, _ = _normalize_nonempty_str_list(canonical_columns)
+        if inventory_cols and canonical_cols:
+            inventory_norm = {col.lower(): col for col in inventory_cols}
+            effective_covered = {col.lower() for col in canonical_cols}
+
+            selector_sources: List[Any] = []
+            artifact_requirements = contract.get("artifact_requirements")
+            if isinstance(artifact_requirements, dict):
+                clean_dataset = artifact_requirements.get("clean_dataset")
+                if isinstance(clean_dataset, dict):
+                    selector_sources.append(clean_dataset.get("required_feature_selectors"))
+            selector_sources.append(contract.get("required_feature_selectors"))
+            selector_sources.append(contract.get("feature_selectors"))
+
+            for selector_source in selector_sources:
+                selector_cols, _ = _expand_required_feature_selectors(selector_source, inventory_cols)
+                for col in selector_cols:
+                    effective_covered.add(col.lower())
+
+            inventory_set = set(inventory_norm)
+            coverage = len(effective_covered & inventory_set) / max(1, len(inventory_set))
+            coverage_threshold = 0.80
+            if coverage < coverage_threshold:
+                missing = [inventory_norm[key] for key in sorted(inventory_set - effective_covered)]
+                issues.append(
+                    _strict_issue(
+                        "contract.canonical_columns_coverage",
+                        "error",
+                        (
+                            "canonical_columns + declared selectors cover only "
+                            f"{coverage:.0%} of column_inventory (minimum {coverage_threshold:.0%})."
+                        ),
+                        {"missing_columns_sample": missing[:25], "missing_count": len(missing)},
+                    )
+                )
 
     required_outputs = contract.get("required_outputs")
     if not isinstance(required_outputs, list) or not required_outputs:
@@ -3298,6 +3474,66 @@ def validate_contract_minimal_readonly(
                 )
 
     if requires_ml:
+        target_candidates = _collect_target_candidates()
+        outcome_columns = _collect_outcome_columns()
+        if target_candidates and outcome_columns:
+            target_norm = {col.lower() for col in target_candidates if col}
+            unexpected_outcomes = [
+                col for col in outcome_columns
+                if col and col.lower() not in target_norm
+            ]
+            if unexpected_outcomes:
+                issues.append(
+                    _strict_issue(
+                        "contract.outcome_columns_sanity",
+                        "error",
+                        "outcome columns include non-target fields; outcomes must contain only target column(s).",
+                        {
+                            "unexpected_outcomes": unexpected_outcomes[:25],
+                            "target_candidates": target_candidates[:25],
+                        },
+                    )
+                )
+
+        allowed_feature_sets = contract.get("allowed_feature_sets")
+        model_features: List[str] = []
+        if isinstance(allowed_feature_sets, dict):
+            model_features, _ = _normalize_nonempty_str_list(allowed_feature_sets.get("model_features"))
+        if not model_features:
+            column_roles = contract.get("column_roles")
+            if isinstance(column_roles, dict):
+                model_features, _ = _normalize_nonempty_str_list(column_roles.get("pre_decision"))
+
+        if model_features:
+            structural_norm = {
+                col.lower()
+                for col in _collect_structural_columns()
+                if isinstance(col, str) and col.strip()
+            }
+            useful_features = [
+                feat
+                for feat in model_features
+                if _looks_like_selector_token(feat) or feat.lower() not in structural_norm
+            ]
+            if not useful_features:
+                issues.append(
+                    _strict_issue(
+                        "contract.model_features_empty",
+                        "error",
+                        "model_features contains only structural columns (split/id/time). No useful modeling features remain.",
+                        {"model_features": model_features[:25], "structural_columns": sorted(structural_norm)[:25]},
+                    )
+                )
+        else:
+            issues.append(
+                _strict_issue(
+                    "contract.model_features_empty",
+                    "error",
+                    "model_features is missing/empty; declare at least one useful modeling feature.",
+                    {"model_features": model_features},
+                )
+            )
+
         evaluation_spec = contract.get("evaluation_spec")
         if not isinstance(evaluation_spec, dict) or not evaluation_spec:
             issues.append(

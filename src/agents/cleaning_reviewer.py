@@ -70,6 +70,14 @@ _FALLBACK_CLEANING_GATES = [
             "max_dup_increase_pct": 1.0,
         },
     },
+    {
+        "name": "feature_coverage_sanity",
+        "severity": "SOFT",
+        "params": {
+            "min_feature_count": 3,
+            "check_against": "data_atlas",
+        },
+    },
 ]
 
 
@@ -692,6 +700,9 @@ def _normalize_gate_name(name: Any) -> str:
         "target_split_null_alignment": "target_null_alignment_with_split",
         "id_uniqueness_validation": "id_uniqueness_validation",
         "id_uniqueness_check": "id_uniqueness_validation",
+        "feature_coverage_sanity": "feature_coverage_sanity",
+        "feature_coverage_check": "feature_coverage_sanity",
+        "feature_cover_sanity": "feature_coverage_sanity",
     }
     return alias_map.get(key, key)
 
@@ -1509,6 +1520,15 @@ def _evaluate_gates_deterministic(
             else:
                 issues = _check_row_count_sanity(manifest, params)
             evidence["row_counts"] = (manifest.get("row_counts") or {})
+        elif gate_key == "feature_coverage_sanity":
+            issues, evidence = _check_feature_coverage_sanity(
+                cleaned_header=cleaned_header,
+                required_columns=required_columns,
+                column_roles=column_roles,
+                allowed_feature_sets=allowed_feature_sets,
+                dataset_profile=dataset_profile,
+                params=params,
+            )
         elif gate_key == "numeric_parsing_validation":
             issues, evidence = _check_numeric_parsing_validation(sample_str, sample_infer, params)
         elif gate_key == "numeric_type_casting_check":
@@ -2343,6 +2363,138 @@ def _check_row_count_sanity(manifest: Dict[str, Any], params: Dict[str, Any]) ->
         if increase_pct > max_dup_increase_pct:
             issues.append(f"Row increase {increase_pct:.2f}% exceeds {max_dup_increase_pct:.2f}%")
     return issues
+
+
+def _check_feature_coverage_sanity(
+    cleaned_header: List[str],
+    required_columns: List[str],
+    column_roles: Dict[str, List[str]],
+    allowed_feature_sets: Dict[str, Any],
+    dataset_profile: Optional[Dict[str, Any]],
+    params: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {}
+
+    min_feature_count = params.get("min_feature_count", 3)
+    try:
+        min_feature_count = int(min_feature_count)
+    except Exception:
+        min_feature_count = 3
+    min_feature_count = max(0, min_feature_count)
+
+    check_against = str(params.get("check_against") or "data_atlas").strip().lower()
+    min_feature_ratio = params.get("min_feature_ratio", 0.2)
+    try:
+        min_feature_ratio = float(min_feature_ratio)
+    except Exception:
+        min_feature_ratio = 0.2
+    min_feature_ratio = max(0.0, min(1.0, min_feature_ratio))
+
+    structural_cols: List[str] = []
+    structural_cols.extend(_columns_with_role_tokens(column_roles, {"id", "identifier", "key"}))
+    structural_cols.extend(_columns_with_role_tokens(column_roles, {"split", "partition", "fold"}))
+    structural_cols.extend(_columns_with_role_tokens(column_roles, {"target", "label", "outcome"}))
+    structural_cols.extend(_columns_with_role_tokens(column_roles, {"time", "timestamp", "date"}))
+
+    dataset_semantics = (
+        dataset_profile.get("dataset_semantics")
+        if isinstance(dataset_profile, dict) and isinstance(dataset_profile.get("dataset_semantics"), dict)
+        else {}
+    )
+    if isinstance(dataset_semantics, dict):
+        for key in ("split_candidates", "id_candidates", "identifier_columns"):
+            structural_cols.extend(_list_str(dataset_semantics.get(key)))
+        structural_cols.extend(_list_str(dataset_semantics.get("primary_target")))
+        structural_cols.extend(_list_str(dataset_semantics.get("target_columns")))
+
+    structural_cols.extend(_list_str(params.get("target_column")))
+    structural_cols.extend(_list_str(params.get("target_columns")))
+    structural_cols.extend(_list_str(params.get("id_columns")))
+    structural_cols.extend(_list_str(params.get("split_columns")))
+
+    structural_norm = {str(col).strip().lower() for col in structural_cols if str(col).strip()}
+    cleaned_feature_cols = [
+        col for col in (cleaned_header or [])
+        if str(col).strip() and str(col).strip().lower() not in structural_norm
+    ]
+
+    model_features = []
+    if isinstance(allowed_feature_sets, dict):
+        model_features = _list_str(allowed_feature_sets.get("model_features"))
+    expected_model_features = [
+        col for col in model_features
+        if str(col).strip() and str(col).strip().lower() not in structural_norm
+    ]
+
+    source_columns: List[str] = []
+    if check_against in {"data_atlas", "column_inventory"}:
+        source_columns = _load_column_inventory_names("data/column_inventory.json")
+        if not source_columns and isinstance(dataset_profile, dict):
+            source_columns = _list_str(dataset_profile.get("column_inventory"))
+            if not source_columns:
+                source_columns = _list_str(dataset_profile.get("columns"))
+
+    if not source_columns:
+        source_columns = _list_str(required_columns)
+        if not source_columns and model_features:
+            source_columns = list(model_features)
+
+    source_feature_cols = [
+        col for col in source_columns
+        if str(col).strip() and str(col).strip().lower() not in structural_norm
+    ]
+
+    source_feature_count = len({str(col).strip().lower() for col in source_feature_cols})
+    cleaned_feature_count = len({str(col).strip().lower() for col in cleaned_feature_cols})
+    expected_model_count = len({str(col).strip().lower() for col in expected_model_features})
+
+    min_candidates: List[int] = []
+    if min_feature_count > 0:
+        min_candidates.append(min_feature_count)
+    if source_feature_count > 0:
+        min_candidates.append(source_feature_count)
+    if expected_model_count > 0:
+        min_candidates.append(expected_model_count)
+    min_required = min(min_candidates) if min_candidates else 0
+
+    evidence.update(
+        {
+            "check_against": check_against,
+            "min_feature_count": min_feature_count,
+            "min_required_effective": min_required,
+            "cleaned_feature_count": cleaned_feature_count,
+            "cleaned_feature_sample": cleaned_feature_cols[:25],
+            "source_feature_count": source_feature_count,
+            "source_feature_sample": source_feature_cols[:25],
+            "expected_model_feature_count": expected_model_count,
+            "expected_model_feature_sample": expected_model_features[:25],
+            "structural_columns_sample": sorted(structural_norm)[:25],
+        }
+    )
+
+    if min_required > 0 and cleaned_feature_count < min_required:
+        issues.append(
+            f"cleaned dataset has {cleaned_feature_count} non-structural features; expected at least {min_required}"
+        )
+
+    if source_feature_count > 0:
+        coverage_ratio = float(cleaned_feature_count / max(1, source_feature_count))
+        evidence["feature_coverage_ratio"] = round(coverage_ratio, 4)
+        if (
+            cleaned_feature_count > 0
+            and cleaned_feature_count < source_feature_count
+            and coverage_ratio < min_feature_ratio
+        ):
+            issues.append(
+                "cleaned feature coverage ratio "
+                f"{coverage_ratio:.2f} is below minimum {min_feature_ratio:.2f} against source feature inventory"
+            )
+    else:
+        evidence["feature_coverage_ratio"] = None
+        evidence["skip_reason"] = "source_feature_inventory_unavailable"
+
+    return issues, evidence
 
 
 def _check_outlier_policy_applied(
