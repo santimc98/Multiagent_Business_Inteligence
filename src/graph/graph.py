@@ -14,6 +14,7 @@ import threading
 import time
 import fnmatch
 import traceback
+import importlib.util
 from pathlib import Path
 from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple
@@ -8821,6 +8822,12 @@ class AgentState(TypedDict):
     data_engineer_failed: bool
     # Domain Expert
     domain_expert_reviews: List[Dict[str, Any]]
+    domain_expert_validation: Dict[str, Any]
+    domain_expert_selection_validation: Dict[str, Any]
+    domain_expert_ranked_candidates: List[Dict[str, Any]]
+    domain_expert_reselection: Dict[str, Any]
+    strategy_reselected: bool
+    strategist_diversity_validation: Dict[str, Any]
     # Visuals State
     has_partial_visuals: bool
     plots_local: List[str]
@@ -9394,20 +9401,7 @@ def run_strategist(state: AgentState) -> AgentState:
     column_manifest = state.get("column_manifest")
     if not isinstance(column_manifest, dict) or not column_manifest:
         column_manifest = _load_json_safe("data/column_manifest.json") or {}
-    compute_constraints = {
-        "runtime_mode": _get_execution_runtime_mode(),
-    }
-    heavy_cfg = _get_heavy_runner_config() or {}
-    if isinstance(heavy_cfg, dict):
-        timeout_sec = heavy_cfg.get("script_timeout_seconds")
-        if isinstance(timeout_sec, int) and timeout_sec > 0:
-            compute_constraints["max_runtime_seconds"] = int(timeout_sec)
-    execution_profile = state.get("execution_profile_context")
-    if isinstance(execution_profile, dict):
-        for key in ("max_runtime_seconds", "max_memory_mb", "gpu_available", "cpu_cores"):
-            value = execution_profile.get(key)
-            if value is not None:
-                compute_constraints[key] = value
+    compute_constraints = _collect_domain_expert_compute_constraints(state if isinstance(state, dict) else {})
     dataset_profile = state.get("profile") if isinstance(state.get("profile"), dict) else None
     if not dataset_profile and isinstance(state.get("dataset_profile"), dict):
         dataset_profile = state.get("dataset_profile")
@@ -9478,6 +9472,9 @@ def run_strategist(state: AgentState) -> AgentState:
     strategist_json_repair = result.get("json_repair") if isinstance(result, dict) else {}
     if not isinstance(strategist_json_repair, dict):
         strategist_json_repair = {}
+    diversity_validation = result.get("diversity_validation") if isinstance(result, dict) else {}
+    if not isinstance(diversity_validation, dict):
+        diversity_validation = {}
 
     # Fallback if list is empty or malformed
     if not strategies_list:
@@ -9504,6 +9501,7 @@ def run_strategist(state: AgentState) -> AgentState:
         "strategy_spec": strategy_spec,
         "column_validation": column_validation,
         "strategist_json_repair": strategist_json_repair,
+        "strategist_diversity_validation": diversity_validation,
     }
 
 def run_domain_expert(state: AgentState) -> AgentState:
@@ -9618,6 +9616,8 @@ def run_domain_expert(state: AgentState) -> AgentState:
     best_strategy = None
     best_score = -1.0
     selection_reason = "Default Selection"
+    selection_validation: Dict[str, Any] = {}
+    candidate_ranking: List[Dict[str, Any]] = []
 
     print("\n🧐 EXPERT DELIBERATION:")
     normalized_reviews: List[Dict[str, Any]] = []
@@ -9664,31 +9664,97 @@ def run_domain_expert(state: AgentState) -> AgentState:
 
         score = _safe_float(match.get('score'), 0.0) if isinstance(match, dict) else 0.0
         selectable = bool(match.get("selectable", score >= 3.0)) if isinstance(match, dict) else False
+        exec_validation = _validate_selected_strategy_executability(
+            strat if isinstance(strat, dict) else {},
+            review=match if isinstance(match, dict) else None,
+            compute_constraints=compute_constraints if isinstance(compute_constraints, dict) else {},
+        )
+        candidate_ranking.append(
+            {
+                "strategy_index": idx,
+                "title": str(strat.get("title") or f"strategy_{idx}"),
+                "score": score,
+                "selectable": selectable,
+                "executable": bool(exec_validation.get("ok")),
+                "blockers": exec_validation.get("blockers") or [],
+                "warnings": exec_validation.get("warnings") or [],
+                "reasoning": str(match.get("reasoning") or "") if isinstance(match, dict) else "",
+            }
+        )
 
         print(f"  • Strategy: {strat.get('title')} | Score: {score}/10")
         if isinstance(match, dict):
              critique = str(match.get("reasoning") or "")
              print(f"    - Critique: {critique[:120]}...")
              print(f"    - Selectable: {selectable}")
+        print(f"    - Executable: {bool(exec_validation.get('ok'))} | Blockers: {exec_validation.get('blockers') or []}")
 
-        if selectable and score > best_score:
+        if selectable and bool(exec_validation.get("ok")) and score > best_score:
             best_score = score
             best_strategy = strat
             selection_reason = str(match.get('reasoning') or "Highest Score") if isinstance(match, dict) else "Highest Score"
+            selection_validation = exec_validation
 
-    # Fallback to first strategy if none reaches selectable threshold.
+    # Fallback: choose best selectable candidate with minimum blockers.
     if not best_strategy and strategies_list:
-        best_strategy = strategies_list[0]
-        selection_reason = "Fallback: First strategy selected (no selectable review >= 3.0)."
+        best_candidate = None
+        for candidate in candidate_ranking:
+            if not candidate.get("selectable"):
+                continue
+            if best_candidate is None:
+                best_candidate = candidate
+                continue
+            cand_blockers = len(candidate.get("blockers") or [])
+            best_blockers = len(best_candidate.get("blockers") or [])
+            if cand_blockers < best_blockers:
+                best_candidate = candidate
+                continue
+            if cand_blockers == best_blockers and _safe_float(candidate.get("score"), 0.0) > _safe_float(best_candidate.get("score"), 0.0):
+                best_candidate = candidate
+        if best_candidate is None and candidate_ranking:
+            best_candidate = max(candidate_ranking, key=lambda c: _safe_float(c.get("score"), 0.0))
+        if isinstance(best_candidate, dict):
+            try:
+                best_idx = int(best_candidate.get("strategy_index"))
+            except Exception:
+                best_idx = 0
+            best_idx = max(0, min(best_idx, len(strategies_list) - 1))
+            best_strategy = strategies_list[best_idx]
+            selection_reason = (
+                "Fallback selection applied due to executability constraints. "
+                f"Chosen strategy_index={best_idx} with blockers={best_candidate.get('blockers') or []}"
+            )
+            selection_validation = {
+                "ok": len(best_candidate.get("blockers") or []) == 0,
+                "blockers": best_candidate.get("blockers") or [],
+                "warnings": best_candidate.get("warnings") or [],
+            }
+        else:
+            best_strategy = strategies_list[0]
+            selection_reason = "Fallback: First strategy selected (no candidate ranking available)."
+            selection_validation = {"ok": False, "blockers": ["no_candidate_ranking"], "warnings": []}
 
+    if not isinstance(best_strategy, dict):
+        best_strategy = {}
     print(f"\n🏆 WINNER: {best_strategy.get('title')} (Score: {best_score})")
     print(f"   Reason: {selection_reason}\n")
+
+    ranked_candidates_sorted = sorted(
+        candidate_ranking,
+        key=lambda c: (
+            0 if bool(c.get("selectable")) else 1,
+            len(c.get("blockers") or []),
+            -_safe_float(c.get("score"), 0.0),
+        ),
+    )
 
     return {
         "selected_strategy": best_strategy,
         "selection_reason": selection_reason,
         "domain_expert_reviews": normalized_reviews,
         "domain_expert_validation": review_validation,
+        "domain_expert_selection_validation": selection_validation,
+        "domain_expert_ranked_candidates": ranked_candidates_sorted,
     }
 
 
@@ -9789,6 +9855,125 @@ def _get_heavy_runner_config() -> Dict[str, Any] | None:
         "output_prefix": os.getenv("HEAVY_RUNNER_OUTPUT_PREFIX", "outputs"),
         "dataset_prefix": os.getenv("HEAVY_RUNNER_DATASET_PREFIX", "datasets"),
         "script_timeout_seconds": script_timeout_seconds,
+    }
+
+
+_TECHNIQUE_PACKAGE_HINTS: Dict[str, List[str]] = {
+    "xgboost": ["xgboost"],
+    "lightgbm": ["lightgbm"],
+    "catboost": ["catboost"],
+    "pytorch": ["torch"],
+    "torch": ["torch"],
+    "tensorflow": ["tensorflow"],
+    "transformer": ["transformers"],
+    "bert": ["transformers"],
+    "lstm": ["torch", "tensorflow"],
+    "neural network": ["torch", "tensorflow"],
+    "prophet": ["prophet"],
+    "arima": ["statsmodels"],
+    "sarima": ["statsmodels"],
+    "survival": ["lifelines"],
+    "shap": ["shap"],
+}
+
+
+def _collect_domain_expert_compute_constraints(state: Dict[str, Any]) -> Dict[str, Any]:
+    compute_constraints = {
+        "runtime_mode": _get_execution_runtime_mode(),
+    }
+    heavy_cfg = _get_heavy_runner_config() or {}
+    if isinstance(heavy_cfg, dict):
+        timeout_sec = heavy_cfg.get("script_timeout_seconds")
+        if isinstance(timeout_sec, int) and timeout_sec > 0:
+            compute_constraints["max_runtime_seconds"] = int(timeout_sec)
+    execution_profile = state.get("execution_profile_context")
+    if isinstance(execution_profile, dict):
+        for key in ("max_runtime_seconds", "max_memory_mb", "gpu_available", "cpu_cores"):
+            value = execution_profile.get(key)
+            if value is not None:
+                compute_constraints[key] = value
+    dataset_profile = state.get("profile") if isinstance(state.get("profile"), dict) else None
+    if not dataset_profile and isinstance(state.get("dataset_profile"), dict):
+        dataset_profile = state.get("dataset_profile")
+    if isinstance(dataset_profile, dict):
+        compute_hints = dataset_profile.get("compute_hints")
+        if isinstance(compute_hints, dict):
+            for key in ("estimated_memory_mb", "scale_category", "cross_validation_feasible", "deep_learning_feasible"):
+                value = compute_hints.get(key)
+                if value is not None:
+                    compute_constraints[key] = value
+    return compute_constraints
+
+
+def _required_packages_from_techniques(techniques: Any) -> List[str]:
+    if not isinstance(techniques, list):
+        return []
+    packages: List[str] = []
+    for item in techniques:
+        text = str(item or "").strip().lower()
+        if not text:
+            continue
+        for hint, deps in _TECHNIQUE_PACKAGE_HINTS.items():
+            if hint in text:
+                for dep in deps:
+                    if dep not in packages:
+                        packages.append(dep)
+    return packages
+
+
+def _validate_selected_strategy_executability(
+    strategy: Dict[str, Any],
+    *,
+    review: Optional[Dict[str, Any]],
+    compute_constraints: Dict[str, Any],
+) -> Dict[str, Any]:
+    blockers: List[str] = []
+    warnings: List[str] = []
+    if not isinstance(strategy, dict):
+        return {"ok": False, "blockers": ["strategy_not_dict"], "warnings": []}
+
+    meta = strategy.get("_meta") if isinstance(strategy.get("_meta"), dict) else {}
+    col_meta = meta.get("column_validation") if isinstance(meta.get("column_validation"), dict) else {}
+    invalid_count = int(col_meta.get("invalid_count") or 0)
+    if invalid_count > 0:
+        blockers.append("invalid_required_columns")
+    if bool(col_meta.get("over_budget")):
+        warnings.append("required_columns_over_budget")
+
+    techniques = strategy.get("techniques")
+    if not isinstance(techniques, list) or not techniques:
+        blockers.append("missing_techniques")
+
+    required_columns = strategy.get("required_columns")
+    if isinstance(required_columns, list) and len(required_columns) == 0:
+        warnings.append("empty_required_columns")
+
+    max_runtime_seconds = int(_safe_float(compute_constraints.get("max_runtime_seconds"), 0.0))
+    difficulty = str(strategy.get("estimated_difficulty") or "").strip().lower()
+    if max_runtime_seconds > 0 and difficulty == "high" and max_runtime_seconds < 900:
+        blockers.append("high_difficulty_under_runtime_budget")
+    elif max_runtime_seconds > 0 and difficulty == "high" and max_runtime_seconds < 1800:
+        warnings.append("high_difficulty_tight_runtime_budget")
+
+    runtime_mode = str(compute_constraints.get("runtime_mode") or "").strip().lower()
+    required_packages = _required_packages_from_techniques(techniques)
+    if runtime_mode == "local" and required_packages:
+        missing_local = [pkg for pkg in required_packages if importlib.util.find_spec(pkg) is None]
+        if missing_local:
+            blockers.append(f"missing_local_dependencies:{','.join(missing_local[:8])}")
+    elif required_packages:
+        warnings.append(f"requires_dependencies:{','.join(required_packages[:8])}")
+
+    review_score = _safe_float(review.get("score"), 0.0) if isinstance(review, dict) else 0.0
+    if review_score < 3.0:
+        blockers.append("score_below_selectable_threshold")
+
+    return {
+        "ok": len(blockers) == 0,
+        "blockers": blockers,
+        "warnings": warnings,
+        "required_packages": required_packages,
+        "runtime_mode": runtime_mode,
     }
 
 
@@ -17573,9 +17758,160 @@ def retry_handler(state: AgentState) -> AgentState:
     if len(current_history) > 20:
         current_history = current_history[-20:]
 
-    return {
-        "feedback_history": current_history
+    result: Dict[str, Any] = {
+        "feedback_history": current_history,
+        "strategy_reselected": False,
     }
+
+    try:
+        can_reselect = bool(_is_blocking_retry_reason(state if isinstance(state, dict) else {}))
+        strategies_wrapper = state.get("strategies") if isinstance(state.get("strategies"), dict) else {}
+        strategies_list = strategies_wrapper.get("strategies") if isinstance(strategies_wrapper, dict) else []
+        if can_reselect and isinstance(strategies_list, list) and len(strategies_list) > 1:
+            selected = state.get("selected_strategy") if isinstance(state.get("selected_strategy"), dict) else {}
+            selected_title = str(selected.get("title") or "").strip().lower()
+            selected_index = None
+            for idx, strat in enumerate(strategies_list):
+                if not isinstance(strat, dict):
+                    continue
+                if selected and strat is selected:
+                    selected_index = idx
+                    break
+                if selected_title and str(strat.get("title") or "").strip().lower() == selected_title:
+                    selected_index = idx
+                    break
+            if selected_index is None:
+                selected_index = 0
+
+            strategy_spec = state.get("strategy_spec") if isinstance(state.get("strategy_spec"), dict) else {}
+            column_validation = state.get("column_validation") if isinstance(state.get("column_validation"), dict) else {}
+            compute_constraints = _collect_domain_expert_compute_constraints(state if isinstance(state, dict) else {})
+
+            invalid_details_map: Dict[int, Dict[str, Any]] = {}
+            for item in (column_validation.get("invalid_details") or []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    idx = int(item.get("strategy_index"))
+                except Exception:
+                    continue
+                invalid_details_map[idx] = item
+            over_budget_map: Dict[int, Dict[str, Any]] = {}
+            for item in (column_validation.get("over_budget_details") or []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    idx = int(item.get("strategy_index"))
+                except Exception:
+                    continue
+                over_budget_map[idx] = item
+
+            alternatives: List[Dict[str, Any]] = []
+            for idx, strat in enumerate(strategies_list):
+                if idx == selected_index or not isinstance(strat, dict):
+                    continue
+                enriched = dict(strat)
+                enriched["_strategy_index"] = idx
+                enriched["_title"] = str(strat.get("title") or f"strategy_{idx}")
+                enriched["_meta"] = {
+                    "column_validation": {
+                        "invalid_count": len((invalid_details_map.get(idx) or {}).get("invalid_columns", [])),
+                        "invalid_columns": (invalid_details_map.get(idx) or {}).get("invalid_columns", []),
+                        "over_budget": idx in over_budget_map,
+                        "max_required_columns": (over_budget_map.get(idx) or {}).get("max_required_columns"),
+                        "required_count": (over_budget_map.get(idx) or {}).get("required_count")
+                        or (invalid_details_map.get(idx) or {}).get("required_count"),
+                    },
+                    "strategy_spec": strategy_spec,
+                    "compute_constraints": compute_constraints,
+                }
+                alternatives.append(enriched)
+
+            if alternatives:
+                data_summary = _build_senior_summary_context(state if isinstance(state, dict) else {})
+                business_objective = str(state.get("business_objective") or "")
+                failure_tail = str(state.get("execution_output") or "")[-2500:]
+                dataset_memory_context = str(state.get("dataset_memory_context") or "")
+                dataset_memory_context = (
+                    f"{dataset_memory_context}\n\nRESELECTION_RUNTIME_CONTEXT:\n{failure_tail}"
+                    if failure_tail
+                    else dataset_memory_context
+                )
+                reselection_eval = domain_expert.evaluate_strategies(
+                    data_summary,
+                    business_objective,
+                    alternatives,
+                    compute_constraints=compute_constraints,
+                    dataset_memory_context=dataset_memory_context,
+                )
+                reselection_reviews = reselection_eval.get("reviews") if isinstance(reselection_eval, dict) else []
+                reselection_reviews = reselection_reviews if isinstance(reselection_reviews, list) else []
+
+                best_alt = None
+                best_alt_score = -1.0
+                best_alt_review = None
+                for alt in alternatives:
+                    alt_idx = int(alt.get("_strategy_index") or -1)
+                    review = None
+                    for rev in reselection_reviews:
+                        if not isinstance(rev, dict):
+                            continue
+                        try:
+                            if int(rev.get("strategy_index")) == alt_idx:
+                                review = rev
+                                break
+                        except Exception:
+                            continue
+                    score = _safe_float(review.get("score"), 0.0) if isinstance(review, dict) else 0.0
+                    selectable = bool(review.get("selectable", score >= 3.0)) if isinstance(review, dict) else False
+                    exec_check = _validate_selected_strategy_executability(
+                        alt,
+                        review=review if isinstance(review, dict) else None,
+                        compute_constraints=compute_constraints,
+                    )
+                    if selectable and bool(exec_check.get("ok")) and score > best_alt_score:
+                        best_alt = alt
+                        best_alt_score = score
+                        best_alt_review = review
+
+                if isinstance(best_alt, dict):
+                    clean_alt = {k: v for k, v in best_alt.items() if not str(k).startswith("_")}
+                    alt_title = str(clean_alt.get("title") or "alternative_strategy")
+                    reselection_reason = str(best_alt_review.get("reasoning") or "") if isinstance(best_alt_review, dict) else ""
+                    current_history.append(
+                        f"DOMAIN_EXPERT_RESELECTION: switched to '{alt_title}' after blocking failure."
+                    )
+                    result.update(
+                        {
+                            "feedback_history": current_history[-20:],
+                            "selected_strategy": clean_alt,
+                            "selection_reason": (
+                                f"Reselected after blocking retry failure. {reselection_reason}".strip()
+                                if reselection_reason
+                                else "Reselected after blocking retry failure."
+                            ),
+                            "strategy_reselected": True,
+                            "domain_expert_reselection": {
+                                "status": "reselected",
+                                "previous_strategy_index": selected_index,
+                                "new_strategy_title": alt_title,
+                                "score": best_alt_score,
+                                "reviews_count": len([r for r in reselection_reviews if isinstance(r, dict)]),
+                            },
+                            "domain_expert_reviews": [r for r in reselection_reviews if isinstance(r, dict)],
+                        }
+                    )
+    except Exception as reselection_err:
+        current_history.append(f"DOMAIN_EXPERT_RESELECTION_WARNING: {reselection_err}")
+        result["feedback_history"] = current_history[-20:]
+
+    return result
+
+
+def check_retry_handler_route(state: AgentState):
+    if bool(state.get("strategy_reselected")):
+        return "replan"
+    return "engineer"
 
 def retry_sandbox_execution(state: AgentState) -> AgentState:
     retry_count = int(state.get("sandbox_retry_count", 0)) + 1
@@ -20115,7 +20451,14 @@ workflow.add_conditional_edges(
     }
 )
 
-workflow.add_edge("retry_handler", "engineer")
+workflow.add_conditional_edges(
+    "retry_handler",
+    check_retry_handler_route,
+    {
+        "engineer": "engineer",
+        "replan": "execution_planner",
+    }
+)
 workflow.add_edge("translator", "generate_pdf")
 workflow.add_edge("generate_pdf", END)
 

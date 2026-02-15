@@ -3,6 +3,7 @@ import json
 import re
 import hashlib
 import logging
+from difflib import SequenceMatcher
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -148,6 +149,22 @@ class StrategistAgent:
             value = 3
         return 1 if value <= 1 else 3
 
+    def _get_diversity_threshold(self) -> float:
+        raw = os.getenv("STRATEGIST_DIVERSITY_SIMILARITY_THRESHOLD", "0.8")
+        try:
+            value = float(raw)
+        except Exception:
+            value = 0.8
+        return max(0.5, min(value, 0.98))
+
+    def _get_diversity_repair_attempts(self) -> int:
+        raw = os.getenv("STRATEGIST_DIVERSITY_REPAIR_ATTEMPTS", "1")
+        try:
+            value = int(raw)
+        except Exception:
+            value = 1
+        return max(0, min(value, 3))
+
     def _column_families(self, allowed_columns: List[str]) -> List[Dict[str, Any]]:
         buckets: Dict[str, List[Tuple[int, str]]] = {}
         for col in allowed_columns:
@@ -275,6 +292,226 @@ class StrategistAgent:
             parse_error=parse_error,
             broken_json=raw_output,
         )
+
+    def _strategy_token_set(self, strategy: Dict[str, Any]) -> set[str]:
+        tokens: set[str] = set()
+        if not isinstance(strategy, dict):
+            return tokens
+
+        def _add_text(value: Any) -> None:
+            text = str(value or "").strip().lower()
+            if not text:
+                return
+            for tok in re.findall(r"[a-z0-9_]{3,}", text):
+                tokens.add(tok)
+
+        for key in ("objective_type", "analysis_type", "title", "validation_strategy", "success_metric"):
+            _add_text(strategy.get(key))
+
+        for item in strategy.get("techniques") or []:
+            _add_text(item)
+        for name in self._extract_required_column_names(strategy):
+            _add_text(name)
+        return tokens
+
+    def _strategy_similarity(self, left: Dict[str, Any], right: Dict[str, Any]) -> float:
+        left_tokens = self._strategy_token_set(left)
+        right_tokens = self._strategy_token_set(right)
+        if left_tokens and right_tokens:
+            union = left_tokens | right_tokens
+            overlap = left_tokens & right_tokens
+            jaccard = float(len(overlap) / max(len(union), 1))
+        else:
+            jaccard = 0.0
+        left_title = str(left.get("title") or "")
+        right_title = str(right.get("title") or "")
+        title_sim = SequenceMatcher(None, left_title.lower(), right_title.lower()).ratio()
+        return max(jaccard, title_sim)
+
+    def _find_redundant_strategy_pairs(
+        self,
+        strategies: List[Dict[str, Any]],
+        threshold: float,
+    ) -> List[Dict[str, Any]]:
+        issues: List[Dict[str, Any]] = []
+        for idx_a in range(len(strategies)):
+            for idx_b in range(idx_a + 1, len(strategies)):
+                left = strategies[idx_a] if isinstance(strategies[idx_a], dict) else {}
+                right = strategies[idx_b] if isinstance(strategies[idx_b], dict) else {}
+                sim = self._strategy_similarity(left, right)
+                if sim >= threshold:
+                    issues.append(
+                        {
+                            "left_index": idx_a,
+                            "right_index": idx_b,
+                            "similarity": round(float(sim), 4),
+                            "left_title": str(left.get("title") or f"strategy_{idx_a}"),
+                            "right_title": str(right.get("title") or f"strategy_{idx_b}"),
+                        }
+                    )
+        return issues
+
+    def _build_diversity_repair_prompt(
+        self,
+        *,
+        payload: Dict[str, Any],
+        redundancy_report: List[Dict[str, Any]],
+        allowed_columns: List[str],
+        max_required_columns: Optional[int],
+        data_summary: str,
+        user_request: str,
+        strategy_count: int,
+    ) -> str:
+        from src.utils.prompting import render_prompt
+
+        template = """
+You are repairing strategist output to ensure strategy diversity.
+Keep business objective alignment, but make strategies materially distinct.
+
+Return ONLY valid raw JSON with top-level key "strategies".
+Do not include markdown.
+
+Constraints:
+- Preserve exact column names from AUTHORIZED_COLUMN_INVENTORY.
+- Keep each strategy executable and coherent.
+- Each strategy must differ in at least one of:
+  1) technique family
+  2) validation strategy rationale
+  3) fallback chain
+- Keep strategy count = $strategy_count
+- If required_columns budget exists, respect it.
+
+*** USER REQUEST ***
+$user_request
+
+*** DATA SUMMARY ***
+$data_summary
+
+*** AUTHORIZED COLUMN INVENTORY ***
+$authorized_column_inventory
+
+*** REQUIRED COLUMNS BUDGET ***
+$required_columns_budget
+
+*** REDUNDANCY REPORT ***
+$redundancy_report
+
+*** CURRENT STRATEGIES JSON (EDIT THIS) ***
+$payload_json
+"""
+        budget_text = (
+            str(max_required_columns)
+            if isinstance(max_required_columns, int) and max_required_columns > 0
+            else "none"
+        )
+        return render_prompt(
+            template,
+            user_request=user_request,
+            data_summary=data_summary,
+            authorized_column_inventory=json.dumps(allowed_columns, ensure_ascii=False),
+            required_columns_budget=budget_text,
+            redundancy_report=json.dumps(redundancy_report, ensure_ascii=False, indent=2),
+            payload_json=json.dumps(payload, ensure_ascii=False, indent=2),
+            strategy_count=str(strategy_count),
+        )
+
+    def _ensure_strategy_diversity(
+        self,
+        *,
+        payload: Dict[str, Any],
+        data_summary: str,
+        user_request: str,
+        allowed_columns: List[str],
+        max_required_columns: Optional[int],
+        strategy_count: int,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return {"strategies": []}, {"status": "invalid_payload"}
+        strategies = payload.get("strategies")
+        if not isinstance(strategies, list):
+            return payload, {"status": "missing_strategies"}
+        strategies = [s for s in strategies if isinstance(s, dict)]
+        if len(strategies) <= 1:
+            return payload, {"status": "not_applicable", "strategy_count": len(strategies)}
+        if any(bool(s.get("_autofilled_variant")) for s in strategies):
+            return payload, {
+                "status": "autofill_skip",
+                "strategy_count": len(strategies),
+                "repair_applied": False,
+            }
+
+        threshold = self._get_diversity_threshold()
+        redundancy = self._find_redundant_strategy_pairs(strategies, threshold)
+        if not redundancy:
+            return payload, {
+                "status": "ok",
+                "threshold": threshold,
+                "redundant_pairs": [],
+                "repair_applied": False,
+            }
+
+        attempts = self._get_diversity_repair_attempts()
+        if attempts <= 0:
+            return payload, {
+                "status": "redundant_no_repair",
+                "threshold": threshold,
+                "redundant_pairs": redundancy,
+                "repair_applied": False,
+            }
+
+        best_payload = payload
+        best_redundancy = redundancy
+        for attempt in range(1, attempts + 1):
+            prompt = self._build_diversity_repair_prompt(
+                payload=best_payload,
+                redundancy_report=best_redundancy,
+                allowed_columns=allowed_columns,
+                max_required_columns=max_required_columns,
+                data_summary=data_summary,
+                user_request=user_request,
+                strategy_count=strategy_count,
+            )
+            try:
+                repaired = self._call_model(
+                    prompt,
+                    temperature=0.0,
+                    context_tag="strategist_diversity_repair",
+                )
+                candidate_parsed = json.loads(self._clean_json(repaired))
+                candidate_payload = self._normalize_strategist_output(candidate_parsed)
+                candidate_payload = self._enforce_strategy_count(candidate_payload, strategy_count)
+                candidate_validation = self._validate_required_columns(
+                    candidate_payload,
+                    allowed_columns,
+                    max_required_columns=max_required_columns,
+                )
+                if int(candidate_validation.get("invalid_count", 0)) > 0:
+                    continue
+                candidate_strategies = [
+                    s for s in (candidate_payload.get("strategies") or []) if isinstance(s, dict)
+                ]
+                candidate_redundancy = self._find_redundant_strategy_pairs(candidate_strategies, threshold)
+                if len(candidate_redundancy) < len(best_redundancy):
+                    best_payload = candidate_payload
+                    best_redundancy = candidate_redundancy
+                if not candidate_redundancy:
+                    return best_payload, {
+                        "status": "repaired",
+                        "threshold": threshold,
+                        "repair_applied": True,
+                        "attempts_used": attempt,
+                        "redundant_pairs": [],
+                    }
+            except Exception:
+                continue
+
+        return best_payload, {
+            "status": "partially_repaired" if len(best_redundancy) < len(redundancy) else "redundant_unresolved",
+            "threshold": threshold,
+            "repair_applied": len(best_redundancy) < len(redundancy),
+            "attempts_used": attempts,
+            "redundant_pairs": best_redundancy,
+        }
 
     def _parse_with_json_repair(
         self,
@@ -633,6 +870,14 @@ class StrategistAgent:
             # Normalization (Fix for crash 'list' object has no attribute 'get')
             payload = self._normalize_strategist_output(parsed)
             payload = self._enforce_strategy_count(payload, strategy_count)
+            payload, diversity_validation = self._ensure_strategy_diversity(
+                payload=payload,
+                data_summary=data_summary,
+                user_request=user_request,
+                allowed_columns=allowed_columns,
+                max_required_columns=required_columns_budget,
+                strategy_count=strategy_count,
+            )
             column_validation = self._validate_required_columns(
                 payload,
                 allowed_columns,
@@ -660,6 +905,7 @@ class StrategistAgent:
             column_validation["wide_schema_mode"] = wide_schema_mode
             column_validation["required_columns_budget"] = required_columns_budget
             payload["column_validation"] = column_validation
+            payload["diversity_validation"] = diversity_validation
             payload["json_repair"] = json_repair_meta
 
             # Build strategy_spec from LLM reasoning (not hardcoded inference)
@@ -696,6 +942,11 @@ class StrategistAgent:
                 "repair_applied": False,
                 "attempts_used": 0,
             }
+            fallback["diversity_validation"] = {
+                "status": "fallback",
+                "repair_applied": False,
+                "redundant_pairs": [],
+            }
             strategy_spec = self._build_strategy_spec_from_llm(fallback, data_summary, user_request)
             fallback["strategy_spec"] = strategy_spec
             fallback["strategy_count_requested"] = strategy_count
@@ -718,6 +969,7 @@ class StrategistAgent:
         while len(strategies) < 3 and strategies:
             strategies.append(dict(strategies[-1]))
             strategies[-1]["title"] = f"{strategies[-1].get('title', 'Strategy')} (Variant {len(strategies)})"
+            strategies[-1]["_autofilled_variant"] = True
         payload["strategies"] = strategies
         return payload
 

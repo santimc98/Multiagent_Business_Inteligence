@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 
 from src.utils.senior_protocol import SENIOR_STRATEGY_PROTOCOL
+from src.utils.domain_knowledge import infer_domain_guidance
 
 load_dotenv()
 
@@ -70,6 +71,12 @@ class DomainExpertAgent:
         normalized_strategies = self._normalize_strategies(strategies)
         llm_error = ""
         llm_reviews: List[Dict[str, Any]] = []
+        domain_guidance = infer_domain_guidance(
+            data_summary=data_summary or "",
+            business_objective=business_objective or "",
+            dataset_memory_context=dataset_memory_context or "",
+            max_domains=2,
+        )
 
         prompt = self._build_prompt(
             data_summary=data_summary,
@@ -77,6 +84,7 @@ class DomainExpertAgent:
             strategies=normalized_strategies,
             compute_constraints=compute_constraints or {},
             dataset_memory_context=dataset_memory_context,
+            domain_guidance=domain_guidance,
         )
         self.last_prompt = prompt
 
@@ -105,6 +113,7 @@ class DomainExpertAgent:
 
         if llm_error:
             validation_meta["llm_error"] = llm_error
+        validation_meta["domain_guidance"] = domain_guidance
 
         return {
             "reviews": validated_reviews,
@@ -119,6 +128,7 @@ class DomainExpertAgent:
         strategies: List[Dict[str, Any]],
         compute_constraints: Dict[str, Any],
         dataset_memory_context: str,
+        domain_guidance: Dict[str, Any],
     ) -> str:
         from src.utils.prompting import render_prompt
 
@@ -140,6 +150,9 @@ $compute_constraints
 
 *** DATASET MEMORY CONTEXT (PRIOR RUNS) ***
 $dataset_memory_context
+
+*** DOMAIN GUIDANCE (KNOWLEDGE BASE) ***
+$domain_guidance
 
 *** CANDIDATE STRATEGIES (INDEXED) ***
 $strategies_text
@@ -180,6 +193,7 @@ Output schema:
             data_summary=data_summary or "",
             compute_constraints=json.dumps(compute_constraints or {}, ensure_ascii=True),
             dataset_memory_context=(dataset_memory_context or "")[:3000],
+            domain_guidance=json.dumps(domain_guidance or {}, ensure_ascii=True),
             strategies_text=json.dumps(strategies, ensure_ascii=True, indent=2),
         )
 

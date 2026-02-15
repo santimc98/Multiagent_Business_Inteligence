@@ -324,6 +324,9 @@ class StewardAgent:
             KEY COLUMNS (Top 50 Importance):
             {profile['column_details']}
 
+            REMAINING COLUMNS SUMMARY:
+            {profile.get('remaining_columns_summary', 'N/A')}
+
             AMBIGUITY REPORT:
             {profile['ambiguities']}
 
@@ -764,12 +767,14 @@ RULES:
         col_details = ""
         ambiguities = ""
         glossary = ""
+        remaining_columns_summary = ""
         ids = []
         dates = []
 
         # Preserve original order; avoid heuristic target suggestions.
         all_cols = df.columns.tolist()
         sorted_cols = all_cols[:50]
+        remaining_cols = all_cols[50:]
 
         def _norm_header(name: str) -> str:
             cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
@@ -852,6 +857,45 @@ RULES:
             if role_hints:
                 sample_vals = df[col].dropna().astype(str).head(3).tolist()
                 glossary += f"- {col}: dtype={dtype}, hints={role_hints}, sample={sample_vals}\n"
+
+        if remaining_cols:
+            type_counts = {"numeric": 0, "categorical": 0, "boolean": 0, "datetime": 0, "other": 0}
+            numeric_min = None
+            numeric_max = None
+            for col in remaining_cols:
+                series = df[col]
+                dtype = series.dtype
+                try:
+                    if pd.api.types.is_bool_dtype(dtype):
+                        type_counts["boolean"] += 1
+                        continue
+                    if pd.api.types.is_datetime64_any_dtype(dtype):
+                        type_counts["datetime"] += 1
+                        continue
+                    numeric_probe = pd.to_numeric(series, errors="coerce")
+                    numeric_ratio = float(numeric_probe.notna().mean())
+                    if numeric_ratio >= 0.8:
+                        type_counts["numeric"] += 1
+                        if numeric_probe.notna().any():
+                            cmin = float(numeric_probe.min())
+                            cmax = float(numeric_probe.max())
+                            numeric_min = cmin if numeric_min is None else min(numeric_min, cmin)
+                            numeric_max = cmax if numeric_max is None else max(numeric_max, cmax)
+                    elif pd.api.types.is_object_dtype(dtype) or pd.api.types.is_string_dtype(dtype):
+                        type_counts["categorical"] += 1
+                    else:
+                        type_counts["other"] += 1
+                except Exception:
+                    type_counts["other"] += 1
+            type_chunks = [f"{k}={v}" for k, v in type_counts.items() if int(v) > 0]
+            range_text = ""
+            if numeric_min is not None and numeric_max is not None:
+                range_text = f", numeric_range=[{round(float(numeric_min), 4)}, {round(float(numeric_max), 4)}]"
+            remaining_columns_summary = (
+                f"Remaining columns ({len(remaining_cols)} beyond top-50): "
+                + ", ".join(type_chunks)
+                + range_text
+            )
             
         # Representative Examples
         try:
@@ -864,6 +908,7 @@ RULES:
             "alerts": alerts,
             "ambiguities": ambiguities or "None detected.",
             "glossary": glossary or "None.",
+            "remaining_columns_summary": remaining_columns_summary,
             "ids": ids,
             "dates": dates,
             "examples": examples
