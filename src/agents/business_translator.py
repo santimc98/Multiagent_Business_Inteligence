@@ -3,7 +3,7 @@ import re
 import html
 import csv
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
 import google.generativeai as genai
 
@@ -11,7 +11,6 @@ load_dotenv()
 
 from string import Template
 import json
-from typing import Dict, Any, Optional, List
 from src.utils.prompting import render_prompt
 from src.utils.senior_protocol import SENIOR_TRANSLATION_PROTOCOL, SENIOR_EVIDENCE_RULE
 from src.utils.text_encoding import sanitize_text, sanitize_text_payload
@@ -23,53 +22,51 @@ from src.utils.csv_dialect import (
 )
 
 
-def _detect_primary_language(text: str) -> str:
+def _detect_primary_language(text: str, preferred_language: Optional[str] = None) -> str:
     """
     Detect primary language using stopword heuristics.
-    Returns 'es' for Spanish, 'en' for English (default).
-
-    Uses common stopwords and articles that differ between languages:
-    - Spanish: el, la, los, las, un, una, de, que, y, en, para, con, por
-    - English: the, a, an, of, to, and, in, for, with, is, are, that
+    Returns 'es' for Spanish and 'en' for English (fallback).
     """
+    if preferred_language in {"es", "en"}:
+        return preferred_language
+
+    fallback = os.getenv("TRANSLATOR_DEFAULT_LANGUAGE", "en").strip().lower()
+    if fallback not in {"es", "en"}:
+        fallback = "en"
+
     if not text:
-        return "en"
+        return fallback
 
     text_lower = text.lower()
-    words = set(re.findall(r'\b\w+\b', text_lower))
+    words = set(re.findall(r"\b\w+\b", text_lower))
+    if len(words) < 10:
+        return fallback
 
-    # Spanish stopwords (high-frequency, distinctive)
+    # Keep only high-frequency function words (no domain-specific terms).
     spanish_markers = {
-        'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas',
-        'de', 'del', 'que', 'qué', 'en', 'para', 'con', 'por',
-        'como', 'cómo', 'pero', 'más', 'este', 'esta', 'esto',
-        'ese', 'esa', 'eso', 'aquel', 'aquella', 'hay', 'ser',
-        'está', 'están', 'son', 'tiene', 'tienen', 'puede',
-        'sobre', 'entre', 'cuando', 'donde', 'sin', 'según',
-        'precio', 'cliente', 'datos', 'modelo', 'resultado',
-        'optimización', 'análisis', 'negocio', 'valor',
+        "el", "la", "los", "las", "un", "una", "unos", "unas",
+        "de", "del", "que", "qué", "en", "para", "con", "por",
+        "como", "cómo", "pero", "más", "este", "esta", "esto",
+        "ese", "esa", "eso", "aquel", "aquella", "hay", "ser",
+        "está", "están", "son", "tiene", "tienen", "puede",
+        "sobre", "entre", "cuando", "donde", "sin", "según",
     }
-
-    # English stopwords (high-frequency, distinctive)
     english_markers = {
-        'the', 'a', 'an', 'of', 'to', 'and', 'in', 'for', 'with',
-        'is', 'are', 'was', 'were', 'be', 'been', 'being',
-        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
-        'could', 'should', 'may', 'might', 'must', 'shall',
-        'this', 'that', 'these', 'those', 'it', 'its',
-        'from', 'by', 'on', 'at', 'or', 'but', 'not', 'as',
-        'price', 'customer', 'data', 'model', 'result',
-        'optimization', 'analysis', 'business', 'value',
+        "the", "a", "an", "of", "to", "and", "in", "for", "with",
+        "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would",
+        "could", "should", "may", "might", "must", "shall",
+        "this", "that", "these", "those", "it", "its",
+        "from", "by", "on", "at", "or", "but", "not", "as",
     }
 
     spanish_count = len(words & spanish_markers)
     english_count = len(words & english_markers)
-
-    # Require significant difference to switch from default (English)
-    if spanish_count > english_count + 2:
+    if spanish_count >= english_count + 2:
         return "es"
-    return "en"
-
+    if english_count >= spanish_count + 2:
+        return "en"
+    return fallback
 
 def _safe_load_json(path: str):
     try:
@@ -873,19 +870,26 @@ def _derive_exec_decision(
     verdict = str(review_verdict or "").upper()
     status = str(data_adequacy_report.get("status") if isinstance(data_adequacy_report, dict) else "").lower()
     lift = _extract_lift_value(data_adequacy_report, metrics_payload)
+    min_positive_lift = _coerce_float(os.getenv("TRANSLATOR_MIN_POSITIVE_LIFT", "0.01"))
+    if min_positive_lift is None:
+        min_positive_lift = 0.01
 
     if verdict in {"NEEDS_IMPROVEMENT", "REJECTED"}:
         return "NO_GO"
     if status in {"unknown", "insufficient_signal"}:
         return "GO_WITH_LIMITATIONS"
     if status == "data_limited":
-        if lift is not None and lift <= 0:
+        if lift is not None and lift < 0:
             return "NO_GO"
         return "GO_WITH_LIMITATIONS"
     if status == "sufficient_signal":
         if lift is None:
             return "GO_WITH_LIMITATIONS"
-        return "GO" if lift > 0 else "NO_GO"
+        if lift < 0:
+            return "NO_GO"
+        if lift < min_positive_lift:
+            return "GO_WITH_LIMITATIONS"
+        return "GO"
     return "GO_WITH_LIMITATIONS"
 
 
@@ -893,8 +897,9 @@ def _sanitize_report_text(text: str) -> str:
     if not text:
         return text
     text = sanitize_text(text)
-    while "..." in text:
-        text = text.replace("...", ".")
+    # Only collapse isolated ellipsis tokens to avoid corrupting paths or ranges.
+    text = re.sub(r"(?<=\s)\.\.\.(?=\s|$)", ".", text)
+    text = re.sub(r"(?m)^\s*\.\.\.\s*$", "", text)
     return text
 
 def _sanitize_evidence_value(value: str) -> str:
@@ -956,8 +961,57 @@ def _normalize_evidence_sources(report: str) -> str:
     return "\n".join(out)
 
 
-def _canonical_evidence_section(evidence_paths: List[str]) -> str:
-    items = _build_evidence_items(evidence_paths)
+def _parse_evidence_items_from_report(report: str) -> List[Dict[str, str]]:
+    if not report:
+        return []
+    header = re.search(r"(?im)^\s*##\s+evidencia usada\s*$", report)
+    if not header:
+        return []
+    section = report[header.end():]
+    claims = re.findall(
+        r"\{claim:\s*\"([^\"]*)\"\s*,\s*source:\s*\"([^\"]*)\"\s*\}",
+        section,
+        flags=re.IGNORECASE,
+    )
+    items: List[Dict[str, str]] = []
+    for claim, source in claims:
+        clean_claim = _sanitize_evidence_value(claim)
+        clean_source = _sanitize_evidence_value(source)
+        if not clean_claim:
+            continue
+        if not _is_valid_evidence_source(clean_source):
+            clean_source = "missing"
+        items.append({"claim": clean_claim, "source": clean_source})
+    return items
+
+
+def _canonical_evidence_section(evidence_paths: List[str], llm_items: Optional[List[Dict[str, str]]] = None) -> str:
+    validated_llm_items: List[Dict[str, str]] = []
+    for item in (llm_items or []):
+        if not isinstance(item, dict):
+            continue
+        claim = _sanitize_evidence_value(item.get("claim", ""))
+        source = _sanitize_evidence_value(item.get("source", ""))
+        if not claim:
+            continue
+        if not _is_valid_evidence_source(source):
+            source = "missing"
+        validated_llm_items.append({"claim": claim, "source": source})
+
+    if validated_llm_items:
+        items = validated_llm_items[:6]
+        generic = _build_evidence_items(evidence_paths, min_items=0, max_items=6)
+        for item in generic:
+            if len(items) >= 6:
+                break
+            if any(existing.get("source") == item.get("source") for existing in items):
+                continue
+            items.append(item)
+        while len(items) < 3:
+            items.append({"claim": "No verificable con artifacts actuales", "source": "missing"})
+    else:
+        items = _build_evidence_items(evidence_paths)
+
     evidence_lines = ["evidence:"]
     for item in items:
         claim = _sanitize_evidence_value(item.get("claim", ""))
@@ -978,7 +1032,8 @@ def _ensure_evidence_section(report: str, evidence_paths: List[str]) -> str:
     if not report:
         return report
     report = sanitize_text(report)
-    evidence_block = _canonical_evidence_section(evidence_paths)
+    llm_items = _parse_evidence_items_from_report(report)
+    evidence_block = _canonical_evidence_section(evidence_paths, llm_items=llm_items)
 
     header_match = re.search(r"(?im)^\s*##\s+evidencia usada\s*$", report)
     if header_match:
@@ -1048,6 +1103,451 @@ def _build_fact_cards(case_summary_ctx, scored_rows_ctx, weights_ctx, data_adequ
                 "labels": {},
             })
     return facts[:max_items]
+
+
+def _estimate_prompt_tokens(text: str) -> int:
+    return max(1, len(str(text or "")) // 4)
+
+
+def _normalize_decision_token(value: str) -> Optional[str]:
+    text = str(value or "").upper()
+    if "GO_WITH_LIMITATIONS" in text:
+        return "GO_WITH_LIMITATIONS"
+    if re.search(r"\bNO_GO\b", text):
+        return "NO_GO"
+    if re.search(r"\bGO\b", text):
+        return "GO"
+    return None
+
+
+def _extract_report_decision(content: str) -> Optional[str]:
+    if not content:
+        return None
+    for line in content.splitlines()[:40]:
+        token = _normalize_decision_token(line)
+        if token:
+            return token
+    token = _normalize_decision_token(content)
+    return token
+
+
+def _collect_numeric_reference_values(
+    facts_context: List[Dict[str, Any]],
+    metrics_payload: Dict[str, Any],
+) -> List[float]:
+    refs: List[float] = []
+    for item in facts_context or []:
+        if not isinstance(item, dict):
+            continue
+        value = _coerce_float(item.get("value"))
+        if value is not None:
+            refs.append(value)
+    for _, value in _flatten_metrics(metrics_payload if isinstance(metrics_payload, dict) else {}):
+        num = _coerce_float(value if not isinstance(value, dict) else value.get("mean"))
+        if num is not None:
+            refs.append(num)
+    deduped: List[float] = []
+    for value in refs:
+        if any(abs(value - existing) <= 1e-9 for existing in deduped):
+            continue
+        deduped.append(value)
+    return deduped
+
+
+def _extract_report_metric_claims(content: str) -> List[Tuple[str, float, str]]:
+    if not content:
+        return []
+    patterns = [
+        ("accuracy", r"(?i)accuracy\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?"),
+        ("f1", r"(?i)\bf1\b\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?"),
+        ("auc", r"(?i)\b(?:roc[-_\s]?auc|auc)\b\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?"),
+        ("gini", r"(?i)\b(?:normalized[_\s-]?gini|gini)\b\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?"),
+        ("rmse", r"(?i)\brmse\b\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("mae", r"(?i)\bmae\b\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("r2", r"(?i)\br\^?2\b\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("lift", r"(?i)\blift\b\s*[:=]?\s*([+-]?\d+(?:\.\d+)?)\s*%?"),
+    ]
+    claims: List[Tuple[str, float, str]] = []
+    for metric_name, pattern in patterns:
+        for match in re.finditer(pattern, content):
+            raw = match.group(1)
+            value = _coerce_float(raw)
+            if value is None:
+                continue
+            full_match = match.group(0)
+            claims.append((metric_name, float(value), full_match))
+    return claims
+
+
+def _value_matches_references(value: float, refs: List[float], relative_tolerance: float = 0.05) -> bool:
+    if not refs:
+        return True
+    candidates = [value]
+    if value > 1:
+        candidates.append(value / 100.0)
+    for candidate in candidates:
+        for ref in refs:
+            abs_tol = max(1e-6, abs(ref) * relative_tolerance)
+            if abs(candidate - ref) <= abs_tol:
+                return True
+    return False
+
+
+def _validate_report_structure(content: str, expected_language: str) -> List[str]:
+    issues: List[str] = []
+    if not content:
+        return ["empty_report"]
+    length = len(content)
+    if length < 500:
+        issues.append("report_too_short")
+    if length > 30000:
+        issues.append("report_too_long")
+    decision_header = re.search(r"(?im)^\s*##\s+(Executive Decision|Decisión Ejecutiva)\s*$", content)
+    evidence_header = re.search(r"(?im)^\s*##\s+Evidencia usada\s*$", content)
+    risk_header = re.search(r"(?im)^\s*##\s+(Risks\s*&\s*Limitations|Riesgos\s*&\s*Limitaciones)\s*$", content)
+    if not decision_header:
+        issues.append("missing_decision_section")
+    if not evidence_header:
+        issues.append("missing_evidence_section")
+    if not risk_header:
+        issues.append("missing_risks_section")
+    if expected_language == "es":
+        if re.search(r"(?i)\b(the|therefore|however)\b", content[:600]):
+            issues.append("possible_language_mix")
+    return issues
+
+
+def _validate_report(
+    content: str,
+    expected_decision: str,
+    facts_context: List[Dict[str, Any]],
+    metrics_payload: Dict[str, Any],
+    plots: List[str],
+    expected_language: str,
+) -> Dict[str, Any]:
+    structure_issues = _validate_report_structure(content, expected_language=expected_language)
+    decision_in_report = _extract_report_decision(content)
+    decision_issue = []
+    if decision_in_report and expected_decision and decision_in_report != expected_decision:
+        decision_issue.append(f"decision_mismatch:{decision_in_report}!={expected_decision}")
+    elif not decision_in_report:
+        decision_issue.append("decision_missing")
+
+    refs = _collect_numeric_reference_values(facts_context, metrics_payload)
+    metric_claims = _extract_report_metric_claims(content)
+    unverified_metrics: List[str] = []
+    for metric_name, value, excerpt in metric_claims:
+        if not _value_matches_references(value, refs):
+            unverified_metrics.append(f"{metric_name}:{excerpt}")
+
+    allowed_plots = {str(path).replace("\\", "/") for path in (plots or [])}
+    invalid_plots: List[str] = []
+    for path in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", content):
+        normalized = str(path).strip().replace("\\", "/")
+        if allowed_plots and normalized not in allowed_plots:
+            invalid_plots.append(normalized)
+
+    critical_issues: List[str] = []
+    for issue in structure_issues:
+        if issue in {"missing_decision_section", "missing_evidence_section", "report_too_short"}:
+            critical_issues.append(issue)
+    critical_issues.extend(decision_issue)
+    if len(unverified_metrics) > 2:
+        critical_issues.append("unverified_metrics_gt2")
+    if invalid_plots:
+        critical_issues.append("invalid_plot_reference")
+
+    return {
+        "structure_issues": structure_issues,
+        "decision_issue": decision_issue,
+        "unverified_metrics": unverified_metrics,
+        "invalid_plots": invalid_plots,
+        "critical_issues": critical_issues,
+        "has_critical": bool(critical_issues),
+    }
+
+
+def _score_report_quality(validation: Dict[str, Any]) -> int:
+    score = 100
+    score -= 8 * len(validation.get("structure_issues", []))
+    score -= 12 * len(validation.get("decision_issue", []))
+    score -= 5 * min(4, len(validation.get("unverified_metrics", [])))
+    score -= 6 * len(validation.get("invalid_plots", []))
+    return max(0, min(100, score))
+
+
+def _build_repair_prompt(
+    report: str,
+    validation: Dict[str, Any],
+    expected_decision: str,
+    evidence_paths: List[str],
+    target_language_code: str,
+) -> str:
+    issues = validation.get("critical_issues", []) + validation.get("structure_issues", [])
+    issues_text = "\n".join(f"- {issue}" for issue in issues) or "- unknown_issue"
+    evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths[:8]) or "- missing"
+    return render_prompt(
+        """
+        Repair the executive report below without discarding useful content.
+        Target language: $lang.
+        Required decision label: $decision.
+
+        Issues to fix:
+        $issues
+
+        Hard constraints:
+        - Keep the report evidence-based and avoid inventing metrics.
+        - Ensure sections exist: Executive Decision/Decisión Ejecutiva, Risks & Limitations/Riesgos & Limitaciones, Evidencia usada.
+        - Keep "## Evidencia usada" with evidence:{claim,source} and artifact bullets.
+        - Use these artifact paths when citing evidence:
+        $evidence_paths
+
+        Original report:
+        ---
+        $report
+        ---
+        """,
+        lang=target_language_code,
+        decision=expected_decision,
+        issues=issues_text,
+        evidence_paths=evidence_paths_text,
+        report=report or "(empty)",
+    )
+
+
+def _generate_deterministic_fallback_report(
+    *,
+    target_language_code: str,
+    executive_decision_label: str,
+    business_objective: str,
+    strategy_title: str,
+    error_message: str,
+    facts_context: List[Dict[str, Any]],
+    evidence_paths: List[str],
+) -> str:
+    is_es = target_language_code == "es"
+    title = "# Reporte Ejecutivo (Fallback Determinístico)" if is_es else "# Executive Report (Deterministic Fallback)"
+    objective_title = "## Objetivo y enfoque" if is_es else "## Objective and approach"
+    decision_title = "## Decisión Ejecutiva" if is_es else "## Executive Decision"
+    risks_title = "## Riesgos & Limitaciones" if is_es else "## Risks & Limitations"
+    actions_title = "## Próximas acciones" if is_es else "## Next actions"
+    warning_note = (
+        "Este reporte se generó de forma determinística por un fallo de traducción del LLM."
+        if is_es else
+        "This report was generated deterministically due to an LLM translation failure."
+    )
+    lines: List[str] = [
+        title,
+        "",
+        decision_title,
+        f"- {executive_decision_label}",
+        "",
+        objective_title,
+        f"- {business_objective or 'N/A'}",
+        f"- Strategy: {strategy_title or 'N/A'}",
+        "",
+        "## Evidence & Metrics",
+    ]
+    if facts_context:
+        for fact in facts_context[:6]:
+            lines.append(
+                f"- {fact.get('metric', 'metric')}: {fact.get('value', 'N/A')} (source: {fact.get('source', 'missing')})"
+            )
+    else:
+        lines.append("- No metric facts available in artifacts.")
+    lines.extend([
+        "",
+        risks_title,
+        f"- {warning_note}",
+        f"- Error: {error_message}",
+        "",
+        actions_title,
+        "- Review artifacts directly and regenerate the executive report.",
+        "- Validate metric integrity before making a production decision.",
+    ])
+    lines.append("")
+    lines.append("## Evidencia usada")
+    lines.append("")
+    lines.append(_canonical_evidence_section(evidence_paths))
+    return "\n".join(lines) + "\n"
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    raw = str(text).strip()
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    n = len(raw)
+    for start in range(n):
+        if raw[start] != "{":
+            continue
+        depth = 0
+        for end in range(start, n):
+            ch = raw[end]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw[start:end + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except Exception:
+                        break
+    return None
+
+
+def _validate_outline_payload(payload: Dict[str, Any]) -> List[str]:
+    issues: List[str] = []
+    if not isinstance(payload, dict):
+        return ["outline_not_dict"]
+    decision = payload.get("executive_decision")
+    if not isinstance(decision, dict) or not decision.get("label"):
+        issues.append("outline_missing_executive_decision")
+    sections = payload.get("sections")
+    if not isinstance(sections, list) or len(sections) < 3:
+        issues.append("outline_sections_insufficient")
+        return issues
+    for idx, section in enumerate(sections[:10]):
+        if not isinstance(section, dict):
+            issues.append(f"outline_section_{idx}_not_dict")
+            continue
+        heading = section.get("heading") or section.get("title")
+        if not heading:
+            issues.append(f"outline_section_{idx}_missing_heading")
+        bullets = section.get("bullets")
+        if not isinstance(bullets, list) or not bullets:
+            issues.append(f"outline_section_{idx}_missing_bullets")
+    return issues
+
+
+def _build_outline_prompt(
+    *,
+    target_language_code: str,
+    executive_decision_label: str,
+    facts_block: Dict[str, Any],
+    reporting_policy_context: Dict[str, Any],
+    evidence_paths: List[str],
+    execution_results: str,
+) -> str:
+    evidence_paths_text = "\n".join(f"- {p}" for p in evidence_paths[:8]) or "- missing"
+    return render_prompt(
+        """
+You are a senior executive reporting planner.
+Generate ONLY valid JSON (no markdown, no commentary), in language code: $target_language_code.
+
+Goal: produce an outline plan for the final executive report.
+The final decision label must be: $executive_decision_label
+
+FACTS_BLOCK:
+$facts_block_json
+
+reporting_policy:
+$reporting_policy_json
+
+evidence_paths:
+$evidence_paths
+
+execution_results:
+$execution_results
+
+Return exactly this schema:
+{
+  "executive_decision": {"label": "...", "reason": "..."},
+  "sections": [
+    {
+      "id": "decision|objective_approach|evidence_metrics|business_impact|risks_limitations|next_actions|visual_insights",
+      "heading": "...",
+      "bullets": ["...", "..."],
+      "evidence_refs": ["artifact/path.json", "..."]
+    }
+  ],
+  "evidence_summary": [
+    {"claim": "...", "source": "artifact/path.json"}
+  ]
+}
+""",
+        target_language_code=target_language_code,
+        executive_decision_label=executive_decision_label,
+        facts_block_json=json.dumps(facts_block, ensure_ascii=False),
+        reporting_policy_json=json.dumps(reporting_policy_context or {}, ensure_ascii=False),
+        evidence_paths=evidence_paths_text,
+        execution_results=str(execution_results or "")[:12000],
+    )
+
+
+def _extract_steward_signal_pack(
+    steward_summary: Dict[str, Any],
+    data_profile: Dict[str, Any],
+    dataset_semantics: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not isinstance(steward_summary, dict):
+        steward_summary = {}
+    if not isinstance(data_profile, dict):
+        data_profile = {}
+    if not isinstance(dataset_semantics, dict):
+        dataset_semantics = {}
+
+    selectors = dataset_semantics.get("selectors", {}) if isinstance(dataset_semantics.get("selectors"), dict) else {}
+    target_analysis = dataset_semantics.get("target_analysis", {}) if isinstance(dataset_semantics.get("target_analysis"), dict) else {}
+    profile_stats = data_profile.get("basic_stats", {}) if isinstance(data_profile.get("basic_stats"), dict) else {}
+    missingness = data_profile.get("missingness_top30", []) if isinstance(data_profile.get("missingness_top30"), list) else []
+    associations = data_profile.get("feature_target_associations", []) if isinstance(data_profile.get("feature_target_associations"), list) else []
+    compute_hints = data_profile.get("compute_hints", {}) if isinstance(data_profile.get("compute_hints"), dict) else {}
+
+    top_missing: List[Dict[str, Any]] = []
+    for item in missingness[:5]:
+        if not isinstance(item, dict):
+            continue
+        top_missing.append(
+            {
+                "column": item.get("column"),
+                "missing_frac": item.get("missing_frac"),
+            }
+        )
+
+    top_assoc: List[Dict[str, Any]] = []
+    for item in associations[:6]:
+        if not isinstance(item, dict):
+            continue
+        score = item.get("score")
+        if score is None:
+            score = item.get("association")
+        top_assoc.append(
+            {
+                "feature": item.get("feature") or item.get("column"),
+                "target": item.get("target"),
+                "method": item.get("method"),
+                "score": score,
+                "direction": item.get("direction"),
+            }
+        )
+
+    return {
+        "rows": profile_stats.get("n_rows"),
+        "cols": profile_stats.get("n_cols"),
+        "primary_target": selectors.get("primary_target") or target_analysis.get("primary_target"),
+        "training_rows_rule": selectors.get("training_rows_rule"),
+        "scoring_rows_rule": selectors.get("scoring_rows_rule_primary") or selectors.get("scoring_rows_rule_secondary"),
+        "split_candidates": selectors.get("split_candidates", []),
+        "target_null_frac": target_analysis.get("target_null_frac_exact"),
+        "top_missingness": top_missing,
+        "top_feature_target_associations": top_assoc,
+        "compute_hints": {
+            "scale_category": compute_hints.get("scale_category"),
+            "estimated_memory_mb": compute_hints.get("estimated_memory_mb"),
+            "cross_validation_feasible": compute_hints.get("cross_validation_feasible"),
+            "deep_learning_feasible": compute_hints.get("deep_learning_feasible"),
+        },
+        "summary_excerpt": str(steward_summary.get("summary") or "")[:1200],
+    }
 
 class BusinessTranslatorAgent:
     def __init__(self, api_key: str = None):
@@ -1148,10 +1648,21 @@ class BusinessTranslatorAgent:
         plot_insights = _safe_load_json("data/plot_insights.json") or {}
         insights = _safe_load_json("data/insights.json") or {}
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
+        data_profile = (
+            _safe_load_json("data/data_profile.json")
+            or _safe_load_json(os.path.join("work", "artifacts", "data_profile.json"))
+            or {}
+        )
+        dataset_semantics = _safe_load_json("data/dataset_semantics.json") or {}
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
         run_summary = _safe_load_json("data/run_summary.json") or {}
         recommendations_preview = _safe_load_json("reports/recommendations_preview.json") or {}
         metrics_payload = _safe_load_json("data/metrics.json") or {}
+        steward_signal_pack = _extract_steward_signal_pack(
+            steward_summary=steward_summary,
+            data_profile=data_profile,
+            dataset_semantics=dataset_semantics,
+        )
         weights_path = _first_artifact_path(artifact_index, "weights")
         predictions_path = _first_artifact_path(artifact_index, "predictions")
         weights_payload = _safe_load_json(weights_path) if weights_path else None
@@ -1168,12 +1679,6 @@ class BusinessTranslatorAgent:
             data_adequacy_report,
             metrics_payload,
         )
-        if isinstance(run_summary, dict):
-            outcome = str(run_summary.get("run_outcome") or "").upper()
-            if outcome in {"GO", "NO_GO", "GO_WITH_LIMITATIONS"}:
-                executive_decision_label = outcome
-            elif outcome in {"APPROVE_WITH_WARNINGS", "APPROVED"}:
-                executive_decision_label = "GO_WITH_LIMITATIONS"
 
         required_outputs: List[str] = []
         if isinstance(contract.get("required_outputs"), list):
@@ -1394,8 +1899,8 @@ class BusinessTranslatorAgent:
                 return {
                     "label": "NO_DATA",
                     "status": "UNKNOWN",
-                    "message": "No se encontró reporte de alineación de casos.",
-                    "recommendation": "Revisar si el proceso generó data/case_alignment_report.json.",
+                    "message": "No se encontrÃ³ reporte de alineaciÃ³n de casos.",
+                    "recommendation": "Revisar si el proceso generÃ³ data/case_alignment_report.json.",
                 }
             status = case_alignment_report.get("status")
             failures = case_alignment_report.get("failures", [])
@@ -1405,14 +1910,14 @@ class BusinessTranslatorAgent:
                 return {
                     "label": "PENDIENTE_DEFINICION_GATES",
                     "status": "SKIPPED",
-                    "message": "No se definieron gates de alineación de casos en el contrato.",
-                    "recommendation": "Definir métricas y umbrales en el contrato para evaluar preparación de negocio.",
+                    "message": "No se definieron gates de alineaciÃ³n de casos en el contrato.",
+                    "recommendation": "Definir mÃ©tricas y umbrales en el contrato para evaluar preparaciÃ³n de negocio.",
                 }
             if status == "PASS":
                 return {
                     "label": "APTO_CONDICIONAL",
                     "status": "PASS",
-                    "message": "La alineación con la lógica de casos cumple los umbrales definidos.",
+                    "message": "La alineaciÃ³n con la lÃ³gica de casos cumple los umbrales definidos.",
                     "key_metrics": metrics,
                 }
             # FAIL
@@ -1427,9 +1932,9 @@ class BusinessTranslatorAgent:
             return {
                 "label": "NO_APTO_PARA_PRODUCCION",
                 "status": "FAIL",
-                "message": "La solución no cumple los criterios de alineación por casos.",
+                "message": "La soluciÃ³n no cumple los criterios de alineaciÃ³n por casos.",
                 "details": details,
-                "recommendation": "Priorizar reducción de violaciones entre casos antes de considerar producción.",
+                "recommendation": "Priorizar reducciÃ³n de violaciones entre casos antes de considerar producciÃ³n.",
             }
 
         contract_context = _summarize_contract()
@@ -1586,329 +2091,462 @@ class BusinessTranslatorAgent:
         recommendations_table_text = _recommendations_table(recommendations_preview, max_rows=3)
         evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths) if evidence_paths else "No data available."
 
-        # Define Template
-        SYSTEM_PROMPT_TEMPLATE = Template("""
-        You are a Senior Executive Translator and Data Storyteller.
-        Your goal is to translate technical outputs into a decision-ready business narrative.
-        
-        TONE: Professional, evidence-driven, decisive. Avoid unnecessary jargon.
-        STYLE: Prioritize decision, evidence, risks, and next actions. No fluff.
-
-        === SENIOR TRANSLATION PROTOCOL ===
-        $senior_translation_protocol
-
-        === EVIDENCE RULE ===
-        $senior_evidence_rule
-        
-        *** FORMATTING CONSTRAINTS (CRITICAL) ***
-        1. **LANGUAGE:** The target language is: $target_language_name ($target_language_code).
-           GENERATE THE ENTIRE REPORT IN THIS LANGUAGE. Do not mix languages.
-        2. **NO MARKDOWN TABLES:** The PDF generator breaks on markdown table syntax.
-           DO NOT use pipe-based tables (| col | col |).
-           Use either:
-           - HTML tables (preferred for visual executive reporting), or
-           - ASCII grid tables provided in context.
-           Do not mix pipe tables with HTML tables.
-        3. **NO ELLIPSIS:** Never output the literal sequence "..." anywhere in the report.
-        4. **NO TRUNCATED SENTENCES:** Do not leave sentences hanging; rewrite as complete, concise sentences.
-
-        *** SENIOR CONSULTANT NARRATIVE STYLE (CRITICAL) ***
-        You are writing like a TOP-TIER MANAGEMENT CONSULTANT, not filling out a form.
-
-        FLUID NARRATIVE PRINCIPLES:
-        1. **NO "SLOT-FILLING":** The reporting_policy is a STRATEGIC GUIDE, not a template to fill.
-           Adapt the narrative structure to what the evidence supports.
-        2. **NEVER WRITE "Not available", "No disponible", "N/A", or similar placeholders.**
-           If evidence for a section is missing:
-           - OPTION A: Merge the content into another section where it fits naturally.
-           - OPTION B: Briefly explain WHY it's missing and what it would take to obtain it.
-           - OPTION C: Omit the section entirely if it adds no value.
-        3. **COHERENT FLOW:** Each section should flow logically into the next.
-           Use transition sentences. The reader should feel like reading a narrative, not a checklist.
-        4. **EXECUTIVE BREVITY:** Say more with less. Every sentence should earn its place.
-           Cut filler phrases like "It is worth noting that..." or "As mentioned previously..."
-        5. **CONFIDENT TONE:** Write decisively. Avoid hedging unless the data truly warrants it.
-           Bad: "It appears that there might be some indication..."
-           Good: "The data shows a clear pattern of..."
-        
-        CONTEXT:
-        - Business Objective: $business_objective
-        - Strategy: $strategy_title
-        - Hypothesis: $hypothesis
-        - Compliance Check: $compliance
-        - Executive Decision Label (deterministic): $executive_decision_label
-        - Contract: $contract_context
-        - Integrity Audit: $integrity_context
-        - Output Contract: $output_contract_context
-        - Case Alignment QA: $case_alignment_context
-        - Business Readiness (Case Alignment): $case_alignment_business_status
-        - Alignment Check: $alignment_check_context
-        - Gate Context: $gate_context
-        - Review Feedback: $review_feedback
-        - Steward Summary: $steward_context
-        - Cleaning Summary: $cleaning_context
-        - Run Summary: $run_summary_context
-        - Data Adequacy: $data_adequacy_context
-        - Data Adequacy Report (verbatim): $data_adequacy_report_json
-        - Insights (primary): $insights_context
-        - Fact Cards (use as evidence): $facts_context
-        - Model Metrics & Weights: $weights_context
-        - Model Metrics (Expanded): $model_metrics_context
-        - Case Summary Snapshot: $case_summary_context
-        - Scored Rows Snapshot: $scored_rows_context
-        - Plot Insights (data-driven): $plot_insights_json
-        - Artifacts Available: $artifacts_context
-        - Artifact Manifest (json): $artifact_manifest_context
-        - Artifact Inventory Table (HTML): $artifact_inventory_table_html
-        - Artifact Compliance Table (HTML): $artifact_compliance_table_html
-        - KPI Snapshot Table (HTML): $kpi_snapshot_table_html
-        - Run Timeline (tail): $run_timeline_context
-        - Recommendations Preview: $recommendations_preview_context
-        - Cleaned Data Sample Table (text): $cleaned_sample_table_text
-        - Scored Rows Sample Table (text): $scored_sample_table_text
-        - Artifact Headers Table (text): $artifact_headers_table_text
-        - Metrics Table (text): $metrics_table_text
-        - Recommendations Table (text): $recommendations_table_text
-        - Evidence Paths (max 8): $evidence_paths_text
-        - Reporting Policy: $reporting_policy_context
-        - Translator View: $translator_view_context
-        - Slot Payloads: $slot_payloads_context
-        - Slot Coverage: $slot_coverage_context
-        - Decisioning Requirements (json): $decisioning_context_json
-        - Decisioning Columns (text): $decisioning_columns_text
-
-        GUIDANCE:
-        - Use Insights as the primary evidence source; only reference other artifacts if they add clear value.
-        - Prefer HTML tables for executive readability when summarizing artifacts, compliance, and KPIs.
-        - You may embed the provided HTML snippets directly (Artifact Inventory Table, Artifact Compliance Table, KPI Snapshot Table) and then comment on the implications.
-        - Keep sample tables concise (3-8 rows) and label them as snapshots.
-        - Include a short "Data schema snapshot" section using Artifact Headers Table (text) or the inventory/compliance HTML tables if clearer.
-        - If reporting_policy.demonstrative_examples_enabled is true AND run_outcome is in reporting_policy.demonstrative_examples_when_outcome_in,
-          you MUST include a section titled "Ejemplos ilustrativos (no aptos para producción)".
-          Use recommendations_preview.items (max 3-5) and include strong disclaimers plus support (n, observed_support if available).
-          If items are empty, explain why using recommendations_preview.reason and mention which artifact was missing.
-        - If run_outcome is GO, you may include a short "Recommendations Snapshot" section if recommendations_preview.items exists,
-          without the "illustrative" labeling.
-        - For every plot you mention, include 1-3 concrete findings (n/%/top categories) drawn from plot_insights_json. If no quantitative insights are available for a plot, explicitly say "No se dispone de insights cuantitativos para este gráfico" (or equivalent in the target language).
-        - Do NOT invent segment/category names; only mention names that appear in facts, insights, or plot_insights_json.
-        - Data Adequacy must be reported verbatim: status, up to 3 reason tags, and up to 3 recommendations from data_adequacy_report_json. Do not rephrase status (e.g., keep "sufficient_signal" as-is).
-        - If data_adequacy_report_json reasons include classification_baseline_missing or regression_baseline_missing, call it out as a limitation and advise adding Dummy baselines.
-        - Plot paths must use forward slashes. If VISUALS CONTEXT plot_reference_mode is "figure_only", reference plots as "Figure: <filename>" instead of inline markdown images.
-        - Slot-driven reporting (STRATEGIC GUIDE, not rigid template):
-          For each slot in reporting_policy.slots:
-            * if mode == "required": include it using evidence; if evidence is missing, ADAPT:
-              - Merge the content into a related section, OR
-              - Briefly explain what data would be needed, OR
-              - Omit if it adds no value to the narrative.
-            * if mode == "conditional" or "optional": include only if payload exists; otherwise omit.
-          Structure the report using reporting_policy.sections as a GUIDE; adapt the structure to tell a coherent story.
-        - Decision Policy / Actions:
-          If DECISIONING REQUIREMENTS (json) indicates enabled=true, add a dedicated section titled "Decision Policy / Actions" after "Evidence & Metrics".
-          Describe each required decision column (name, type, role, derivation logic) using the JSON context and mention how the column supports prioritized actions or flags.
-          Reference the Scored Rows Sample Table to show concrete values for those columns. Do not invent values nor attributes beyond what the sample shows.
-
-        ERROR CONDITION:
-        $error_condition
-        
-        VISUALS CONTEXT (JSON):
-        $visuals_context_json
-
-        ERROR LOGIC (HIGHEST PRIORITY):
-        Determine execution status:
-        - ERROR if "$error_condition" != "No critical errors." OR Run Summary indicates FAIL.
-        - SUCCESS otherwise.
-
-        IF ERROR DETECTED:
-        1. Title: "EXECUTION FAILURE REPORT" (in the target language).
-        2. Status Line: START with "⛔ BLOCKED / FALLO CRÍTICO".
-        3. Explain the failure based on error_condition and run_summary (non-technical, executive tone).
-        4. State which critical artifacts are missing and why that blocks a decision (use Evidence Paths + artifact_index).
-        5. If VISUALS CONTEXT indicates plots_list is non-empty:
-           - Include a short subsection "Visual evidence available" and list each plot.
-           - If plot_reference_mode is "figure_only", reference as "Figure: <filename>" instead of inline images.
-           - Otherwise embed each plot using forward slashes:
-             ![<filename>](<exact_path_from_plots_list>)
-           - Under each plot add 1 bullet: what it suggests based on context and visual inspection.
-           - Do NOT claim "no visualizations" when plots_list is non-empty.
-        6. Close with 2-4 "Next actions" that would unblock the pipeline (data / pipeline / validation).
-
-        IF SUCCESS (Only if NO Error):
-        OUTPUT FORMAT (FLEXIBLE, EXECUTIVE-FIRST):
-        - Treat reporting_policy.sections as a recommended outline, not a rigid template.
-        - You may merge/reorder/add sections if that improves clarity for executives and remains evidence-based.
-        - Use level-2 headings for major sections.
-        - Keep a coherent narrative arc: decision -> evidence -> risks -> actions.
-        - You MUST still include the final section "## Evidencia usada" at the end (see later instruction).
-
-        SECTION TITLE GUIDELINES:
-        - decision -> Executive Decision
-        - objective_approach -> Objective & Approach
-        - evidence_metrics -> Evidence & Metrics
-        - business_impact -> Business Impact
-        - risks_limitations -> Risks & Limitations
-        - next_actions -> Recommended Next Actions
-        - visual_insights -> Visual Insights
-        - If a section key is not listed above: convert it to Title Case (replace "_" with " ").
-
-        SLOT-TO-SECTION GUIDELINES (use best judgment; do NOT invent):
-        - model_metrics, predictions_overview, forecast_summary, ranking_top -> Evidence & Metrics
-        - explainability, error_analysis -> Evidence & Metrics (or Risks & Limitations if negative)
-        - alignment_risks -> Risks & Limitations
-        - segment_pricing -> Business Impact (and/or Recommended Next Actions if it contains recommendations)
-
-        REQUIRED CONTENT BY SECTION (adapt to the objective and available evidence):
-        - Executive Decision:
-          * First line: readiness (GO / GO_WITH_LIMITATIONS / NO_GO) + 1-sentence reason.
-          * Use the Executive Decision Label (deterministic) as the readiness label.
-          * Ground the reason in gates/reviewer verdict/alignment check; if a required artifact is missing, downgrade readiness.
-        - Objective & Approach:
-          * Restate the business objective in plain language.
-          * Summarize the chosen strategy and the minimum viable method used (segmentation + model + optimization).
-          * Briefly describe the data preparation at a high level (no code, no hallucinations).
-        - Evidence & Metrics:
-          * Cite at least 3 concrete numbers (metrics, counts, segment sizes, ranges) from facts_context, metrics.json summary, scored_rows snapshot, or alignment_check.
-          * For each number: include the source artifact name/path.
-          * If a metric is unavailable: DO NOT write "No disponible". Instead, explain what would be needed to obtain it, or omit if not critical.
-          * Include required/available slots from reporting_policy.slots (respect mode).
-        - Business Impact:
-          * Translate the evidence into business implications (pricing decision logic, expected value, risk/return).
-          * If there is a segment-based recommendation, explain how segments differ WITHOUT inventing segment names.
-        - Risks & Limitations:
-          * List the top 3-6 risks/limitations (data quality, leakage risk, small sample size, misalignment warnings).
-          * Include an "Execution Trace" bullet list: summarize iterations, warnings, and reviewer verdict using run_summary + review_feedback + gate_context (no speculation).
-          * Report Data Adequacy verbatim: status, up to 3 reason tags, and up to 3 recommendations from data_adequacy_report_json.
-          * If Data Adequacy indicates data_limited/insufficient_signal, state it clearly and tie it to confidence.
-          * If Data Adequacy reports missing baseline metrics, call it out and advise adding Dummy baselines.
-          * If Alignment Check is WARN/FAIL, state it explicitly and the practical implication.
-        - Recommended Next Actions:
-          * 2-5 specific, actionable steps (quick wins + structural data improvements) aligned to the objective.
-          * If Data Adequacy provides recommendations, reuse them (do NOT invent).
-        - Visual Insights (ONLY if this section exists in reporting_policy.sections):
-          * For EACH plot in VISUALS CONTEXT plots_list:
-            - Use forward slashes in paths. If plot_reference_mode is "figure_only", reference as "Figure: <filename>" instead of inline images.
-            - Otherwise embed the plot using the exact path string:
-              ![<filename>](<exact_path_from_plots_list>)
-            - Add 1-3 bullets with concrete takeaways, grounded in plot_insights_json/facts/metrics.
-            - If no quantitative insights exist for a plot, describe what the visualization suggests qualitatively.
-          * Do NOT describe only the chart type; state what it implies for the business decision.
-          * Do NOT claim "no visualizations" when plots_list is non-empty.
-
-        Ensure logical consistency: do not claim elasticity, uplift, or improvements unless supported by metrics or plots.
-        If quality gates are missing or misaligned, explicitly state that evaluation confidence is reduced.
-        IF DATA ADEQUACY:
-        If Data Adequacy indicates status "data_limited" AND threshold_reached is true,
-        explicitly say the performance ceiling is likely due to data quality/coverage,
-        and list 2-4 concrete data improvement steps from Data Adequacy recommendations.
-        If Data Adequacy indicates "insufficient_signal", state that metrics are incomplete
-        and the report should be treated as directional, not decision-grade.
-        If run_outcome is GO_WITH_LIMITATIONS, explicitly state limitations and scope of validity.
-
-        If Business Readiness indicates NO_APTO_PARA_PRODUCCION, explicitly state it and summarize
-        the main reasons using gate context and review feedback in executive language.
-        If Alignment Check is WARN or FAIL, explicitly state the limitation and whether it is data-limited
-        or method-choice, and reflect it in Risks & Limitations.
-
-        End the report with a final section titled "Evidencia usada" that includes:
-        - A mini-section labeled "evidence" (use the literal word "evidence", do NOT translate) with 3-8 items formatted as {claim: "...", source: "..."}.
-          If evidence is missing, set source="missing". Sources must be artifact paths or script paths; otherwise use source="missing".
-        - A bullet list of up to 8 artifact paths from Evidence Paths.
-                OUTPUT: Markdown format (NO TABLES).
-        """)
-        
+        # Prompt assembly (FACTS_BLOCK + NARRATIVE_GUIDE + CONTEXT_APPENDIX)
         error_condition_str = f"CRITICAL ERROR ENCOUNTERED: {error_message}" if error_message else "No critical errors."
-
-        # Detect language from business objective using stopword heuristics
-        target_language_code = _detect_primary_language(business_objective)
+        preferred_language = None
+        if isinstance(view_constraints, dict):
+            preferred_language = view_constraints.get("language") or view_constraints.get("report_language")
+        preferred_language = str(preferred_language).strip().lower() if preferred_language else None
+        if preferred_language not in {"es", "en"}:
+            preferred_language = None
+        target_language_code = _detect_primary_language(business_objective, preferred_language=preferred_language)
         target_language_name = "Spanish" if target_language_code == "es" else "English"
 
-        system_prompt = SYSTEM_PROMPT_TEMPLATE.substitute(
-            target_language_code=target_language_code,
-            target_language_name=target_language_name,
-            business_objective=business_objective,
-            strategy_title=strategy_title,
-            hypothesis=hypothesis,
-            compliance=compliance,
-            executive_decision_label=executive_decision_label,
-            error_condition=error_condition_str,
-            senior_translation_protocol=SENIOR_TRANSLATION_PROTOCOL,
-            senior_evidence_rule=SENIOR_EVIDENCE_RULE,
-            visuals_context_json=visuals_context_json,
-            analysis_type=analysis_type,
-            contract_context=json.dumps(contract_context, ensure_ascii=False),
-            integrity_context=integrity_context,
-            output_contract_context=output_contract_context,
-            case_alignment_context=case_alignment_context,
-            case_alignment_business_status=json.dumps(case_alignment_business_status, ensure_ascii=False),
-            gate_context=json.dumps(gate_context, ensure_ascii=False),
-            review_feedback=json.dumps(review_feedback_context, ensure_ascii=False),
-            steward_context=json.dumps(steward_context, ensure_ascii=False),
-            cleaning_context=json.dumps(cleaning_context, ensure_ascii=False),
-            run_summary_context=json.dumps(run_summary_context, ensure_ascii=False),
-            data_adequacy_context=json.dumps(data_adequacy_context, ensure_ascii=False),
-            data_adequacy_report_json=json.dumps(data_adequacy_report, ensure_ascii=False),
-            insights_context=json.dumps(insights, ensure_ascii=False),
-            alignment_check_context=json.dumps(alignment_check_context, ensure_ascii=False),
-            facts_context=json.dumps(facts_context, ensure_ascii=False),
-            weights_context=json.dumps(weights_context, ensure_ascii=False),
-            model_metrics_context=json.dumps(model_metrics_context, ensure_ascii=False),
-            case_summary_context=json.dumps(case_summary_context, ensure_ascii=False),
-            scored_rows_context=json.dumps(scored_rows_context, ensure_ascii=False),
-            plot_insights_json=json.dumps(plot_insights, ensure_ascii=False),
-            artifacts_context=json.dumps(artifacts_context, ensure_ascii=False),
-            artifact_manifest_context=json.dumps(manifest, ensure_ascii=False),
-            artifact_inventory_table_html=artifact_inventory_table_html,
-            artifact_compliance_table_html=artifact_compliance_table_html,
-            kpi_snapshot_table_html=kpi_snapshot_table_html,
-            run_timeline_context=json.dumps(run_timeline_context, ensure_ascii=False),
-            recommendations_preview_context=json.dumps(recommendations_preview, ensure_ascii=False),
-            cleaned_sample_table_text=cleaned_sample_table_text,
-            scored_sample_table_text=scored_sample_table_text,
-            artifact_headers_table_text=artifact_headers_table_text,
-            metrics_table_text=metrics_table_text,
-            recommendations_table_text=recommendations_table_text,
-            evidence_paths_text=evidence_paths_text,
-            reporting_policy_context=json.dumps(reporting_policy_context, ensure_ascii=False),
-            translator_view_context=json.dumps(translator_view_context, ensure_ascii=False),
-            slot_payloads_context=json.dumps(slot_payloads, ensure_ascii=False),
-            slot_coverage_context=json.dumps(slot_coverage_context, ensure_ascii=False),
-            decisioning_context_json=decisioning_context_json,
-            decisioning_columns_text=decisioning_columns_text,
-        )
-        
-        # Execution Results
-        execution_results = state.get('execution_output', 'No execution results available.')
+        run_outcome_token = _normalize_decision_token((run_summary or {}).get("run_outcome"))
+        decision_discrepancy = None
+        if run_outcome_token and run_outcome_token != executive_decision_label:
+            decision_discrepancy = {
+                "derived_decision": executive_decision_label,
+                "run_outcome": run_outcome_token,
+                "note": "run_summary outcome differs from deterministic derivation",
+            }
 
+        facts_block = {
+            "executive_decision_label": executive_decision_label,
+            "decision_discrepancy": decision_discrepancy,
+            "business_objective": business_objective,
+            "strategy_title": strategy_title,
+            "review_verdict": review_verdict or compliance,
+            "steward_signal_pack": steward_signal_pack,
+            "data_adequacy": {
+                "status": (data_adequacy_report or {}).get("status"),
+                "reasons": (data_adequacy_report or {}).get("reasons", [])[:3],
+                "recommendations": (data_adequacy_report or {}).get("recommendations", [])[:3],
+            },
+            "artifacts_summary": manifest.get("summary", {}) if isinstance(manifest, dict) else {},
+            "decisioning_columns": decisioning_columns,
+            "metrics_preview": _flatten_metrics(metrics_payload)[:14] if isinstance(metrics_payload, dict) else [],
+        }
+
+        context_appendix = {
+            "reporting_policy": reporting_policy_context,
+            "translator_view": translator_view_context,
+            "slot_payloads": slot_payloads,
+            "slot_coverage": slot_coverage_context,
+            "steward_signal_pack": steward_signal_pack,
+            "steward_context": steward_context,
+            "cleaning_context": cleaning_context,
+            "run_summary_context": run_summary_context,
+            "artifact_manifest": manifest,
+            "data_adequacy_report_json": data_adequacy_report,
+            "alignment_check": alignment_check_context,
+            "model_metrics_context": model_metrics_context,
+            "case_summary_context": case_summary_context,
+            "scored_rows_context": scored_rows_context,
+            "plot_insights_json": plot_insights,
+            "recommendations_preview": recommendations_preview,
+            "run_timeline_context": run_timeline_context,
+        }
+
+        SYSTEM_PROMPT_TEMPLATE = Template("""
+You are a Senior Executive Translator and Data Storyteller.
+Create a decision-ready executive report grounded in evidence.
+
+=== SENIOR TRANSLATION PROTOCOL ===
+$senior_translation_protocol
+
+=== EVIDENCE RULE ===
+$senior_evidence_rule
+
+TARGET LANGUAGE: $target_language_name ($target_language_code)
+
+FACTS_BLOCK (do not alter values):
+$facts_block_json
+
+NARRATIVE_GUIDE:
+- Coherent flow: decision -> evidence -> risks -> actions.
+- Use reporting_policy as guide, avoid rigid slot-filling.
+- Never invent metrics/segments/artifact paths.
+- Avoid placeholders like "Not available", "No disponible", "N/A".
+- Include final section "## Evidencia usada".
+- If reporting_policy.demonstrative_examples_enabled applies, include:
+  "Ejemplos ilustrativos (no aptos para producción)".
+
+REFERENCE CONTEXT:
+- Business Objective: $business_objective
+- Strategy: $strategy_title
+- Hypothesis: $hypothesis
+- Compliance Check: $compliance
+- Executive Decision Label (deterministic): $executive_decision_label
+- Error condition: $error_condition
+- Visuals Context (JSON): $visuals_context_json
+- Decisioning Requirements (json): $decisioning_context_json
+- Decisioning Columns (text): $decisioning_columns_text
+- Evidence Paths (max 8): $evidence_paths_text
+- Outline Plan (pass-1 JSON): $outline_plan_json
+- reporting_policy: $reporting_policy_context
+- Slot Coverage: $slot_coverage_context
+- Artifact Inventory Table (HTML): $artifact_inventory_table_html
+- Artifact Compliance Table (HTML): $artifact_compliance_table_html
+- KPI Snapshot Table (HTML): $kpi_snapshot_table_html
+- Metrics Table (text): $metrics_table_text
+- Cleaned Data Sample Table (text): $cleaned_sample_table_text
+- Scored Rows Sample Table (text): $scored_sample_table_text
+- Artifact Headers Table (text): $artifact_headers_table_text
+- Recommendations Table (text): $recommendations_table_text
+
+CONTEXT_APPENDIX:
+$context_appendix_json
+
+OUTPUT RULES:
+- Markdown output, no markdown pipe tables.
+- Prefer provided HTML tables for visual summaries.
+- If Outline Plan is non-empty, follow it as the narrative skeleton while preserving factual consistency.
+- Required sections:
+  1) Executive Decision / Decisión Ejecutiva
+  2) Objective & Approach / Objetivo y enfoque
+  3) Evidence & Metrics
+  4) Risks & Limitations / Riesgos & Limitaciones
+  5) Recommended Next Actions / Próximas acciones
+  6) Evidencia usada (final)
+""")
+
+        execution_results = state.get("execution_output", "No execution results available.")
         USER_MESSAGE_TEMPLATE = """
-        Generate the Executive Report.
+Generate the Executive Report.
 
-        *** EXECUTION FINDINGS (RESULTS & METRICS) ***
-        $execution_results
+EXECUTION FINDINGS:
+$execution_results
 
-        *** INSTRUCTIONS ***
-        Use ONLY the structured context provided in the system prompt above.
-        Do NOT invent numbers or claims not supported by the artifacts.
-        Use reporting_policy.slots as a GUIDE, not a rigid template. Adapt the narrative structure to the evidence.
-        NEVER write placeholder text like "Not available" or "No disponible" - adapt or omit instead.
-        Cite source artifact names for all metrics (e.g., "Source: metrics.json" or "Fuente: metrics.json").
-        Include the "Evidencia usada" section with the required mini-section labeled "evidence" and {claim, source} items.
-        Write like a senior management consultant: confident, concise, and coherent.
-        """
+INSTRUCTIONS:
+- Use only evidence from provided context/artifacts.
+- Keep executive tone: concise, clear, actionable.
+- Include final section "## Evidencia usada" with:
+  evidence:
+  {claim: "...", source: "..."}
+- Sources must be artifact/script paths; if unknown, use source="missing".
+"""
 
-        user_message = render_prompt(
-            USER_MESSAGE_TEMPLATE,
-            execution_results=execution_results
-        )
+        prompt_values = {
+            "senior_translation_protocol": SENIOR_TRANSLATION_PROTOCOL,
+            "senior_evidence_rule": SENIOR_EVIDENCE_RULE,
+            "target_language_name": target_language_name,
+            "target_language_code": target_language_code,
+            "facts_block_json": json.dumps(facts_block, ensure_ascii=False),
+            "business_objective": business_objective,
+            "strategy_title": strategy_title,
+            "hypothesis": hypothesis,
+            "compliance": compliance,
+            "executive_decision_label": executive_decision_label,
+            "error_condition": error_condition_str,
+            "visuals_context_json": visuals_context_json,
+            "decisioning_context_json": decisioning_context_json,
+            "decisioning_columns_text": decisioning_columns_text,
+            "evidence_paths_text": evidence_paths_text,
+            "outline_plan_json": "{}",
+            "reporting_policy_context": json.dumps(reporting_policy_context, ensure_ascii=False),
+            "slot_coverage_context": json.dumps(slot_coverage_context, ensure_ascii=False),
+            "artifact_inventory_table_html": artifact_inventory_table_html,
+            "artifact_compliance_table_html": artifact_compliance_table_html,
+            "kpi_snapshot_table_html": kpi_snapshot_table_html,
+            "metrics_table_text": metrics_table_text,
+            "cleaned_sample_table_text": cleaned_sample_table_text,
+            "scored_sample_table_text": scored_sample_table_text,
+            "artifact_headers_table_text": artifact_headers_table_text,
+            "recommendations_table_text": recommendations_table_text,
+            "context_appendix_json": json.dumps(context_appendix, ensure_ascii=False),
+        }
 
-        full_prompt = system_prompt + "\n\n" + user_message
+        two_pass_enabled = str(os.getenv("TRANSLATOR_TWO_PASS_ENABLED", "1")).strip().lower() not in {
+            "0",
+            "off",
+            "false",
+            "no",
+        }
+        two_pass_notes: List[str] = []
+        outline_payload: Dict[str, Any] = {}
+        outline_issues: List[str] = []
+        if two_pass_enabled:
+            outline_prompt = _build_outline_prompt(
+                target_language_code=target_language_code,
+                executive_decision_label=executive_decision_label,
+                facts_block=facts_block,
+                reporting_policy_context=reporting_policy_context if isinstance(reporting_policy_context, dict) else {},
+                evidence_paths=evidence_paths,
+                execution_results=execution_results,
+            )
+            try:
+                outline_response = self.model.generate_content(outline_prompt)
+                outline_text = (getattr(outline_response, "text", "") or "").strip()
+                parsed_outline = _extract_first_json_object(outline_text)
+                if parsed_outline is None:
+                    two_pass_notes.append("outline_parse_failed")
+                else:
+                    outline_issues = _validate_outline_payload(parsed_outline)
+                    if outline_issues:
+                        two_pass_notes.append("outline_validation_failed")
+                    else:
+                        outline_payload = parsed_outline
+                        two_pass_notes.append("outline_generated")
+            except Exception as outline_exc:
+                two_pass_notes.append(f"outline_error:{outline_exc}")
+
+        if outline_payload:
+            prompt_values["outline_plan_json"] = json.dumps(outline_payload, ensure_ascii=False)
+            context_appendix["outline_plan"] = outline_payload
+            prompt_values["context_appendix_json"] = json.dumps(context_appendix, ensure_ascii=False)
+
+        def _compose_prompt(values: Dict[str, str]) -> str:
+            system_prompt = SYSTEM_PROMPT_TEMPLATE.substitute(values)
+            user_message = render_prompt(USER_MESSAGE_TEMPLATE, execution_results=execution_results)
+            return system_prompt + "\n\n" + user_message
+
+        full_prompt = _compose_prompt(prompt_values)
+        max_prompt_tokens = int(os.getenv("TRANSLATOR_MAX_PROMPT_TOKENS", "28000"))
+        est_tokens = _estimate_prompt_tokens(full_prompt)
+        prompt_budget_notes: List[str] = []
+
+        if est_tokens > max_prompt_tokens:
+            drop_order = [
+                "context_appendix_json",
+                "recommendations_table_text",
+                "artifact_headers_table_text",
+                "cleaned_sample_table_text",
+                "scored_sample_table_text",
+                "slot_coverage_context",
+            ]
+            for key in drop_order:
+                value = str(prompt_values.get(key) or "")
+                if not value or value.startswith("[omitted due to prompt budget"):
+                    continue
+                prompt_values[key] = f"[omitted due to prompt budget: {key}]"
+                prompt_budget_notes.append(key)
+                full_prompt = _compose_prompt(prompt_values)
+                est_tokens = _estimate_prompt_tokens(full_prompt)
+                if est_tokens <= max_prompt_tokens:
+                    break
+
+        if prompt_budget_notes:
+            full_prompt += "\n\n[Prompt budget adjustments applied]\n- " + "\n- ".join(prompt_budget_notes)
+
         self.last_prompt = full_prompt
+
+        def _persist_quality_audit(payload: Dict[str, Any]) -> None:
+            try:
+                os.makedirs("data", exist_ok=True)
+                with open("data/translator_quality_check.json", "w", encoding="utf-8") as f_q:
+                    json.dump(payload, f_q, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
 
         try:
             response = self.model.generate_content(full_prompt)
             content = (getattr(response, "text", "") or "").strip()
+            is_echo_response = content.strip() == full_prompt.strip()
             content = _sanitize_report_text(content)
             content = _ensure_evidence_section(content, evidence_paths)
             content = sanitize_text(content)
+
+            validation = {
+                "has_critical": False,
+                "critical_issues": [],
+                "unverified_metrics": [],
+                "structure_issues": [],
+                "invalid_plots": [],
+                "decision_issue": [],
+            }
+
+            if not is_echo_response:
+                validation = _validate_report(
+                    content=content,
+                    expected_decision=executive_decision_label,
+                    facts_context=facts_context if isinstance(facts_context, list) else [],
+                    metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
+                    plots=plots,
+                    expected_language=target_language_code,
+                )
+                if validation.get("has_critical"):
+                    repair_prompt = _build_repair_prompt(
+                        report=content,
+                        validation=validation,
+                        expected_decision=executive_decision_label,
+                        evidence_paths=evidence_paths,
+                        target_language_code=target_language_code,
+                    )
+                    repair_response = self.model.generate_content(repair_prompt)
+                    repaired = (getattr(repair_response, "text", "") or "").strip()
+                    repaired = _sanitize_report_text(repaired)
+                    repaired = _ensure_evidence_section(repaired, evidence_paths)
+                    repaired = sanitize_text(repaired)
+                    repair_validation = _validate_report(
+                        content=repaired,
+                        expected_decision=executive_decision_label,
+                        facts_context=facts_context if isinstance(facts_context, list) else [],
+                        metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
+                        plots=plots,
+                        expected_language=target_language_code,
+                    )
+                    if repair_validation.get("has_critical"):
+                        content = _generate_deterministic_fallback_report(
+                            target_language_code=target_language_code,
+                            executive_decision_label=executive_decision_label,
+                            business_objective=business_objective,
+                            strategy_title=strategy_title,
+                            error_message=", ".join(repair_validation.get("critical_issues", [])),
+                            facts_context=facts_context if isinstance(facts_context, list) else [],
+                            evidence_paths=evidence_paths,
+                        )
+                        validation = repair_validation
+                    else:
+                        content = repaired
+                        validation = repair_validation
+
+            quality_score = 100 if is_echo_response else _score_report_quality(validation)
+            quality_threshold = int(os.getenv("TRANSLATOR_MIN_QUALITY_SCORE", "60"))
+            quality_retry_applied = False
+            quality_retry_error = None
+            quality_fallback_triggered = False
+
+            if not is_echo_response and quality_score < quality_threshold:
+                quality_retry_applied = True
+                retry_validation = dict(validation)
+                critical = retry_validation.get("critical_issues", [])
+                if "low_quality_score" not in critical:
+                    critical = list(critical) + ["low_quality_score"]
+                    retry_validation["critical_issues"] = critical
+                retry_validation["has_critical"] = True
+                try:
+                    quality_repair_prompt = _build_repair_prompt(
+                        report=content,
+                        validation=retry_validation,
+                        expected_decision=executive_decision_label,
+                        evidence_paths=evidence_paths,
+                        target_language_code=target_language_code,
+                    )
+                    quality_repair_response = self.model.generate_content(quality_repair_prompt)
+                    quality_candidate = (getattr(quality_repair_response, "text", "") or "").strip()
+                    quality_candidate = _sanitize_report_text(quality_candidate)
+                    quality_candidate = _ensure_evidence_section(quality_candidate, evidence_paths)
+                    quality_candidate = sanitize_text(quality_candidate)
+                    quality_candidate_validation = _validate_report(
+                        content=quality_candidate,
+                        expected_decision=executive_decision_label,
+                        facts_context=facts_context if isinstance(facts_context, list) else [],
+                        metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
+                        plots=plots,
+                        expected_language=target_language_code,
+                    )
+                    quality_candidate_score = _score_report_quality(quality_candidate_validation)
+                    if quality_candidate_score >= quality_score:
+                        content = quality_candidate
+                        validation = quality_candidate_validation
+                        quality_score = quality_candidate_score
+                except Exception as quality_exc:
+                    quality_retry_error = str(quality_exc)
+
+            low_score_fallback_enabled = str(os.getenv("TRANSLATOR_LOW_SCORE_FALLBACK", "1")).strip().lower() not in {
+                "0",
+                "off",
+                "false",
+                "no",
+            }
+            if (
+                not is_echo_response
+                and quality_score < quality_threshold
+                and low_score_fallback_enabled
+            ):
+                quality_fallback_triggered = True
+                content = _generate_deterministic_fallback_report(
+                    target_language_code=target_language_code,
+                    executive_decision_label=executive_decision_label,
+                    business_objective=business_objective,
+                    strategy_title=strategy_title,
+                    error_message=f"report_quality_below_threshold:{quality_score}<{quality_threshold}",
+                    facts_context=facts_context if isinstance(facts_context, list) else [],
+                    evidence_paths=evidence_paths,
+                )
+                validation = {
+                    "has_critical": True,
+                    "critical_issues": ["low_quality_score"],
+                    "unverified_metrics": validation.get("unverified_metrics", []),
+                    "structure_issues": validation.get("structure_issues", []),
+                    "invalid_plots": validation.get("invalid_plots", []),
+                    "decision_issue": validation.get("decision_issue", []),
+                }
+                quality_score = 0
+
+            if not is_echo_response and validation.get("unverified_metrics") and not validation.get("has_critical"):
+                warning_lines = "\n".join(f"- {item}" for item in validation.get("unverified_metrics", [])[:6])
+                content = (
+                    content.rstrip()
+                    + "\n\n## Validation Notes\n"
+                    + "Some metric claims could not be matched deterministically:\n"
+                    + warning_lines
+                    + "\n"
+                )
+            if decision_discrepancy:
+                content = (
+                    content.rstrip()
+                    + "\n\n## Decision Reconciliation Note\n"
+                    + f"Derived decision: {decision_discrepancy.get('derived_decision')} | "
+                    + f"run_summary outcome: {decision_discrepancy.get('run_outcome')}\n"
+                )
+            if prompt_budget_notes:
+                content = (
+                    content.rstrip()
+                    + "\n\n## Prompt Budget Note\n"
+                    + "Some low-priority context blocks were compacted to stay within model limits.\n"
+                )
+
+            _persist_quality_audit(
+                {
+                    "prompt_estimated_tokens": est_tokens,
+                    "max_prompt_tokens": max_prompt_tokens,
+                    "prompt_budget_notes": prompt_budget_notes,
+                    "two_pass": {
+                        "enabled": two_pass_enabled,
+                        "notes": two_pass_notes,
+                        "outline_issues": outline_issues,
+                        "outline_generated": bool(outline_payload),
+                    },
+                    "quality_threshold": quality_threshold,
+                    "quality_retry_applied": quality_retry_applied,
+                    "quality_retry_error": quality_retry_error,
+                    "quality_fallback_triggered": quality_fallback_triggered,
+                    "quality_score": quality_score,
+                    "validation": validation,
+                    "decision_discrepancy": decision_discrepancy,
+                }
+            )
             self.last_response = content
             return content
         except Exception as e:
-            return f"Error generating report: {e}"
+            fallback = _generate_deterministic_fallback_report(
+                target_language_code=target_language_code,
+                executive_decision_label=executive_decision_label,
+                business_objective=business_objective,
+                strategy_title=strategy_title,
+                error_message=str(e),
+                facts_context=facts_context if isinstance(facts_context, list) else [],
+                evidence_paths=evidence_paths,
+            )
+            _persist_quality_audit(
+                {
+                    "prompt_estimated_tokens": est_tokens,
+                    "max_prompt_tokens": max_prompt_tokens,
+                    "prompt_budget_notes": prompt_budget_notes,
+                    "two_pass": {
+                        "enabled": two_pass_enabled,
+                        "notes": two_pass_notes,
+                        "outline_issues": outline_issues,
+                        "outline_generated": bool(outline_payload),
+                    },
+                    "quality_score": 0,
+                    "validation": {"has_critical": True, "critical_issues": ["llm_exception"]},
+                    "exception": str(e),
+                }
+            )
+            self.last_response = fallback
+            return fallback
+
+
