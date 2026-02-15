@@ -54,6 +54,8 @@ class ReviewBoardAgent:
             "3) If only advisory/optimization items remain, return APPROVE_WITH_WARNINGS.\n"
             "4) If all critical areas pass, return APPROVED.\n"
             "5) Use progress_tracker when available: if performance regressed and blockers remain unresolved, avoid optimistic approval.\n"
+            "6) Use iteration_history when available to detect progress trends, plateaus, or regressions across iterations.\n"
+            "   If metrics have plateaued for 2+ iterations with no improvement, flag it in required_actions.\n"
             "Do not invent evidence.\n\n"
             "Evidence policy:\n"
             "- Prefer deterministic_facts entries when available.\n"
@@ -167,6 +169,22 @@ class ReviewBoardAgent:
             if action not in required_actions:
                 required_actions.append(action)
 
+        # Check iteration_history for plateau detection
+        iteration_history = context.get("iteration_history") if isinstance(context.get("iteration_history"), list) else []
+        if len(iteration_history) >= 2:
+            recent = iteration_history[-2:]
+            metrics = [h.get("primary_metric") for h in recent if isinstance(h, dict) and h.get("primary_metric") is not None]
+            if len(metrics) == 2:
+                try:
+                    if abs(float(metrics[1]) - float(metrics[0])) < 1e-6:
+                        if "metric_plateau" not in failed_areas:
+                            failed_areas.append("metric_plateau")
+                        plateau_action = "Metrics have plateaued across iterations. Consider changing approach or hyperparameters."
+                        if plateau_action not in required_actions:
+                            required_actions.append(plateau_action)
+                except (ValueError, TypeError):
+                    pass
+
         summary = "Fallback board verdict from reviewer packets."
         if status_conflict:
             summary += " Conflict detected between reviewer and qa_reviewer verdicts."
@@ -178,6 +196,8 @@ class ReviewBoardAgent:
             except Exception:
                 delta_txt = str(delta)
             summary += f" Progress tracker: {metric_name} delta={delta_txt}."
+        if iteration_history:
+            summary += f" Iteration history available ({len(iteration_history)} prior iterations)."
 
         return {
             "status": status,

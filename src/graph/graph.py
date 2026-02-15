@@ -8434,6 +8434,72 @@ def _extract_metric_target_hint(evaluation_spec: Dict[str, Any] | None, contract
                     return float(value), f"{prefix}.qa_gates[{gate_name}].params.{key}"
     return None, ""
 
+def _build_retry_context(
+    *,
+    runtime_tail: str,
+    hard_failures: List[str],
+    failed_gates: List[str],
+    missing_outputs: List[str],
+    present_outputs: List[str],
+    required_fixes: List[str],
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build a structured retry_context for targeted error recovery.
+    Classifies the error type so downstream agents know exactly what to fix.
+    """
+    error_type = "unknown"
+    specific_error = ""
+    blocked_imports: List[str] = []
+
+    runtime_lower = (runtime_tail or "").lower()
+
+    # Classify error type
+    if runtime_tail and ("traceback" in runtime_lower or "error" in runtime_lower):
+        if "importerror" in runtime_lower or "modulenotfounderror" in runtime_lower:
+            error_type = "security_violation"
+            # Extract blocked import names from error
+            import re as _re
+            import_match = _re.search(r"(?:import|module).*?['\"]([^'\"]+)['\"]", runtime_lower)
+            if import_match:
+                blocked_imports.append(import_match.group(1))
+            specific_error = runtime_tail[:500]
+        elif "blocked" in runtime_lower or "forbidden" in runtime_lower or "security" in runtime_lower:
+            error_type = "security_violation"
+            specific_error = runtime_tail[:500]
+        else:
+            error_type = "runtime_error"
+            specific_error = runtime_tail[:500]
+    elif missing_outputs:
+        error_type = "output_missing"
+        specific_error = f"Missing outputs: {', '.join(missing_outputs[:5])}"
+    elif failed_gates:
+        error_type = "gate_failure"
+        specific_error = f"Failed gates: {', '.join(failed_gates[:5])}"
+
+    # Extract blocked imports from state if available
+    safety_report = state.get("last_safety_scan") if isinstance(state.get("last_safety_scan"), dict) else {}
+    if isinstance(safety_report, dict):
+        violations = safety_report.get("violations") or safety_report.get("blocked") or []
+        if isinstance(violations, list):
+            for v in violations:
+                name = str(v.get("module") if isinstance(v, dict) else v)
+                if name and name not in blocked_imports:
+                    blocked_imports.append(name)
+
+    return {
+        "error_type": error_type,
+        "specific_error": specific_error,
+        "blocked_imports": blocked_imports[:10],
+        "missing_outputs": missing_outputs[:10],
+        "working_components": present_outputs[:8],
+        "failed_gates": [
+            {"gate": g, "evidence": "see quality_focus for details"}
+            for g in failed_gates[:8]
+        ],
+    }
+
+
 def _build_iteration_handoff(
     state: Dict[str, Any] | None,
     status: str | None,
@@ -8581,6 +8647,17 @@ def _build_iteration_handoff(
     if not patch_objectives:
         patch_objectives.append("Apply reviewer and QA feedback with minimal, targeted code edits.")
 
+    # ── Retry context: structured error classification for targeted retries ──
+    retry_context = _build_retry_context(
+        runtime_tail=runtime_tail,
+        hard_failures=hard_failures,
+        failed_gates=failed_gates,
+        missing_outputs=missing_outputs,
+        present_outputs=present_outputs,
+        required_fixes=required_fixes,
+        state=state,
+    )
+
     return {
         "handoff_version": "v1",
         "mode": "patch" if next_iteration > 1 else "build",
@@ -8616,6 +8693,7 @@ def _build_iteration_handoff(
         },
         "must_preserve": must_preserve[:8],
         "patch_objectives": patch_objectives[:8],
+        "retry_context": retry_context,
     }
 
 def _suggest_next_actions(
@@ -19936,6 +20014,20 @@ def run_review_board(state: AgentState) -> AgentState:
     board_context["progress_tracker"] = _build_review_progress_tracker(state if isinstance(state, dict) else {})
     board_context["review_verdict_before_board"] = state.get("review_verdict")
     board_context["review_feedback_before_board"] = state.get("review_feedback")
+
+    # Add iteration_history for trend/plateau detection by the Review Board
+    metric_history = state.get("metric_history") if isinstance(state.get("metric_history"), list) else []
+    if metric_history:
+        board_context["iteration_history"] = [
+            {
+                "iteration": int(h.get("iteration", i)),
+                "primary_metric": h.get("primary_metric_value"),
+                "metric_name": str(h.get("primary_metric_name") or ""),
+                "status": str(h.get("status") or ""),
+            }
+            for i, h in enumerate(metric_history)
+            if isinstance(h, dict)
+        ][-10:]  # Keep last 10 iterations max
 
     verdict = review_board.adjudicate(board_context)
     if not isinstance(verdict, dict):

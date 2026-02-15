@@ -2,7 +2,8 @@ from src.agents.cleaning_reviewer import _check_row_count_sanity, _normalize_gat
 
 
 def test_normalize_gate_name_numeric_parsing_verification():
-    assert _normalize_gate_name("Numeric Parsing Verification") == "numeric_parsing_validation"
+    # After seniority refactoring: alias_map removed, generic normalization only
+    assert _normalize_gate_name("Numeric Parsing Verification") == "numeric_parsing_verification"
 
 
 def test_row_count_sanity_supports_alternate_manifest_keys():

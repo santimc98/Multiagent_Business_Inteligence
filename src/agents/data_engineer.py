@@ -509,6 +509,16 @@ class DataEngineerAgent:
         - Use only dependencies allowed by RUNTIME_DEPENDENCY_CONTEXT.
         - Script must parse as valid Python.
 
+        SANDBOX SECURITY - BLOCKED IMPORTS (HARD CONSTRAINT):
+        These imports are FORBIDDEN and will cause immediate script rejection:
+        - sys, subprocess, socket, requests, httpx, urllib, ftplib
+        - paramiko, selenium, playwright, openai, google.generativeai, builtins
+        - eval(), exec(), compile(), __import__()
+        ALLOWED imports: pandas, numpy, sklearn, scipy, xgboost, catboost, lightgbm,
+        matplotlib, seaborn, json, os.path, os.makedirs, csv, math, statistics,
+        collections, itertools, functools, typing, warnings, re, datetime, pathlib.Path
+        If you need sys.stdout or sys.exit, use print() and raise SystemExit instead.
+
         DTYPE SAFETY PATTERNS:
         - Read raw CSV with dtype=str and convert explicitly where needed.
         - Use pd.to_numeric(..., errors='coerce') before numeric casts.

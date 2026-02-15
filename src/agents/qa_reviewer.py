@@ -47,10 +47,13 @@ def _extract_json_object(text: str) -> Optional[str]:
 
 _CONTRACT_FALLBACK_WARNING = "CONTRACT_BROKEN_FALLBACK: qa_gates missing; please fix contract generation"
 
-CONTRACT_BROKEN_FALLBACK_GATES = [
+# Fallback gates removed (seniority refactoring): if the contract is missing
+# qa_gates, the reviewer rejects with CONTRACT_BROKEN_FALLBACK to force
+# contract regeneration instead of inventing its own gates.
+# EXCEPTION: security_sandbox is an unconditional system-safety gate that
+# must always be present regardless of contract state.
+_UNCONDITIONAL_SAFETY_GATES = [
     {"name": "security_sandbox", "severity": "HARD", "params": {}},
-    {"name": "must_read_input_csv", "severity": "HARD", "params": {}},
-    {"name": "no_synthetic_data", "severity": "HARD", "params": {}},
 ]
 
 
@@ -131,10 +134,19 @@ def resolve_qa_gates(evaluation_spec: Dict[str, Any] | None) -> tuple[List[Dict[
             or []
         )
     qa_gates = _normalize_qa_gates(raw_gates)
-    if qa_gates:
-        return qa_gates, contract_source, warnings
-    warnings.append(_CONTRACT_FALLBACK_WARNING)
-    return list(CONTRACT_BROKEN_FALLBACK_GATES), "fallback", warnings
+    if not qa_gates:
+        warnings.append(_CONTRACT_FALLBACK_WARNING)
+        qa_gates = list(_UNCONDITIONAL_SAFETY_GATES)
+        contract_source = "fallback"
+    else:
+        # Ensure unconditional safety gates are always present even when
+        # the contract provides its own qa_gates.
+        existing_names = {str(g.get("name")).lower() for g in qa_gates if isinstance(g, dict) and g.get("name")}
+        for safety_gate in _UNCONDITIONAL_SAFETY_GATES:
+            if str(safety_gate["name"]).lower() not in existing_names:
+                qa_gates.append(dict(safety_gate))
+    return qa_gates, contract_source, warnings
+
 
 
 def _resolve_ml_data_path(evaluation_spec: Dict[str, Any] | None) -> str:
@@ -615,33 +627,21 @@ def _call_name(call_node: ast.Call) -> str:
     return ""
 
 
-_REGRESSOR_KEYWORDS = {
-    "LinearRegression",
-    "ElasticNet",
-    "Lasso",
-    "Ridge",
-    "HuberRegressor",
-    "SVR",
-    "KNeighborsRegressor",
-    "DecisionTreeRegressor",
-    "RandomForestRegressor",
-    "GradientBoostingRegressor",
-    "XGBRegressor",
-    "CatBoostRegressor",
-    "ExtraTreesRegressor",
-    "LGBMRegressor",
-    "SGDRegressor",
-    "LinearSVR",
-}
-
-
 def _looks_like_regressor(name: str) -> bool:
+    """Detect regressors generically by naming convention, not hardcoded list."""
     if not name:
         return False
-    if name.endswith("Regressor"):
-        return True
     simple = name.split(".")[-1]
-    return simple in _REGRESSOR_KEYWORDS or simple.lower() in {"svr"}
+    # Convention: sklearn/xgboost/lightgbm/catboost regressors end in "Regressor"
+    if simple.endswith("Regressor"):
+        return True
+    # Convention: SVR/LinearSVR are support vector regressors
+    if simple.lower() in {"svr", "linearsvr"}:
+        return True
+    # Convention: common regression models (ElasticNet, Lasso, Ridge) inherit RegressorMixin
+    if simple in {"ElasticNet", "Lasso", "Ridge", "LinearRegression"}:
+        return True
+    return False
 
 
 def _extract_target_name(target_node: ast.AST) -> Optional[str]:

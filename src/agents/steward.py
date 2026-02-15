@@ -1156,20 +1156,12 @@ def write_dataset_profile(profile: Dict[str, Any], path: str = "data/dataset_pro
 # SENIOR REASONING: UNIVERSAL DATA PROFILE (Evidence Layer)
 # ============================================================================
 
-# Tokens that suggest a column is used for train/test splitting
-SPLIT_CANDIDATE_TOKENS = {"split", "set", "fold", "train", "test", "partition", "is_train", "is_test"}
-
-_TEMPORAL_HINT_TOKENS = {
-    "date",
-    "time",
-    "timestamp",
-    "datetime",
-    "month",
-    "year",
-    "day",
-    "week",
-    "hour",
-}
+# ── Token sets removed (seniority refactoring) ──────────────────────────
+# Split and temporal column detection is now handled by the LLM semantic
+# passes (decide_semantics_pass1/pass2). The following are kept as minimal
+# structural hints only for the evidence-layer profiling, not for
+# classification decisions.
+# ─────────────────────────────────────────────────────────────────────────
 
 
 def _infer_temporal_granularity(seconds: float) -> str:
@@ -1195,9 +1187,13 @@ def _compute_temporal_analysis(
     max_rows: int = 10000,
 ) -> Dict[str, Any]:
     candidates: List[str] = []
+    # Use dtype-based detection + minimal structural hints for temporal candidates
+    _temporal_hints = {"date", "time", "timestamp", "datetime", "month", "year", "day", "week", "hour"}
     for col in columns:
         tokenized = str(col).lower().replace("-", "_")
-        if any(tok in tokenized for tok in _TEMPORAL_HINT_TOKENS):
+        if any(tok in tokenized for tok in _temporal_hints):
+            candidates.append(col)
+        elif hasattr(df[col], "dtype") and pd.api.types.is_datetime64_any_dtype(df[col]):
             candidates.append(col)
     if not candidates:
         return {"is_time_series": False, "detected_datetime_columns": [], "details": []}
@@ -1584,12 +1580,13 @@ def build_data_profile(
                 pass
         outcome_analysis[outcome_col] = analysis_entry
 
-    # 4. Split candidates: columns with tokens like split/set/fold/train/test/partition
+    # 4. Split candidates: columns with structural hints for train/test splitting
+    _split_hints = {"split", "set", "fold", "train", "test", "partition", "is_train", "is_test"}
     split_candidates = []
     for col in columns:
         col_lower = col.lower().replace("_", " ").replace("-", " ")
         tokens = set(col_lower.split())
-        if tokens & SPLIT_CANDIDATE_TOKENS:
+        if tokens & _split_hints:
             # Gather unique values evidence
             try:
                 uniques = df[col].dropna().unique()[:20].tolist()

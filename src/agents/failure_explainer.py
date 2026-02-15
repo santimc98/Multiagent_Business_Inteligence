@@ -141,30 +141,10 @@ class FailureExplainerAgent:
         return (content or "").strip()
 
     def _fallback(self, error_details: str) -> str:
-        lower = error_details.lower()
-        if "list of cases must be same length as list of conditions" in lower:
-            return "np.select called with mismatched conditions vs choices list lengths."
-        if "numpy.bool_" in lower and "not serializable" in lower:
-            return "json.dumps failed because numpy.bool_ values are not handled by _json_default."
-        if "keyerror" in lower and "not in index" in lower:
-            return "Column selection list includes names that are not present after renaming."
-        if "missing required columns" in lower:
-            return "Required columns are missing after header normalization/mapping."
-        if "typeerror" in lower and "not supported between" in lower:
-            return "Type comparison failed on mixed dtypes; normalize/cast values before comparisons."
-        if "valueerror" in lower and "could not convert" in lower:
-            return "String-to-numeric conversion failed; apply pd.to_numeric(errors='coerce') and null handling."
-        if "indexerror" in lower:
-            return "Index access exceeded bounds; guard list/array sizes before positional access."
-        if "attributeerror" in lower and "has no attribute" in lower:
-            return "Method was called on an unexpected object type; validate object type before using attribute."
-        if "filenotfounderror" in lower:
-            return "File path is invalid or unavailable; use contract-provided input/output paths."
-        if "memoryerror" in lower or "out of memory" in lower or "oom" in lower or "killed" in lower:
-            return "Execution exceeded memory budget; reduce footprint via chunking, sampling, or lower-memory transforms."
-        if "importerror" in lower or "modulenotfounderror" in lower:
-            return "Missing dependency in runtime; use only allowed packages or declare the dependency explicitly."
-        return ""
+        if not error_details:
+            return ""
+        # Provide the raw error as-is; LLM-based diagnosis was unavailable.
+        return f"Automated diagnosis unavailable. Raw error summary: {error_details[:500]}"
 
     @staticmethod
     def _truncate(text: str, limit: int) -> str:

@@ -8,7 +8,9 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 
 from src.utils.senior_protocol import SENIOR_STRATEGY_PROTOCOL
-from src.utils.domain_knowledge import infer_domain_guidance
+
+# domain_knowledge import removed (seniority refactoring):
+# Domain guidance is now inferred by the LLM from data context and business objective.
 
 load_dotenv()
 
@@ -71,12 +73,6 @@ class DomainExpertAgent:
         normalized_strategies = self._normalize_strategies(strategies)
         llm_error = ""
         llm_reviews: List[Dict[str, Any]] = []
-        domain_guidance = infer_domain_guidance(
-            data_summary=data_summary or "",
-            business_objective=business_objective or "",
-            dataset_memory_context=dataset_memory_context or "",
-            max_domains=2,
-        )
 
         prompt = self._build_prompt(
             data_summary=data_summary,
@@ -84,7 +80,6 @@ class DomainExpertAgent:
             strategies=normalized_strategies,
             compute_constraints=compute_constraints or {},
             dataset_memory_context=dataset_memory_context,
-            domain_guidance=domain_guidance,
         )
         self.last_prompt = prompt
 
@@ -113,7 +108,6 @@ class DomainExpertAgent:
 
         if llm_error:
             validation_meta["llm_error"] = llm_error
-        validation_meta["domain_guidance"] = domain_guidance
 
         return {
             "reviews": validated_reviews,
@@ -128,7 +122,6 @@ class DomainExpertAgent:
         strategies: List[Dict[str, Any]],
         compute_constraints: Dict[str, Any],
         dataset_memory_context: str,
-        domain_guidance: Dict[str, Any],
     ) -> str:
         from src.utils.prompting import render_prompt
 
@@ -151,8 +144,10 @@ $compute_constraints
 *** DATASET MEMORY CONTEXT (PRIOR RUNS) ***
 $dataset_memory_context
 
-*** DOMAIN GUIDANCE (KNOWLEDGE BASE) ***
-$domain_guidance
+*** DOMAIN GUIDANCE ***
+Infer domain-specific best practices and risks from the data context and business objective.
+Do not rely on pre-defined domain templates. Reason about the specific domain, data characteristics,
+and business goals to identify relevant risks, best practices, and evaluation criteria.
 
 *** CANDIDATE STRATEGIES (INDEXED) ***
 $strategies_text
@@ -193,7 +188,6 @@ Output schema:
             data_summary=data_summary or "",
             compute_constraints=json.dumps(compute_constraints or {}, ensure_ascii=True),
             dataset_memory_context=(dataset_memory_context or "")[:3000],
-            domain_guidance=json.dumps(domain_guidance or {}, ensure_ascii=True),
             strategies_text=json.dumps(strategies, ensure_ascii=True, indent=2),
         )
 
@@ -386,20 +380,24 @@ Output schema:
                 }
             )
 
-        # Merge with deterministic fallback: ensure one review per strategy index.
-        merged: Dict[int, Dict[str, Any]] = {int(r["strategy_index"]): dict(r) for r in deterministic_reviews}
-        llm_used = 0
+        # LLM-primary: use LLM reviews when available, deterministic only as safety net.
+        llm_by_idx: Dict[int, Dict[str, Any]] = {}
         for item in normalized_llm:
             idx = int(item.get("strategy_index") or 0)
-            if idx < 0 or idx >= max(0, strategy_count):
-                continue
-            merged[idx] = item
-            llm_used += 1
+            if 0 <= idx < max(0, strategy_count):
+                llm_by_idx[idx] = item
+
+        det_by_idx: Dict[int, Dict[str, Any]] = {int(r["strategy_index"]): dict(r) for r in deterministic_reviews}
 
         reviews: List[Dict[str, Any]] = []
+        llm_used = 0
         for idx in range(max(0, strategy_count)):
-            base = merged.get(idx)
-            if not base:
+            if idx in llm_by_idx:
+                base = llm_by_idx[idx]
+                llm_used += 1
+            elif idx in det_by_idx:
+                base = det_by_idx[idx]
+            else:
                 continue
             # Selectability policy requested by audit.
             selectable = _safe_float(base.get("score"), 0.0) >= 3.0

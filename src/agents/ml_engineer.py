@@ -2127,6 +2127,16 @@ $strategy_json
         - Respect required outputs exactly as paths and file formats in the contract.
         - Avoid network/shell operations and filesystem discovery scans.
 
+        SANDBOX SECURITY - BLOCKED IMPORTS (HARD CONSTRAINT):
+        These imports are FORBIDDEN and will cause immediate script rejection:
+        - sys, subprocess, socket, requests, httpx, urllib, ftplib
+        - paramiko, selenium, playwright, openai, google.generativeai, builtins
+        - eval(), exec(), compile(), __import__()
+        ALLOWED imports: pandas, numpy, sklearn, scipy, xgboost, catboost, lightgbm,
+        matplotlib, seaborn, json, os.path, os.makedirs, csv, math, statistics,
+        collections, itertools, functools, typing, warnings, re, datetime, pathlib.Path
+        If you need sys.stdout or sys.exit, use print() and raise SystemExit instead.
+
         DTYPE SAFETY PATTERNS
         - Read CSV with dtype=str first, then convert with pd.to_numeric(errors='coerce') when needed.
         - For nullable integers, use pandas nullable Int64 instead of plain int64 casts.

@@ -25,60 +25,16 @@ _LLM_CALL_WARNING = "LLM_CALL_FAILED"
 _UNEVALUATED_HARD_GATES_WARNING = "UNEVALUATED_HARD_GATES"
 _LLM_FAIL_CLOSED_REASON = "LLM_UNAVAILABLE_WITH_UNEVALUATED_HARD_GATES"
 
-_DEFAULT_ID_REGEX = (
-    r"(?i)(^id$|"
-    r"(?:^|[_\W])(?:id|entity|cod|code|key|partida|invoice|account)(?:[_\W]|$)|"
-    r"(?:_id$)|(?:^id_))"
-)
-_DEFAULT_PERCENT_REGEX = r"(?i)%|pct|percent|plazo"
 
-_FALLBACK_CLEANING_GATES = [
-    {
-        "name": "required_columns_present",
-        "severity": "HARD",
-        "params": {},
-    },
-    {
-        "name": "id_integrity",
-        "severity": "HARD",
-        "params": {
-            "identifier_name_regex": _DEFAULT_ID_REGEX,
-            "detect_scientific_notation": True,
-        },
-    },
-    {
-        # LLM-DELEGATED: This gate uses contextual reasoning, not deterministic rules.
-        # The LLM evaluates cleaning_code + data_profile to determine if rescaling occurred.
-        "name": "no_semantic_rescale",
-        "severity": "HARD",
-        "params": {
-            "allow_percent_like_only": True,
-            "percent_like_name_regex": _DEFAULT_PERCENT_REGEX,
-            "llm_delegated": True,  # Marker for LLM-based evaluation
-        },
-    },
-    {
-        "name": "no_synthetic_data",
-        "severity": "HARD",
-        "params": {},
-    },
-    {
-        "name": "row_count_sanity",
-        "severity": "SOFT",
-        "params": {
-            "max_drop_pct": 5.0,
-            "max_dup_increase_pct": 1.0,
-        },
-    },
-    {
-        "name": "feature_coverage_sanity",
-        "severity": "SOFT",
-        "params": {
-            "min_feature_count": 3,
-            "check_against": "data_atlas",
-        },
-    },
-]
+# ── Hardcoded regex/gates removed (seniority refactoring) ───────────────
+# ID and percent column detection now relies on column_roles from the contract.
+# Fallback cleaning gates removed: if the contract is missing cleaning_gates,
+# the reviewer rejects with CONTRACT_MISSING_CLEANING_GATES to force contract
+# regeneration instead of inventing its own gates.
+# ────────────────────────────────────────────────────────────────────────
+
+# Generic ID regex: matches common identifier column patterns without domain-specific terms
+_GENERIC_ID_REGEX = r"(?i)(^id$|(?:_id$)|(?:^id_)|(?:^|[_\W])(?:id|entity|code|key)(?:[_\W]|$))"
 
 
 class CleaningReviewerAgent:
@@ -571,27 +527,16 @@ def _enforce_contract_strict_rejection(result: Dict[str, Any]) -> Dict[str, Any]
 
 def _merge_cleaning_gates(view: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str, List[str]]:
     contract_gates = _normalize_cleaning_gates(view.get("cleaning_gates"))
-    universal_gates = _normalize_cleaning_gates(_FALLBACK_CLEANING_GATES)
     warnings: List[str] = []
     if contract_gates:
-        contract_names = {
-            _normalize_gate_name(gate.get("name"))
-            for gate in contract_gates
-            if isinstance(gate, dict)
-        }
-        merged = _dedupe_gates(
-            contract_gates
-            + [
-                gate
-                for gate in universal_gates
-                if _normalize_gate_name(gate.get("name")) not in contract_names
-            ]
-        )
+        merged = _dedupe_gates(contract_gates)
         source = "cleaning_view"
     else:
-        merged = universal_gates
+        # No fallback gates: reject with CONTRACT_MISSING_CLEANING_GATES
+        merged = []
         source = "fallback"
         warnings.append(_CLEANING_FALLBACK_WARNING)
+        warnings.append(_CONTRACT_MISSING_CLEANING_GATES)
 
     outlier_policy = view.get("outlier_policy") if isinstance(view.get("outlier_policy"), dict) else {}
     if _outlier_policy_enabled(outlier_policy):
@@ -684,27 +629,7 @@ def _normalize_gate_name(name: Any) -> str:
     if name is None:
         return ""
     key = normalize_gate_name(str(name))
-    if not key:
-        return ""
-    alias_map = {
-        "numericparsingvalidation": "numeric_parsing_validation",
-        "numeric_parsing_validation": "numeric_parsing_validation",
-        "numeric_parsing_verification": "numeric_parsing_validation",
-        "numericparsingverification": "numeric_parsing_validation",
-        "numeric_parsing_check": "numeric_parsing_validation",
-        "numeric_type_casting": "numeric_type_casting_check",
-        "numeric_type_casting_check": "numeric_type_casting_check",
-        "numeric_type_casting_validation": "numeric_type_casting_check",
-        "target_null_alignment_with_split": "target_null_alignment_with_split",
-        "target_null_split_alignment": "target_null_alignment_with_split",
-        "target_split_null_alignment": "target_null_alignment_with_split",
-        "id_uniqueness_validation": "id_uniqueness_validation",
-        "id_uniqueness_check": "id_uniqueness_validation",
-        "feature_coverage_sanity": "feature_coverage_sanity",
-        "feature_coverage_check": "feature_coverage_sanity",
-        "feature_cover_sanity": "feature_coverage_sanity",
-    }
-    return alias_map.get(key, key)
+    return key or ""
 
 
 def _resolve_dialect(raw: Any) -> Dict[str, Any]:
@@ -1068,11 +993,11 @@ def _check_id_uniqueness_validation(
     if not columns:
         columns.extend(_columns_with_role_tokens(column_roles, {"id", "identifier", "key"}))
     if not columns:
-        regex = params.get("identifier_name_regex") or _DEFAULT_ID_REGEX
+        regex = params.get("identifier_name_regex") or _GENERIC_ID_REGEX
         try:
             pattern = re.compile(regex)
         except re.error:
-            pattern = re.compile(_DEFAULT_ID_REGEX)
+            pattern = re.compile(_GENERIC_ID_REGEX)
         columns.extend([col for col in cleaned_header if pattern.search(str(col))])
 
     deduped: List[str] = []
@@ -2656,11 +2581,11 @@ def _resolve_id_integrity_candidates(
 
     role_candidates = [col for col in (role_ctx.get("id_like") or []) if col in cleaned_header]
 
-    regex = params.get("identifier_name_regex") or _DEFAULT_ID_REGEX
+    regex = params.get("identifier_name_regex") or _GENERIC_ID_REGEX
     try:
         pattern = re.compile(regex)
     except re.error:
-        pattern = re.compile(_DEFAULT_ID_REGEX)
+        pattern = re.compile(_GENERIC_ID_REGEX)
     regex_candidates = [col for col in cleaned_header if col not in excluded and pattern.search(str(col))]
 
     candidates: List[str] = []

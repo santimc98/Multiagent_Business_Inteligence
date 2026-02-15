@@ -55,131 +55,24 @@ _API_KEY_SENTINEL = object()
 
 _QA_SEVERITIES = {"HARD", "SOFT"}
 _CLEANING_SEVERITIES = {"HARD", "SOFT"}
-_RESAMPLING_TOKENS = {
-    "bootstrap",
-    "resample",
-    "resampling",
-    "cross validation",
-    "cross-validation",
-    "cv",
-    "kfold",
-    "k-fold",
-    "shuffle split",
-    "stratified",
-    "fold",
-}
 
-_DECISIONING_ENABLED_TOKENS = {
-    "ranking",
-    "priority",
-    "prioritization",
-    "top",
-    "decision",
-    "action",
-    "triage",
-    "moderation",
-    "scorecard",
-    "targeting",
-    "outlier",
-    "review",
-    "segmentation",
-    "operational",
-    "rule",
-    "uncertainty",
-    "policy",
-}
+# ── Token sets removed (seniority refactoring) ──────────────────────────
+# Capability detection (resampling, decisioning, explanation, visualization)
+# is now performed semantically by the LLM inside the contract prompt.
+# See CAPABILITY_DETECTION_PROMPT below.
+# ─────────────────────────────────────────────────────────────────────────
 
-_DECISIONING_REQUIRED_PHRASES = {
-    "ranking",
-    "prioridad",
-    "ranking prioritario",
-    "decision policy",
-    "política de decisión",
-    "segmentación",
-    "acción recomendada",
-    "marcar casos",
-    "baja confianza",
-    "decision rule",
-    "flag de revisión",
-    "moderación humana",
-    "prioritize",
-    "review flag",
-}
-
-_EXPLANATION_REQUIRED_TOKENS = {
-    "explain",
-    "explanation",
-    "explainability",
-    "interpret",
-    "interpretability",
-    "justify",
-    "justification",
-    "driver",
-    "drivers",
-    "factor",
-    "factors",
-    "reason",
-    "reasons",
-    "explicar",
-    "explicacion",
-    "justificar",
-    "determinantes",
-}
-
-_EXPLANATION_REQUIRED_PHRASES = {
-    "factores determinantes",
-    "explicacion por fila",
-    "explicacion por registro",
-    "explain per row",
-    "explain each row",
-    "row explanation",
-    "per-row explanation",
-    "per record explanation",
-}
-
-_VISUAL_ENABLED_TOKENS = {
-    "segment",
-    "segmentation",
-    "outlier",
-    "outliers",
-    "elasticidad",
-    "elasticity",
-    "incertidumbre",
-    "uncertainty",
-    "fairness",
-    "bias",
-    "explicabilidad",
-    "explain",
-    "calibration",
-    "calibración",
-    "geography",
-    "geographical",
-    "geo",
-    "series",
-    "temporal",
-    "timeseries",
-    "error",
-    "analysis",
-    "explainability",
-}
-
-_VISUAL_REQUIRED_PHRASES = {
-    "tablas y gráficos",
-    "tablas y graficos",
-    "tablas graficos",
-    "visual comparison",
-    "comparación visual",
-    "comparacion visual",
-    "comparativa visual",
-    "segmentación por zonas",
-    "segmentacion por zonas",
-    "segmentación por horas",
-    "segmentacion por horas",
-    "detección de outliers",
-    "deteccion de outliers",
-    "explicar drivers",
-    "explain drivers",
-}
+CAPABILITY_DETECTION_PROMPT = """
+CAPABILITY DETECTION (reason from objective and strategy, do NOT use keyword matching):
+When generating the contract, determine semantically whether the objective requires:
+- resampling / cross-validation: Set resampling fields in validation_requirements.
+- decisioning / ranking / action output: Set decisioning_requirements with appropriate columns.
+- explanations / interpretability: Set explanation columns in scored_rows_schema.
+- visualizations: Set visual_requirements in artifact_requirements.
+Base your decisions on the MEANING of the business objective and strategy, not on the
+presence or absence of specific keywords. Set boolean flags and structured specs in the
+contract based on your semantic understanding of what the downstream agents will need.
+"""
 
 CONTRACT_SCHEMA_EXAMPLES_TEXT = build_contract_schema_examples_text()
 
@@ -274,6 +167,16 @@ Hard rules:
 - Every requirement must be consumable by at least one downstream agent view.
 - Follow evidence_policy from INPUTS: use direct evidence first, grounded inference second, and avoid unsupported assumptions.
 - You may add extra fields if useful, but do not omit required minimum fields.
+
+CAPABILITY DETECTION (reason from objective and strategy, do NOT use keyword matching):
+When generating the contract, determine semantically whether the objective requires:
+- resampling / cross-validation: Set resampling fields in validation_requirements.
+- decisioning / ranking / action output: Set decisioning_requirements with appropriate columns.
+- explanations / interpretability: Set explanation columns in scored_rows_schema.
+- visualizations: Set visual_requirements in artifact_requirements.
+Base your decisions on the MEANING of the business objective and strategy, not on the
+presence or absence of specific keywords. Set boolean flags and structured specs in the
+contract based on your semantic understanding of what the downstream agents will need.
 """
 
 CONTRACT_SOURCE_OF_TRUTH_POLICY_V1 = {
@@ -679,16 +582,9 @@ def _compress_text_preserve_ends(
     return text[:head_len] + "\n...\n" + text[-tail_len:]
 
 
-def _matches_any_phrase(text: str, phrases: set[str]) -> bool:
-    normalized = text.lower()
-    return any(phrase in normalized for phrase in phrases)
 
-
-def _contains_decisioning_token(text: str, tokens: set[str]) -> bool:
-    if not text:
-        return False
-    words = set(text.split())
-    return any(tok in words for tok in tokens)
+# _matches_any_phrase and _contains_decisioning_token removed (seniority refactoring):
+# capability detection is now LLM-driven via contract prompt.
 
 
 def _build_decision_column_entry(
@@ -1092,7 +988,8 @@ def _strategy_mentions_resampling(strategy: Dict[str, Any], business_objective: 
     if isinstance(business_objective, str) and business_objective.strip():
         parts.append(business_objective)
     haystack = " ".join(parts).lower()
-    return any(token in haystack for token in _RESAMPLING_TOKENS)
+    # Semantic check: look for resampling-related concepts generically
+    return any(tok in haystack for tok in ("resamp", "cross valid", "cross-valid", "kfold", "k-fold", "bootstrap", "stratified"))
 
 
 def _infer_requires_target(strategy: Dict[str, Any], contract: Dict[str, Any]) -> bool:
@@ -4149,11 +4046,8 @@ def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
     }
 
 
-def _contains_visual_token(text: str, tokens: set[str]) -> bool:
-    if not text:
-        return False
-    words = set(text.split())
-    return any(tok in words for tok in tokens)
+
+# _contains_visual_token removed (seniority refactoring): visual detection is now LLM-driven.
 
 
 def _map_plot_type(plot_type: str | None) -> str:
@@ -4203,8 +4097,14 @@ def _build_visual_requirements(
         contract.get("business_objective"),
         contract.get("strategy_title"),
     )
-    enabled = _contains_visual_token(vision_text, _VISUAL_ENABLED_TOKENS)
-    required = _matches_any_phrase(vision_text, _VISUAL_REQUIRED_PHRASES)
+    # LLM-driven: visual requirements are now set by the LLM in the contract.
+    # Fallback heuristic: enable visuals if strategy/objective mention visualization concepts.
+    enabled = bool(vision_text and any(tok in vision_text.split() for tok in ("visual", "plot", "chart", "graph", "diagram", "figure")))
+    # Check if contract already has explicit visual config from LLM
+    existing_visual = contract.get("artifact_requirements", {}).get("visual_requirements") if isinstance(contract.get("artifact_requirements"), dict) else None
+    if isinstance(existing_visual, dict) and existing_visual.get("enabled"):
+        enabled = True
+    required = isinstance(existing_visual, dict) and bool(existing_visual.get("required"))
 
     dataset_profile = (
         contract.get("dataset_profile") if isinstance(contract.get("dataset_profile"), dict) else {}
@@ -4446,12 +4346,15 @@ def _build_decisioning_requirements(
         or strategy.get("analysis_type")
         or ""
     ).lower()
-    enabled = _contains_decisioning_token(strategy_text, _DECISIONING_ENABLED_TOKENS) or any(
+    # LLM-driven: decisioning/explanation requirements are now set by the LLM in the contract.
+    # Fallback heuristic: check if contract already carries LLM-set decisioning config.
+    existing_dec = contract.get("decisioning_requirements") if isinstance(contract.get("decisioning_requirements"), dict) else {}
+    enabled = bool(existing_dec.get("enabled")) or any(
         kw in objective_type for kw in ["rank", "priority", "decision", "segment", "triage", "outlier", "action"]
     )
-    required = _matches_any_phrase(strategy_text, _DECISIONING_REQUIRED_PHRASES)
-    explanation_needed = _contains_decisioning_token(strategy_text, _EXPLANATION_REQUIRED_TOKENS) or _matches_any_phrase(
-        strategy_text, _EXPLANATION_REQUIRED_PHRASES
+    required = bool(existing_dec.get("required"))
+    explanation_needed = bool(existing_dec.get("explanation_needed")) or any(
+        kw in objective_type for kw in ["explain", "interpret", "driver", "factor"]
     )
     if explanation_needed:
         enabled = True
@@ -4484,7 +4387,10 @@ def _build_decisioning_requirements(
         return "explanation"
 
     def _has_objective(tok_list: List[str]) -> bool:
-        return any(tok in objective_type for tok in tok_list) or _contains_decisioning_token(strategy_text, set(tok_list))
+        if any(tok in objective_type for tok in tok_list):
+            return True
+        words = set(strategy_text.split()) if strategy_text else set()
+        return bool(words & set(tok_list))
 
     is_classification = _has_objective(["class", "classification", "binary", "propensity", "moderation"])
     is_regression = _has_objective(["regress", "price", "eta", "forecast", "numeric", "value"])
