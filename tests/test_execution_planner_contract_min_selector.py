@@ -92,6 +92,9 @@ def test_execution_planner_invalid_json_fallback_uses_single_contract_source() -
     )
 
     assert isinstance(contract, dict)
+    assert contract.get("artifact_requirements")
+    assert isinstance(contract.get("column_dtype_targets"), dict)
+    assert contract.get("scope") in {"cleaning_only", "ml_only", "full_pipeline"}
     assert agent.last_contract_min is None
 
 

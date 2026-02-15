@@ -41,6 +41,11 @@ from src.utils.contract_validator import (
     is_file_path,
     _normalize_selector_entry,
 )
+from src.utils.contract_schema_registry import (
+    build_contract_schema_examples_text,
+    get_contract_schema_repair_action,
+    apply_contract_schema_registry_repairs,
+)
 
 load_dotenv()
 
@@ -176,6 +181,8 @@ _VISUAL_REQUIRED_PHRASES = {
     "explain drivers",
 }
 
+CONTRACT_SCHEMA_EXAMPLES_TEXT = build_contract_schema_examples_text()
+
 MINIMAL_CONTRACT_COMPILER_PROMPT = """
 You are an Execution Contract Compiler for a multi-agent business intelligence system.
 
@@ -194,7 +201,8 @@ Minimal contract interface:
 - canonical_columns: list[str]
 - required_outputs: list[str] file paths
 - column_roles: object mapping role -> list[str]
-- column_dtype_targets: object mapping concrete columns and/or selector families to target dtype contracts
+- column_dtype_targets: object mapping column -> dtype spec.
+  Each value MUST be an object with key "target_dtype" (NOT "type").
 - artifact_requirements: object
 - iteration_policy: object with practical retry/iteration limits (small, numeric, and actionable)
 - outlier_policy (optional): object for robust outlier handling when strategy/data justify it.
@@ -2331,6 +2339,307 @@ def _infer_column_dtype_targets(
     return dtype_targets
 
 
+def _infer_selector_type_from_payload(selector: Dict[str, Any]) -> str:
+    if not isinstance(selector, dict):
+        return ""
+    selector_type = str(selector.get("type") or "").strip().lower()
+    if selector_type:
+        return selector_type
+    if selector.get("pattern") or selector.get("regex"):
+        return "regex"
+    if selector.get("prefix"):
+        if isinstance(selector.get("start"), int) and isinstance(selector.get("end"), int):
+            return "prefix_numeric_range"
+        return "prefix"
+    if selector.get("suffix"):
+        return "suffix"
+    if selector.get("contains"):
+        return "contains"
+    if isinstance(selector.get("columns"), list):
+        return "list"
+    if isinstance(selector.get("except_columns"), list):
+        return "all_columns_except"
+    return ""
+
+
+def _deterministic_repair_column_dtype_targets(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+    targets = contract.get("column_dtype_targets")
+    artifact_requirements = contract.get("artifact_requirements")
+    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
+    if targets in (None, {}) and isinstance(clean_dataset, dict):
+        nested_targets = clean_dataset.get("column_dtype_targets")
+        if isinstance(nested_targets, dict):
+            targets = nested_targets
+    if not isinstance(targets, dict):
+        return contract
+
+    repaired: Dict[str, Dict[str, Any]] = {}
+    for raw_col, raw_spec in targets.items():
+        col = str(raw_col or "").strip()
+        if not col:
+            continue
+        if isinstance(raw_spec, str):
+            dtype = raw_spec.strip() or "preserve"
+            repaired[col] = {"target_dtype": dtype}
+            continue
+        if not isinstance(raw_spec, dict):
+            repaired[col] = {"target_dtype": "preserve"}
+            continue
+
+        spec = dict(raw_spec)
+        if "target_dtype" not in spec or not str(spec.get("target_dtype") or "").strip():
+            for alias in ("type", "dtype", "data_type", "targetType"):
+                if alias in spec and str(spec.get(alias) or "").strip():
+                    spec["target_dtype"] = str(spec.pop(alias)).strip()
+                    break
+        if "target_dtype" not in spec or not str(spec.get("target_dtype") or "").strip():
+            spec["target_dtype"] = "preserve"
+        repaired[col] = spec
+
+    if repaired:
+        contract["column_dtype_targets"] = repaired
+        if isinstance(clean_dataset, dict):
+            clean_dataset["column_dtype_targets"] = copy.deepcopy(repaired)
+    return contract
+
+
+def _deterministic_repair_required_feature_selectors(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+    artifact_requirements = contract.get("artifact_requirements")
+    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
+    if not isinstance(clean_dataset, dict):
+        return contract
+
+    selectors_raw = clean_dataset.get("required_feature_selectors")
+    if selectors_raw is None:
+        return contract
+    if isinstance(selectors_raw, dict):
+        selectors_raw = [selectors_raw]
+    elif isinstance(selectors_raw, str):
+        selectors_raw = [{"selector": selectors_raw}]
+    if not isinstance(selectors_raw, list):
+        return contract
+
+    repaired: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _push(selector_obj: Dict[str, Any]) -> None:
+        fingerprint = json.dumps(selector_obj, sort_keys=True, ensure_ascii=False)
+        if fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        repaired.append(selector_obj)
+
+    for raw_selector in selectors_raw:
+        selector_obj: Dict[str, Any] | None = None
+        if isinstance(raw_selector, str):
+            token = raw_selector.strip()
+            if not token:
+                continue
+            if ":" in token:
+                selector_obj = {"selector": token}
+            elif "*" in token or "?" in token:
+                if token.endswith("*") and token.count("*") == 1 and "?" not in token:
+                    selector_obj = {"type": "prefix", "value": token[:-1]}
+                elif token.startswith("*") and token.count("*") == 1 and "?" not in token:
+                    selector_obj = {"type": "suffix", "value": token[1:]}
+                else:
+                    pattern = "^" + re.escape(token).replace("\\*", ".*").replace("\\?", ".") + "$"
+                    selector_obj = {"type": "regex", "pattern": pattern}
+            else:
+                selector_obj = {"type": "list", "columns": [token]}
+        elif isinstance(raw_selector, dict):
+            selector_obj = dict(raw_selector)
+
+        if not isinstance(selector_obj, dict):
+            continue
+
+        selector_obj = _normalize_selector_entry(selector_obj)
+        selector_type = _infer_selector_type_from_payload(selector_obj)
+        if not selector_type:
+            continue
+        selector_obj["type"] = selector_type
+
+        if selector_type == "regex":
+            pattern = selector_obj.get("pattern") or selector_obj.get("value") or selector_obj.get("regex")
+            pattern_str = str(pattern or "").strip()
+            if not pattern_str:
+                continue
+            selector_obj["pattern"] = pattern_str
+            selector_obj.pop("value", None)
+            selector_obj.pop("regex", None)
+        elif selector_type in {"prefix", "suffix", "contains"}:
+            value = selector_obj.get("value") or selector_obj.get(selector_type)
+            value_str = str(value or "").strip()
+            if not value_str:
+                continue
+            selector_obj["value"] = value_str
+        elif selector_type == "list":
+            cols = selector_obj.get("columns")
+            if isinstance(cols, str):
+                cols = [cols]
+            if not isinstance(cols, list):
+                continue
+            columns = [str(col).strip() for col in cols if str(col).strip()]
+            if not columns:
+                continue
+            selector_obj["columns"] = list(dict.fromkeys(columns))
+        elif selector_type == "all_columns_except":
+            cols = selector_obj.get("except_columns")
+            if isinstance(cols, str):
+                cols = [cols]
+            if not isinstance(cols, list):
+                continue
+            excluded = [str(col).strip() for col in cols if str(col).strip()]
+            if not excluded:
+                continue
+            selector_obj["except_columns"] = list(dict.fromkeys(excluded))
+        elif selector_type == "prefix_numeric_range":
+            prefix = str(selector_obj.get("prefix") or "").strip()
+            start = selector_obj.get("start")
+            end = selector_obj.get("end")
+            if not prefix or not isinstance(start, int) or not isinstance(end, int):
+                continue
+            selector_obj["prefix"] = prefix
+
+        _push(selector_obj)
+
+    clean_dataset["required_feature_selectors"] = repaired
+    return contract
+
+
+def _deterministic_repair_gate_lists(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+
+    def _normalize_gate(gate: Any, gate_key: str, idx: int) -> Dict[str, Any] | None:
+        if isinstance(gate, str):
+            name = gate.strip()
+            if not name:
+                return None
+            return {"name": name, "severity": "HARD", "params": {}}
+        if not isinstance(gate, dict):
+            return None
+
+        name = ""
+        for key in ("name", "id", "gate", "metric", "check", "rule", "title", "label"):
+            value = gate.get(key)
+            if isinstance(value, str) and value.strip():
+                name = value.strip()
+                break
+        if not name:
+            name = f"{gate_key}_{idx + 1}"
+
+        severity = str(gate.get("severity") or gate.get("level") or "HARD").strip().upper()
+        if severity not in _QA_SEVERITIES:
+            severity = "HARD"
+        params = gate.get("params")
+        params_dict = dict(params) if isinstance(params, dict) else {}
+        for key in ("metric", "check", "rule", "threshold", "condition"):
+            if key in gate and key not in params_dict:
+                params_dict[key] = gate.get(key)
+
+        normalized: Dict[str, Any] = {
+            "name": name,
+            "severity": severity,
+            "params": params_dict,
+        }
+        for key in ("condition", "evidence_required", "action_if_fail"):
+            if key in gate and gate.get(key) not in (None, ""):
+                normalized[key] = gate.get(key)
+        return normalized
+
+    for gate_key in ("cleaning_gates", "qa_gates", "reviewer_gates"):
+        gates = contract.get(gate_key)
+        if not isinstance(gates, list):
+            continue
+        repaired = []
+        for idx, gate in enumerate(gates):
+            normalized = _normalize_gate(gate, gate_key, idx)
+            if normalized is not None:
+                repaired.append(normalized)
+        if repaired:
+            contract[gate_key] = repaired
+    return contract
+
+
+def _deterministic_repair_scope(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+    scope_raw = contract.get("scope")
+    scope = normalize_contract_scope(scope_raw) if scope_raw is not None else ""
+    if scope in {"cleaning_only", "ml_only", "full_pipeline"}:
+        contract["scope"] = scope
+        return contract
+
+    artifact_requirements = contract.get("artifact_requirements")
+    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
+    has_cleaning = bool(
+        isinstance(clean_dataset, dict)
+        or isinstance(contract.get("cleaning_gates"), list)
+        or contract.get("data_engineer_runbook")
+    )
+    has_ml = bool(
+        isinstance(contract.get("qa_gates"), list)
+        or isinstance(contract.get("reviewer_gates"), list)
+        or isinstance(contract.get("validation_requirements"), dict)
+        or contract.get("ml_engineer_runbook")
+    )
+
+    if has_cleaning and has_ml:
+        contract["scope"] = "full_pipeline"
+    elif has_cleaning:
+        contract["scope"] = "cleaning_only"
+    elif has_ml:
+        contract["scope"] = "ml_only"
+    return contract
+
+
+def _merge_contract_missing_fields(
+    primary: Dict[str, Any] | None,
+    fallback: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    result = copy.deepcopy(primary) if isinstance(primary, dict) else {}
+    source = fallback if isinstance(fallback, dict) else {}
+    for key, value in source.items():
+        if key not in result or result.get(key) in (None, "", [], {}):
+            result[key] = copy.deepcopy(value)
+            continue
+        current = result.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            result[key] = _merge_contract_missing_fields(current, value)
+    return result
+
+
+def _deep_merge_contract_override(
+    base: Dict[str, Any] | None,
+    patch: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    result = copy.deepcopy(base) if isinstance(base, dict) else {}
+    updates = patch if isinstance(patch, dict) else {}
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_contract_override(result.get(key), value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _apply_deterministic_repairs(contract: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+    repaired = copy.deepcopy(contract)
+    repaired = apply_contract_schema_registry_repairs(repaired)
+    repaired = _deterministic_repair_scope(repaired)
+    repaired = _deterministic_repair_gate_lists(repaired)
+    repaired = _deterministic_repair_required_feature_selectors(repaired)
+    repaired = _deterministic_repair_column_dtype_targets(repaired)
+    return repaired
+
+
 def build_contract_min(
     full_contract_or_partial: Dict[str, Any] | None,
     strategy: Dict[str, Any] | None,
@@ -2338,6 +2647,7 @@ def build_contract_min(
     relevant_columns: List[str] | None,
     target_candidates: List[Dict[str, Any]] | None = None,
     data_profile: Dict[str, Any] | None = None,
+    business_objective_hint: str = "",
 ) -> Dict[str, Any]:
     """
     Build a compact contract_min that aligns agents on relevant columns and gates.
@@ -2786,6 +3096,7 @@ def build_contract_min(
         "clean_dataset": {
             "required_columns": clean_dataset_required_columns,
             "output_path": "data/cleaned_data.csv",
+            "output_manifest_path": "data/cleaning_manifest.json",
             "excluded_constant_columns": dropped_constant_columns if dropped_constant_columns else [],
             "required_feature_selectors": feature_selectors if isinstance(feature_selectors, list) else [],
             "column_dtype_targets": column_dtype_targets,
@@ -2832,7 +3143,8 @@ def build_contract_min(
     business_objective = (
         contract.get("business_objective")
         or strategy_dict.get("business_objective")
-        or ""
+        or str(business_objective_hint or "").strip()
+        or "Objective not specified; produce reliable and actionable artifacts."
     )
     if business_objective and len(business_objective) > 2000:
         business_objective = business_objective[:2000]
@@ -2900,11 +3212,68 @@ def build_contract_min(
     if not isinstance(data_partitioning_notes, list):
         data_partitioning_notes = []
 
+    validation_requirements = contract.get("validation_requirements")
+    if not isinstance(validation_requirements, dict) or not validation_requirements:
+        validation_requirements = {
+            "method": "holdout",
+            "metrics_to_report": ["accuracy"],
+            "primary_metric": "accuracy",
+        }
+
+    objective_analysis = contract.get("objective_analysis")
+    if not isinstance(objective_analysis, dict) or not objective_analysis:
+        objective_analysis = {}
+    if not str(objective_analysis.get("problem_type") or "").strip():
+        objective_analysis = dict(objective_analysis)
+        objective_analysis["problem_type"] = str(objective_type or "unspecified").strip() or "unspecified"
+
+    evaluation_spec = contract.get("evaluation_spec")
+    if not isinstance(evaluation_spec, dict) or not evaluation_spec:
+        evaluation_spec = {}
+    if not str(evaluation_spec.get("objective_type") or "").strip():
+        evaluation_spec = dict(evaluation_spec)
+        evaluation_spec["objective_type"] = str(objective_type or "unspecified").strip() or "unspecified"
+
+    output_dialect = contract.get("output_dialect")
+    if not isinstance(output_dialect, dict):
+        output_dialect = {"sep": ",", "decimal": ".", "encoding": "utf-8"}
+    else:
+        output_dialect = {
+            "sep": str(output_dialect.get("sep") or ","),
+            "decimal": str(output_dialect.get("decimal") or "."),
+            "encoding": str(output_dialect.get("encoding") or "utf-8"),
+        }
+
+    iteration_policy = contract.get("iteration_policy")
+    if isinstance(iteration_policy, str):
+        iteration_policy = {"summary": iteration_policy.strip()} if iteration_policy.strip() else {}
+    if not isinstance(iteration_policy, dict) or not iteration_policy:
+        iteration_policy = {
+            "max_cleaning_retries": 2,
+            "max_training_retries": 2,
+            "max_total_attempts": 4,
+        }
+
+    scope = normalize_contract_scope(contract.get("scope"))
+    if scope not in {"cleaning_only", "ml_only", "full_pipeline"}:
+        has_cleaning = bool(artifact_requirements.get("clean_dataset"))
+        has_ml = bool(validation_requirements)
+        if has_cleaning and has_ml:
+            scope = "full_pipeline"
+        elif has_cleaning:
+            scope = "cleaning_only"
+        elif has_ml:
+            scope = "ml_only"
+        else:
+            scope = "full_pipeline"
+
     from src.utils.contract_accessors import CONTRACT_VERSION_V41, normalize_contract_version
     contract_min = {
         "contract_version": normalize_contract_version(contract.get("contract_version")),
-        "strategy_title": contract.get("strategy_title") or strategy_dict.get("title", ""),
+        "scope": scope,
+        "strategy_title": contract.get("strategy_title") or strategy_dict.get("title", "") or "Execution Plan",
         "business_objective": business_objective,
+        "output_dialect": output_dialect,
         "canonical_columns": canonical_columns,
         "outcome_columns": outcome_cols,
         "decision_columns": decision_cols,
@@ -2931,6 +3300,10 @@ def build_contract_min(
         "reporting_policy": reporting_policy or {},
         "decisioning_requirements": decisioning_requirements,
         "column_dtype_targets": column_dtype_targets,
+        "validation_requirements": validation_requirements,
+        "objective_analysis": objective_analysis,
+        "evaluation_spec": evaluation_spec,
+        "iteration_policy": iteration_policy,
     }
     if prep_reqs_min:
         contract_min["preprocessing_requirements"] = prep_reqs_min
@@ -4265,11 +4638,24 @@ class ExecutionPlannerAgent:
         else:
             resolved_api_key = api_key
         self.api_key = str(resolved_api_key).strip() if resolved_api_key not in (None, "") else None
+        max_output_tokens = 4000
+        try:
+            max_output_tokens = int(os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "4000"))
+        except Exception:
+            max_output_tokens = 4000
+        self._default_max_output_tokens = max(4000, max_output_tokens)
+        context_limit_tokens = 65536
+        try:
+            context_limit_tokens = int(os.getenv("EXECUTION_PLANNER_CONTEXT_WINDOW_TOKENS", "65536"))
+        except Exception:
+            context_limit_tokens = 65536
+        self._context_window_tokens = max(8192, context_limit_tokens)
         self._generation_config = {
             "temperature": 0.0,
             "top_p": 0.9,
             "top_k": 40,
             "response_mime_type": "application/json",
+            "max_output_tokens": self._default_max_output_tokens,
         }
         self._safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -4299,6 +4685,33 @@ class ExecutionPlannerAgent:
         self.last_response = None
         self.last_contract_diagnostics = None
 
+    @staticmethod
+    def _estimate_prompt_tokens(prompt: str) -> int:
+        # Simple approximation: Gemini tokenization is typically close to 3-4 chars/token in mixed JSON/text prompts.
+        if not isinstance(prompt, str) or not prompt:
+            return 1
+        return max(1, len(prompt) // 4)
+
+    def _generation_config_for_prompt(self, prompt: str) -> Dict[str, Any]:
+        prompt_tokens = self._estimate_prompt_tokens(prompt)
+        available = self._context_window_tokens - prompt_tokens - 500
+        if available <= 0:
+            budgeted_max = 1024
+        else:
+            budgeted_max = min(self._default_max_output_tokens, max(1024, int(available)))
+        config = dict(self._generation_config)
+        config["max_output_tokens"] = int(budgeted_max)
+        return config
+
+    def _generate_content_with_budget(self, model_client: Any, prompt: str):
+        generation_config = self._generation_config_for_prompt(prompt)
+        try:
+            response = model_client.generate_content(prompt, generation_config=generation_config)
+        except TypeError:
+            # Some mocks/stubs only accept the positional prompt argument.
+            response = model_client.generate_content(prompt)
+        return response, generation_config
+
     def _build_model_client(self, model_name: str) -> Any:
         if not self.api_key:
             return None
@@ -4324,6 +4737,8 @@ class ExecutionPlannerAgent:
         data_profile: Dict[str, Any] | None = None,
         run_id: str | None = None
     ) -> Dict[str, Any]:
+        deterministic_scaffold_contract: Dict[str, Any] = {}
+
         def _norm(name: str) -> str:
             return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
 
@@ -6971,10 +7386,11 @@ class ExecutionPlannerAgent:
             return "\n".join(lines) if lines else "No issues reported."
 
         def _validate_contract_quality(contract_payload: Dict[str, Any] | None) -> Dict[str, Any]:
+            payload_for_validation = _apply_deterministic_repairs(contract_payload if isinstance(contract_payload, dict) else {})
             base_result: Dict[str, Any]
             try:
                 base_result = validate_contract_minimal_readonly(
-                    copy.deepcopy(contract_payload or {}),
+                    copy.deepcopy(payload_for_validation or {}),
                     column_inventory=column_inventory,
                 )
             except Exception as val_err:
@@ -7260,6 +7676,11 @@ class ExecutionPlannerAgent:
                 "contract.required_outputs_path": (
                     "required_outputs must contain artifact file paths only (no conceptual labels)."
                 ),
+                "contract.column_dtype_targets": (
+                    "Each column_dtype_targets entry must be an object with key 'target_dtype' "
+                    "(NOT 'type'). Example: {\"target_dtype\": \"float64\", \"nullable\": false}. "
+                    "Replace all {\"type\": X} with {\"target_dtype\": X}."
+                ),
             }
             for issue in issues:
                 if not isinstance(issue, dict):
@@ -7268,7 +7689,7 @@ class ExecutionPlannerAgent:
                 if not rule or rule in seen:
                     continue
                 seen.add(rule)
-                action = rule_to_action.get(rule)
+                action = rule_to_action.get(rule) or get_contract_schema_repair_action(rule)
                 if action:
                     actions.append(f"- {action}")
                 else:
@@ -7324,14 +7745,21 @@ class ExecutionPlannerAgent:
                 "Repair the previous execution contract.\n"
                 "Return ONLY one valid JSON object (no markdown, no comments, no code fences).\n"
                 "Patch policy: keep unchanged valid fields stable; modify ONLY fields needed to resolve listed issues.\n"
+                "Schema registry examples:\n"
+                + CONTRACT_SCHEMA_EXAMPLES_TEXT
+                + "\n"
                 "scope MUST be one of: cleaning_only, ml_only, full_pipeline.\n"
                 "Do not invent columns outside column_inventory.\n"
                 "Use downstream_consumer_interface + evidence_policy from ORIGINAL INPUTS.\n"
+                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
+                "Example: {\"age\": {\"target_dtype\": \"float64\", \"nullable\": false}}.\n"
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
                 "column_roles MUST use canonical role buckets only: "
                 "pre_decision, decision, outcome, post_decision_audit_only, identifiers, time_columns, unknown.\n"
                 "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
+                "required_feature_selectors entries must be list[object] and each object must have key type.\n"
+                "Example: [{\"type\": \"prefix\", \"value\": \"feature_\"}, {\"type\": \"regex\", \"pattern\": \"^pixel_\\\\d+$\"}].\n"
                 "If cleaning requires dropping/scaling columns, declare them in "
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy}; "
                 "do not leave these decisions only in runbook prose.\n"
@@ -7355,6 +7783,7 @@ class ExecutionPlannerAgent:
                 "Gate lists must be executable by downstream views: use gate objects with "
                 "{name, severity, params} (severity in HARD|SOFT). If using metric/check/rule language, "
                 "map it to name and keep semantic details in params.\n"
+                "Gate example: {\"name\": \"no_nulls_target\", \"severity\": \"HARD\", \"params\": {\"column\": \"target\"}}.\n"
                 "Top-level minimum keys (required interface for executable views): "
                 + json.dumps(required_top_level)
                 + "\n\nTargeted fixes to apply first:\n"
@@ -7543,6 +7972,10 @@ class ExecutionPlannerAgent:
                 # Auto-normalise LLM format variants (nested dict, string shorthand, etc.)
                 item = _normalize_selector_entry(item)
                 selector_type = str(item.get("type") or "").strip().lower()
+                if not selector_type:
+                    selector_type = _infer_selector_type_from_payload(item)
+                    if selector_type:
+                        item["type"] = selector_type
                 if not selector_type:
                     errors.append(
                         f"artifact_requirements.clean_dataset.required_feature_selectors[{idx}] is missing type"
@@ -7915,11 +8348,18 @@ class ExecutionPlannerAgent:
                 f"GOAL: {section_goal}\n"
                 "Return ONLY one JSON object.\n"
                 "Do not include markdown, comments, or explanations.\n"
+                "Schema registry examples:\n"
+                + CONTRACT_SCHEMA_EXAMPLES_TEXT
+                + "\n"
                 "Use only data from ORIGINAL INPUTS; do not invent columns.\n"
                 "Use downstream_consumer_interface and evidence_policy from ORIGINAL INPUTS.\n"
                 "Keep semantics aligned with strategy/business objective.\n"
                 "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
+                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
+                "Example: {\"age\": {\"target_dtype\": \"float64\", \"nullable\": false}}.\n"
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
+                "required_feature_selectors entries must be list[object] and each object must have key type.\n"
+                "Example: [{\"type\": \"prefix\", \"value\": \"feature_\"}, {\"type\": \"regex\", \"pattern\": \"^pixel_\\\\d+$\"}].\n"
                 "If cleaning requires dropping/scaling columns, set "
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy} explicitly.\n"
                 "For wide feature families, scale_columns may use selector refs "
@@ -7940,6 +8380,7 @@ class ExecutionPlannerAgent:
                 "aligned with strategy/evidence so views can request the right visuals.\n"
                 "Gate lists must be executable by downstream views: each gate should expose a consumable identifier "
                 "(prefer name) and include severity + params.\n"
+                "Gate example: {\"name\": \"no_nulls_target\", \"severity\": \"HARD\", \"params\": {\"column\": \"target\"}}.\n"
                 f"Required keys for this section: {json.dumps(required_keys)}\n"
                 "If this section has no required keys for the selected scope, return {}.\n\n"
                 "ORIGINAL INPUTS:\n"
@@ -8054,12 +8495,19 @@ class ExecutionPlannerAgent:
                 "Return ONLY one JSON object.\n"
                 "No markdown, no comments.\n"
                 "Patch policy: edit only fields required by this SECTION and listed issues; preserve already valid content.\n"
+                "Schema registry examples:\n"
+                + CONTRACT_SCHEMA_EXAMPLES_TEXT
+                + "\n"
                 f"Required keys: {json.dumps(required_keys)}\n"
                 "Use ORIGINAL INPUTS as source of truth and keep compatibility with CURRENT CONTRACT DRAFT.\n"
                 "Use downstream_consumer_interface and evidence_policy from ORIGINAL INPUTS.\n"
                 "Do not invent columns not present in column_inventory.\n\n"
                 "Use artifact file paths for required_outputs.\n\n"
+                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
+                "Example: {\"age\": {\"target_dtype\": \"float64\", \"nullable\": false}}.\n"
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
+                "required_feature_selectors entries must be list[object] and each object must have key type.\n"
+                "Example: [{\"type\": \"prefix\", \"value\": \"feature_\"}, {\"type\": \"regex\", \"pattern\": \"^pixel_\\\\d+$\"}].\n"
                 "If cleaning requires dropping/scaling columns, set "
                 "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy} explicitly.\n"
                 "For wide feature families, scale_columns may use selector refs "
@@ -8079,6 +8527,7 @@ class ExecutionPlannerAgent:
                 "aligned with strategy/evidence so views can request the right visuals.\n\n"
                 "Gate lists must be executable by downstream views: each gate should expose a consumable identifier "
                 "(prefer name) and include severity + params.\n\n"
+                "Gate example: {\"name\": \"no_nulls_target\", \"severity\": \"HARD\", \"params\": {\"column\": \"target\"}}.\n\n"
                 "Targeted fixes:\n"
                 + targeted_actions
                 + "\n\n"
@@ -8146,7 +8595,13 @@ class ExecutionPlannerAgent:
                     "optional": True,
                 },
             ]
-            working_contract: Dict[str, Any] = {}
+            working_contract: Dict[str, Any] = (
+                copy.deepcopy(deterministic_scaffold_contract)
+                if isinstance(deterministic_scaffold_contract, dict) and deterministic_scaffold_contract
+                else {}
+            )
+            if working_contract:
+                working_contract = _apply_deterministic_repairs(working_contract)
             section_diag: List[Dict[str, Any]] = []
             invalid_candidate: Dict[str, Any] | None = None
             invalid_raw: str | None = None
@@ -8195,6 +8650,7 @@ class ExecutionPlannerAgent:
                         parse_error: Optional[Exception] = None
                         finish_reason = None
                         usage_metadata = None
+                        generation_config_used = None
                         parsed: Any = None
                         validation_errors: List[str] = []
                         parse_feedback: str | None = None
@@ -8204,7 +8660,10 @@ class ExecutionPlannerAgent:
                             if model_client is None:
                                 parse_error = ValueError(f"Planner client unavailable for model {model_name}")
                             else:
-                                response = model_client.generate_content(current_prompt)
+                                response, generation_config_used = self._generate_content_with_budget(
+                                    model_client,
+                                    current_prompt,
+                                )
                                 response_text = getattr(response, "text", "") or ""
                                 self.last_prompt = current_prompt
                                 self.last_response = response_text
@@ -8227,6 +8686,7 @@ class ExecutionPlannerAgent:
                             validation_errors = ["section output is not parseable JSON object"]
                         elif isinstance(parsed, dict):
                             payload = _extract_section_payload(parsed, required_keys)
+                            payload = _apply_deterministic_repairs(payload)
                             if optional_section:
                                 optional_keys = [key for key in required_keys if key in payload]
                                 validation_errors = (
@@ -8248,6 +8708,7 @@ class ExecutionPlannerAgent:
                                 )
                             if not validation_errors:
                                 working_contract = _merge_section_payload(working_contract, payload)
+                                working_contract = _apply_deterministic_repairs(working_contract)
                                 section_success = True
                                 parsed = payload
                             else:
@@ -8265,6 +8726,7 @@ class ExecutionPlannerAgent:
                                 "prompt_char_len": len(current_prompt or ""),
                                 "response_char_len": len(response_text or ""),
                                 "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                                "generation_config": generation_config_used,
                                 "usage_metadata": usage_metadata,
                                 "parse_error_type": type(parse_error).__name__ if parse_error else None,
                                 "parse_error_message": str(parse_error) if parse_error else None,
@@ -8277,7 +8739,7 @@ class ExecutionPlannerAgent:
                             break
 
                         if isinstance(parsed, dict) and parsed:
-                            best_payload = parsed
+                            best_payload = _merge_section_payload(working_contract, parsed)
                         if response_text and best_raw is None:
                             best_raw = response_text
                         if parse_feedback and best_parse is None:
@@ -8302,7 +8764,15 @@ class ExecutionPlannerAgent:
                     )
 
                 if not section_success and not optional_section:
-                    invalid_candidate = best_payload if isinstance(best_payload, dict) else None
+                    partial_contract = _merge_contract_missing_fields(
+                        _apply_deterministic_repairs(copy.deepcopy(working_contract)),
+                        deterministic_scaffold_contract,
+                    )
+                    invalid_candidate = (
+                        _merge_contract_missing_fields(best_payload, partial_contract)
+                        if isinstance(best_payload, dict)
+                        else partial_contract
+                    )
                     invalid_raw = best_raw
                     invalid_meta = {
                         "mode": "sectional",
@@ -8316,13 +8786,328 @@ class ExecutionPlannerAgent:
                         "invalid_raw": invalid_raw,
                         "invalid_meta": invalid_meta,
                         "section_diag": section_diag,
+                        "partial_contract": partial_contract,
                     }
 
-            return working_contract, {
+            final_contract = _merge_contract_missing_fields(
+                _apply_deterministic_repairs(working_contract),
+                deterministic_scaffold_contract,
+            )
+            return final_contract, {
                 "invalid_candidate": invalid_candidate,
                 "invalid_raw": invalid_raw,
                 "invalid_meta": invalid_meta,
                 "section_diag": section_diag,
+                "partial_contract": final_contract,
+            }
+
+        def _build_progressive_judgment_prompt(
+            *,
+            original_inputs_text: str,
+            scaffold_contract: Dict[str, Any],
+            allowed_fields: List[str],
+        ) -> str:
+            scaffold_compact = _compress_text_preserve_ends(
+                json.dumps(scaffold_contract or {}, ensure_ascii=False, indent=2),
+                max_chars=22000,
+                head=15000,
+                tail=7000,
+            )
+            return (
+                "You are Execution Contract Compiler in progressive mode.\n"
+                "Pass 1 (deterministic scaffold) is already provided.\n"
+                "Your task is Pass 2: provide only judgment-driven updates as a JSON patch object.\n"
+                "Return ONLY one valid JSON object (no markdown/comments).\n"
+                "The object may contain only keys listed in ALLOWED_PATCH_FIELDS.\n"
+                "Do not remove mandatory scaffold structure. You may override scaffold fields only with evidence.\n"
+                "Use ORIGINAL INPUTS as source of truth and keep compatibility with downstream consumers.\n"
+                "Schema registry examples:\n"
+                + CONTRACT_SCHEMA_EXAMPLES_TEXT
+                + "\n"
+                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
+                "required_feature_selectors entries must be list[object] and each object must include key type.\n"
+                "Gate lists must use executable objects: {name, severity, params}.\n"
+                f"ALLOWED_PATCH_FIELDS: {json.dumps(allowed_fields)}\n\n"
+                "ORIGINAL INPUTS:\n"
+                + (original_inputs_text or "")
+                + "\n\nDETERMINISTIC_SCAFFOLD_CONTRACT:\n"
+                + scaffold_compact
+            )
+
+        def _build_progressive_repair_prompt(
+            *,
+            original_inputs_text: str,
+            scaffold_contract: Dict[str, Any],
+            allowed_fields: List[str],
+            previous_candidate: Dict[str, Any] | None,
+            previous_validation: Dict[str, Any] | None,
+            previous_response_text: str | None,
+            previous_parse_feedback: str | None,
+        ) -> str:
+            validation_feedback = _compact_validation_feedback(previous_validation)
+            parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
+            previous_payload = (
+                json.dumps(previous_candidate, ensure_ascii=False, indent=2)
+                if isinstance(previous_candidate, dict)
+                else (previous_response_text or "")
+            )
+            previous_payload_compact = _compress_text_preserve_ends(
+                previous_payload,
+                max_chars=18000,
+                head=12000,
+                tail=6000,
+            )
+            scaffold_compact = _compress_text_preserve_ends(
+                json.dumps(scaffold_contract or {}, ensure_ascii=False, indent=2),
+                max_chars=22000,
+                head=15000,
+                tail=7000,
+            )
+            return (
+                "Repair the progressive judgment patch.\n"
+                "Return ONLY one valid JSON object (no markdown/comments).\n"
+                "Patch policy: preserve valid updates; change only what fixes listed issues.\n"
+                "The object may contain only keys listed in ALLOWED_PATCH_FIELDS.\n"
+                "Schema registry examples:\n"
+                + CONTRACT_SCHEMA_EXAMPLES_TEXT
+                + "\n"
+                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
+                "required_feature_selectors entries must be list[object] and each object must include key type.\n"
+                "Gate lists must use executable objects: {name, severity, params}.\n"
+                f"ALLOWED_PATCH_FIELDS: {json.dumps(allowed_fields)}\n\n"
+                "ORIGINAL INPUTS:\n"
+                + (original_inputs_text or "")
+                + "\n\nDETERMINISTIC_SCAFFOLD_CONTRACT:\n"
+                + scaffold_compact
+                + "\n\nValidation issues to fix:\n"
+                + validation_feedback
+                + "\n\nParse diagnostics:\n"
+                + parse_feedback
+                + "\n\nPrevious patch/candidate:\n"
+                + previous_payload_compact
+            )
+
+        def _compile_contract_progressive(
+            *,
+            original_inputs_text: str,
+            model_names: List[str],
+            scaffold_contract: Dict[str, Any],
+            max_rounds: int,
+        ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+            progressive_diag: List[Dict[str, Any]] = []
+            if not isinstance(scaffold_contract, dict) or not scaffold_contract:
+                return None, {
+                    "mode": "progressive",
+                    "accepted": False,
+                    "diag": progressive_diag,
+                    "reason": "missing_scaffold",
+                    "best_candidate": None,
+                    "best_validation": None,
+                    "best_raw": None,
+                    "best_parse_feedback": None,
+                }
+
+            allowed_fields = [
+                "scope",
+                "strategy_title",
+                "business_objective",
+                "output_dialect",
+                "canonical_columns",
+                "column_roles",
+                "column_dtype_targets",
+                "artifact_requirements",
+                "required_outputs",
+                "cleaning_gates",
+                "qa_gates",
+                "reviewer_gates",
+                "validation_requirements",
+                "data_engineer_runbook",
+                "ml_engineer_runbook",
+                "objective_analysis",
+                "evaluation_spec",
+                "iteration_policy",
+                "outlier_policy",
+                "reporting_policy",
+                "feature_engineering_plan",
+                "data_analysis",
+                "missing_columns_handling",
+                "execution_constraints",
+                "allowed_feature_sets",
+                "preprocessing_requirements",
+                "leakage_execution_plan",
+                "optimization_specification",
+                "segmentation_constraints",
+                "data_limited_mode",
+                "derived_columns",
+                "unknowns",
+                "assumptions",
+                "notes_for_engineers",
+            ]
+
+            best_candidate: Dict[str, Any] | None = None
+            best_validation: Dict[str, Any] | None = None
+            best_raw: str | None = None
+            best_parse_feedback: str | None = None
+            best_error_count: Optional[int] = None
+            best_warning_count: Optional[int] = None
+
+            current_prompt = _build_progressive_judgment_prompt(
+                original_inputs_text=original_inputs_text,
+                scaffold_contract=scaffold_contract,
+                allowed_fields=allowed_fields,
+            )
+            prompt_name = "prompt_progressive_r1.txt"
+
+            for round_idx in range(1, max_rounds + 1):
+                for model_idx, model_name in enumerate(model_names, start=1):
+                    response_name = f"response_progressive_r{round_idx}_m{model_idx}.txt"
+                    response_text = ""
+                    parse_error: Optional[Exception] = None
+                    finish_reason = None
+                    usage_metadata = None
+                    generation_config_used = None
+                    validation_result: Dict[str, Any] | None = None
+                    accepted = False
+                    parse_feedback: str | None = None
+
+                    try:
+                        model_client = self._build_model_client(model_name)
+                        if model_client is None:
+                            parse_error = ValueError(f"Planner client unavailable for model {model_name}")
+                        else:
+                            response, generation_config_used = self._generate_content_with_budget(
+                                model_client,
+                                current_prompt,
+                            )
+                            response_text = getattr(response, "text", "") or ""
+                            self.last_prompt = current_prompt
+                            self.last_response = response_text
+                            try:
+                                candidates = getattr(response, "candidates", None)
+                                if candidates:
+                                    finish_reason = getattr(candidates[0], "finish_reason", None)
+                            except Exception:
+                                finish_reason = None
+                            usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
+                    except Exception as err:
+                        parse_error = err
+
+                    _persist_attempt(prompt_name, response_name, current_prompt, response_text)
+
+                    parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
+                    if parse_exc:
+                        parse_error = parse_exc
+                        parse_feedback = _build_parse_feedback(response_text, parse_error)
+                    patch_payload: Dict[str, Any] | None = None
+                    candidate_contract: Dict[str, Any] | None = None
+                    if isinstance(parsed, dict):
+                        raw_patch = parsed.get("judgment_patch") if isinstance(parsed.get("judgment_patch"), dict) else parsed
+                        if isinstance(raw_patch, dict):
+                            patch_payload = {
+                                key: value
+                                for key, value in raw_patch.items()
+                                if key in allowed_fields
+                            }
+                            candidate_contract = _deep_merge_contract_override(scaffold_contract, patch_payload)
+                            candidate_contract = _apply_deterministic_repairs(candidate_contract)
+                            try:
+                                validation_result = _validate_contract_quality(copy.deepcopy(candidate_contract))
+                            except Exception as val_err:
+                                validation_result = {
+                                    "status": "error",
+                                    "accepted": False,
+                                    "issues": [
+                                        {
+                                            "severity": "error",
+                                            "rule": "contract_validation_exception",
+                                            "message": str(val_err),
+                                        }
+                                    ],
+                                    "summary": {"error_count": 1, "warning_count": 0},
+                                }
+                            accepted = _contract_is_accepted(validation_result)
+
+                            summary = validation_result.get("summary") if isinstance(validation_result, dict) else {}
+                            error_count = int(summary.get("error_count", 0)) if isinstance(summary, dict) else 9999
+                            warning_count = int(summary.get("warning_count", 0)) if isinstance(summary, dict) else 9999
+                            if (
+                                best_error_count is None
+                                or error_count < best_error_count
+                                or (
+                                    error_count == best_error_count
+                                    and (best_warning_count is None or warning_count < best_warning_count)
+                                )
+                            ):
+                                best_candidate = candidate_contract
+                                best_validation = validation_result
+                                best_raw = response_text
+                                best_parse_feedback = parse_feedback
+                                best_error_count = error_count
+                                best_warning_count = warning_count
+
+                    progressive_diag.append(
+                        {
+                            "compiler_mode": "progressive",
+                            "progressive_round": round_idx,
+                            "model_name": model_name,
+                            "prompt_char_len": len(current_prompt or ""),
+                            "response_char_len": len(response_text or ""),
+                            "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                            "generation_config": generation_config_used,
+                            "usage_metadata": usage_metadata,
+                            "parse_error_type": type(parse_error).__name__ if parse_error else None,
+                            "parse_error_message": str(parse_error) if parse_error else None,
+                            "quality_status": (
+                                str(validation_result.get("status") or "").lower()
+                                if isinstance(validation_result, dict)
+                                else None
+                            ),
+                            "quality_error_count": (
+                                int((validation_result.get("summary") or {}).get("error_count", 0))
+                                if isinstance(validation_result, dict)
+                                else None
+                            ),
+                            "quality_warning_count": (
+                                int((validation_result.get("summary") or {}).get("warning_count", 0))
+                                if isinstance(validation_result, dict)
+                                else None
+                            ),
+                            "quality_accepted": accepted,
+                        }
+                    )
+
+                    if accepted and isinstance(candidate_contract, dict):
+                        return candidate_contract, {
+                            "mode": "progressive",
+                            "accepted": True,
+                            "diag": progressive_diag,
+                            "best_candidate": candidate_contract,
+                            "best_validation": validation_result,
+                            "best_raw": response_text,
+                            "best_parse_feedback": parse_feedback,
+                        }
+
+                if round_idx >= max_rounds:
+                    break
+                prompt_name = f"prompt_progressive_r{round_idx + 1}.txt"
+                current_prompt = _build_progressive_repair_prompt(
+                    original_inputs_text=original_inputs_text,
+                    scaffold_contract=scaffold_contract,
+                    allowed_fields=allowed_fields,
+                    previous_candidate=best_candidate,
+                    previous_validation=best_validation,
+                    previous_response_text=best_raw,
+                    previous_parse_feedback=best_parse_feedback,
+                )
+
+            return None, {
+                "mode": "progressive",
+                "accepted": False,
+                "diag": progressive_diag,
+                "best_candidate": best_candidate,
+                "best_validation": best_validation,
+                "best_raw": best_raw,
+                "best_parse_feedback": best_parse_feedback,
             }
 
         def _build_contract_diagnostics(contract: Dict[str, Any], where: str, llm_success: bool) -> Dict[str, Any]:
@@ -8405,6 +9190,8 @@ class ExecutionPlannerAgent:
 
         def _finalize_and_persist(contract, where, llm_success: bool):
             if isinstance(contract, dict) and contract:
+                contract = _merge_contract_missing_fields(contract, deterministic_scaffold_contract)
+                contract = _apply_deterministic_repairs(contract)
                 contract = _ensure_contract_visual_policy(
                     contract=contract,
                     strategy=strategy if isinstance(strategy, dict) else {},
@@ -8468,6 +9255,23 @@ class ExecutionPlannerAgent:
                     resolved_target = resolved
                     break
 
+        deterministic_scaffold_contract: Dict[str, Any] = {}
+        deterministic_scaffold_build_error: str | None = None
+        try:
+            deterministic_scaffold_contract = build_contract_min(
+                full_contract_or_partial={},
+                strategy=strategy if isinstance(strategy, dict) else {},
+                column_inventory=column_inventory or [],
+                relevant_columns=relevant_columns,
+                target_candidates=target_candidates if isinstance(target_candidates, list) else [],
+                data_profile=data_profile if isinstance(data_profile, dict) else {},
+                business_objective_hint=business_objective,
+            )
+            deterministic_scaffold_contract = _apply_deterministic_repairs(deterministic_scaffold_contract)
+        except Exception as scaffold_err:
+            deterministic_scaffold_contract = {}
+            deterministic_scaffold_build_error = str(scaffold_err)
+
         strategy_json = json.dumps(strategy, indent=2)
         column_sets_payload = column_sets if isinstance(column_sets, dict) else {}
         column_sets_summary = summarize_column_sets(column_sets_payload) if column_sets_payload else ""
@@ -8528,6 +9332,14 @@ class ExecutionPlannerAgent:
             max_chars=2000,
             head=1300,
             tail=700,
+        )
+        deterministic_scaffold_compact = _compress_text_preserve_ends(
+            json.dumps(deterministic_scaffold_contract, ensure_ascii=False, indent=2)
+            if deterministic_scaffold_contract
+            else "{}",
+            max_chars=18000,
+            head=12000,
+            tail=6000,
         )
 
         user_input = f"""
@@ -8633,6 +9445,35 @@ evidence_policy:
 planner_semantic_resolution_policy:
 {json.dumps(PLANNER_SEMANTIC_RESOLUTION_POLICY_V1, indent=2)}
 
+progressive_contract_construction_policy:
+{json.dumps({
+    "pass_1_deterministic_scaffold": [
+        "scope",
+        "canonical_columns",
+        "column_roles",
+        "column_dtype_targets",
+        "artifact_requirements",
+        "required_outputs",
+    ],
+    "pass_2_llm_judgment_fields": [
+        "cleaning_gates",
+        "qa_gates",
+        "reviewer_gates",
+        "runbooks",
+        "evaluation_spec",
+        "validation_requirements",
+        "iteration_policy",
+        "outlier_policy",
+    ],
+    "llm_may_override_scaffold_with_evidence": True,
+}, indent=2)}
+
+deterministic_contract_scaffold:
+{deterministic_scaffold_compact}
+
+deterministic_contract_scaffold_build_error:
+{json.dumps(deterministic_scaffold_build_error)}
+
 contract_consistency_guardrails:
 {json.dumps({
     "required_columns_must_be_non_droppable": True,
@@ -8653,7 +9494,13 @@ domain_expert_critique:
 {critique_for_prompt or "None"}
 """
 
-        full_prompt = MINIMAL_CONTRACT_COMPILER_PROMPT + "\n\nINPUTS:\n" + user_input
+        full_prompt = (
+            MINIMAL_CONTRACT_COMPILER_PROMPT
+            + "\n\nSCHEMA REGISTRY EXAMPLES:\n"
+            + CONTRACT_SCHEMA_EXAMPLES_TEXT
+            + "\n\nINPUTS:\n"
+            + user_input
+        )
         model_chain = [m for m in (self.model_chain or [self.model_name]) if m]
 
         contract: Dict[str, Any] | None = None
@@ -8677,11 +9524,18 @@ domain_expert_critique:
 
         section_first_flag = str(os.getenv("EXECUTION_PLANNER_SECTION_FIRST", "1")).strip().lower()
         section_first_enabled = section_first_flag not in {"0", "false", "no", "off"}
+        progressive_flag = str(os.getenv("EXECUTION_PLANNER_PROGRESSIVE_MODE", "1")).strip().lower()
+        progressive_enabled = progressive_flag not in {"0", "false", "no", "off"}
         sectional_rounds = 2
         try:
             sectional_rounds = max(1, int(os.getenv("EXECUTION_PLANNER_SECTION_ROUNDS", "2")))
         except Exception:
             sectional_rounds = 2
+        progressive_rounds = 2
+        try:
+            progressive_rounds = max(1, int(os.getenv("EXECUTION_PLANNER_PROGRESSIVE_ROUNDS", "2")))
+        except Exception:
+            progressive_rounds = 2
 
         sectional_attempted = False
         sectional_contract_cached: Dict[str, Any] | None = None
@@ -8692,6 +9546,69 @@ domain_expert_critique:
         current_prompt = full_prompt
         current_prompt_name = "prompt_attempt_1.txt"
         attempt_counter = 0
+
+        if progressive_enabled and contract is None:
+            progressive_contract, progressive_payload = _compile_contract_progressive(
+                original_inputs_text=user_input,
+                model_names=model_chain,
+                scaffold_contract=deterministic_scaffold_contract,
+                max_rounds=progressive_rounds,
+            )
+            progressive_diag = progressive_payload.get("diag") if isinstance(progressive_payload, dict) else None
+            if isinstance(progressive_diag, list) and progressive_diag:
+                base_attempt_index = len(planner_diag)
+                for idx, row in enumerate(progressive_diag, start=1):
+                    if isinstance(row, dict):
+                        item = dict(row)
+                    else:
+                        item = {"compiler_mode": "progressive", "detail": str(row)}
+                    if "attempt_index" not in item:
+                        item["attempt_index"] = base_attempt_index + idx
+                    planner_diag.append(item)
+                attempt_counter = max(attempt_counter, len(planner_diag))
+            if isinstance(progressive_contract, dict) and progressive_contract:
+                contract = progressive_contract
+                llm_success = True
+                print("SUCCESS: Execution Planner succeeded via progressive two-pass compiler.")
+            else:
+                progressive_best_candidate = (
+                    progressive_payload.get("best_candidate")
+                    if isinstance(progressive_payload, dict)
+                    else None
+                )
+                progressive_best_validation = (
+                    progressive_payload.get("best_validation")
+                    if isinstance(progressive_payload, dict)
+                    else None
+                )
+                progressive_best_raw = (
+                    progressive_payload.get("best_raw")
+                    if isinstance(progressive_payload, dict)
+                    else None
+                )
+                progressive_best_parse_feedback = (
+                    progressive_payload.get("best_parse_feedback")
+                    if isinstance(progressive_payload, dict)
+                    else None
+                )
+                if isinstance(progressive_best_candidate, dict):
+                    best_candidate = progressive_best_candidate
+                if isinstance(progressive_best_validation, dict):
+                    best_validation = progressive_best_validation
+                    summary = progressive_best_validation.get("summary")
+                    if isinstance(summary, dict):
+                        try:
+                            best_error_count = int(summary.get("error_count", 0))
+                        except Exception:
+                            best_error_count = None
+                        try:
+                            best_warning_count = int(summary.get("warning_count", 0))
+                        except Exception:
+                            best_warning_count = None
+                if isinstance(progressive_best_raw, str):
+                    best_response_text = progressive_best_raw
+                if isinstance(progressive_best_parse_feedback, str):
+                    best_parse_feedback = progressive_best_parse_feedback
 
         if section_first_enabled:
             sectional_attempted = True
@@ -8726,6 +9643,11 @@ domain_expert_critique:
                     planner_diag.append(row)
 
             if isinstance(sectional_contract_cached, dict) and sectional_contract_cached:
+                sectional_contract_cached = _merge_contract_missing_fields(
+                    sectional_contract_cached,
+                    deterministic_scaffold_contract,
+                )
+                sectional_contract_cached = _apply_deterministic_repairs(sectional_contract_cached)
                 try:
                     sectional_validation_cached = _validate_contract_quality(copy.deepcopy(sectional_contract_cached))
                 except Exception as section_val_err:
@@ -8747,6 +9669,30 @@ domain_expert_critique:
                 contract = sectional_contract_cached
                 llm_success = True
                 print("SUCCESS: Execution Planner succeeded via sectional compiler (primary path).")
+            else:
+                sectional_partial = (
+                    sectional_payload_cached.get("partial_contract")
+                    if isinstance(sectional_payload_cached.get("partial_contract"), dict)
+                    else None
+                )
+                if isinstance(sectional_partial, dict) and sectional_partial:
+                    sectional_partial = _merge_contract_missing_fields(
+                        sectional_partial,
+                        deterministic_scaffold_contract,
+                    )
+                    sectional_partial = _apply_deterministic_repairs(sectional_partial)
+                    try:
+                        rescue_validation = _validate_contract_quality(copy.deepcopy(sectional_partial))
+                    except Exception:
+                        rescue_validation = None
+                    if _contract_is_accepted(rescue_validation):
+                        sectional_contract_cached = sectional_partial
+                        sectional_validation_cached = rescue_validation
+                        sectional_accepted_cached = True
+                        print(
+                            "INFO: Sectional partial contract rescued and cached; "
+                            "continuing full-contract generation for richer LLM output."
+                        )
 
         if contract is None:
             for quality_round in range(1, max_quality_rounds + 1):
@@ -8759,6 +9705,7 @@ domain_expert_critique:
                     parse_error: Optional[Exception] = None
                     finish_reason = None
                     usage_metadata = None
+                    generation_config_used = None
                     validation_result: Dict[str, Any] | None = None
                     quality_accepted = False
 
@@ -8772,7 +9719,10 @@ domain_expert_critique:
                         if model_client is None:
                             parse_error = ValueError(f"Planner client unavailable for model {model_name}")
                         else:
-                            response = model_client.generate_content(current_prompt)
+                            response, generation_config_used = self._generate_content_with_budget(
+                                model_client,
+                                current_prompt,
+                            )
                             response_text = getattr(response, "text", "") or ""
                             self.last_response = response_text
                     except Exception as err:
@@ -8800,8 +9750,13 @@ domain_expert_critique:
                     quality_error_message = None
                     if parsed is not None and isinstance(parsed, dict):
                         round_has_candidate = True
+                        candidate_for_validation = _merge_contract_missing_fields(
+                            parsed,
+                            deterministic_scaffold_contract,
+                        )
+                        candidate_for_validation = _apply_deterministic_repairs(candidate_for_validation)
                         try:
-                            validation_result = _validate_contract_quality(copy.deepcopy(parsed))
+                            validation_result = _validate_contract_quality(copy.deepcopy(candidate_for_validation))
                         except Exception as val_err:
                             validation_result = {
                                 "status": "error",
@@ -8815,7 +9770,7 @@ domain_expert_critique:
                                 ],
                                 "summary": {"error_count": 1, "warning_count": 0},
                             }
-                        latest_candidate_for_repair = parsed
+                        latest_candidate_for_repair = candidate_for_validation
                         latest_validation_for_repair = validation_result if isinstance(validation_result, dict) else None
                         latest_response_text_for_repair = response_text
                         latest_parse_feedback_for_repair = None
@@ -8852,7 +9807,7 @@ domain_expert_critique:
                                     and (best_warning_count is None or warning_count < best_warning_count)
                                 )
                             ):
-                                best_candidate = parsed
+                                best_candidate = candidate_for_validation
                                 best_validation = validation_result
                                 best_response_text = response_text
                                 best_error_count = error_count
@@ -8874,6 +9829,7 @@ domain_expert_critique:
                             "prompt_char_len": len(current_prompt or ""),
                             "response_char_len": len(response_text or ""),
                             "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                            "generation_config": generation_config_used,
                             "usage_metadata": usage_metadata,
                             "had_json_parse_error": bool(had_json_parse_error),
                             "parse_error_type": type(parse_error).__name__ if parse_error else None,
@@ -8914,7 +9870,8 @@ domain_expert_critique:
                         print(f"WARNING: Planner contract rejected by quality gate on attempt {attempt_counter} (model={model_name}).")
                         continue
 
-                    contract = parsed
+                    contract = _merge_contract_missing_fields(parsed, deterministic_scaffold_contract)
+                    contract = _apply_deterministic_repairs(contract)
                     llm_success = True
                     break
 
@@ -8995,6 +9952,11 @@ domain_expert_critique:
                         planner_diag.append(row)
 
                 if isinstance(sectional_contract, dict) and sectional_contract:
+                    sectional_contract = _merge_contract_missing_fields(
+                        sectional_contract,
+                        deterministic_scaffold_contract,
+                    )
+                    sectional_contract = _apply_deterministic_repairs(sectional_contract)
                     try:
                         sectional_validation = _validate_contract_quality(copy.deepcopy(sectional_contract))
                     except Exception as section_val_err:
@@ -9017,14 +9979,218 @@ domain_expert_critique:
                 llm_success = True
                 print("SUCCESS: Execution Planner succeeded via sectional compiler fallback.")
             else:
-                contract = {}
-                llm_success = False
+                fallback_attempts: List[Dict[str, Any]] = []
+
+                def _record_fallback_attempt(source: str, validation: Dict[str, Any] | None) -> None:
+                    summary = validation.get("summary") if isinstance(validation, dict) else {}
+                    fallback_attempts.append(
+                        {
+                            "source": source,
+                            "accepted": _contract_is_accepted(validation),
+                            "status": (validation.get("status") if isinstance(validation, dict) else None),
+                            "error_count": int(summary.get("error_count", 0)) if isinstance(summary, dict) else None,
+                            "warning_count": int(summary.get("warning_count", 0)) if isinstance(summary, dict) else None,
+                        }
+                    )
+
+                accepted_fallback_contract: Dict[str, Any] | None = None
+                accepted_fallback_source = ""
+
+                fallback_candidates: List[Tuple[str, Dict[str, Any]]] = []
+                if isinstance(best_candidate, dict) and best_candidate:
+                    fallback_candidates.append(("best_candidate", best_candidate))
+                partial_from_sectional = (
+                    sectional_payload.get("partial_contract")
+                    if isinstance(sectional_payload.get("partial_contract"), dict)
+                    else None
+                )
+                if isinstance(partial_from_sectional, dict) and partial_from_sectional:
+                    fallback_candidates.append(("sectional_partial_contract", partial_from_sectional))
+                invalid_from_sectional = (
+                    sectional_payload.get("invalid_candidate")
+                    if isinstance(sectional_payload.get("invalid_candidate"), dict)
+                    else None
+                )
+                if isinstance(invalid_from_sectional, dict) and invalid_from_sectional:
+                    fallback_candidates.append(("sectional_invalid_candidate", invalid_from_sectional))
+                if isinstance(sectional_contract, dict) and sectional_contract:
+                    fallback_candidates.append(("sectional_contract_raw", sectional_contract))
+
+                dedup_seen: set[str] = set()
+                for source, raw_candidate in fallback_candidates:
+                    fingerprint = json.dumps(raw_candidate, sort_keys=True, ensure_ascii=False)
+                    if fingerprint in dedup_seen:
+                        continue
+                    dedup_seen.add(fingerprint)
+                    candidate = _merge_contract_missing_fields(raw_candidate, deterministic_scaffold_contract)
+                    candidate = _apply_deterministic_repairs(candidate)
+                    try:
+                        validation = _validate_contract_quality(copy.deepcopy(candidate))
+                    except Exception as candidate_err:
+                        validation = {
+                            "status": "error",
+                            "accepted": False,
+                            "issues": [
+                                {
+                                    "severity": "error",
+                                    "rule": "contract_validation_exception",
+                                    "message": str(candidate_err),
+                                }
+                            ],
+                            "summary": {"error_count": 1, "warning_count": 0},
+                        }
+                    _record_fallback_attempt(source, validation)
+                    if _contract_is_accepted(validation):
+                        accepted_fallback_contract = candidate
+                        accepted_fallback_source = source
+                        break
+
+                if accepted_fallback_contract is None:
+                    scaffold_candidate = _apply_deterministic_repairs(
+                        _merge_contract_missing_fields({}, deterministic_scaffold_contract)
+                    )
+                    if scaffold_candidate:
+                        try:
+                            scaffold_validation = _validate_contract_quality(copy.deepcopy(scaffold_candidate))
+                        except Exception as scaffold_err:
+                            scaffold_validation = {
+                                "status": "error",
+                                "accepted": False,
+                                "issues": [
+                                    {
+                                        "severity": "error",
+                                        "rule": "contract_validation_exception",
+                                        "message": str(scaffold_err),
+                                    }
+                                ],
+                                "summary": {"error_count": 1, "warning_count": 0},
+                            }
+                        _record_fallback_attempt("deterministic_scaffold", scaffold_validation)
+                        if _contract_is_accepted(scaffold_validation):
+                            accepted_fallback_contract = scaffold_candidate
+                            accepted_fallback_source = "deterministic_scaffold"
+
+                if accepted_fallback_contract is None:
+                    contract_min_seed = (
+                        best_candidate
+                        if isinstance(best_candidate, dict)
+                        else (
+                            partial_from_sectional
+                            if isinstance(partial_from_sectional, dict)
+                            else {}
+                        )
+                    )
+                    try:
+                        contract_min = build_contract_min(
+                            full_contract_or_partial=contract_min_seed,
+                            strategy=strategy if isinstance(strategy, dict) else {},
+                            column_inventory=column_inventory or [],
+                            relevant_columns=relevant_columns,
+                            target_candidates=target_candidates if isinstance(target_candidates, list) else [],
+                            data_profile=data_profile if isinstance(data_profile, dict) else {},
+                            business_objective_hint=business_objective,
+                        )
+                    except Exception as contract_min_err:
+                        contract_min = {}
+                        fallback_attempts.append(
+                            {
+                                "source": "build_contract_min_exception",
+                                "accepted": False,
+                                "status": "error",
+                                "error": str(contract_min_err),
+                            }
+                        )
+
+                    if isinstance(contract_min, dict) and contract_min:
+                        merged_contract_min = _merge_contract_missing_fields(
+                            _apply_deterministic_repairs(contract_min_seed if isinstance(contract_min_seed, dict) else {}),
+                            contract_min,
+                        )
+                        merged_contract_min = _merge_contract_missing_fields(
+                            merged_contract_min,
+                            deterministic_scaffold_contract,
+                        )
+                        merged_contract_min = _apply_deterministic_repairs(merged_contract_min)
+                        try:
+                            merged_validation = _validate_contract_quality(copy.deepcopy(merged_contract_min))
+                        except Exception as merged_err:
+                            merged_validation = {
+                                "status": "error",
+                                "accepted": False,
+                                "issues": [
+                                    {
+                                        "severity": "error",
+                                        "rule": "contract_validation_exception",
+                                        "message": str(merged_err),
+                                    }
+                                ],
+                                "summary": {"error_count": 1, "warning_count": 0},
+                            }
+                        _record_fallback_attempt("build_contract_min_merged", merged_validation)
+                        if _contract_is_accepted(merged_validation):
+                            accepted_fallback_contract = merged_contract_min
+                            accepted_fallback_source = "build_contract_min_merged"
+                        else:
+                            contract_min_only = _apply_deterministic_repairs(contract_min)
+                            try:
+                                min_validation = _validate_contract_quality(copy.deepcopy(contract_min_only))
+                            except Exception as min_err:
+                                min_validation = {
+                                    "status": "error",
+                                    "accepted": False,
+                                    "issues": [
+                                        {
+                                            "severity": "error",
+                                            "rule": "contract_validation_exception",
+                                            "message": str(min_err),
+                                        }
+                                    ],
+                                    "summary": {"error_count": 1, "warning_count": 0},
+                                }
+                            _record_fallback_attempt("build_contract_min_only", min_validation)
+                            if _contract_is_accepted(min_validation):
+                                accepted_fallback_contract = contract_min_only
+                                accepted_fallback_source = "build_contract_min_only"
+
+                if isinstance(accepted_fallback_contract, dict) and accepted_fallback_contract:
+                    contract = accepted_fallback_contract
+                    llm_success = True
+                    print(
+                        "SUCCESS: Execution Planner recovered with deterministic fallback "
+                        f"({accepted_fallback_source})."
+                    )
+                else:
+                    best_effort_contract = (
+                        best_candidate
+                        if isinstance(best_candidate, dict) and best_candidate
+                        else (
+                            partial_from_sectional
+                            if isinstance(partial_from_sectional, dict) and partial_from_sectional
+                            else (
+                                invalid_from_sectional
+                                if isinstance(invalid_from_sectional, dict) and invalid_from_sectional
+                                else (
+                                    sectional_contract
+                                    if isinstance(sectional_contract, dict) and sectional_contract
+                                    else deterministic_scaffold_contract
+                                )
+                            )
+                        )
+                    )
+                    contract = _apply_deterministic_repairs(
+                        _merge_contract_missing_fields(
+                            best_effort_contract if isinstance(best_effort_contract, dict) else {},
+                            deterministic_scaffold_contract,
+                        )
+                    )
+                    llm_success = False
+
                 planner_candidate_invalid = (
                     best_candidate
                     if isinstance(best_candidate, dict)
                     else (
-                        sectional_payload.get("invalid_candidate")
-                        if isinstance(sectional_payload.get("invalid_candidate"), dict)
+                        invalid_from_sectional
+                        if isinstance(invalid_from_sectional, dict)
                         else (sectional_contract if isinstance(sectional_contract, dict) else None)
                     )
                 )
@@ -9047,6 +10213,7 @@ domain_expert_critique:
                         if isinstance(sectional_payload.get("invalid_meta"), dict)
                         else {}
                     ),
+                    "fallback_attempts": fallback_attempts,
                 }
 
         if llm_success and resolved_target:
