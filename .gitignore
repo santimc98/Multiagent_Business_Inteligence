@@ -75,6 +75,7 @@ data/report_artifact_manifest.json
 data/report_visual_tables.json
 data/plan.json
 data/qa_static_facts.json
+data/translator_quality_check.json
 data/strategy_spec.json
 data/contract_min.json
 data/run_facts_pack.json
