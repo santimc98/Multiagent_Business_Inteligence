@@ -11,7 +11,7 @@ class FakeOpenAI:
 
 def test_incomplete_reprompt_context_has_contract_and_outputs(monkeypatch):
     monkeypatch.setenv("ML_ENGINEER_PROVIDER", "zai")
-    monkeypatch.setenv("ZAI_API_KEY", "dummy-zai")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", FakeOpenAI)
 
     agent = MLEngineerAgent()
@@ -43,7 +43,7 @@ def test_incomplete_reprompt_context_has_contract_and_outputs(monkeypatch):
 
 def test_reprompt_context_includes_critical_errors(monkeypatch):
     monkeypatch.setenv("ML_ENGINEER_PROVIDER", "zai")
-    monkeypatch.setenv("ZAI_API_KEY", "dummy-zai")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", FakeOpenAI)
 
     agent = MLEngineerAgent()

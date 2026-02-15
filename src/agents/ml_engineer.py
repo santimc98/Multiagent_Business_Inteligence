@@ -89,78 +89,64 @@ DEFAULT_PLAN: Dict[str, Any] = {
 class MLEngineerAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the ML Engineer Agent with the configured provider.
+        Initializes the ML Engineer Agent with OpenRouter only.
+        Model routing is fully controlled via:
+        - OPENROUTER_ML_PRIMARY_MODEL
+        - OPENROUTER_ML_FALLBACK_MODEL
         """
         self.logger = logging.getLogger(__name__)
-        self.provider = (os.getenv("ML_ENGINEER_PROVIDER", "openrouter") or "openrouter").strip().lower()
+        configured_provider = (os.getenv("ML_ENGINEER_PROVIDER", "openrouter") or "openrouter").strip().lower()
+        if configured_provider and configured_provider != "openrouter":
+            self.logger.warning(
+                "ML_ENGINEER_PROVIDER=%s ignored; forcing provider=openrouter",
+                configured_provider,
+            )
+        self.provider = "openrouter"
         self.fallback_model_name = None
         self.last_model_used = None
         self.last_fallback_reason = None
         self.last_training_policy_warnings = None
-        if self.provider == "zai":
-            self.api_key = api_key or os.getenv("ZAI_API_KEY") or os.getenv("GLM_API_KEY")
-            if not self.api_key:
-                raise ValueError("Z.ai API Key is required.")
-            self.client = OpenAI(
-                api_key=self.api_key,
-                base_url="https://api.z.ai/api/paas/v4/",
-                timeout=None,
-            )
-            self.model_name = os.getenv("ZAI_MODEL") or os.getenv("GLM_MODEL") or "glm-4.7"
-        elif self.provider == "openrouter":
-            self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
-            if not self.api_key:
-                raise ValueError("OpenRouter API Key is required.")
-            timeout_raw = os.getenv("OPENROUTER_TIMEOUT_SECONDS")
-            try:
-                timeout_seconds = float(timeout_raw) if timeout_raw else 120.0
-            except ValueError:
-                timeout_seconds = 120.0
-            headers = {}
-            referer = os.getenv("OPENROUTER_HTTP_REFERER")
-            if referer:
-                headers["HTTP-Referer"] = referer
-            title = os.getenv("OPENROUTER_X_TITLE")
-            if title:
-                headers["X-Title"] = title
-            client_kwargs = {
-                "api_key": self.api_key,
-                "base_url": "https://openrouter.ai/api/v1",
-                "timeout": timeout_seconds,
-            }
-            if headers:
-                client_kwargs["default_headers"] = headers
-            self.client = OpenAI(**client_kwargs)
-            self.model_name = (
-                os.getenv("ML_ENGINEER_PRIMARY_MODEL")
-                or os.getenv("OPENROUTER_ML_PRIMARY_MODEL")
-                or "moonshotai/kimi-k2.5"
-            )
-            self.fallback_model_name = (
-                os.getenv("ML_ENGINEER_FALLBACK_MODEL")
-                or os.getenv("OPENROUTER_ML_FALLBACK_MODEL")
-                or "minimax/minimax-m2.5"
-            )
-        elif self.provider == "deepseek":
-            self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
-            if not self.api_key:
-                raise ValueError("DeepSeek API Key is required.")
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        if not self.api_key:
+            raise ValueError("OpenRouter API Key is required.")
+        timeout_raw = os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+        try:
+            timeout_seconds = float(timeout_raw) if timeout_raw else 120.0
+        except ValueError:
+            timeout_seconds = 120.0
+        headers = {}
+        referer = os.getenv("OPENROUTER_HTTP_REFERER")
+        if referer:
+            headers["HTTP-Referer"] = referer
+        title = os.getenv("OPENROUTER_X_TITLE")
+        if title:
+            headers["X-Title"] = title
+        client_kwargs = {
+            "api_key": self.api_key,
+            "base_url": "https://openrouter.ai/api/v1",
+            "timeout": timeout_seconds,
+        }
+        if headers:
+            client_kwargs["default_headers"] = headers
+        self.client = OpenAI(**client_kwargs)
 
-            self.client = OpenAI(
-                api_key=self.api_key,
-                base_url="https://api.deepseek.com",
-                timeout=None,
-            )
-            self.model_name = "deepseek-reasoner"
-        elif self.provider in {"google", "gemini"}:
-            self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
-            if not self.api_key:
-                raise ValueError("Google API Key is required.")
-            from google import genai
-            self.client = genai.Client(api_key=self.api_key)
-            self.model_name = os.getenv("ML_ENGINEER_MODEL", "gemini-3-flash-preview") or "gemini-3-flash-preview"
-        else:
-            raise ValueError(f"Unsupported ML_ENGINEER_PROVIDER: {self.provider}")
+        self.model_name = (
+            os.getenv("OPENROUTER_ML_PRIMARY_MODEL")
+            or "moonshotai/kimi-k2.5"
+        ).strip()
+        self.fallback_model_name = (
+            os.getenv("OPENROUTER_ML_FALLBACK_MODEL")
+            or "minimax/minimax-m2.5"
+        ).strip()
+        if not self.model_name:
+            self.model_name = "moonshotai/kimi-k2.5"
+        if not self.fallback_model_name:
+            self.fallback_model_name = "minimax/minimax-m2.5"
+        self.logger.info(
+            "ML_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s",
+            self.model_name,
+            self.fallback_model_name,
+        )
         self.last_prompt = None
         self.last_response = None
 
@@ -1252,93 +1238,31 @@ class MLEngineerAgent:
         return deduped
 
     def _execute_llm_call(self, sys_prompt: str, usr_prompt: str, temperature: float = 0.1) -> str:
-        """Helper to execute LLM call with current provider."""
+        """Helper to execute plan-stage LLM call through OpenRouter."""
         model_name = self.model_name
-        
-        # Determine label
-        if self.provider in {"google", "gemini"}:
-            provider_label = "Google"
-        elif self.provider == "zai":
-            provider_label = "Z.ai"
-        elif self.provider == "openrouter":
-            provider_label = "OpenRouter"
-        else:
-            provider_label = "DeepSeek"
-            
+
         self.last_prompt = sys_prompt + "\n\nUSER:\n" + usr_prompt
-        print(f"DEBUG: ML Engineer (Plan) calling {provider_label} Model ({model_name})...")
-        
+        print(f"DEBUG: ML Engineer (Plan) calling OpenRouter Model ({model_name})...")
+
         try:
-            if self.provider == "zai":
-                from src.utils.llm_throttle import glm_call_slot
-                with glm_call_slot():
-                    response = self.client.chat.completions.create(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": sys_prompt},
-                            {"role": "user", "content": usr_prompt}
-                        ],
-                        temperature=temperature,
-                    )
-                return response.choices[0].message.content
-            elif self.provider == "openrouter":
-                messages = [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": usr_prompt},
-                ]
-                response, model_used = call_chat_with_fallback(
-                    self.client,
-                    messages,
-                    [self.model_name, self.fallback_model_name],
-                    call_kwargs={"temperature": temperature},
-                    logger=self.logger,
-                    context_tag="ml_engineer_plan",
-                )
-                self.last_model_used = model_used
-                self.logger.info("ML_ENGINEER_MODEL_USED: %s", model_used)
-                content = extract_response_text(response)
-                if not content:
-                    raise ValueError("EMPTY_COMPLETION")
-                return content
-            elif self.provider in {"google", "gemini"}:
-                full_prompt = sys_prompt + "\n\nUSER INPUT:\n" + usr_prompt
-                from google.genai import types
-                
-                # Thinking config logic
-                thinking_level = (os.getenv("ML_ENGINEER_THINKING_LEVEL") or "high").strip().lower()
-                if thinking_level not in {"minimal", "low", "medium", "high"}:
-                    thinking_level = "high"
-                    
-                response = self.client.models.generate_content(
-                    model=model_name,
-                    contents=full_prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=temperature,
-                        top_p=0.9,
-                        top_k=40,
-                        max_output_tokens=8192,
-                        candidate_count=1,
-                        thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
-                        safety_settings=[
-                            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
-                            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
-                            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
-                            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
-                        ],
-                    ),
-                )
-                return getattr(response, "text", "")
-            else:
-                # Deepseek or fallback
-                response = self.client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": usr_prompt}
-                    ],
-                    temperature=temperature,
-                )
-                return response.choices[0].message.content
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": usr_prompt},
+            ]
+            response, model_used = call_chat_with_fallback(
+                self.client,
+                messages,
+                [self.model_name, self.fallback_model_name],
+                call_kwargs={"temperature": temperature},
+                logger=self.logger,
+                context_tag="ml_engineer_plan",
+            )
+            self.last_model_used = model_used
+            self.logger.info("ML_ENGINEER_MODEL_USED: %s", model_used)
+            content = extract_response_text(response)
+            if not content:
+                raise ValueError("EMPTY_COMPLETION")
+            return content
         except Exception as e:
             # Check for 504
             if "504" in str(e):
@@ -2444,19 +2368,8 @@ $strategy_json
         else:
             current_temp = base_temp
 
-        thinking_level = (os.getenv("ML_ENGINEER_THINKING_LEVEL") or "high").strip().lower()
-        if thinking_level not in {"minimal", "low", "medium", "high"}:
-            thinking_level = "high"
-
         from src.utils.retries import call_with_retries
-        if self.provider in {"google", "gemini"}:
-            provider_label = "Google"
-        elif self.provider == "zai":
-            provider_label = "Z.ai"
-        elif self.provider == "openrouter":
-            provider_label = "OpenRouter"
-        else:
-            provider_label = "DeepSeek"
+        provider_label = "OpenRouter"
 
         def _call_model_with_prompts(
             sys_prompt: str,
@@ -2466,60 +2379,15 @@ $strategy_json
         ) -> str:
             self.last_prompt = sys_prompt + "\n\nUSER:\n" + usr_prompt
             print(f"DEBUG: ML Engineer calling {provider_label} Model ({model_name})...")
-            if self.provider == "zai":
-                from src.utils.llm_throttle import glm_call_slot
-                with glm_call_slot():
-                    response = self.client.chat.completions.create(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": sys_prompt},
-                            {"role": "user", "content": usr_prompt}
-                        ],
-                        temperature=temperature,
-                    )
-                content = response.choices[0].message.content
-            elif self.provider == "openrouter":
-                response = self.client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": usr_prompt}
-                    ],
-                    temperature=temperature,
-                )
-                content = response.choices[0].message.content
-            elif self.provider in {"google", "gemini"}:
-                full_prompt = sys_prompt + "\n\nUSER INPUT:\n" + usr_prompt
-                from google.genai import types
-                response = self.client.models.generate_content(
-                    model=model_name,
-                    contents=full_prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=temperature,
-                        top_p=0.9,
-                        top_k=40,
-                        max_output_tokens=8192,
-                        candidate_count=1,
-                        thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
-                        safety_settings=[
-                            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
-                            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
-                            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
-                            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
-                        ],
-                    ),
-                )
-                content = getattr(response, "text", "")
-            else:
-                response = self.client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": usr_prompt}
-                    ],
-                    temperature=temperature,
-                )
-                content = response.choices[0].message.content
+            response = self.client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": usr_prompt}
+                ],
+                temperature=temperature,
+            )
+            content = response.choices[0].message.content
             self.last_response = content
             
             # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
@@ -2538,48 +2406,39 @@ $strategy_json
 
         try:
             self.last_fallback_reason = None
-            if self.provider == "openrouter":
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ]
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ]
 
-                def _call_openrouter():
-                    self.last_prompt = system_prompt + "\n\nUSER:\n" + user_message
-                    response, model_used = call_chat_with_fallback(
-                        self.client,
-                        messages,
-                        [self.model_name, self.fallback_model_name],
-                        call_kwargs={"temperature": current_temp},
-                        logger=self.logger,
-                        context_tag="ml_engineer",
-                    )
-                    if model_used != self.model_name:
-                        self.last_fallback_reason = "fallback_used"
-                    self.last_model_used = model_used
-                    self.logger.info("ML_ENGINEER_MODEL_USED: %s", model_used)
-                    content = extract_response_text(response)
-                    if not content:
-                        raise ValueError("EMPTY_COMPLETION")
-                    self.last_response = content
-                    if "504 Gateway Time-out" in content or "<html" in content.lower():
-                        raise ConnectionError("LLM Server Timeout (504 Received)")
-                    return content
+            def _call_openrouter():
+                self.last_prompt = system_prompt + "\n\nUSER:\n" + user_message
+                response, model_used = call_chat_with_fallback(
+                    self.client,
+                    messages,
+                    [self.model_name, self.fallback_model_name],
+                    call_kwargs={"temperature": current_temp},
+                    logger=self.logger,
+                    context_tag="ml_engineer",
+                )
+                if model_used != self.model_name:
+                    self.last_fallback_reason = "fallback_used"
+                self.last_model_used = model_used
+                self.logger.info("ML_ENGINEER_MODEL_USED: %s", model_used)
+                content = extract_response_text(response)
+                if not content:
+                    raise ValueError("EMPTY_COMPLETION")
+                self.last_response = content
+                if "504 Gateway Time-out" in content or "<html" in content.lower():
+                    raise ConnectionError("LLM Server Timeout (504 Received)")
+                return content
 
-                content = call_with_retries(
-                    _call_openrouter,
-                    max_retries=5,
-                    backoff_factor=2,
-                    initial_delay=2,
-                )
-            else:
-                content = call_with_retries(
-                    lambda: _call_model_with_prompts(system_prompt, user_message, current_temp, self.model_name),
-                    max_retries=5,
-                    backoff_factor=2,
-                    initial_delay=2,
-                )
-                self.last_model_used = self.model_name
+            content = call_with_retries(
+                _call_openrouter,
+                max_retries=5,
+                backoff_factor=2,
+                initial_delay=2,
+            )
             print(f"DEBUG: {provider_label} response received.")
             code = self._clean_code(content)
             if code.strip().startswith("{") or code.strip().startswith("["):

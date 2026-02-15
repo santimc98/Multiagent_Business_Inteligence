@@ -57,15 +57,21 @@ class DataEngineerAgent:
         self.client = OpenAI(**client_kwargs)
 
         self.model_name = (
-            os.getenv("DATA_ENGINEER_PRIMARY_MODEL")
-            or os.getenv("OPENROUTER_DE_PRIMARY_MODEL")
-            or os.getenv("DEEPSEEK_DE_PRIMARY_MODEL")
+            os.getenv("OPENROUTER_DE_PRIMARY_MODEL")
             or "moonshotai/kimi-k2.5"
-        )
+        ).strip()
         self.fallback_model_name = (
-            os.getenv("DATA_ENGINEER_FALLBACK_MODEL")
-            or os.getenv("OPENROUTER_DE_FALLBACK_MODEL")
+            os.getenv("OPENROUTER_DE_FALLBACK_MODEL")
             or "minimax/minimax-m2.5"
+        ).strip()
+        if not self.model_name:
+            self.model_name = "moonshotai/kimi-k2.5"
+        if not self.fallback_model_name:
+            self.fallback_model_name = "minimax/minimax-m2.5"
+        self.logger.info(
+            "DATA_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s",
+            self.model_name,
+            self.fallback_model_name,
         )
 
         self.last_prompt = None
