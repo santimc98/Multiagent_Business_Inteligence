@@ -77,6 +77,7 @@ def convert_dataset_profile_to_data_profile(
     outcome_analysis = {}
     outcome_cols = _extract_outcome_columns(contract)
     cardinality = dataset_profile.get("cardinality", {})
+    compute_hints = dataset_profile.get("compute_hints") if isinstance(dataset_profile.get("compute_hints"), dict) else {}
 
     for outcome_col in outcome_cols:
         if outcome_col not in columns:
@@ -113,6 +114,12 @@ def convert_dataset_profile_to_data_profile(
                     class_counts[val] = int(tv.get("count", 0))
             analysis_entry["n_classes"] = len(class_counts) if class_counts else n_unique
             analysis_entry["class_counts"] = class_counts
+            if class_counts:
+                min_class = min(class_counts.values())
+                max_class = max(class_counts.values())
+                total_classes = sum(class_counts.values())
+                analysis_entry["class_imbalance_ratio"] = round(float(min_class / max(max_class, 1)), 6)
+                analysis_entry["minority_class_share"] = round(float(min_class / max(total_classes, 1)), 6)
 
         outcome_analysis[outcome_col] = analysis_entry
 
@@ -193,6 +200,7 @@ def convert_dataset_profile_to_data_profile(
         "text_summary": dataset_profile.get("text_summary", {}),
         "duplicate_stats": dataset_profile.get("duplicate_stats", {}),
         "sampling": dataset_profile.get("sampling", {}),
+        "compute_hints": compute_hints,
         "sampling_uncertainty": {
             "is_uncertain_for_column_level_deterministic_inference": sampled_profile_uncertain,
             "sample_rows": sample_rows,

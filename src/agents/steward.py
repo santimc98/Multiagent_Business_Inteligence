@@ -1036,6 +1036,30 @@ def build_dataset_profile(
         duplicate_rows = 0
         duplicate_frac = 0.0
 
+    rows_for_compute = int(df.shape[0])
+    if isinstance(sampling_metadata, dict):
+        total_rows = sampling_metadata.get("total_rows_in_file")
+        if isinstance(total_rows, (int, float)) and int(total_rows) > 0:
+            rows_for_compute = int(total_rows)
+    cols_for_compute = int(df.shape[1])
+    estimated_memory_mb = round(float(rows_for_compute * cols_for_compute * 8 / 1_000_000), 2)
+    if rows_for_compute < 5_000:
+        scale_category = "small"
+    elif rows_for_compute < 50_000:
+        scale_category = "medium"
+    elif rows_for_compute < 500_000:
+        scale_category = "large"
+    else:
+        scale_category = "xlarge"
+    compute_hints = {
+        "estimated_memory_mb": estimated_memory_mb,
+        "scale_category": scale_category,
+        "cross_validation_feasible": rows_for_compute < 100_000,
+        "deep_learning_feasible": rows_for_compute > 10_000 and cols_for_compute < 1_000,
+        "rows_for_estimate": rows_for_compute,
+        "cols_for_estimate": cols_for_compute,
+    }
+
     profile = {
         "rows": int(df.shape[0]),
         "cols": int(df.shape[1]),
@@ -1068,6 +1092,7 @@ def build_dataset_profile(
             "encoding": encoding,
             "diagnostics": dialect_info.get("diagnostics") or {},
         },
+        "compute_hints": compute_hints,
     }
     return profile
 
@@ -1088,6 +1113,282 @@ def write_dataset_profile(profile: Dict[str, Any], path: str = "data/dataset_pro
 
 # Tokens that suggest a column is used for train/test splitting
 SPLIT_CANDIDATE_TOKENS = {"split", "set", "fold", "train", "test", "partition", "is_train", "is_test"}
+
+_TEMPORAL_HINT_TOKENS = {
+    "date",
+    "time",
+    "timestamp",
+    "datetime",
+    "month",
+    "year",
+    "day",
+    "week",
+    "hour",
+}
+
+
+def _infer_temporal_granularity(seconds: float) -> str:
+    if seconds <= 0:
+        return "unknown"
+    if seconds < 90:
+        return "sub-minute"
+    if seconds < 5400:
+        return "hourly"
+    if seconds < 172800:
+        return "daily"
+    if seconds < 1209600:
+        return "weekly"
+    if seconds < 38016000:
+        return "monthly"
+    return "yearly"
+
+
+def _compute_temporal_analysis(
+    df: pd.DataFrame,
+    columns: List[str],
+    max_candidates: int = 30,
+    max_rows: int = 10000,
+) -> Dict[str, Any]:
+    candidates: List[str] = []
+    for col in columns:
+        tokenized = str(col).lower().replace("-", "_")
+        if any(tok in tokenized for tok in _TEMPORAL_HINT_TOKENS):
+            candidates.append(col)
+    if not candidates:
+        return {"is_time_series": False, "detected_datetime_columns": [], "details": []}
+
+    sample_df = df
+    if len(df) > max_rows:
+        try:
+            sample_df = df.sample(max_rows, random_state=42)
+        except Exception:
+            sample_df = df.head(max_rows)
+
+    details: List[Dict[str, Any]] = []
+    for col in candidates[:max_candidates]:
+        try:
+            parsed = pd.to_datetime(sample_df[col], errors="coerce", dayfirst=True)
+            parse_ratio = float(parsed.notna().mean())
+            if parse_ratio < 0.6:
+                continue
+            non_null = parsed.dropna()
+            is_sorted = bool(non_null.is_monotonic_increasing) if len(non_null) > 1 else False
+            median_seconds = None
+            granularity = "unknown"
+            if len(non_null) > 2:
+                diffs = non_null.sort_values().diff().dropna().dt.total_seconds()
+                if not diffs.empty:
+                    median_seconds = float(diffs.median())
+                    granularity = _infer_temporal_granularity(median_seconds)
+            details.append(
+                {
+                    "column": col,
+                    "parse_ratio": round(parse_ratio, 4),
+                    "is_sorted_ascending": is_sorted,
+                    "median_step_seconds": round(median_seconds, 3) if isinstance(median_seconds, (int, float)) else None,
+                    "granularity_hint": granularity,
+                }
+            )
+        except Exception:
+            continue
+
+    is_time_series = any(bool(item.get("is_sorted_ascending")) for item in details)
+    return {
+        "is_time_series": bool(is_time_series),
+        "detected_datetime_columns": [str(item.get("column")) for item in details if item.get("column")],
+        "details": details[:20],
+    }
+
+
+def _compute_feature_target_associations(
+    df: pd.DataFrame,
+    *,
+    target_col: str,
+    inferred_type: str,
+    top_k: int = 20,
+    max_numeric_cols: int = 60,
+    max_categorical_cols: int = 40,
+    max_rows: int = 50000,
+) -> List[Dict[str, Any]]:
+    if target_col not in df.columns:
+        return []
+    work = df
+    if len(work) > max_rows:
+        try:
+            work = work.sample(max_rows, random_state=42)
+        except Exception:
+            work = work.head(max_rows)
+
+    associations: List[Dict[str, Any]] = []
+    numeric_candidates: List[str] = []
+    categorical_candidates: List[str] = []
+    for col in work.columns:
+        if col == target_col:
+            continue
+        series = work[col]
+        try:
+            numeric_ratio = float(pd.to_numeric(series, errors="coerce").notna().mean())
+        except Exception:
+            numeric_ratio = 0.0
+        if numeric_ratio >= 0.8:
+            numeric_candidates.append(col)
+        else:
+            categorical_candidates.append(col)
+
+    numeric_candidates = numeric_candidates[:max_numeric_cols]
+    categorical_candidates = categorical_candidates[:max_categorical_cols]
+
+    if inferred_type == "regression":
+        target_num = pd.to_numeric(work[target_col], errors="coerce")
+        candidate_scores: List[Tuple[str, float]] = []
+        for col in numeric_candidates:
+            try:
+                feat = pd.to_numeric(work[col], errors="coerce")
+                pair = pd.DataFrame({"x": feat, "y": target_num}).dropna()
+                if len(pair) < 30:
+                    continue
+                corr = float(pair["x"].corr(pair["y"]))
+                if pd.isna(corr):
+                    continue
+                candidate_scores.append((col, corr))
+            except Exception:
+                continue
+        candidate_scores.sort(key=lambda item: abs(item[1]), reverse=True)
+        for col, corr in candidate_scores[:top_k]:
+            associations.append(
+                {
+                    "column": col,
+                    "target": target_col,
+                    "method": "pearson",
+                    "score": round(abs(float(corr)), 6),
+                    "direction": "positive" if corr >= 0 else "negative",
+                }
+            )
+    else:
+        # Classification/other: numeric eta^2 + categorical Cramer's V.
+        target = work[target_col].astype(str)
+        target_non_null = target[target.notna()]
+        if target_non_null.empty:
+            return []
+
+        # Numeric -> eta squared
+        for col in numeric_candidates:
+            try:
+                feat = pd.to_numeric(work[col], errors="coerce")
+                pair = pd.DataFrame({"x": feat, "y": target}).dropna()
+                if len(pair) < 50:
+                    continue
+                grand_mean = float(pair["x"].mean())
+                grouped = pair.groupby("y")["x"]
+                ss_between = 0.0
+                for _, values in grouped:
+                    n_g = float(len(values))
+                    mean_g = float(values.mean())
+                    ss_between += n_g * ((mean_g - grand_mean) ** 2)
+                ss_total = float(((pair["x"] - grand_mean) ** 2).sum())
+                if ss_total <= 0:
+                    continue
+                eta_sq = max(0.0, min(1.0, ss_between / ss_total))
+                associations.append(
+                    {
+                        "column": col,
+                        "target": target_col,
+                        "method": "anova_eta_squared",
+                        "score": round(float(eta_sq), 6),
+                        "direction": "non_directional",
+                    }
+                )
+            except Exception:
+                continue
+
+        # Categorical -> chi2 / Cramer's V
+        for col in categorical_candidates:
+            try:
+                contingency = pd.crosstab(work[col].astype(str), target)
+                if contingency.shape[0] < 2 or contingency.shape[1] < 2:
+                    continue
+                n = float(contingency.values.sum())
+                if n <= 0:
+                    continue
+                try:
+                    from scipy.stats import chi2_contingency  # type: ignore
+
+                    chi2, _, _, _ = chi2_contingency(contingency, correction=False)
+                except Exception:
+                    observed = contingency.values.astype(float)
+                    expected = (
+                        observed.sum(axis=1, keepdims=True)
+                        * observed.sum(axis=0, keepdims=True)
+                        / max(observed.sum(), 1.0)
+                    )
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        chi2_mat = np.where(expected > 0, ((observed - expected) ** 2) / expected, 0.0)
+                    chi2 = float(np.nansum(chi2_mat))
+                r, k = contingency.shape
+                denom = max(min(k - 1, r - 1), 1)
+                cramers_v = float(np.sqrt(max(chi2 / n / denom, 0.0)))
+                associations.append(
+                    {
+                        "column": col,
+                        "target": target_col,
+                        "method": "chi2_cramers_v",
+                        "score": round(float(cramers_v), 6),
+                        "direction": "non_directional",
+                    }
+                )
+            except Exception:
+                continue
+
+        associations.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        associations = associations[:top_k]
+
+    associations.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return associations[:top_k]
+
+
+def _compute_multicollinearity_pairs(
+    df: pd.DataFrame,
+    *,
+    threshold: float = 0.95,
+    max_numeric_cols: int = 60,
+    max_pairs: int = 200,
+) -> List[Dict[str, Any]]:
+    numeric_cols: List[str] = []
+    for col in df.columns:
+        try:
+            ratio = float(pd.to_numeric(df[col], errors="coerce").notna().mean())
+        except Exception:
+            ratio = 0.0
+        if ratio >= 0.85:
+            numeric_cols.append(str(col))
+    if len(numeric_cols) < 2:
+        return []
+    numeric_cols = numeric_cols[:max_numeric_cols]
+
+    try:
+        numeric_df = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        corr = numeric_df.corr().abs()
+    except Exception:
+        return []
+
+    pairs: List[Dict[str, Any]] = []
+    cols = list(corr.columns)
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            value = corr.iloc[i, j]
+            if pd.isna(value):
+                continue
+            if float(value) >= threshold:
+                pairs.append(
+                    {
+                        "col_a": cols[i],
+                        "col_b": cols[j],
+                        "corr_abs": round(float(value), 6),
+                    }
+                )
+            if len(pairs) >= max_pairs:
+                return pairs
+    return pairs
 
 
 def build_data_profile(
@@ -1191,6 +1492,16 @@ def build_data_profile(
                 class_counts = {str(k): int(v) for k, v in counts.items()}
                 analysis_entry["n_classes"] = n_unique
                 analysis_entry["class_counts"] = class_counts
+                if class_counts:
+                    min_class = min(class_counts.values())
+                    max_class = max(class_counts.values())
+                    total_classes = sum(class_counts.values())
+                    analysis_entry["class_imbalance_ratio"] = round(
+                        float(min_class / max(max_class, 1)), 6
+                    )
+                    analysis_entry["minority_class_share"] = round(
+                        float(min_class / max(total_classes, 1)), 6
+                    )
             except Exception:
                 pass
         else:
@@ -1206,6 +1517,24 @@ def build_data_profile(
                         "max": float(numeric_series.max()),
                     }
                     analysis_entry["quantiles"] = quantiles
+                    try:
+                        analysis_entry["skewness"] = float(numeric_series.skew())
+                    except Exception:
+                        analysis_entry["skewness"] = None
+                    try:
+                        analysis_entry["kurtosis"] = float(numeric_series.kurtosis())
+                    except Exception:
+                        analysis_entry["kurtosis"] = None
+                    q1 = float(numeric_series.quantile(0.25))
+                    q3 = float(numeric_series.quantile(0.75))
+                    iqr = q3 - q1
+                    if iqr > 0:
+                        low = q1 - 1.5 * iqr
+                        high = q3 + 1.5 * iqr
+                        outlier_frac = float(((numeric_series < low) | (numeric_series > high)).mean())
+                    else:
+                        outlier_frac = 0.0
+                    analysis_entry["outlier_frac_iqr"] = round(outlier_frac, 6)
             except Exception:
                 pass
         outcome_analysis[outcome_col] = analysis_entry
@@ -1260,6 +1589,50 @@ def build_data_profile(
                     "severity": "SOFT",
                 })
 
+    # 8. Temporal analysis
+    temporal_analysis = _compute_temporal_analysis(df, columns)
+
+    # 9. Feature-target associations (top signal features)
+    primary_target = ""
+    primary_target_type = ""
+    for col in outcome_cols:
+        entry = outcome_analysis.get(col)
+        if isinstance(entry, dict) and entry.get("present"):
+            primary_target = col
+            primary_target_type = str(entry.get("inferred_type") or "")
+            break
+    feature_target_associations: List[Dict[str, Any]] = []
+    if primary_target:
+        try:
+            feature_target_associations = _compute_feature_target_associations(
+                df,
+                target_col=primary_target,
+                inferred_type=primary_target_type or "classification",
+                top_k=20,
+            )
+        except Exception:
+            feature_target_associations = []
+
+    # 10. Multicollinearity
+    multicollinearity_pairs = _compute_multicollinearity_pairs(df, threshold=0.95)
+
+    # 11. Compute hints
+    estimated_memory_mb = round(float(n_rows * n_cols * 8 / 1_000_000), 2)
+    if n_rows < 5_000:
+        scale_category = "small"
+    elif n_rows < 50_000:
+        scale_category = "medium"
+    elif n_rows < 500_000:
+        scale_category = "large"
+    else:
+        scale_category = "xlarge"
+    compute_hints = {
+        "estimated_memory_mb": estimated_memory_mb,
+        "scale_category": scale_category,
+        "cross_validation_feasible": n_rows < 100_000,
+        "deep_learning_feasible": n_rows > 10_000 and n_cols < 1_000,
+    }
+
     profile = {
         "basic_stats": {
             "n_rows": n_rows,
@@ -1273,6 +1646,10 @@ def build_data_profile(
         "constant_columns": constant_columns,
         "high_cardinality_columns": high_cardinality_columns,
         "leakage_flags": leakage_flags,
+        "temporal_analysis": temporal_analysis,
+        "feature_target_associations": feature_target_associations,
+        "multicollinearity_pairs_high": multicollinearity_pairs,
+        "compute_hints": compute_hints,
         "generated_at": datetime.utcnow().isoformat(),
     }
     return profile

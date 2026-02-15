@@ -80,6 +80,7 @@ def build_data_atlas(
     missing_frac = profile.get("missing_frac") if isinstance(profile.get("missing_frac"), dict) else {}
     cardinality = profile.get("cardinality") if isinstance(profile.get("cardinality"), dict) else {}
     sampling = profile.get("sampling") if isinstance(profile.get("sampling"), dict) else {}
+    compute_hints = profile.get("compute_hints") if isinstance(profile.get("compute_hints"), dict) else {}
 
     entries: List[Dict[str, Any]] = []
     constant_like_cols: List[str] = []
@@ -165,6 +166,7 @@ def build_data_atlas(
             "strategy": str(sampling.get("strategy") or "unknown"),
             "total_rows_in_file": _safe_int(sampling.get("total_rows_in_file")),
         },
+        "compute_hints": compute_hints,
         "signals": {
             "constant_like_count": len(constant_like_cols),
             "constant_like_sample": constant_like_cols[:30],
@@ -188,6 +190,7 @@ def summarize_data_atlas(
         return ""
     coverage = atlas.get("coverage") if isinstance(atlas.get("coverage"), dict) else {}
     sampling = atlas.get("sampling") if isinstance(atlas.get("sampling"), dict) else {}
+    compute_hints = atlas.get("compute_hints") if isinstance(atlas.get("compute_hints"), dict) else {}
     signals = atlas.get("signals") if isinstance(atlas.get("signals"), dict) else {}
     columns = atlas.get("columns") if isinstance(atlas.get("columns"), list) else []
 
@@ -204,6 +207,13 @@ def summarize_data_atlas(
         f"- sampling: strategy={sampling.get('strategy')}, was_sampled={sampling.get('was_sampled')}, "
         f"sample_size={sampling.get('sample_size')}, total_rows_in_file={sampling.get('total_rows_in_file')}"
     )
+    if compute_hints:
+        lines.append(
+            f"- compute_hints: scale={compute_hints.get('scale_category')}, "
+            f"estimated_memory_mb={compute_hints.get('estimated_memory_mb')}, "
+            f"cv_feasible={compute_hints.get('cross_validation_feasible')}, "
+            f"dl_feasible={compute_hints.get('deep_learning_feasible')}"
+        )
     lines.append(
         f"- constant_like_count: {int(signals.get('constant_like_count') or 0)} "
         f"(sample={list(signals.get('constant_like_sample') or [])[:8]})"

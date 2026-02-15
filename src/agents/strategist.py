@@ -11,6 +11,37 @@ from src.utils.llm_fallback import call_chat_with_fallback, extract_response_tex
 
 load_dotenv()
 
+
+class _TextResponse:
+    def __init__(self, text: str):
+        self.text = text
+
+
+class _OpenRouterModelShim:
+    """
+    Backward-compatible generate_content interface.
+    Tests and legacy callers can monkeypatch `agent.model.generate_content`.
+    """
+
+    def __init__(self, agent: "StrategistAgent"):
+        self._agent = agent
+
+    def generate_content(self, prompt: str) -> _TextResponse:
+        response, model_used = call_chat_with_fallback(
+            llm_client=self._agent.client,
+            messages=[{"role": "user", "content": prompt}],
+            model_chain=self._agent.model_chain,
+            call_kwargs={"temperature": self._agent._pending_temperature},
+            logger=self._agent.logger,
+            context_tag=self._agent._pending_context_tag,
+        )
+        content = extract_response_text(response)
+        if not content:
+            raise ValueError("EMPTY_COMPLETION")
+        self._agent.last_model_used = model_used
+        return _TextResponse(str(content))
+
+
 class StrategistAgent:
     def __init__(self, api_key: str = None):
         """
@@ -60,20 +91,21 @@ class StrategistAgent:
         self.last_repair_response = None
         self.last_json_repair_meta = None
         self.last_model_used = None
+        self._pending_temperature = 0.1
+        self._pending_context_tag = "strategist_generate"
+        self.model = _OpenRouterModelShim(self)
 
     def _call_model(self, prompt: str, *, temperature: float, context_tag: str) -> str:
-        response, model_used = call_chat_with_fallback(
-            llm_client=self.client,
-            messages=[{"role": "user", "content": prompt}],
-            model_chain=self.model_chain,
-            call_kwargs={"temperature": temperature},
-            logger=self.logger,
-            context_tag=context_tag,
-        )
-        content = extract_response_text(response)
+        self._pending_temperature = temperature
+        self._pending_context_tag = context_tag
+        response = self.model.generate_content(prompt)
+        content = (getattr(response, "text", "") or "").strip()
+        if not content:
+            content = extract_response_text(response)
         if not content:
             raise ValueError("EMPTY_COMPLETION")
-        self.last_model_used = model_used
+        if not self.last_model_used:
+            self.last_model_used = self.model_name
         return content
 
     def _get_wide_schema_threshold(self) -> int:
@@ -107,6 +139,14 @@ class StrategistAgent:
         except Exception:
             value = 180000
         return max(12000, min(value, 400000))
+
+    def _get_strategy_count(self) -> int:
+        raw = os.getenv("STRATEGIST_STRATEGY_COUNT", "3")
+        try:
+            value = int(raw)
+        except Exception:
+            value = 3
+        return 1 if value <= 1 else 3
 
     def _column_families(self, allowed_columns: List[str]) -> List[Dict[str, Any]]:
         buckets: Dict[str, List[Tuple[int, str]]] = {}
@@ -299,6 +339,7 @@ class StrategistAgent:
         column_inventory: Optional[List[str]] = None,
         column_sets: Optional[Dict[str, Any]] = None,
         column_manifest: Optional[Dict[str, Any]] = None,
+        compute_constraints: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generates a single strategy based on the data summary and user request.
@@ -334,6 +375,19 @@ class StrategistAgent:
             if required_columns_budget
             else "No explicit required_columns budget in this run."
         )
+        strategy_count = self._get_strategy_count()
+        if strategy_count == 1:
+            strategy_count_guidance = (
+                "Generate 1 primary strategy with complete detail. "
+                "Include a concise fallback_chain inside the same strategy."
+            )
+        else:
+            strategy_count_guidance = "Generate 3 distinct strategies."
+        compute_constraints_payload = (
+            compute_constraints
+            if isinstance(compute_constraints, dict)
+            else {}
+        )
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Chief Data Strategist inside a multi-agent system. Your goal is to craft ONE optimal strategy
@@ -359,6 +413,9 @@ class StrategistAgent:
 
         *** REQUIRED COLUMNS BUDGET ***
         $required_columns_budget_guidance
+
+        *** COMPUTE CONSTRAINTS ***
+        $compute_constraints
 
         *** USER REQUEST ***
         "$user_request"
@@ -503,7 +560,8 @@ class StrategistAgent:
 
         *** CRITICAL OUTPUT RULES ***
         - RETURN ONLY RAW JSON. NO MARKDOWN. NO COMMENTS.
-        - The output must be a dictionary with a single key "strategies" containing a LIST of 3 objects.
+        - The output must be a dictionary with a single key "strategies" containing a LIST of exactly $strategy_count objects.
+        - Strategy count guidance: $strategy_count_guidance
         - The object must include these keys:
           {
             "title": "Strategy name",
@@ -549,15 +607,18 @@ class StrategistAgent:
             column_manifest=json.dumps(column_manifest_payload, ensure_ascii=False),
             wide_schema_guidance=wide_schema_guidance,
             required_columns_budget_guidance=required_columns_budget_guidance,
+            compute_constraints=json.dumps(compute_constraints_payload, ensure_ascii=False),
             user_request=user_request,
             senior_strategy_protocol=SENIOR_STRATEGY_PROTOCOL,
+            strategy_count=str(strategy_count),
+            strategy_count_guidance=strategy_count_guidance,
         )
         self.last_prompt = system_prompt
         
         try:
             content = self._call_model(
                 system_prompt,
-                temperature=0.3,
+                temperature=0.1,
                 context_tag="strategist_generate",
             )
             self.last_response = content
@@ -571,6 +632,7 @@ class StrategistAgent:
 
             # Normalization (Fix for crash 'list' object has no attribute 'get')
             payload = self._normalize_strategist_output(parsed)
+            payload = self._enforce_strategy_count(payload, strategy_count)
             column_validation = self._validate_required_columns(
                 payload,
                 allowed_columns,
@@ -603,6 +665,7 @@ class StrategistAgent:
             # Build strategy_spec from LLM reasoning (not hardcoded inference)
             strategy_spec = self._build_strategy_spec_from_llm(payload, data_summary, user_request)
             payload["strategy_spec"] = strategy_spec
+            payload["strategy_count_requested"] = strategy_count
             return payload
 
         except Exception as e:
@@ -627,6 +690,7 @@ class StrategistAgent:
                 allowed_columns,
                 max_required_columns=required_columns_budget,
             )
+            fallback = self._enforce_strategy_count(fallback, strategy_count)
             fallback["json_repair"] = {
                 "status": "fallback",
                 "repair_applied": False,
@@ -634,7 +698,28 @@ class StrategistAgent:
             }
             strategy_spec = self._build_strategy_spec_from_llm(fallback, data_summary, user_request)
             fallback["strategy_spec"] = strategy_spec
+            fallback["strategy_count_requested"] = strategy_count
             return fallback
+
+    def _enforce_strategy_count(self, payload: Dict[str, Any], strategy_count: int) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"strategies": []}
+        strategies = payload.get("strategies")
+        if not isinstance(strategies, list):
+            strategies = []
+        strategies = [s for s in strategies if isinstance(s, dict)]
+        if strategy_count <= 1:
+            payload["strategies"] = strategies[:1]
+            return payload
+        if len(strategies) >= 3:
+            payload["strategies"] = strategies[:3]
+            return payload
+        # Backfill with safest available entries if model under-produced.
+        while len(strategies) < 3 and strategies:
+            strategies.append(dict(strategies[-1]))
+            strategies[-1]["title"] = f"{strategies[-1].get('title', 'Strategy')} (Variant {len(strategies)})"
+        payload["strategies"] = strategies
+        return payload
 
     def _normalize_strategist_output(self, parsed: Any) -> Dict[str, Any]:
         """

@@ -9,6 +9,7 @@ import hashlib
 import csv
 import ast
 import math
+import difflib
 import threading
 import time
 import fnmatch
@@ -1173,6 +1174,11 @@ _RUN_FACTS_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+_STEWARD_FACTS_BLOCK_RE = re.compile(
+    r"=== STEWARD_FACTS \(deterministic, source-of-truth\) ===.*?=== END STEWARD_FACTS ===",
+    re.DOTALL,
+)
+
 
 def _minimal_agent_context_enabled() -> bool:
     raw = os.getenv("AGENT_MINIMAL_CONTEXT_MODE", "1")
@@ -1183,12 +1189,128 @@ def _strip_run_facts_blocks(text: str) -> str:
     if not isinstance(text, str) or not text:
         return ""
     cleaned = _RUN_FACTS_BLOCK_RE.sub("", text)
+    cleaned = _STEWARD_FACTS_BLOCK_RE.sub("", cleaned)
     return cleaned.strip()
 
 
 def _build_senior_summary_context(state: Dict[str, Any]) -> str:
     base = _strip_run_facts_blocks(str((state or {}).get("data_summary", "") or ""))
     return _prepend_dataset_semantics_summary(base, state if isinstance(state, dict) else {})
+
+
+def _build_steward_facts_block(state: Dict[str, Any]) -> str:
+    if not isinstance(state, dict):
+        return ""
+    profile = state.get("profile") if isinstance(state.get("profile"), dict) else None
+    if not profile and isinstance(state.get("dataset_profile"), dict):
+        profile = state.get("dataset_profile")
+    if not profile:
+        profile_path = _abs_in_work(os.getcwd(), "data/dataset_profile.json")
+        loaded_profile = _load_json_safe(profile_path)
+        if isinstance(loaded_profile, dict):
+            profile = loaded_profile
+    profile = profile if isinstance(profile, dict) else {}
+    dataset_semantics = state.get("dataset_semantics") if isinstance(state.get("dataset_semantics"), dict) else {}
+    dataset_training_mask = (
+        state.get("dataset_training_mask")
+        if isinstance(state.get("dataset_training_mask"), dict)
+        else {}
+    )
+    column_sets = state.get("column_sets") if isinstance(state.get("column_sets"), dict) else {}
+    data_profile = state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {}
+    rows = profile.get("rows")
+    cols = profile.get("cols")
+    try:
+        rows = int(rows)
+    except Exception:
+        rows = None
+    try:
+        cols = int(cols)
+    except Exception:
+        cols = None
+    compute_hints = profile.get("compute_hints") if isinstance(profile.get("compute_hints"), dict) else {}
+    primary_target = str(dataset_semantics.get("primary_target") or "").strip()
+    split_candidates = dataset_semantics.get("split_candidates") if isinstance(dataset_semantics.get("split_candidates"), list) else []
+    id_candidates = dataset_semantics.get("id_candidates") if isinstance(dataset_semantics.get("id_candidates"), list) else []
+    training_rows_rule = str(dataset_training_mask.get("training_rows_rule") or "").strip()
+    scoring_rows_rule = str(dataset_training_mask.get("scoring_rows_rule") or "").strip()
+    target_analysis = dataset_semantics.get("target_analysis") if isinstance(dataset_semantics.get("target_analysis"), dict) else {}
+
+    missing_frac = profile.get("missing_frac") if isinstance(profile.get("missing_frac"), dict) else {}
+    missing_alerts = []
+    for col_name, frac in missing_frac.items():
+        try:
+            frac_val = float(frac)
+        except Exception:
+            continue
+        if frac_val <= 0:
+            continue
+        missing_alerts.append((str(col_name), frac_val))
+    missing_alerts.sort(key=lambda item: item[1], reverse=True)
+
+    constants_count = 0
+    selectors = column_sets.get("selectors") if isinstance(column_sets.get("selectors"), dict) else {}
+    for key in ("constant_like", "constant", "drop_candidates", "stable_zero"):
+        value = selectors.get(key)
+        if isinstance(value, list):
+            constants_count += len([x for x in value if isinstance(x, str) and x.strip()])
+
+    associations = (
+        data_profile.get("feature_target_associations")
+        if isinstance(data_profile.get("feature_target_associations"), list)
+        else []
+    )
+    top_assoc: List[str] = []
+    for item in associations[:5]:
+        if not isinstance(item, dict):
+            continue
+        col = str(item.get("column") or "").strip()
+        score = item.get("score")
+        method = str(item.get("method") or "").strip()
+        if not col:
+            continue
+        if isinstance(score, (int, float)):
+            top_assoc.append(f"{col}({round(float(score), 4)} via {method or 'association'})")
+        else:
+            top_assoc.append(f"{col}({method or 'association'})")
+
+    lines: List[str] = ["=== STEWARD_FACTS (deterministic, source-of-truth) ==="]
+    if rows is not None and cols is not None:
+        lines.append(f"- Shape: {rows} rows x {cols} cols")
+    if primary_target:
+        lines.append(f"- Target: {primary_target}")
+    if training_rows_rule:
+        lines.append(f"- Training rows rule: {training_rows_rule}")
+    if scoring_rows_rule:
+        lines.append(f"- Scoring rows rule: {scoring_rows_rule}")
+    if split_candidates:
+        lines.append(f"- Split candidates: {', '.join(str(c) for c in split_candidates[:8])}")
+    if id_candidates:
+        lines.append(f"- ID candidates: {', '.join(str(c) for c in id_candidates[:8])}")
+    if isinstance(target_analysis, dict):
+        imbalance = target_analysis.get("class_imbalance_ratio")
+        if imbalance is not None:
+            lines.append(f"- Target imbalance ratio: {imbalance}")
+        partial_label = target_analysis.get("partial_label_detected")
+        if partial_label is not None:
+            lines.append(f"- Partial label detected: {bool(partial_label)}")
+    if missing_alerts:
+        top_missing = ", ".join(f"{c}={round(v,4)}" for c, v in missing_alerts[:5])
+        lines.append(f"- Top missingness: {top_missing}")
+    if constants_count > 0:
+        lines.append(f"- Constant/drop-candidate columns signaled: {constants_count}")
+    if top_assoc:
+        lines.append(f"- Top feature-target associations: {', '.join(top_assoc)}")
+    if compute_hints:
+        scale = compute_hints.get("scale_category")
+        mem_mb = compute_hints.get("estimated_memory_mb")
+        cv_ok = compute_hints.get("cross_validation_feasible")
+        dl_ok = compute_hints.get("deep_learning_feasible")
+        lines.append(
+            f"- Compute hints: scale={scale}, estimated_memory_mb={mem_mb}, cv_feasible={cv_ok}, dl_feasible={dl_ok}"
+        )
+    lines.append("=== END STEWARD_FACTS ===")
+    return "\n".join(lines)
 
 
 def _build_agent_feedback_context(state: Dict[str, Any], agent_label: str) -> str:
@@ -1223,11 +1345,14 @@ def _build_agent_feedback_context(state: Dict[str, Any], agent_label: str) -> st
 def _prepend_dataset_semantics_summary(text: str, state: Dict[str, Any]) -> str:
     if not isinstance(state, dict):
         return text
+    facts_block = _build_steward_facts_block(state)
     summary = state.get("dataset_semantics_summary")
     column_sets_summary = state.get("column_sets_summary")
     column_manifest_summary = state.get("column_manifest_summary")
     data_atlas_summary = state.get("data_atlas_summary")
-    combined = summary or ""
+    combined = facts_block or ""
+    if summary:
+        combined = f"{combined}\n{summary}" if combined else summary
     if column_sets_summary:
         combined = f"{combined}\n{column_sets_summary}" if combined else column_sets_summary
     if column_manifest_summary:
@@ -9231,7 +9356,7 @@ def run_steward(state: AgentState) -> AgentState:
     return steward_payload
 
 def run_strategist(state: AgentState) -> AgentState:
-    print("--- [2] Strategist: Formulating 3 Strategies (OpenRouter GLM-5) ---")
+    print("--- [2] Strategist: Formulating Strategies ---")
     abort_state = _abort_if_requested(state, "strategist")
     if abort_state:
         return abort_state
@@ -9269,12 +9394,37 @@ def run_strategist(state: AgentState) -> AgentState:
     column_manifest = state.get("column_manifest")
     if not isinstance(column_manifest, dict) or not column_manifest:
         column_manifest = _load_json_safe("data/column_manifest.json") or {}
+    compute_constraints = {
+        "runtime_mode": _get_execution_runtime_mode(),
+    }
+    heavy_cfg = _get_heavy_runner_config() or {}
+    if isinstance(heavy_cfg, dict):
+        timeout_sec = heavy_cfg.get("script_timeout_seconds")
+        if isinstance(timeout_sec, int) and timeout_sec > 0:
+            compute_constraints["max_runtime_seconds"] = int(timeout_sec)
+    execution_profile = state.get("execution_profile_context")
+    if isinstance(execution_profile, dict):
+        for key in ("max_runtime_seconds", "max_memory_mb", "gpu_available", "cpu_cores"):
+            value = execution_profile.get(key)
+            if value is not None:
+                compute_constraints[key] = value
+    dataset_profile = state.get("profile") if isinstance(state.get("profile"), dict) else None
+    if not dataset_profile and isinstance(state.get("dataset_profile"), dict):
+        dataset_profile = state.get("dataset_profile")
+    if isinstance(dataset_profile, dict):
+        compute_hints = dataset_profile.get("compute_hints")
+        if isinstance(compute_hints, dict):
+            for key in ("estimated_memory_mb", "scale_category", "cross_validation_feasible", "deep_learning_feasible"):
+                value = compute_hints.get(key)
+                if value is not None:
+                    compute_constraints[key] = value
     result = strategist.generate_strategies(
         data_summary,
         user_context,
         column_inventory=column_inventory,
         column_sets=column_sets,
         column_manifest=column_manifest if isinstance(column_manifest, dict) else {},
+        compute_constraints=compute_constraints,
     )
     run_id = state.get("run_id")
     if run_id:
@@ -9298,6 +9448,7 @@ def run_strategist(state: AgentState) -> AgentState:
                     if isinstance(column_manifest, dict)
                     else 0
                 ),
+                "compute_constraints": compute_constraints,
             },
         )
     # Defensive handling of strategist result types (Fix for potential crashes)
@@ -9321,6 +9472,12 @@ def run_strategist(state: AgentState) -> AgentState:
              strategies_list = []
     
     strategies_list = [s for s in strategies_list if isinstance(s, dict)]
+    column_validation = result.get("column_validation") if isinstance(result, dict) else {}
+    if not isinstance(column_validation, dict):
+        column_validation = {}
+    strategist_json_repair = result.get("json_repair") if isinstance(result, dict) else {}
+    if not isinstance(strategist_json_repair, dict):
+        strategist_json_repair = {}
 
     # Fallback if list is empty or malformed
     if not strategies_list:
@@ -9345,6 +9502,8 @@ def run_strategist(state: AgentState) -> AgentState:
     return {
         "strategies": {"strategies": strategies_list},
         "strategy_spec": strategy_spec,
+        "column_validation": column_validation,
+        "strategist_json_repair": strategist_json_repair,
     }
 
 def run_domain_expert(state: AgentState) -> AgentState:
@@ -9366,9 +9525,79 @@ def run_domain_expert(state: AgentState) -> AgentState:
         if context_pack:
             data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
 
+    strategy_spec = state.get("strategy_spec")
+    if not isinstance(strategy_spec, dict):
+        strategy_spec = {}
+    column_validation = state.get("column_validation")
+    if not isinstance(column_validation, dict):
+        column_validation = {}
+    compute_constraints = {
+        "runtime_mode": _get_execution_runtime_mode(),
+    }
+    heavy_cfg = _get_heavy_runner_config() or {}
+    if isinstance(heavy_cfg, dict):
+        timeout_sec = heavy_cfg.get("script_timeout_seconds")
+        if isinstance(timeout_sec, int) and timeout_sec > 0:
+            compute_constraints["max_runtime_seconds"] = int(timeout_sec)
+    execution_profile = state.get("execution_profile_context")
+    if isinstance(execution_profile, dict):
+        for key in ("max_runtime_seconds", "max_memory_mb", "gpu_available", "cpu_cores"):
+            value = execution_profile.get(key)
+            if value is not None:
+                compute_constraints[key] = value
+
+    invalid_details_map: Dict[int, Dict[str, Any]] = {}
+    for item in (column_validation.get("invalid_details") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("strategy_index"))
+        except Exception:
+            continue
+        invalid_details_map[idx] = item
+    over_budget_map: Dict[int, Dict[str, Any]] = {}
+    for item in (column_validation.get("over_budget_details") or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("strategy_index"))
+        except Exception:
+            continue
+        over_budget_map[idx] = item
+
+    enriched_strategies: List[Dict[str, Any]] = []
+    for idx, strat in enumerate(strategies_list):
+        if not isinstance(strat, dict):
+            continue
+        enriched = dict(strat)
+        enriched["_strategy_index"] = idx
+        enriched["_title"] = str(strat.get("title") or f"strategy_{idx}")
+        enriched["_meta"] = {
+            "column_validation": {
+                "invalid_count": len((invalid_details_map.get(idx) or {}).get("invalid_columns", [])),
+                "invalid_columns": (invalid_details_map.get(idx) or {}).get("invalid_columns", []),
+                "over_budget": idx in over_budget_map,
+                "max_required_columns": (over_budget_map.get(idx) or {}).get("max_required_columns"),
+                "required_count": (over_budget_map.get(idx) or {}).get("required_count")
+                or (invalid_details_map.get(idx) or {}).get("required_count"),
+            },
+            "strategy_spec": strategy_spec,
+            "compute_constraints": compute_constraints,
+        }
+        enriched_strategies.append(enriched)
+
     # Deliberation Step
-    evaluation = domain_expert.evaluate_strategies(data_summary, business_objective, strategies_list)
+    evaluation = domain_expert.evaluate_strategies(
+        data_summary,
+        business_objective,
+        enriched_strategies,
+        compute_constraints=compute_constraints,
+        dataset_memory_context=str(state.get("dataset_memory_context") or ""),
+    )
     reviews = evaluation.get('reviews', [])
+    review_validation = evaluation.get("review_validation") if isinstance(evaluation, dict) else {}
+    if not isinstance(review_validation, dict):
+        review_validation = {}
     run_id = state.get("run_id")
     if run_id:
         log_agent_snapshot(
@@ -9380,6 +9609,8 @@ def run_domain_expert(state: AgentState) -> AgentState:
                 "data_summary": data_summary,
                 "business_objective": business_objective,
                 "strategy_count": len(strategies_list) if isinstance(strategies_list, list) else 0,
+                "compute_constraints": compute_constraints,
+                "review_validation": review_validation,
             },
         )
 
@@ -9388,28 +9619,67 @@ def run_domain_expert(state: AgentState) -> AgentState:
     best_score = -1.0
     selection_reason = "Default Selection"
 
-    # Map reviews to strategies (assuming order consistency or title matching)
-    # We use Title matching for robustness
-
     print("\n🧐 EXPERT DELIBERATION:")
-    for strat in strategies_list:
-        # Find matching review
-        match = next((r for r in reviews if r.get('title') == strat.get('title')), None)
-        score = match.get('score', 0) if match else 0
+    normalized_reviews: List[Dict[str, Any]] = []
+    if isinstance(reviews, list):
+        normalized_reviews = [r for r in reviews if isinstance(r, dict)]
+    title_lookup = {}
+    for rev in normalized_reviews:
+        title = str(rev.get("title") or "").strip().lower()
+        if title:
+            title_lookup[title] = rev
+
+    for idx, strat in enumerate(strategies_list):
+        match = None
+        # Primary: positional index contract
+        if idx < len(normalized_reviews):
+            candidate = normalized_reviews[idx]
+            cand_idx = candidate.get("strategy_index")
+            try:
+                if cand_idx is None or int(cand_idx) == idx:
+                    match = candidate
+            except Exception:
+                pass
+        # Secondary: explicit strategy_index search
+        if match is None:
+            for candidate in normalized_reviews:
+                try:
+                    if int(candidate.get("strategy_index")) == idx:
+                        match = candidate
+                        break
+                except Exception:
+                    continue
+        # Tertiary: fuzzy title match
+        if match is None:
+            strat_title = str(strat.get("title") or "").strip().lower()
+            best_ratio = 0.0
+            best_candidate = None
+            for rev_title, candidate in title_lookup.items():
+                ratio = difflib.SequenceMatcher(None, rev_title, strat_title).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_candidate = candidate
+            if best_candidate is not None and best_ratio >= 0.70:
+                match = best_candidate
+
+        score = _safe_float(match.get('score'), 0.0) if isinstance(match, dict) else 0.0
+        selectable = bool(match.get("selectable", score >= 3.0)) if isinstance(match, dict) else False
 
         print(f"  • Strategy: {strat.get('title')} | Score: {score}/10")
-        if match:
-             print(f"    - Critique: {match.get('reasoning')[:100]}...")
+        if isinstance(match, dict):
+             critique = str(match.get("reasoning") or "")
+             print(f"    - Critique: {critique[:120]}...")
+             print(f"    - Selectable: {selectable}")
 
-        if score > best_score:
+        if selectable and score > best_score:
             best_score = score
             best_strategy = strat
-            selection_reason = match.get('reasoning') if match else "Highest Score"
+            selection_reason = str(match.get('reasoning') or "Highest Score") if isinstance(match, dict) else "Highest Score"
 
-    # Fallback to first if no valid scores
+    # Fallback to first strategy if none reaches selectable threshold.
     if not best_strategy and strategies_list:
         best_strategy = strategies_list[0]
-        selection_reason = "Fallback: First strategy selected (No scores available)."
+        selection_reason = "Fallback: First strategy selected (no selectable review >= 3.0)."
 
     print(f"\n🏆 WINNER: {best_strategy.get('title')} (Score: {best_score})")
     print(f"   Reason: {selection_reason}\n")
@@ -9417,7 +9687,8 @@ def run_domain_expert(state: AgentState) -> AgentState:
     return {
         "selected_strategy": best_strategy,
         "selection_reason": selection_reason,
-        "domain_expert_reviews": reviews
+        "domain_expert_reviews": normalized_reviews,
+        "domain_expert_validation": review_validation,
     }
 
 
