@@ -2971,7 +2971,13 @@ def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | 
             for item in values:
                 if not item:
                     continue
-                path = str(item)
+                # Support dict items with "path" key (owner-aware format)
+                if isinstance(item, dict):
+                    path = item.get("path") or ""
+                else:
+                    path = str(item)
+                if not path:
+                    continue
                 if _looks_like_filesystem_path(path):
                     file_like.append(_normalize_output_path(path))
                 else:
@@ -11900,7 +11906,9 @@ def _finalize_heavy_execution(
             content_issues=content_issues,
         )
 
-    oc_report = check_required_outputs(output_contract)
+    # Validate only ML engineer's outputs in post-ML finalization
+    from src.utils.output_contract import check_required_outputs_for_owner
+    oc_report = check_required_outputs_for_owner(output_contract, "ml_engineer")
     try:
         os.makedirs("data", exist_ok=True)
         dump_json("data/output_contract_report.json", oc_report)

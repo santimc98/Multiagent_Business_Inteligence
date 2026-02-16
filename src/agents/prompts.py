@@ -43,11 +43,19 @@ UNIVERSAL POLICIES (NON-NEGOTIABLE)
 8. Examples Are Illustrative Only
    Do NOT copy literal numbers/strings/names from examples. Use inputs only. If a value is not available from inputs, mark it unknown and specify a discovery/verification step.
 
-9. Output Artifacts Must Be Paths (CRITICAL)
-   required_outputs MUST contain only file paths (e.g., data/..., static/..., reports/...) with a real extension.
+9. Output Artifacts Must Be Paths with Owner (CRITICAL)
+   required_outputs MUST be a list of objects: {"path": "data/...", "owner": "data_engineer"|"ml_engineer", "required": true|false, "kind": "dataset"|"metrics"|"predictions"|..., "description": "..."}.
+   Rules for owner assignment:
+     - owner="data_engineer" for: cleaned_data.csv, cleaning_manifest.json
+     - owner="ml_engineer" for everything else (scored_rows.csv, metrics.json, alignment_check.json, submission.csv, plots, etc.)
+   Rules for required determination:
+     - cleaned_data.csv is ALWAYS required.
+     - If objective is predictive/causal/prescriptive: scored_rows.csv and metrics.json are required.
+     - If objective is descriptive/exploratory: scored_rows.csv and metrics.json are OPTIONAL (required=false).
+     - If objective is a Kaggle competition or asks for submission: include {"path": "data/submission.csv", "owner": "ml_engineer", "required": true, ...}.
    NEVER put column names, metric names, or conceptual deliverables into required_outputs.
-   If the objective asks for a “listado/list/report/tabla”, map it to data/scored_rows.csv and define its columns in artifact_requirements.scored_rows_schema or decisioning_requirements.
-   If a deliverable is conceptual (e.g., “Accuracy”, “Brier Score”), put it in reporting_requirements, not required_outputs.
+   If the objective asks for a "listado/list/report/tabla", map it to data/scored_rows.csv and define its columns in artifact_requirements.scored_rows_schema or decisioning_requirements.
+   If a deliverable is conceptual (e.g., "Accuracy", "Brier Score"), put it in reporting_requirements, not required_outputs.
 
 INPUTS YOU WILL RECEIVE
 
@@ -394,7 +402,7 @@ Your output MUST be a valid JSON object with these top-level keys:
 "available_columns": ["<full_inventory>"],
 "canonical_columns": ["<minimal_required_subset>"],
 "derived_columns": ["<list_of_names>"],
-"required_outputs": ["<list_of_paths>"],
+"required_outputs": [{"path": "<file_path>", "owner": "data_engineer|ml_engineer", "required": true, "kind": "<kind>", "description": "<desc>"}],
 
 "iteration_policy": {...},
 "unknowns": [...],
@@ -410,6 +418,7 @@ FINAL CHECK (self-verify before output)
 * Did you include data_limited_mode and allowed_feature_sets?
 * Did you bind artifacts with derived_columns_minimum vs optional_in_data_limited?
 * Did you ensure gates reference contract fields (not literals)?
+* Did you determine required_outputs dynamically with owner and required fields based on objective type?
 * Output JSON only.
 
 Generate the complete execution contract now (JSON only, no markdown).

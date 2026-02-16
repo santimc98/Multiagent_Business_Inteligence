@@ -137,6 +137,31 @@ def check_required_outputs(required_outputs: List[Any]) -> Dict[str, object]:
     }
 
 
+def check_required_outputs_for_owner(
+    required_outputs: List[Any], owner: str
+) -> Dict[str, object]:
+    """Validate required outputs filtered by owner.
+
+    Filters the list to only items belonging to *owner* before delegating to
+    check_required_outputs(). Items without an explicit 'owner' field are
+    assigned one via path-based inference.
+    """
+    from src.utils.contract_accessors import _infer_owner_from_path
+
+    filtered: List[Any] = []
+    for item in required_outputs or []:
+        if isinstance(item, dict):
+            path = item.get("path") or ""
+            item_owner = item.get("owner") or _infer_owner_from_path(path)
+        elif isinstance(item, str):
+            item_owner = _infer_owner_from_path(item)
+        else:
+            continue
+        if item_owner == owner:
+            filtered.append(item)
+    return check_required_outputs(filtered)
+
+
 def check_scored_rows_schema(
     scored_rows_path: str,
     required_columns: List[str],

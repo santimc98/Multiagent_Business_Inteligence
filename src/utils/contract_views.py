@@ -1314,7 +1314,11 @@ def build_ml_view(
                     required_files_payload.append(str(path))
             else:
                 required_files_payload.append(str(entry))
-    artifact_payload: Dict[str, Any] = {"required_outputs": required_outputs}
+    # Filter required_outputs for ML view: exclude data_engineer outputs
+    from src.utils.contract_accessors import _infer_owner_from_path
+    ml_required_outputs = [p for p in required_outputs if _infer_owner_from_path(p) != "data_engineer"]
+
+    artifact_payload: Dict[str, Any] = {"required_outputs": ml_required_outputs}
     if required_files_payload:
         artifact_payload["required_files"] = required_files_payload
     if scored_rows_schema:
@@ -1333,7 +1337,7 @@ def build_ml_view(
         "allowed_feature_sets": allowed_sets,
         "forbidden_features": final_forbidden,
         "column_dtype_targets": column_dtype_targets,
-        "required_outputs": required_outputs,
+        "required_outputs": ml_required_outputs,
         "validation_requirements": validation,
     }
     column_sets_summary = contract_min.get("column_sets_summary") or contract_full.get("column_sets_summary")
@@ -1799,7 +1803,11 @@ def build_contract_views_projection(
     if not isinstance(scored_rows_schema, dict):
         scored_rows_schema = {}
 
-    artifact_payload: Dict[str, Any] = {"required_outputs": required_outputs}
+    # Filter required_outputs for ML view: exclude data_engineer outputs
+    from src.utils.contract_accessors import _infer_owner_from_path as _infer_owner
+    ml_required_outputs_v41 = [p for p in required_outputs if _infer_owner(p) != "data_engineer"]
+
+    artifact_payload: Dict[str, Any] = {"required_outputs": ml_required_outputs_v41}
     if required_files:
         artifact_payload["required_files"] = required_files
     if scored_rows_schema:
@@ -1887,7 +1895,7 @@ def build_contract_views_projection(
         "allowed_feature_sets": allowed_feature_sets,
         "forbidden_features": forbidden_features,
         "column_dtype_targets": column_dtype_targets,
-        "required_outputs": required_outputs,
+        "required_outputs": ml_required_outputs_v41,
         "validation_requirements": validation_requirements,
         "evaluation_spec": evaluation_spec,
         "objective_analysis": objective_analysis,

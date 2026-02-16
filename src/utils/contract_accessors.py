@@ -956,3 +956,38 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
             seen.add(norm)
             result.append(norm)
     return result
+
+
+def _infer_owner_from_path(path: str) -> str:
+    """Infer which engineer owns a deliverable based on its path.
+
+    Returns "data_engineer" for cleaning-related artifacts, "ml_engineer" otherwise.
+    """
+    lower = (path or "").lower()
+    if any(tok in lower for tok in ("cleaned_data", "cleaning_manifest")):
+        return "data_engineer"
+    return "ml_engineer"
+
+
+def get_required_outputs_by_owner(contract: Dict[str, Any], owner: str) -> List[str]:
+    """Return required output paths filtered by owner.
+
+    Supports both List[str] (legacy) and List[dict] formats for required_outputs.
+    When items lack an explicit 'owner' field, uses _infer_owner_from_path as fallback.
+    """
+    if not isinstance(contract, dict):
+        return []
+    raw = contract.get("required_outputs")
+    if not isinstance(raw, list) or not raw:
+        return []
+    result: List[str] = []
+    for item in raw:
+        if isinstance(item, dict):
+            path = item.get("path") or ""
+            item_owner = item.get("owner") or _infer_owner_from_path(path)
+            if item_owner == owner:
+                result.append(path)
+        elif isinstance(item, str):
+            if _infer_owner_from_path(item) == owner:
+                result.append(item)
+    return result

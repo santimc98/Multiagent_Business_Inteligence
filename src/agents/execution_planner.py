@@ -1628,7 +1628,7 @@ def _create_v41_skeleton(
           "canonical_columns_compact": compact_column_representation(available_cols, max_display=40)
           if feature_selectors
           else {},
-        "required_outputs": ["data/cleaned_data.csv", "data/metrics.json", "data/alignment_check.json"],
+        "required_outputs": ["data/cleaned_data.csv"],
         
         "iteration_policy": {
             "max_iterations": 3,
@@ -2847,17 +2847,35 @@ def build_contract_min(
     if not isinstance(full_artifact_requirements, dict):
         full_artifact_requirements = {}
 
-    default_outputs = [
-        "data/cleaned_data.csv",
-        "data/scored_rows.csv",
-        "data/metrics.json",
-        "data/alignment_check.json",
-    ]
-    full_required_files = _extract_required_paths(full_artifact_requirements)
-    if full_required_files:
-        required_outputs = list(dict.fromkeys(full_required_files + default_outputs))
+    # Dynamic required_outputs: trust LLM-determined outputs, only enforce
+    # cleaned_data.csv as universal safety net.
+    minimal_safety = ["data/cleaned_data.csv"]
+
+    def _extract_paths_from_outputs(raw_outputs: list) -> List[str]:
+        """Extract path strings from a list that may contain str or dict items."""
+        paths: List[str] = []
+        for item in raw_outputs or []:
+            if isinstance(item, dict):
+                path = item.get("path") or item.get("output") or item.get("artifact")
+            elif isinstance(item, str):
+                path = item
+            else:
+                continue
+            if path and is_probably_path(str(path)):
+                paths.append(str(path))
+        return paths
+
+    llm_outputs = contract.get("required_outputs")
+    if isinstance(llm_outputs, list) and llm_outputs:
+        # Trust LLM-determined outputs, only ensure minimal safety
+        required_outputs = _extract_paths_from_outputs(llm_outputs)
+        for safe in minimal_safety:
+            if safe not in required_outputs:
+                required_outputs.append(safe)
     else:
-        required_outputs = list(default_outputs)
+        # Fallback: artifact_requirements + minimal safety
+        full_required_files = _extract_required_paths(full_artifact_requirements)
+        required_outputs = list(dict.fromkeys((full_required_files or []) + minimal_safety))
 
     # P1.5: Infer feature selectors for wide datasets
     feature_selectors = []
@@ -5612,12 +5630,20 @@ class ExecutionPlannerAgent:
                 return "Weights or scoring artifact required by the contract."
             return "Requested deliverable."
 
+        def _infer_deliverable_owner(path: str) -> str:
+            """Infer which engineer owns a deliverable based on its path."""
+            lower = (path or "").lower()
+            if any(tok in lower for tok in ("cleaned_data", "cleaning_manifest")):
+                return "data_engineer"
+            return "ml_engineer"
+
         def _build_deliverable(
             path: str,
             required: bool = True,
             kind: str | None = None,
             description: str | None = None,
             deliverable_id: str | None = None,
+            owner: str | None = None,
         ) -> Dict[str, Any]:
             if not path:
                 return {}
@@ -5630,6 +5656,7 @@ class ExecutionPlannerAgent:
                 "required": bool(required),
                 "kind": kind_val,
                 "description": desc_val,
+                "owner": owner or _infer_deliverable_owner(path),
             }
 
         def _normalize_deliverables(
@@ -5663,6 +5690,7 @@ class ExecutionPlannerAgent:
                     kind=item.get("kind"),
                     description=item.get("description"),
                     deliverable_id=item.get("id"),
+                    owner=item.get("owner"),
                 )
                 if deliverable:
                     normalized.append(deliverable)
@@ -5680,7 +5708,7 @@ class ExecutionPlannerAgent:
                     continue
                 if path in by_path:
                     existing = merged[by_path[path]]
-                    for key in ("id", "kind", "description"):
+                    for key in ("id", "kind", "description", "owner"):
                         if item.get(key):
                             existing[key] = item.get(key)
                     if "required" in item and item.get("required") is not None:
@@ -5719,32 +5747,42 @@ class ExecutionPlannerAgent:
             """
             deliverables: List[Dict[str, Any]] = []
 
-            def _add(path: str, required: bool = True, kind: str | None = None, description: str | None = None) -> None:
-                item = _build_deliverable(path, required=required, kind=kind, description=description)
+            def _add(path: str, required: bool = True, kind: str | None = None,
+                     description: str | None = None, owner: str | None = None) -> None:
+                item = _build_deliverable(path, required=required, kind=kind,
+                                          description=description, owner=owner)
                 if item:
                     deliverables.append(item)
 
             # Determine if this objective involves model training
             involves_model_training = objective_type in ("predictive", "prescriptive", "causal")
 
-            # Core deliverable: cleaned_data.csv is always required
-            _add("data/cleaned_data.csv", True, "dataset", "Cleaned dataset used for downstream analysis.")
+            # Core deliverable: cleaned_data.csv is always required (data_engineer)
+            _add("data/cleaned_data.csv", True, "dataset",
+                 "Cleaned dataset used for downstream analysis.", owner="data_engineer")
 
             # CONTEXT-AWARE: metrics.json only required if model training is involved
             if involves_model_training:
-                _add("data/metrics.json", True, "metrics", "Model metrics and validation summary.")
+                _add("data/metrics.json", True, "metrics",
+                     "Model metrics and validation summary.", owner="ml_engineer")
             else:
-                _add("data/metrics.json", False, "metrics", "Optional metrics for descriptive analysis.")
+                _add("data/metrics.json", False, "metrics",
+                     "Optional metrics for descriptive analysis.", owner="ml_engineer")
 
-            _add("static/plots/*.png", False, "plot", "Optional diagnostic plots.")
-            _add("data/predictions.csv", False, "predictions", "Optional predictions output.")
-            _add("data/feature_importances.json", False, "feature_importances", "Optional feature importance output.")
-            _add("data/error_analysis.json", False, "error_analysis", "Optional error analysis output.")
+            _add("static/plots/*.png", False, "plot",
+                 "Optional diagnostic plots.", owner="ml_engineer")
+            _add("data/predictions.csv", False, "predictions",
+                 "Optional predictions output.", owner="ml_engineer")
+            _add("data/feature_importances.json", False, "feature_importances",
+                 "Optional feature importance output.", owner="ml_engineer")
+            _add("data/error_analysis.json", False, "error_analysis",
+                 "Optional error analysis output.", owner="ml_engineer")
             _add(
                 "reports/recommendations_preview.json",
                 False,
                 "report",
                 "Optional illustrative recommendation preview for executive reporting.",
+                owner="ml_engineer",
             )
 
             target_type = str(spec_obj.get("target_type") or "").lower()
@@ -5755,17 +5793,23 @@ class ExecutionPlannerAgent:
 
             # CONTEXT-AWARE: scored_rows.csv only required for scoring/optimization objectives
             if any(tok in signal_text for tok in ["ranking", "scoring", "weight", "weights", "optimization", "optimiz", "priorit"]):
-                _add("data/weights.json", False, "weights", "Optional weights artifact for legacy consumers.")
-                _add("data/case_summary.csv", False, "dataset", "Optional legacy case summary output.")
+                _add("data/weights.json", False, "weights",
+                     "Optional weights artifact for legacy consumers.", owner="ml_engineer")
+                _add("data/case_summary.csv", False, "dataset",
+                     "Optional legacy case summary output.", owner="ml_engineer")
                 # scored_rows required for prescriptive, optional for descriptive
-                _add("data/scored_rows.csv", involves_model_training, "predictions", "Scored rows output.")
-                _add("data/case_alignment_report.json", False, "report", "Optional legacy alignment report.")
+                _add("data/scored_rows.csv", involves_model_training, "predictions",
+                     "Scored rows output.", owner="ml_engineer")
+                _add("data/case_alignment_report.json", False, "report",
+                     "Optional legacy alignment report.", owner="ml_engineer")
             elif involves_model_training:
                 # Predictive/causal without explicit scoring: scored_rows still required
-                _add("data/scored_rows.csv", True, "predictions", "Model predictions output.")
+                _add("data/scored_rows.csv", True, "predictions",
+                     "Model predictions output.", owner="ml_engineer")
             else:
                 # Descriptive: scored_rows is optional
-                _add("data/scored_rows.csv", False, "predictions", "Optional scored rows for descriptive analysis.")
+                _add("data/scored_rows.csv", False, "predictions",
+                     "Optional scored rows for descriptive analysis.", owner="ml_engineer")
 
             return deliverables
 
@@ -5788,24 +5832,12 @@ class ExecutionPlannerAgent:
             # Build required_outputs from deliverables
             req_outputs = [item["path"] for item in deliverables if item.get("required")]
 
-            # CONTEXT-AWARE: Only force core ML outputs for objectives that involve model training
-            # For descriptive objectives, scored_rows.csv and metrics.json are optional
-            objective_type = _infer_objective_type()
-            involves_model_training = objective_type in ("predictive", "prescriptive", "causal")
+            # Safety net: only cleaned_data.csv is universally forced.
+            # All other outputs (scored_rows, metrics, alignment_check) are determined
+            # by _derive_deliverables based on objective_type — no more hardcoded forcing.
+            if "data/cleaned_data.csv" not in req_outputs:
+                req_outputs.append("data/cleaned_data.csv")
 
-            # alignment_check.json is always required (documents what was done)
-            if "data/alignment_check.json" not in req_outputs:
-                req_outputs.append("data/alignment_check.json")
-
-            # scored_rows.csv and metrics.json only forced for model-training objectives
-            if involves_model_training:
-                if "data/scored_rows.csv" not in req_outputs:
-                    req_outputs.append("data/scored_rows.csv")
-                if "data/metrics.json" not in req_outputs:
-                    req_outputs.append("data/metrics.json")
-            else:
-                print(f"DYNAMIC_DELIVERABLES: objective_type={objective_type}, scored_rows.csv and metrics.json are OPTIONAL")
-            
             # Normalize paths: ensure data/ prefix
             def _normalize_path(p: str) -> str:
                 known = ["metrics.json", "alignment_check.json", "scored_rows.csv", "cleaned_data.csv"]
@@ -5814,7 +5846,7 @@ class ExecutionPlannerAgent:
                 if base in known and not p.startswith("data/"):
                     return f"data/{base}"
                 return p
-            
+
             contract["required_outputs"] = [_normalize_path(p) for p in req_outputs]
 
             artifact_reqs = contract.get("artifact_requirements", {})
