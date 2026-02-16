@@ -10,7 +10,9 @@ duckdb
 google-cloud-storage
 
 # --- Machine Learning (Classic & Boosting) ---
-scikit-learn==1.4.2
+# NOTE: catboost 1.2.8 is incompatible with sklearn >=1.8 (__sklearn_tags__ missing).
+# Pin sklearn <1.8 until catboost releases a fix (tracked: catboost/catboost#2955).
+scikit-learn>=1.6,<1.8
 xgboost
 lightgbm
 catboost
