@@ -6966,6 +6966,16 @@ def _artifact_alignment_gate(
         schema_recommended = scored_schema.get("recommended_columns")
         if isinstance(schema_recommended, list):
             allowed_cols.extend([str(col) for col in schema_recommended if col])
+    # Also read scored_rows_schema directly from artifact_requirements
+    # (contract may store schema here instead of / in addition to file_schemas)
+    scored_rows_schema_direct = reqs.get("scored_rows_schema") if isinstance(reqs, dict) else None
+    if isinstance(scored_rows_schema_direct, dict):
+        sr_required = scored_rows_schema_direct.get("required_columns")
+        if isinstance(sr_required, list):
+            allowed_cols.extend([str(col) for col in sr_required if col])
+        sr_recommended = scored_rows_schema_direct.get("recommended_columns")
+        if isinstance(sr_recommended, list):
+            allowed_cols.extend([str(col) for col in sr_recommended if col])
     decisioning_cols: List[str] = []
     decisioning_req = contract.get("decisioning_requirements", {}) if isinstance(contract, dict) else {}
     decisioning_out = decisioning_req.get("output") if isinstance(decisioning_req, dict) else {}

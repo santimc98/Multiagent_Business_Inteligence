@@ -2779,8 +2779,16 @@ def build_contract_min(
         resolved_targets: List[str] = []
         if not target_candidates:
             return resolved_targets
+        # Only accept candidates with name-based evidence (score >= 2.0).
+        # Pure statistical signals like low_cardinality (score ~1.0) are not
+        # sufficient to classify a column as an outcome/target — they indicate
+        # categorical features, not prediction targets.
+        _MIN_TARGET_SCORE = 2.0
         for item in target_candidates:
             if not isinstance(item, dict):
+                continue
+            candidate_score = item.get("score")
+            if isinstance(candidate_score, (int, float)) and candidate_score < _MIN_TARGET_SCORE:
                 continue
             raw = item.get("column") or item.get("name") or item.get("candidate")
             if not raw:
@@ -9219,6 +9227,8 @@ class ExecutionPlannerAgent:
                 "missing_columns_handling",
                 "execution_constraints",
                 "allowed_feature_sets",
+                "outcome_columns",
+                "decision_columns",
                 "preprocessing_requirements",
                 "leakage_execution_plan",
                 "optimization_specification",
