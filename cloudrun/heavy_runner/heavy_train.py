@@ -503,7 +503,17 @@ def _resolve_execute_code_mode(payload: Dict[str, Any]) -> Tuple[str, List[str],
     required_payload = payload.get("required_outputs")
     required = []
     if isinstance(required_payload, list):
-        required = [_normalize_rel_path(path) for path in required_payload if path]
+        raw_paths = []
+        for item in required_payload:
+            if isinstance(item, dict):
+                path = item.get("path") or ""
+            elif isinstance(item, str):
+                path = item
+            else:
+                continue
+            if path:
+                raw_paths.append(path)
+        required = [_normalize_rel_path(path) for path in raw_paths if path]
         required = [path for path in required if path]
         required = list(dict.fromkeys(required))
     # Accept both legacy and explicit DE mode tags.
