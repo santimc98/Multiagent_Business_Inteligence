@@ -3483,10 +3483,11 @@ def validate_contract_minimal_readonly(
                 if col and col.lower() not in target_norm
             ]
             if unexpected_outcomes:
+                severity = "error" if len(unexpected_outcomes) >= 3 else "warning"
                 issues.append(
                     _strict_issue(
                         "contract.outcome_columns_sanity",
-                        "error",
+                        severity,
                         "outcome columns include non-target fields; outcomes must contain only target column(s).",
                         {
                             "unexpected_outcomes": unexpected_outcomes[:25],

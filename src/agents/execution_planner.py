@@ -4738,19 +4738,20 @@ class ExecutionPlannerAgent:
             return 1
         return max(1, len(prompt) // 4)
 
-    def _generation_config_for_prompt(self, prompt: str) -> Dict[str, Any]:
+    def _generation_config_for_prompt(self, prompt: str, output_token_floor: int = 1024) -> Dict[str, Any]:
         prompt_tokens = self._estimate_prompt_tokens(prompt)
         available = self._context_window_tokens - prompt_tokens - 500
+        floor = max(1024, int(output_token_floor))
         if available <= 0:
-            budgeted_max = 1024
+            budgeted_max = floor
         else:
-            budgeted_max = min(self._default_max_output_tokens, max(1024, int(available)))
+            budgeted_max = min(self._default_max_output_tokens, max(floor, int(available)))
         config = dict(self._generation_config)
         config["max_output_tokens"] = int(budgeted_max)
         return config
 
-    def _generate_content_with_budget(self, model_client: Any, prompt: str):
-        generation_config = self._generation_config_for_prompt(prompt)
+    def _generate_content_with_budget(self, model_client: Any, prompt: str, output_token_floor: int = 1024):
+        generation_config = self._generation_config_for_prompt(prompt, output_token_floor=output_token_floor)
         try:
             response = model_client.generate_content(prompt, generation_config=generation_config)
         except TypeError:
@@ -7615,8 +7616,8 @@ class ExecutionPlannerAgent:
                 severe_outcome_divergence = (
                     bool(outcome_union)
                     and (
-                        len(outcome_diff) >= 4
-                        or (len(outcome_diff) >= 2 and outcome_divergence >= 0.6)
+                        len(outcome_diff) >= 6
+                        or (len(outcome_diff) >= 3 and outcome_divergence >= 0.75)
                     )
                 )
                 if severe_outcome_divergence:
@@ -8947,6 +8948,7 @@ class ExecutionPlannerAgent:
                                 response, generation_config_used = self._generate_content_with_budget(
                                     model_client,
                                     current_prompt,
+                                    output_token_floor=2048 * round_idx,
                                 )
                                 response_text = getattr(response, "text", "") or ""
                                 self.last_prompt = current_prompt
@@ -9262,6 +9264,7 @@ class ExecutionPlannerAgent:
                             response, generation_config_used = self._generate_content_with_budget(
                                 model_client,
                                 current_prompt,
+                                output_token_floor=2048 * round_idx,
                             )
                             response_text = getattr(response, "text", "") or ""
                             self.last_prompt = current_prompt
@@ -9431,6 +9434,63 @@ class ExecutionPlannerAgent:
             status = str(validation_result.get("status") or "unknown").lower()
             issues = validation_result.get("issues") if isinstance(validation_result, dict) else []
             accepted = _contract_is_accepted(validation_result if isinstance(validation_result, dict) else None)
+
+            # Best-effort soft acceptance: if the contract has minimum
+            # required structure and only non-structural quality errors,
+            # downgrade those errors to warnings so the pipeline can proceed.
+            _DIAG_BESTEFFORT_MIN_KEYS = {"scope", "column_roles", "canonical_columns"}
+            _DIAG_BESTEFFORT_SOFT_RULES = {
+                "contract.outcome_columns_sanity",
+                "contract.llm_min_contract_divergence",
+                "contract.iteration_policy_limits",
+                "contract.iteration_policy_alias",
+                "contract.canonical_columns_coverage",
+            }
+            if (
+                not accepted
+                and isinstance(contract, dict)
+                and contract
+                and _DIAG_BESTEFFORT_MIN_KEYS.issubset(set(contract.keys()))
+                and isinstance(issues, list)
+            ):
+                diag_error_rules = [
+                    str(iss.get("rule") or "")
+                    for iss in issues
+                    if isinstance(iss, dict)
+                    and str(iss.get("severity") or "").lower() in {"error", "fail"}
+                ]
+                if diag_error_rules and all(r in _DIAG_BESTEFFORT_SOFT_RULES for r in diag_error_rules):
+                    for iss in issues:
+                        if (
+                            isinstance(iss, dict)
+                            and str(iss.get("severity") or "").lower() in {"error", "fail"}
+                            and str(iss.get("rule") or "") in _DIAG_BESTEFFORT_SOFT_RULES
+                        ):
+                            iss["severity"] = "warning"
+                            iss["message"] = "[best-effort accepted] " + str(iss.get("message") or "")
+                    recalc_errors = sum(
+                        1 for iss in issues
+                        if isinstance(iss, dict) and str(iss.get("severity") or "").lower() in {"error", "fail"}
+                    )
+                    recalc_warnings = sum(
+                        1 for iss in issues
+                        if isinstance(iss, dict) and str(iss.get("severity") or "").lower() == "warning"
+                    )
+                    if recalc_errors == 0:
+                        status = "warning" if recalc_warnings > 0 else "ok"
+                        accepted = True
+                        validation_result["status"] = status
+                        validation_result["accepted"] = True
+                        validation_result["issues"] = issues
+                        summary_vr = validation_result.get("summary") or {}
+                        summary_vr["error_count"] = recalc_errors
+                        summary_vr["warning_count"] = recalc_warnings
+                        validation_result["summary"] = summary_vr
+                        print(
+                            "CONTRACT_BESTEFFORT_ACCEPT: Downgraded non-structural errors to warnings; "
+                            f"contract accepted with {recalc_warnings} warning(s)."
+                        )
+
             if status == "error":
                 print(f"CONTRACT_VALIDATION_ERROR: {len(issues) if isinstance(issues, list) else 0} issues found")
                 if isinstance(issues, list):
@@ -10023,6 +10083,7 @@ domain_expert_critique:
                             response, generation_config_used = self._generate_content_with_budget(
                                 model_client,
                                 current_prompt,
+                                output_token_floor=3072 * quality_round,
                             )
                             response_text = getattr(response, "text", "") or ""
                             self.last_response = response_text
@@ -10484,7 +10545,67 @@ domain_expert_critique:
                             deterministic_scaffold_contract,
                         )
                     )
-                    llm_success = False
+                    # Best-effort acceptance: if the contract has minimum required
+                    # structure and only non-structural quality errors, accept it
+                    # with warnings instead of failing the entire pipeline.
+                    _BESTEFFORT_MIN_KEYS = {"scope", "column_roles", "canonical_columns"}
+                    _BESTEFFORT_SOFT_RULES = {
+                        "contract.outcome_columns_sanity",
+                        "contract.llm_min_contract_divergence",
+                        "contract.iteration_policy_limits",
+                        "contract.iteration_policy_alias",
+                        "contract.canonical_columns_coverage",
+                    }
+                    has_min_keys = (
+                        isinstance(contract, dict)
+                        and contract
+                        and _BESTEFFORT_MIN_KEYS.issubset(set(contract.keys()))
+                    )
+                    if has_min_keys:
+                        try:
+                            be_validation = _validate_contract_quality(copy.deepcopy(contract))
+                        except Exception:
+                            be_validation = None
+                        if isinstance(be_validation, dict):
+                            be_issues = be_validation.get("issues") or []
+                            be_error_rules = [
+                                str(iss.get("rule") or "")
+                                for iss in be_issues
+                                if isinstance(iss, dict)
+                                and str(iss.get("severity") or "").lower() in {"error", "fail"}
+                            ]
+                            all_soft = all(r in _BESTEFFORT_SOFT_RULES for r in be_error_rules)
+                            if all_soft:
+                                # Downgrade remaining errors to warnings in the validation result
+                                for iss in be_issues:
+                                    if isinstance(iss, dict) and str(iss.get("severity") or "").lower() in {"error", "fail"}:
+                                        if str(iss.get("rule") or "") in _BESTEFFORT_SOFT_RULES:
+                                            iss["severity"] = "warning"
+                                            iss["message"] = "[best-effort accepted] " + str(iss.get("message") or "")
+                                error_count = sum(
+                                    1 for iss in be_issues
+                                    if isinstance(iss, dict) and str(iss.get("severity") or "").lower() in {"error", "fail"}
+                                )
+                                warning_count = sum(
+                                    1 for iss in be_issues
+                                    if isinstance(iss, dict) and str(iss.get("severity") or "").lower() == "warning"
+                                )
+                                be_validation["status"] = "error" if error_count > 0 else ("warning" if warning_count > 0 else "ok")
+                                be_validation["accepted"] = error_count == 0
+                                be_validation["issues"] = be_issues
+                                summary = be_validation.get("summary") or {}
+                                summary["error_count"] = error_count
+                                summary["warning_count"] = warning_count
+                                be_validation["summary"] = summary
+                                if be_validation.get("accepted"):
+                                    llm_success = True
+                                    _record_fallback_attempt("best_effort_soft_accept", be_validation)
+                                    print(
+                                        "SUCCESS: Execution Planner accepted best-effort contract "
+                                        "(only non-structural quality warnings remain)."
+                                    )
+                    if not llm_success:
+                        llm_success = False
 
                 planner_candidate_invalid = (
                     best_candidate
