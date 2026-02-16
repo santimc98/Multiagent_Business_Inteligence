@@ -62,6 +62,39 @@ def _ensure_trailing_sep(path: str) -> str:
     return path if path.endswith(os.sep) else path + os.sep
 
 
+# ---------------------------------------------------------------------------
+# P0 FIX 4: Large-file extensions whose intermediate outputs should be cleaned
+# after a successful attempt to avoid multi-GB duplication across attempts.
+# ---------------------------------------------------------------------------
+_LARGE_DATA_EXTENSIONS: set = {".csv", ".parquet", ".xlsx", ".xls", ".pkl", ".pickle", ".h5", ".hdf5"}
+_CLEANUP_SIZE_THRESHOLD: int = 10 * 1024 * 1024  # 10 MB
+
+
+def _cleanup_previous_attempts(stage_dir: str, current_attempt: int) -> None:
+    """Remove large data files from previous attempts' output directories.
+
+    Only deletes files with data extensions above the size threshold.
+    Keeps small files (status.json, error.json, request.json, logs) for debugging.
+    """
+    if current_attempt < 1 or not os.path.isdir(stage_dir):
+        return
+    for prev in range(current_attempt):
+        prev_output = os.path.join(stage_dir, f"attempt_{prev}", "output")
+        if not os.path.isdir(prev_output):
+            continue
+        for dirpath, _, filenames in os.walk(prev_output):
+            for name in filenames:
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in _LARGE_DATA_EXTENSIONS:
+                    continue
+                full = os.path.join(dirpath, name)
+                try:
+                    if os.path.getsize(full) > _CLEANUP_SIZE_THRESHOLD:
+                        os.remove(full)
+                except Exception:
+                    pass
+
+
 def launch_local_runner_job(
     *,
     run_id: str,
@@ -96,10 +129,13 @@ def launch_local_runner_job(
         attempt_num = 0
 
     attempt_scope = f"attempt_{attempt_num}" if attempt_num > 0 else "attempt_0"
-    # Use absolute paths because heavy_runner executes from repo_root cwd.
-    # Relative INPUT_URI/CODE_URI can break when orchestrator cwd != repo_root.
-    base_dir = os.path.abspath(
-        os.path.join("runs", str(run_id or "unknown"), "sandbox", "local_runner", stage_scope, attempt_scope)
+    # P0 FIX: Resolve from PROJECT ROOT, not cwd.
+    # When cwd is runs/<run_id>/work/, the old relative path created a
+    # self-referencing loop: runs/<id>/work/runs/<id>/sandbox/... (14+ GB).
+    # Using the same project-root derivation as heavy_train.py (line 140).
+    _project_root = str(Path(__file__).resolve().parents[2])
+    base_dir = os.path.join(
+        _project_root, "runs", str(run_id or "unknown"), "sandbox", "local_runner", stage_scope, attempt_scope
     )
     input_dir = os.path.join(base_dir, "input")
     output_dir = os.path.join(base_dir, "output")
@@ -257,6 +293,16 @@ def launch_local_runner_job(
         error_payload = None
 
     has_error = bool(error_payload) or job_failed
+
+    # P0 FIX 4: After a successful attempt, clean large data files from
+    # previous attempts to avoid multi-GB duplication (e.g. scored_data.csv
+    # at 1.25 GB × N attempts).
+    if not has_error and attempt_num > 0:
+        stage_dir = os.path.join(
+            _project_root, "runs", str(run_id or "unknown"),
+            "sandbox", "local_runner", stage_scope,
+        )
+        _cleanup_previous_attempts(stage_dir, attempt_num)
 
     return {
         "status": "error" if has_error else "success",

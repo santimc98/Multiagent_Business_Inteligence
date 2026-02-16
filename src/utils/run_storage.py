@@ -133,10 +133,23 @@ def _archive_run(run_id: str, run_dir: str, archive_dir: str) -> Optional[str]:
     zip_name = f"run_{run_id}.zip"
     zip_path = os.path.join(archive_dir, zip_name)
     base_dir = os.path.abspath(os.path.dirname(run_dir))
+
+    # P0 FIX: Exclude work/ (all useful data is already in artifacts/ and report/),
+    # __pycache__, and files larger than 50 MB to prevent multi-GB archives.
+    _ARCHIVE_SKIP_DIRS = {"work", "__pycache__", ".git", ".venv", "node_modules"}
+    _ARCHIVE_MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB
+
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(run_dir):
+        for root, dirs, files in os.walk(run_dir):
+            # Prune excluded directories in-place to avoid walking into them
+            dirs[:] = [d for d in dirs if d not in _ARCHIVE_SKIP_DIRS]
             for file in files:
                 path = os.path.join(root, file)
+                try:
+                    if os.path.getsize(path) > _ARCHIVE_MAX_FILE_BYTES:
+                        continue
+                except Exception:
+                    continue
                 arcname = os.path.relpath(path, base_dir)
                 zf.write(path, arcname)
     return zip_path

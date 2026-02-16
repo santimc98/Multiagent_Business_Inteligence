@@ -15,6 +15,26 @@ from src.utils.text_encoding import sanitize_text, sanitize_text_payload
 
 RUNS_DIR = "runs"
 
+# ---------------------------------------------------------------------------
+# P0 FIX: Anti-bloat constants
+# ---------------------------------------------------------------------------
+# Prefixes to NEVER copy into run bundles (prevents self-referencing loops
+# and __pycache__ noise).
+_BUNDLE_EXCLUDE_PREFIXES: List[str] = [
+    "runs",
+    "__pycache__",
+    ".git",
+    ".venv",
+    "node_modules",
+]
+
+# CSVs larger than this are replaced by a lightweight .meta.json stub
+# containing path, size, and sha256 — avoids multi-GB duplication.
+_LARGE_CSV_MAX_BYTES: int = 50 * 1024 * 1024  # 50 MB
+
+# Extensions subject to the size cap.
+_LARGE_FILE_EXTENSIONS: set = {".csv", ".parquet", ".xlsx", ".xls", ".pkl", ".pickle", ".h5", ".hdf5"}
+
 _RUN_DIRS: Dict[str, str] = {}
 _RUN_ATTEMPTS: Dict[str, List[Dict[str, Any]]] = {}
 _TEE_STREAM = None
@@ -136,7 +156,11 @@ def _should_copy_file(
     exclude_prefixes: Optional[List[str]],
 ) -> bool:
     rel_norm = _normalize_rel_path(rel_path)
-    for prefix in _normalize_exclude_prefixes(exclude_prefixes):
+    # Merge caller-provided + global exclude prefixes.
+    all_prefixes = _normalize_exclude_prefixes(
+        (exclude_prefixes or []) + _BUNDLE_EXCLUDE_PREFIXES
+    )
+    for prefix in all_prefixes:
         if rel_norm == prefix or rel_norm.startswith(prefix + "/"):
             return False
     if since_epoch is not None:
@@ -146,6 +170,33 @@ def _should_copy_file(
         except Exception:
             return False
     return True
+
+
+def _is_oversized_data_file(path: str) -> bool:
+    """Return True if path is a data file exceeding _LARGE_CSV_MAX_BYTES."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _LARGE_FILE_EXTENSIONS:
+        return False
+    try:
+        return os.path.getsize(path) > _LARGE_CSV_MAX_BYTES
+    except Exception:
+        return False
+
+
+def _write_stub_meta(src_path: str, dest_path: str) -> None:
+    """Write a lightweight .meta.json instead of copying the large file."""
+    meta = {
+        "_stub": True,
+        "original_path": os.path.abspath(src_path),
+        "size_bytes": os.path.getsize(src_path),
+        "size_mb": round(os.path.getsize(src_path) / (1024 * 1024), 2),
+        "sha256": _hash_file(src_path),
+        "note": "File too large for run_bundle. See original_path for the actual file.",
+    }
+    meta_dest = dest_path + ".meta.json"
+    _ensure_dir(os.path.dirname(meta_dest))
+    with open(meta_dest, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
 
 
 def init_run_bundle(
@@ -318,13 +369,19 @@ def copy_run_artifacts(
         return
     dest_root = os.path.join(run_dir, "artifacts")
     _ensure_dir(dest_root)
+    seen_hashes: Dict[str, str] = {}  # sha256 -> first dest path (dedup)
     for src in sources:
         if not src or not os.path.exists(src):
             continue
         try:
             if os.path.isdir(src):
                 base_name = os.path.basename(src.rstrip("/\\"))
-                for root, _, files in os.walk(src):
+                for root, dirs, files in os.walk(src):
+                    # Prune excluded dirs in-place to avoid walking into them
+                    dirs[:] = [
+                        d for d in dirs
+                        if d not in {"runs", "__pycache__", ".git", ".venv", "node_modules"}
+                    ]
                     for name in files:
                         path = os.path.join(root, name)
                         rel = os.path.relpath(path, src)
@@ -332,6 +389,10 @@ def copy_run_artifacts(
                         if not _should_copy_file(path, rel_path, since_epoch, exclude_prefixes):
                             continue
                         dest = os.path.join(dest_root, os.path.normpath(rel_path))
+                        # Large data files → write stub instead of copying
+                        if _is_oversized_data_file(path):
+                            _write_stub_meta(path, dest)
+                            continue
                         _ensure_dir(os.path.dirname(dest))
                         shutil.copy2(path, dest)
             else:
@@ -339,6 +400,9 @@ def copy_run_artifacts(
                 if not _should_copy_file(src, rel, since_epoch, exclude_prefixes):
                     continue
                 dest = os.path.join(dest_root, os.path.normpath(rel))
+                if _is_oversized_data_file(src):
+                    _write_stub_meta(src, dest)
+                    continue
                 _ensure_dir(os.path.dirname(dest))
                 shutil.copy2(src, dest)
         except Exception:
@@ -378,7 +442,11 @@ def copy_run_reports(
         try:
             if os.path.isdir(src):
                 base_name = os.path.basename(src.rstrip("/\\"))
-                for root, _, files in os.walk(src):
+                for root, dirs, files in os.walk(src):
+                    dirs[:] = [
+                        d for d in dirs
+                        if d not in {"runs", "__pycache__", ".git", ".venv", "node_modules"}
+                    ]
                     for name in files:
                         path = os.path.join(root, name)
                         rel = os.path.relpath(path, src)
@@ -386,6 +454,9 @@ def copy_run_reports(
                         if not _should_copy_file(path, rel_path, since_epoch, exclude_prefixes):
                             continue
                         dest = os.path.join(dest_root, os.path.normpath(rel_path))
+                        if _is_oversized_data_file(path):
+                            _write_stub_meta(path, dest)
+                            continue
                         _ensure_dir(os.path.dirname(dest))
                         shutil.copy2(path, dest)
             else:
@@ -393,6 +464,9 @@ def copy_run_reports(
                 if not _should_copy_file(src, rel, since_epoch, exclude_prefixes):
                     continue
                 dest = os.path.join(dest_root, os.path.normpath(rel))
+                if _is_oversized_data_file(src):
+                    _write_stub_meta(src, dest)
+                    continue
                 _ensure_dir(os.path.dirname(dest))
                 shutil.copy2(src, dest)
         except Exception:
