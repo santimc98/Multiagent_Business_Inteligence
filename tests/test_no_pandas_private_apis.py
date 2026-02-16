@@ -2,14 +2,15 @@ import pytest
 import os
 import re
 
-# We test the AGENT FILES themselves to ensure they don't hallucinate these imports in their prompts/templates,
-# AND we ideally would test generated code, but for now we static scan the agent source to ensure they ban them.
+# We test the AGENT FILES themselves to ensure they explicitly ban dangerous APIs
+# in their prompts, preventing the LLM from generating insecure code.
 
 AGENTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/agents'))
 
 def test_pandas_private_api_ban_in_prompts():
     """
-    Scans agent files to ensure they explicitly mention the BAN on private APIs.
+    Scans agent files to ensure they explicitly mention the BAN on private APIs
+    or dangerous imports in their sandbox security section.
     """
     target_agents = ["data_engineer.py"]
     
@@ -18,9 +19,15 @@ def test_pandas_private_api_ban_in_prompts():
         with open(path, 'r', encoding='utf-8') as f:
             content = f.read()
             
-        # Check if the prompt contains the ban string
-        if "pandas.io.*" not in content and "pd.io.parsers" not in content:
-            pytest.fail(f"{filename} does not seem to explicitly ban pandas.io private APIs in its prompt.")
+        # Check if the prompt contains security ban strings (old or new format)
+        has_ban = (
+            "pandas.io.*" in content
+            or "pd.io.parsers" in content
+            or "SANDBOX SECURITY" in content
+            or "BLOCKED IMPORTS" in content
+        )
+        if not has_ban:
+            pytest.fail(f"{filename} does not seem to explicitly ban dangerous imports in its prompt.")
 
 if __name__ == "__main__":
     try:

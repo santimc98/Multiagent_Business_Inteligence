@@ -1,3 +1,13 @@
+"""
+Tests for MLEngineerAgent._check_training_policy_compliance.
+
+NOTE (v5.0): Static AST/regex-based policy compliance was deprecated in favour of
+execution-based validation.  The method now returns [] unconditionally.
+These tests verify the deprecated method's API contract (returns empty list)
+and document the original intent for future reference.
+"""
+import pytest
+
 from src.agents.ml_engineer import MLEngineerAgent
 
 
@@ -26,6 +36,7 @@ train_df = df[df['__split'] == 'train'].copy()
     assert issues == []
 
 
+@pytest.mark.skip(reason="Deprecated v5.0: static training policy checks moved to execution-based QA validation")
 def test_training_policy_flags_missing_filter_when_no_split_or_label():
     agent = _agent()
     code = "df = pd.read_csv('data/cleaned_data.csv')"
@@ -36,6 +47,7 @@ def test_training_policy_flags_missing_filter_when_no_split_or_label():
     assert "training_rows_filter_missing" in issues
 
 
+@pytest.mark.skip(reason="Deprecated v5.0: static training policy checks moved to execution-based QA validation")
 def test_training_policy_infers_split_column_from_evidence():
     agent = _agent()
     code = "df = pd.read_csv('data/cleaned_data.csv')"
@@ -52,6 +64,7 @@ def test_training_policy_infers_split_column_from_evidence():
     assert "split_column_filter_missing" in issues
 
 
+@pytest.mark.skip(reason="Deprecated v5.0: static training policy checks moved to execution-based QA validation")
 def test_training_policy_requires_label_filter_when_train_filter_explicit():
     agent = _agent()
     code = """

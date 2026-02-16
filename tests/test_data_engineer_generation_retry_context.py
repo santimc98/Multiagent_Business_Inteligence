@@ -62,6 +62,9 @@ def test_generation_failure_retry_includes_error_context(tmp_path, monkeypatch):
     result = graph_module.run_data_engineer(state)
 
     assert len(stub.calls) == 2
-    assert "GENERATION_FAILURE_CONTEXT" in stub.calls[1]
-    assert "INVALID_PYTHON_SYNTAX" in stub.calls[1]
+    # The retry context now uses ITERATION_FEEDBACK_CONTEXT with structured JSON
+    # that includes the generation failure details
+    retry_context = stub.calls[1]
+    assert "ITERATION_FEEDBACK" in retry_context or "GENERATION_FAILURE" in retry_context
+    assert "INVALID_PYTHON_SYNTAX" in retry_context
     assert result.get("pipeline_aborted_reason") == "data_engineer_generation_failed"

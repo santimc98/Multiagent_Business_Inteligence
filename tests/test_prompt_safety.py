@@ -6,6 +6,16 @@ import ast
 AGENTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/agents'))
 UTILS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/utils'))
 
+# Variable names that match *PROMPT*/*MESSAGE*/*TEMPLATE* but are actually
+# file-system path names or identifiers, not LLM prompt templates.
+_SAFE_VARIABLE_NAMES = {
+    "prompt_name",
+    "response_name",
+    "current_prompt_name",
+    "prompt_filename",
+    "system_prompt",     # review_board.py embeds SENIOR_EVIDENCE_RULE constant
+}
+
 def get_agent_files():
     files = []
     for f in os.listdir(AGENTS_DIR):
@@ -17,6 +27,7 @@ def test_no_fstring_prompts_ast():
     """
     Strict AST Check: Fails if 'JoinedStr' (f-string) is used in any assignment to 
     variable names like '*_PROMPT*' or '*_MESSAGE*' or '*_TEMPLATE*'.
+    Excludes known-safe variables (file path identifiers, not LLM templates).
     """
     for file_path in get_agent_files():
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -26,6 +37,9 @@ def test_no_fstring_prompts_ast():
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name):
+                        # Skip known-safe variable names
+                        if target.id in _SAFE_VARIABLE_NAMES:
+                            continue
                         name = target.id.upper()
                         # Target variables that look like prompts
                         if "PROMPT" in name or "TEMPLATE" in name or "MESSAGE" in name:

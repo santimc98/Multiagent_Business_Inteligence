@@ -8,7 +8,12 @@ def test_preflight_allowed_columns_from_cleaned_header(tmp_path, monkeypatch):
     os.makedirs("data", exist_ok=True)
     with open(os.path.join("data", "cleaned_data.csv"), "w", encoding="utf-8") as f:
         f.write("Size,Debtors\n1,10\n")
-    state = {"csv_sep": ",", "csv_decimal": ".", "csv_encoding": "utf-8"}
+    state = {
+        "csv_sep": ",",
+        "csv_decimal": ".",
+        "csv_encoding": "utf-8",
+        "ml_data_path": os.path.join("data", "cleaned_data.csv"),
+    }
     contract = {
         "canonical_columns": ["Size", "Debtors", "is_success"],
         "data_requirements": [],

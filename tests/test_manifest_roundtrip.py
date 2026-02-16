@@ -1,108 +1,133 @@
+"""
+Tests for the manifest/artifact roundtrip flow during ML code execution.
 
-import pytest
-from unittest.mock import MagicMock, patch, mock_open
+NOTE: The original E2B Sandbox execution path has been replaced by the
+Heavy Runner (Cloud Run / Local Runner) architecture. These tests verify
+the heavy runner request construction and contract handling.
+"""
 import os
+import json
+import pytest
+from unittest.mock import patch
+
 from src.graph.graph import execute_code
 
-def test_manifest_roundtrip_upload():
-    # Setup State
-    state = {
-        "generated_code": "import pandas as pd\n# Load Data\ndf = pd.read_csv('data/cleaned_data.csv')",
-        "execution_output": "",
-        "execution_attempt": 1,
-        "run_id": "testrun"
+
+def _make_heavy_result(*, ok=True, downloaded=None, error=None):
+    """Build a minimal heavy_result dict that execute_code expects."""
+    return {
+        "status": "SUCCEEDED" if ok else "FAILED",
+        "status_ok": ok,
+        "job_failed_raw": not ok,
+        "output_uri": "gs://test/outputs/",
+        "dataset_uri": "gs://test/datasets/",
+        "downloaded": downloaded or {},
+        "missing_artifacts": [],
+        "gcs_listing": [],
+        "error": error,
+        "error_raw": None,
+        "status_arbitration": "ok" if ok else "error",
+        "gcloud_flag": None,
     }
-    
-    # Mock Sandbox and File Ops
-    with patch("src.graph.graph.Sandbox") as MockSandbox, \
-         patch("src.graph.graph.os.path.exists") as mock_exists, \
-         patch("builtins.open", mock_open(read_data=b"manifest_json_content")) as mock_file, \
-         patch("src.graph.graph.scan_code_safety", return_value=(True, [])), \
-         patch.dict(os.environ, {"E2B_API_KEY": "mock_key"}):
-         
-        # Configure Mock Sandbox interactions explicitly
-        mock_sb_instance = MagicMock()
-        mock_ctx = MagicMock()
-        mock_ctx.__enter__.return_value = mock_sb_instance
-        MockSandbox.create.return_value = mock_ctx
 
-        mock_instance = mock_sb_instance
-        
-        # Setup run_code return values
-        mock_run = MagicMock()
-        mock_run.exit_code = 0
-        mock_run.stdout = ""
-        mock_instance.commands.run.return_value = mock_run
 
-        mock_exec = MagicMock()
-        mock_exec.logs.stdout = ["Success"]
-        mock_exec.logs.stderr = []
-        mock_exec.error = None
-        mock_instance.run_code.return_value = mock_exec
+def test_manifest_roundtrip_upload(tmp_path, monkeypatch):
+    """Verify that execute_code correctly submits the heavy runner request
+    with required dependencies and outputs, and returns without error."""
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    (tmp_path / "data" / "cleaned_data.csv").write_text("a,target\n1,0\n2,1\n", encoding="utf-8")
 
-        # Simulate local manifest exists
-        # Side effect: True for manifest, True for plots dir? Simplified: True always.
-        mock_exists.return_value = True 
-        
-        # Execute Node
-        execute_code(state)
-        
-        # ASSERTIONS
-        
-        # 1. Verify Upload Call
-        # Should upload manifest to /home/user/run/<run_id>/attempt_<k>/cleaning_manifest.json
-        expected_suffix = "cleaning_manifest.json"
-        
-        # Check that we wrote the manifest twice (canonical + root)
-        # also we wrote the csv once
-        assert mock_instance.files.write.call_count >= 3 # csv + manifest*2
-        
-        # 2. Verify Code Patching
-        # The code written to the sandbox should include manifest bindings
-        code_payloads = [
-            args[1]
-            for args, _ in mock_instance.files.write.call_args_list
-            if len(args) >= 2 and isinstance(args[1], str)
-        ]
-        executed_code = "\n".join(code_payloads)
-        
-        assert "MANIFEST_PATH" in executed_code
-        assert "cleaning_manifest.json" in executed_code
-        
-def test_manifest_patching_logic():
+    manifest = {"dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"}}
+    (tmp_path / "data" / "cleaning_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
     state = {
-        "generated_code": "import json\nimport pandas as pd\nmd = json.load(open('data/cleaning_manifest.json'))\ndf = pd.read_csv('./data/cleaned_data.csv')",
+        "generated_code": "import pandas as pd\ndf = pd.read_csv('data/cleaned_data.csv')\nprint('ok')",
         "execution_output": "",
-        "execution_attempt": 1,
-        "csv_path": "data/dummy.csv", # Required by checks? No, but maybe.
-        "run_id": "testrun"
+        "execution_attempt": 0,
+        "run_id": "testrun-manifest",
+        "ml_data_path": str(tmp_path / "data" / "cleaned_data.csv"),
+        "execution_contract": {
+            "required_outputs": ["data/cleaned_data.csv", "data/metrics.json"],
+            "required_dependencies": [],
+            "outcome_columns": ["target"],
+            "evaluation_spec": {"target_column": "target"},
+        },
     }
-    
-    with patch("src.graph.graph.Sandbox") as MockSandbox, \
-         patch("os.path.exists", return_value=True), \
-         patch("builtins.open", mock_open(read_data=b"{}")), \
-         patch("src.graph.graph.scan_code_safety", return_value=(True, [])), \
-         patch.dict(os.environ, {"E2B_API_KEY": "mock_key"}):
-         
-        mock_instance = MockSandbox.create.return_value.__enter__.return_value
-        mock_instance.commands.run.return_value.exit_code = 0
-        mock_instance.commands.run.return_value.stdout = ""
-        mock_instance.run_code.return_value.logs.stdout = ["ok"]
-        mock_instance.run_code.return_value.logs.stderr = []
-        mock_instance.run_code.return_value.error = None
-        
-        # Capture executed code
+
+    downloaded = {
+        "data/metrics.json": str(tmp_path / "data" / "metrics.json"),
+    }
+    (tmp_path / "data" / "metrics.json").write_text('{"rmse": 0.5}', encoding="utf-8")
+
+    launched_requests = []
+
+    def capture_launch(**kwargs):
+        launched_requests.append(kwargs.get("request", {}))
+        return _make_heavy_result(ok=True, downloaded=downloaded)
+
+    with patch("src.graph.graph._get_execution_runtime_mode", return_value="cloudrun"), \
+         patch("src.graph.graph._get_heavy_runner_config", return_value={"job": "j", "bucket": "b", "region": "r"}), \
+         patch("src.graph.graph.launch_heavy_runner_job", side_effect=capture_launch), \
+         patch("src.graph.graph.scan_code_safety", return_value=(True, [])):
+
         result = execute_code(state)
-        
-        # Verify code was uploaded and patched
-        code_payloads = [
-            args[1]
-            for args, _ in mock_instance.files.write.call_args_list
-            if len(args) >= 2 and isinstance(args[1], str)
-        ]
-        executed_code = "\n".join(code_payloads)
-        
-        assert "MANIFEST_PATH" in executed_code
-        assert "/home/user/run/testrun/ml_engineer/" in executed_code
-        assert "open('data/cleaning_manifest.json')" not in executed_code
-        assert "pd.read_csv('./data/cleaned_data.csv')" not in executed_code
+
+    # The heavy runner should have been called
+    assert len(launched_requests) > 0, "Heavy runner should have been launched"
+    request = launched_requests[0]
+
+    # Required outputs should be in the request
+    assert "data/metrics.json" in request.get("required_outputs", [])
+
+    # Target column should be resolved
+    assert request.get("target_col") == "target"
+
+    # No error
+    assert not result.get("error_message", "").startswith("HEAVY_RUNNER: target column missing")
+
+
+def test_manifest_patching_logic(tmp_path, monkeypatch):
+    """Verify that the execution contract required_outputs are included in the heavy runner request."""
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    (tmp_path / "data" / "cleaned_data.csv").write_text("a,target\n1,0\n2,1\n", encoding="utf-8")
+
+    manifest = {"dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"}}
+    (tmp_path / "data" / "cleaning_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    state = {
+        "generated_code": "import pandas as pd\ndf = pd.read_csv('data/cleaned_data.csv')\nprint('ok')",
+        "execution_output": "",
+        "execution_attempt": 0,
+        "run_id": "testrun-manifest-patch",
+        "ml_data_path": str(tmp_path / "data" / "cleaned_data.csv"),
+        "execution_contract": {
+            "required_outputs": [
+                "data/cleaned_data.csv",
+                "data/metrics.json",
+                "data/cleaning_manifest.json",
+            ],
+            "required_dependencies": [],
+            "outcome_columns": ["target"],
+            "evaluation_spec": {"target_column": "target"},
+        },
+    }
+
+    launched_requests = []
+
+    def capture_launch(**kwargs):
+        launched_requests.append(kwargs.get("request", {}))
+        return _make_heavy_result(ok=True, downloaded={})
+
+    with patch("src.graph.graph._get_execution_runtime_mode", return_value="cloudrun"), \
+         patch("src.graph.graph._get_heavy_runner_config", return_value={"job": "j", "bucket": "b", "region": "r"}), \
+         patch("src.graph.graph.launch_heavy_runner_job", side_effect=capture_launch), \
+         patch("src.graph.graph.scan_code_safety", return_value=(True, [])):
+
+        execute_code(state)
+
+    assert len(launched_requests) > 0, "Heavy runner should have been launched"
+    required_in_request = launched_requests[0].get("required_outputs", [])
+    assert "data/metrics.json" in required_in_request
+    assert "data/cleaning_manifest.json" in required_in_request
