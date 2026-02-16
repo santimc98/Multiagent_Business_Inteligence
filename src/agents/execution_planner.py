@@ -36,7 +36,6 @@ from src.utils.column_sets import build_column_manifest, summarize_column_sets
 from src.utils.contract_validator import (
     validate_contract_minimal_readonly,
     normalize_contract_scope,
-    normalize_artifact_requirements,
     is_probably_path,
     is_file_path,
     _normalize_selector_entry,
@@ -320,6 +319,115 @@ def _extract_required_paths(artifact_requirements: Dict[str, Any]) -> List[str]:
         if path and is_probably_path(str(path)):
             paths.append(str(path))
     return paths
+
+
+def _normalize_artifact_path(value: Any) -> str:
+    if value is None:
+        return ""
+    path = str(value).strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    path = path.lstrip("/")
+    path = re.sub(r"/{2,}", "/", path)
+    return path
+
+
+def _extract_file_like_outputs(raw_outputs: Any) -> List[str]:
+    if not isinstance(raw_outputs, list):
+        return []
+    paths: List[str] = []
+    seen: set[str] = set()
+    for item in raw_outputs:
+        candidate = ""
+        if isinstance(item, dict):
+            for key in ("path", "file", "output", "artifact"):
+                value = item.get(key)
+                normalized = _normalize_artifact_path(value)
+                if normalized and is_probably_path(normalized):
+                    candidate = normalized
+                    break
+        else:
+            normalized = _normalize_artifact_path(item)
+            if normalized and is_probably_path(normalized):
+                candidate = normalized
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(candidate)
+    return paths
+
+
+def normalize_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Align required_outputs with artifact_requirements.required_files.
+    Only file-like outputs are mirrored (universal path heuristics).
+    """
+    if not isinstance(contract, dict):
+        return contract
+
+    artifact_requirements = contract.get("artifact_requirements")
+    if not isinstance(artifact_requirements, dict):
+        artifact_requirements = {}
+
+    required_files_raw = artifact_requirements.get("required_files")
+    required_files_list = required_files_raw if isinstance(required_files_raw, list) else []
+    use_dict_entries = any(isinstance(entry, dict) for entry in required_files_list)
+
+    normalized_required_files: List[Any] = []
+    seen_paths: set[str] = set()
+    for entry in required_files_list:
+        if isinstance(entry, dict):
+            raw_path = entry.get("path") or entry.get("output") or entry.get("artifact")
+            normalized_path = _normalize_artifact_path(raw_path)
+            if not normalized_path or not is_probably_path(normalized_path):
+                continue
+            key = normalized_path.lower()
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            normalized_entry = dict(entry)
+            normalized_entry["path"] = normalized_path
+            normalized_required_files.append(normalized_entry if use_dict_entries else normalized_path)
+        else:
+            normalized_path = _normalize_artifact_path(entry)
+            if not normalized_path or not is_probably_path(normalized_path):
+                continue
+            key = normalized_path.lower()
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            if use_dict_entries:
+                normalized_required_files.append(
+                    {"path": normalized_path, "description": "Auto-normalized required file path"}
+                )
+            else:
+                normalized_required_files.append(normalized_path)
+
+    required_output_paths = _extract_file_like_outputs(contract.get("required_outputs"))
+    evaluation_spec = contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {}
+    evaluation_required_paths = _extract_file_like_outputs(evaluation_spec.get("required_outputs"))
+
+    for path in required_output_paths + evaluation_required_paths:
+        key = path.lower()
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        if use_dict_entries:
+            normalized_required_files.append(
+                {
+                    "path": path,
+                    "description": "Auto-added to align with required_outputs",
+                }
+            )
+        else:
+            normalized_required_files.append(path)
+
+    artifact_requirements["required_files"] = normalized_required_files
+    contract["artifact_requirements"] = artifact_requirements
+    return contract
 
 
 def _merge_scored_rows_schema(
@@ -9389,6 +9497,7 @@ class ExecutionPlannerAgent:
                         final_errors = _lint_deliverable_invariants(contract, obj_type)
                         if final_errors:
                             print(f"DELIVERABLE_LINT: {len(final_errors)} errors persist after replan")
+                contract = normalize_artifact_requirements(contract)
             diagnostics = _build_contract_diagnostics(contract if isinstance(contract, dict) else {}, where, llm_success)
             self.last_contract_diagnostics = diagnostics
             _persist_contracts(

@@ -2132,9 +2132,12 @@ $strategy_json
         - sys, subprocess, socket, requests, httpx, urllib, ftplib
         - paramiko, selenium, playwright, openai, google.generativeai, builtins
         - eval(), exec(), compile(), __import__()
+        FORBIDDEN CALLS (HARD):
+        - os.remove, os.unlink, pathlib.Path.unlink, shutil.rmtree, os.rmdir
+        - Never use file deletion as a validation strategy.
         ALLOWED imports: pandas, numpy, sklearn, scipy, xgboost, catboost, lightgbm,
         matplotlib, seaborn, json, os.path, os.makedirs, csv, math, statistics,
-        collections, itertools, functools, typing, warnings, re, datetime, pathlib.Path
+        collections, itertools, functools, typing, warnings, re, datetime, pathlib.Path, uuid
         If you need sys.stdout or sys.exit, use print() and raise SystemExit instead.
 
         DTYPE SAFETY PATTERNS
@@ -2162,9 +2165,15 @@ $strategy_json
         PREFLIGHT GATES (MANDATORY BEFORE fit)
         - Gate A: required input columns exist.
         - Gate B: target and task are consistent with evaluation spec.
+          Use robust target normalization before validation:
+          read target as str, strip/lower, then attempt pd.to_numeric(errors='coerce').
+          For binary targets, accept equivalent values {0, 1} including "0", "1", "0.0", "1.0".
+          Log unique target values before and after normalization in PRE_FLIGHT_GATES output.
         - Gate C: train/scoring row rules are applied explicitly.
         - Gate D: forbidden/audit-only columns are excluded from modeling features.
         - Gate E: required output directories and paths are writable.
+          For Gate E writability checks, create directories and write a marker file
+          like ".write_test_<uuid>.txt"; do not delete marker files.
         - Print PRE_FLIGHT_GATES with PASS/FAIL per gate.
 
         REPAIR PRIORITY (WHEN FEEDBACK EXISTS)

@@ -28,6 +28,13 @@ from src.graph.steps.result_evaluator import (
     _harmonize_review_packets_with_final_eval,
     _looks_blocking_retry_signal,
 )
+from src.graph.steps.retry_policy import (
+    should_reselect_strategy_on_retry,
+)
+from src.graph.steps.handoff_utils import (
+    extract_preflight_gate_failures,
+    extract_preflight_gate_tail,
+)
 
 __all__ = [
     "_resolve_contract_columns",
@@ -45,4 +52,7 @@ __all__ = [
     "_apply_review_consistency_guard",
     "_harmonize_review_packets_with_final_eval",
     "_looks_blocking_retry_signal",
+    "should_reselect_strategy_on_retry",
+    "extract_preflight_gate_failures",
+    "extract_preflight_gate_tail",
 ]

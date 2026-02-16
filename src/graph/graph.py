@@ -197,6 +197,11 @@ from src.utils.text_encoding import (
     sanitize_text_payload_with_stats,
     mojibake_score,
 )
+from src.graph.steps.retry_policy import should_reselect_strategy_on_retry
+from src.graph.steps.handoff_utils import (
+    extract_preflight_gate_failures,
+    extract_preflight_gate_tail,
+)
 
 
 def _retry_sandbox_operations(sandbox_func, max_attempts: int = 2, run_id: Optional[str] = None, step: Optional[str] = None) -> Any:
@@ -8541,11 +8546,34 @@ def _build_iteration_handoff(
         max_len=240,
     )
     evidence_focus = merged_findings.get("evidence") or []
+    if not isinstance(evidence_focus, list):
+        evidence_focus = []
 
     runtime_tail = _truncate_handoff_text(
         state.get("last_runtime_error_tail") or state.get("execution_output"),
         max_len=520,
     )
+    execution_output_text = str(state.get("execution_output") or "")
+    preflight_failures = extract_preflight_gate_failures(execution_output_text)
+    preflight_raw_tail = extract_preflight_gate_tail(execution_output_text, max_chars=700)
+    if preflight_failures:
+        for fail in preflight_failures[:8]:
+            gate_name = str(fail.get("gate") or "").strip().upper()
+            if not gate_name:
+                continue
+            gate_id = f"preflight_gate_{gate_name}"
+            if gate_id not in failed_gates:
+                failed_gates.append(gate_id)
+            detail_text = _truncate_handoff_text(fail.get("detail"), max_len=220)
+            claim = f"PRE_FLIGHT_GATES Gate {gate_name}: FAIL"
+            if detail_text:
+                claim = f"{claim} - {detail_text}"
+            evidence_item = {
+                "claim": claim,
+                "source": "execution_output.pre_flight_gates",
+            }
+            if evidence_item not in evidence_focus:
+                evidence_focus.append(evidence_item)
     reviewer_feedback = _truncate_handoff_text(
         review_result.get("feedback") or gate_context.get("feedback") or state.get("review_feedback"),
         max_len=1200,
@@ -8655,7 +8683,7 @@ def _build_iteration_handoff(
         state=state,
     )
 
-    return {
+    handoff: Dict[str, Any] = {
         "handoff_version": "v1",
         "mode": "patch" if next_iteration > 1 else "build",
         "from_iteration": iteration_count,
@@ -8692,6 +8720,12 @@ def _build_iteration_handoff(
         "patch_objectives": patch_objectives[:8],
         "retry_context": retry_context,
     }
+    if preflight_failures:
+        handoff["preflight_gates"] = {
+            "fails": preflight_failures[:10],
+            "raw_tail": preflight_raw_tail,
+        }
+    return handoff
 
 def _suggest_next_actions(
     preflight_issues: List[str],
@@ -18402,13 +18436,22 @@ def retry_handler(state: AgentState) -> AgentState:
         "feedback_history": current_history,
         "strategy_reselected": False,
     }
+    route_reason = "policy_not_evaluated"
 
     try:
-        can_reselect = bool(_is_blocking_retry_reason(state if isinstance(state, dict) else {}))
-        strategies_wrapper = state.get("strategies") if isinstance(state.get("strategies"), dict) else {}
+        state_dict = state if isinstance(state, dict) else {}
+        strategies_wrapper = state_dict.get("strategies") if isinstance(state_dict.get("strategies"), dict) else {}
         strategies_list = strategies_wrapper.get("strategies") if isinstance(strategies_wrapper, dict) else []
+        selected = state_dict.get("selected_strategy") if isinstance(state_dict.get("selected_strategy"), dict) else None
+        can_reselect, reselect_reason = should_reselect_strategy_on_retry(
+            state_dict,
+            strategies_list if isinstance(strategies_list, list) else [],
+            selected if isinstance(selected, dict) else None,
+        )
+        route_reason = reselect_reason or "policy_default_engineer"
+
         if can_reselect and isinstance(strategies_list, list) and len(strategies_list) > 1:
-            selected = state.get("selected_strategy") if isinstance(state.get("selected_strategy"), dict) else {}
+            selected = selected if isinstance(selected, dict) else {}
             selected_title = str(selected.get("title") or "").strip().lower()
             selected_index = None
             for idx, strat in enumerate(strategies_list):
@@ -18541,9 +18584,23 @@ def retry_handler(state: AgentState) -> AgentState:
                             "domain_expert_reviews": [r for r in reselection_reviews if isinstance(r, dict)],
                         }
                     )
+                    route_reason = f"{route_reason}|domain_expert_reselected"
+                else:
+                    current_history.append("DOMAIN_EXPERT_RESELECTION: no viable alternative selected; keeping current strategy.")
+                    route_reason = f"{route_reason}|no_viable_alternative"
+            else:
+                route_reason = f"{route_reason}|no_alternative_strategies"
+        elif can_reselect:
+            route_reason = f"{route_reason}|insufficient_strategy_options"
     except Exception as reselection_err:
         current_history.append(f"DOMAIN_EXPERT_RESELECTION_WARNING: {reselection_err}")
-        result["feedback_history"] = current_history[-20:]
+        route_reason = f"reselection_exception:{type(reselection_err).__name__}"
+
+    route = "replan" if bool(result.get("strategy_reselected")) else "engineer"
+    current_history.append(f"RETRY_ROUTE_DECISION: {route} (reason={route_reason})")
+    if len(current_history) > 20:
+        current_history = current_history[-20:]
+    result["feedback_history"] = current_history
 
     return result
 
