@@ -216,10 +216,10 @@ class MLEngineerAgent:
         try:
             import pandas as pd
 
+            # Read with natural dtype inference so the ML engineer sees real dtypes
             preview = pd.read_csv(
                 path,
                 nrows=max_rows,
-                dtype=str,
                 sep=csv_sep or ",",
                 decimal=csv_decimal or ".",
                 encoding=csv_encoding or "utf-8",
@@ -2226,28 +2226,19 @@ $strategy_json
         AUTHORITATIVE CONTEXT
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title ($analysis_type)
+        - Strategy Hypothesis: $hypothesis
+        - Strategy Techniques: $strategy_techniques
+        - Strategy Fallback Chain: $strategy_fallback_chain
         - ML_VIEW_CONTEXT: $ml_view_context
-        - EXECUTION_CONTRACT_CONTEXT: $execution_contract_context
         - Evaluation Spec: $evaluation_spec_json
         - Required Outputs: $deliverables_json
         - Canonical Columns: $canonical_columns
         - Required Features: $required_columns
-        - Runtime Dependency Context: $runtime_dependency_context_json
-        - Data Sample Context: $data_sample_context_json
-        - Plot Spec: $plot_spec_context
-        - Visual Requirements: $visual_requirements_context
-        - Decisioning Requirements: $decisioning_requirements_context
-        - Decisioning Notes: $decisioning_policy_notes
-        - Decisioning Columns: $decisioning_columns_text
-        - Alignment Requirements: $alignment_requirements_json
-        - Feature Semantics: $feature_semantics_json
-        - Business Sanity Checks: $business_sanity_checks_json
-        - Signal Summary: $signal_summary_json
-        - Cleaned Data Summary (advisory): $cleaned_data_summary_min_json
         - Column Dtype Targets: $column_dtype_targets_json
+        - Data Sample Context: $data_sample_context_json
+        - Cleaned Data Summary (advisory): $cleaned_data_summary_min_json
         - Execution Profile Context: $execution_profile_json
-        - Iteration Memory: $iteration_memory_json
-        - Iteration Memory (compact): $iteration_memory_block
+        $optional_context_block
         - Data Audit Context: $data_audit_context
 
         Return Python code only.
@@ -2410,11 +2401,52 @@ $strategy_json
         if not isinstance(column_dtype_targets, dict):
             column_dtype_targets = {}
 
+        # Build strategy context fields
+        _techniques = strategy.get('techniques') or []
+        _fallback_chain = strategy.get('fallback_chain') or []
+        _strategy_techniques = json.dumps(_techniques, ensure_ascii=False) if _techniques else "N/A"
+        _strategy_fallback_chain = "\n".join(f"  {item}" for item in _fallback_chain) if _fallback_chain else "N/A"
+
+        # Build optional context block (Fix 4: skip empty fields)
+        _optional_parts = []
+        _runtime_dep = runtime_dependency_context_json
+        if _runtime_dep and _runtime_dep not in ("{}", "null", ""):
+            _optional_parts.append(f"- Runtime Dependency Context: {_runtime_dep}")
+        _iter_mem = self._serialize_json_for_prompt(
+            iteration_memory or [],
+            max_chars=4000,
+            max_str_len=400,
+            max_list_items=40,
+        )
+        if _iter_mem and _iter_mem not in ("[]", "{}", "null", ""):
+            _optional_parts.append(f"- Iteration Memory: {_iter_mem}")
+        if iteration_memory_block:
+            _optional_parts.append(f"- Iteration Memory (compact): {iteration_memory_block}")
+        for _opt_key, _opt_label in [
+            ("decisioning_requirements", "Decisioning Requirements"),
+            ("alignment_requirements", "Alignment Requirements"),
+            ("feature_semantics", "Feature Semantics"),
+            ("business_sanity_checks", "Business Sanity Checks"),
+        ]:
+            _opt_val = execution_contract_input.get(_opt_key)
+            if _opt_val and _opt_val != {} and _opt_val != []:
+                _optional_parts.append(
+                    f"- {_opt_label}: {self._serialize_json_for_prompt(_opt_val, max_chars=3000, max_str_len=400, max_list_items=60)}"
+                )
+        if signal_summary and signal_summary != {}:
+            _optional_parts.append(
+                f"- Signal Summary: {self._serialize_json_for_prompt(signal_summary, max_chars=3000, max_str_len=400, max_list_items=60)}"
+            )
+        _optional_context_block = "\n        ".join(_optional_parts) if _optional_parts else ""
+
         render_kwargs = dict(
             business_objective=business_objective,
             strategy_title=strategy.get('title', 'Unknown'),
             analysis_type=str(strategy.get('analysis_type', 'predictive')).upper(),
             hypothesis=strategy.get('hypothesis', 'N/A'),
+            strategy_techniques=_strategy_techniques,
+            strategy_fallback_chain=_strategy_fallback_chain,
+            optional_context_block=_optional_context_block,
             required_columns=json.dumps(required_columns_payload),
             deliverables_json=deliverables_json,
             canonical_columns=self._serialize_json_for_prompt(
@@ -2423,52 +2455,14 @@ $strategy_json
                 max_str_len=400,
                 max_list_items=120,
             ),
-            business_alignment_json=self._serialize_json_for_prompt(
-                execution_contract_input.get("business_alignment", {}),
-                max_chars=3000,
-                max_str_len=400,
-                max_list_items=60,
-            ),
-            alignment_requirements_json=self._serialize_json_for_prompt(
-                execution_contract_input.get("alignment_requirements", []),
-                max_chars=3000,
-                max_str_len=400,
-                max_list_items=60,
-            ),
-            feature_semantics_json=self._serialize_json_for_prompt(
-                execution_contract_input.get("feature_semantics", []),
-                max_chars=3500,
-                max_str_len=400,
-                max_list_items=60,
-            ),
-            business_sanity_checks_json=self._serialize_json_for_prompt(
-                execution_contract_input.get("business_sanity_checks", []),
-                max_chars=3000,
-                max_str_len=400,
-                max_list_items=60,
-            ),
             data_path=data_path,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
-            execution_contract_context=self._serialize_json_for_prompt(
-                execution_contract_compact,
-                max_chars=12000,
-                max_str_len=700,
-                max_list_items=120,
-            ),
             ml_view_context=ml_view_json,
-            plot_spec_context=plot_spec_json,
             evaluation_spec_json=evaluation_spec_json,
             ml_engineer_runbook=ml_runbook_json,
-            # V4.1: availability_summary removed
-            signal_summary_json=self._serialize_json_for_prompt(
-                signal_summary or {},
-                max_chars=3000,
-                max_str_len=400,
-                max_list_items=60,
-            ),
             cleaned_data_summary_min_json=self._serialize_json_for_prompt(
                 cleaned_data_summary_payload,
                 max_chars=5000,
@@ -2481,16 +2475,8 @@ $strategy_json
                 max_str_len=500,
                 max_list_items=120,
             ),
-            runtime_dependency_context_json=runtime_dependency_context_json,
             data_sample_context_json=data_sample_context_json,
             execution_profile_json=execution_profile_json,
-            iteration_memory_json=self._serialize_json_for_prompt(
-                iteration_memory or [],
-                max_chars=4000,
-                max_str_len=400,
-                max_list_items=40,
-            ),
-            iteration_memory_block=iteration_memory_block or "",
             dataset_scale=dataset_scale,
         )
         # Safe Rendering for System Prompt
