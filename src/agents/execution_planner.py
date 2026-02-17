@@ -4692,11 +4692,11 @@ class ExecutionPlannerAgent:
         else:
             resolved_api_key = api_key
         self.api_key = str(resolved_api_key).strip() if resolved_api_key not in (None, "") else None
-        max_output_tokens = 4000
+        max_output_tokens = 16384
         try:
-            max_output_tokens = int(os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "4000"))
+            max_output_tokens = int(os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "16384"))
         except Exception:
-            max_output_tokens = 4000
+            max_output_tokens = 16384
         self._default_max_output_tokens = max(4000, max_output_tokens)
         context_limit_tokens = 65536
         try:
@@ -9895,7 +9895,7 @@ domain_expert_critique:
 
         section_first_flag = str(os.getenv("EXECUTION_PLANNER_SECTION_FIRST", "1")).strip().lower()
         section_first_enabled = section_first_flag not in {"0", "false", "no", "off"}
-        progressive_flag = str(os.getenv("EXECUTION_PLANNER_PROGRESSIVE_MODE", "1")).strip().lower()
+        progressive_flag = str(os.getenv("EXECUTION_PLANNER_PROGRESSIVE_MODE", "0")).strip().lower()
         progressive_enabled = progressive_flag not in {"0", "false", "no", "off"}
         sectional_rounds = 2
         try:
