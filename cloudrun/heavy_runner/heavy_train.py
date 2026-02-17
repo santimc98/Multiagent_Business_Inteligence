@@ -550,6 +550,10 @@ def execute_code_mode(payload: Dict[str, Any], output_uri: str, run_id: str) -> 
         Exit code (0 for success, non-zero for failure)
     """
     work_dir = "/tmp/run"
+    # Clean previous execution artifacts to prevent cross-contamination
+    if os.path.exists(work_dir):
+        import shutil
+        shutil.rmtree(work_dir, ignore_errors=True)
     os.makedirs(work_dir, exist_ok=True)
 
     mode, required_outputs, skip_paths = _resolve_execute_code_mode(payload)

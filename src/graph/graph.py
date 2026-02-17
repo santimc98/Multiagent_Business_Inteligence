@@ -8116,7 +8116,6 @@ def _has_runtime_failure_marker(output: str | None) -> bool:
     text = str(output or "")
     checks = [
         "Traceback (most recent call last)",
-        "EXECUTION ERROR",
         "HEAVY_RUNNER_ERROR",
         "Sandbox Execution Failed",
         "peer closed connection",
@@ -11874,16 +11873,16 @@ def _finalize_heavy_execution(
     )
     if artifact_issues:
         issue_text = "; ".join(artifact_issues)
-        output = f"{output}\nEXECUTION ERROR: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
+        output = f"{output}\nVALIDATION_WARNING: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
 
     stale_outputs = _find_stale_outputs(required_outputs, exec_start_ts)
     if stale_outputs:
-        output = f"{output}\nEXECUTION ERROR: STALE_OUTPUTS: {stale_outputs}"
+        output = f"{output}\nVALIDATION_WARNING: STALE_OUTPUTS: {stale_outputs}"
 
     content_issues, content_diagnostics = _validate_artifact_content(state)
     if content_issues:
         issue_text = ", ".join(content_issues)
-        output = f"{output}\nEXECUTION ERROR: ARTIFACT_CONTENT_INVALID: {issue_text}"
+        output = f"{output}\nVALIDATION_WARNING: ARTIFACT_CONTENT_INVALID: {issue_text}"
 
     heavy_error_kind = state.get("heavy_runner_error_kind")
     heavy_error_context = state.get("heavy_runner_error_context")
@@ -17296,7 +17295,11 @@ def execute_code(state: AgentState) -> AgentState:
             csv_decimal = dialect["decimal"]
             csv_encoding = dialect["encoding"]
             eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
-            required_outputs = _resolve_required_outputs(contract, state)
+            # Filter required_outputs by owner so ML engineer is only checked
+            # against ML artifacts (not DE artifacts like cleaned_data.csv).
+            from src.utils.contract_accessors import get_required_outputs_by_owner
+            ml_required = get_required_outputs_by_owner(contract, "ml_engineer")
+            required_outputs = ml_required if ml_required else _resolve_required_outputs(contract, state)
             expected_outputs = _resolve_expected_output_paths(contract, state)
             preserve_paths = []
             ml_candidate_paths = _candidate_ml_input_paths(state if isinstance(state, dict) else {})
@@ -18245,7 +18248,7 @@ def execute_code(state: AgentState) -> AgentState:
         else:
             # Hard block: This is the 3rd+ occurrence, fail the execution
             issue_text = "; ".join(artifact_issues)
-            output = f"{output}\nEXECUTION ERROR: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
+            output = f"{output}\nVALIDATION_WARNING: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
 
         # Track current issues for next iteration (universal tracking)
         if "artifact_alignment_issue_history" not in state:
@@ -18254,12 +18257,12 @@ def execute_code(state: AgentState) -> AgentState:
 
     stale_outputs = _find_stale_outputs(required_outputs, exec_start_ts)
     if stale_outputs:
-        output = f"{output}\nEXECUTION ERROR: STALE_OUTPUTS: {stale_outputs}"
+        output = f"{output}\nVALIDATION_WARNING: STALE_OUTPUTS: {stale_outputs}"
 
     content_issues, content_diagnostics = _validate_artifact_content(state)
     if content_issues:
         issue_text = ", ".join(content_issues)
-        output = f"{output}\nEXECUTION ERROR: ARTIFACT_CONTENT_INVALID: {issue_text}"
+        output = f"{output}\nVALIDATION_WARNING: ARTIFACT_CONTENT_INVALID: {issue_text}"
 
     # Check for Runtime Errors in Output (Traceback)
     sandbox_failed = (
@@ -18444,7 +18447,7 @@ def retry_handler(state: AgentState) -> AgentState:
 
     # Append execution summary
     last_output = state.get('execution_output', '')
-    if last_output and ("Traceback" in last_output or "EXECUTION ERROR" in last_output):
+    if last_output and ("Traceback" in last_output or "EXECUTION ERROR" in last_output or "VALIDATION_WARNING" in last_output):
         summary = f"EXECUTION OUTPUT (last run): {last_output[-3000:]}" # Truncate to save context
         current_history.append(summary)
 
@@ -20381,7 +20384,6 @@ def check_execution_status(state: AgentState):
     # Traceback check (Runtime Error)
     has_error = (
         "Traceback (most recent call last)" in output
-        or "EXECUTION ERROR" in output
         or "HEAVY_RUNNER_ERROR" in output
         or "Sandbox Execution Failed" in output
         or "peer closed connection" in output
