@@ -115,3 +115,7 @@ work/
 # Local analysis notes
 Solución_csvs_ancho.md
 Solucion_csvs_ancho.md
+auditoria_*.md
+
+# Kaggle submissions
+kaggle_submission/
