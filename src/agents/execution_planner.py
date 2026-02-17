@@ -87,6 +87,9 @@ Return format:
 
 Minimal contract interface:
 - scope: one of ["cleaning_only", "ml_only", "full_pipeline"]
+  - cleaning_only: Use ONLY for pure ETL/data quality tasks where no modeling, analysis, or prediction is requested.
+  - full_pipeline: The STANDARD for predictive/prescriptive constraints. Use this whenever a model or analysis is the goal, even if data is dirty (the pipeline handles cleaning automatically).
+  - ml_only: Use only if input data is explicitly stated to be pre-cleaned and trusted.
 - strategy_title: string
 - business_objective: string
 - output_dialect: object (csv sep/decimal/encoding when known)
@@ -99,6 +102,7 @@ Minimal contract interface:
   - pre_decision: ALL model input features available before prediction/decision.
     Includes numeric, categorical, binary, and engineered predictor inputs.
   - decision: Decision/action output columns emitted by policy/model (often empty in contract stage).
+    - If strategy implies optimization (e.g. "optimize price"), include the decision variable here.
   - identifiers: Entity keys/ids used for joins/traceability (non-predictive).
   - post_decision_audit_only: Columns used only for post-hoc analysis/compliance.
   CRITICAL: In predictive tasks, outcome MUST contain only the target column(s).

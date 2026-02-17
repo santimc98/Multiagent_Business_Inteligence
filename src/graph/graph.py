@@ -15810,6 +15810,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "outlier_report_path": de_outlier_report_path,
             "cleaned_data_summary_min": cleaned_data_summary_min,
             "cleaned_data_summary_min_path": cleaned_data_summary_min_path,
+            "error_message": None,
         }
         merged_state = dict(state or {})
         merged_state.update(result)
