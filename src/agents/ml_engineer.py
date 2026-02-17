@@ -2141,23 +2141,14 @@ $strategy_json
         If you need sys.stdout or sys.exit, use print() and raise SystemExit instead.
 
         DTYPE SAFETY PATTERNS
-        - The Data Engineer already cleaned and typed all columns. Read cleaned_data.csv WITHOUT dtype=str.
-          Use: pd.read_csv(path, sep=sep, decimal=decimal) — let pandas infer numeric dtypes naturally.
-          Only use dtype=str for the raw input CSV, NEVER for cleaned_data.csv.
+        - cleaned_data.csv is already typed by the Data Engineer. Read it respecting its dtypes:
+          Use pd.read_csv(path, sep=sep, decimal=decimal) without forcing dtype=str.
         - After loading, verify dtypes match column_dtype_targets; fix mismatches with pd.to_numeric(errors='coerce').
         - For nullable integers, use pandas nullable Int64 instead of plain int64 casts.
         - Never assume clean target dtype without verifying nullability and domain.
         - Enforce column_dtype_targets when present (column-level and selector-family targets).
-
-        CATEGORICAL FEATURES IN MULTI-MODEL ENSEMBLES (CRITICAL)
-        - Categorical features (sex, chest_pain_type, etc.) are stored as float64 in cleaned_data.csv.
-        - For CatBoost: cast categorical columns to int BEFORE passing (e.g., df[col].astype(int)).
-          CatBoost accepts int or str for cat_features. Use int to stay compatible with other models.
-        - For LightGBM: keep categorical columns as int or float. LightGBM REJECTS object/str dtype.
-          Use categorical_feature parameter with integer-typed columns.
-        - For XGBoost/sklearn: keep as float64 (default from CSV). No special handling needed.
-        - NEVER cast numeric columns to str/object for any reason. This breaks LightGBM and sklearn.
-        - If you need different representations per model, create separate DataFrames or convert just before each model's fit call.
+        - Before calling any ML framework's fit/train, print and verify all feature dtypes.
+          Every framework has dtype constraints — validate compatibility before fitting.
 
         OUTPUT SAFETY PATTERNS
         - Ensure parent directories exist before each artifact write.
@@ -2204,9 +2195,8 @@ $strategy_json
         - If contract says requires_target=false, do not fit supervised models; still emit required artifacts with explicit no-train status.
         - Use robust preprocessing for missing values and mixed dtypes.
         - Handle outliers with data-driven, non-destructive methods unless contract says otherwise.
-        - OOF predictions: initialize oof_preds with shape matching ONLY training rows (not full dataset).
-          If train_mask filters to N rows, oof_preds = np.zeros(N). Use local fold indices within the
-          training subset. Never index oof_preds with the full-dataset mask.
+        - Array shapes: ensure prediction arrays match the subset they index (e.g., OOF predictions
+          sized to training rows, not the full dataset).
 
         FEATURE GOVERNANCE
         - Use only contract-allowed features:

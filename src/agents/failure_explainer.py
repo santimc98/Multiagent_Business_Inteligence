@@ -17,15 +17,36 @@ class FailureExplainerAgent:
 
     def __init__(self, api_key: Any = None):
         self.api_key = api_key or os.getenv("MIMO_API_KEY")
-        if not self.api_key:
-            self.client = None
-        else:
+        self.client = None
+        self.model_name = "mimo-v2-flash"
+        if self.api_key:
             self.client = OpenAI(
                 api_key=self.api_key,
                 base_url="https://api.xiaomimimo.com/v1",
                 timeout=None,
             )
-        self.model_name = "mimo-v2-flash"
+        # Fallback: use OpenRouter if MIMO is unavailable
+        self._fallback_client = None
+        self._fallback_model = None
+        if not self.client:
+            _or_key = os.getenv("OPENROUTER_API_KEY")
+            if _or_key:
+                self._fallback_client = OpenAI(
+                    api_key=_or_key,
+                    base_url="https://openrouter.ai/api/v1",
+                    timeout=60.0,
+                )
+                self._fallback_model = os.getenv(
+                    "FAILURE_EXPLAINER_FALLBACK_MODEL", "google/gemini-2.0-flash-001"
+                )
+
+    def _get_active_client_and_model(self):
+        """Return (client, model_name) using primary or fallback."""
+        if self.client:
+            return self.client, self.model_name
+        if self._fallback_client:
+            return self._fallback_client, self._fallback_model
+        return None, None
 
     def explain_data_engineer_failure(
         self,
@@ -35,7 +56,8 @@ class FailureExplainerAgent:
     ) -> str:
         if not code or not error_details:
             return ""
-        if not self.client:
+        active_client, active_model = self._get_active_client_and_model()
+        if not active_client:
             return self._fallback(error_details)
 
         ctx = context or {}
@@ -66,8 +88,8 @@ class FailureExplainerAgent:
         )
 
         def _call_model():
-            response = self.client.chat.completions.create(
-                model=self.model_name,
+            response = active_client.chat.completions.create(
+                model=active_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -91,7 +113,8 @@ class FailureExplainerAgent:
     ) -> str:
         if not code or not error_details:
             return ""
-        if not self.client:
+        active_client, active_model = self._get_active_client_and_model()
+        if not active_client:
             return self._fallback(error_details)
 
         ctx = context or {}
@@ -123,8 +146,8 @@ class FailureExplainerAgent:
         )
 
         def _call_model():
-            response = self.client.chat.completions.create(
-                model=self.model_name,
+            response = active_client.chat.completions.create(
+                model=active_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
