@@ -379,6 +379,155 @@ def compact_data_profile_for_llm(
     return compact
 
 
+def build_column_metadata_for_strategist(
+    data_profile: Dict[str, Any],
+    dataset_semantics: Dict[str, Any],
+    max_cols: int = 60,
+) -> Dict[str, Any]:
+    """
+    Build a compact column_metadata dict for the Strategist agent.
+
+    Assembles explicit target, column types, per-column statistics, and
+    quality flags from already-computed data_profile + dataset_semantics.
+    """
+    data_profile = data_profile if isinstance(data_profile, dict) else {}
+    dataset_semantics = dataset_semantics if isinstance(dataset_semantics, dict) else {}
+
+    columns: List[str] = []
+    basic_stats = data_profile.get("basic_stats")
+    if isinstance(basic_stats, dict):
+        columns = list(basic_stats.get("columns") or [])
+
+    dtypes = data_profile.get("dtypes") or {}
+    missingness = data_profile.get("missingness") or {}
+    cardinality = data_profile.get("cardinality") or {}
+    numeric_summary = data_profile.get("numeric_summary") or {}
+    outcome_analysis = data_profile.get("outcome_analysis") or {}
+
+    # --- 1. Target ---
+    primary_target = str(dataset_semantics.get("primary_target") or "").strip()
+    target_block: Dict[str, Any] = {}
+    if primary_target:
+        target_block["column"] = primary_target
+        oa = outcome_analysis.get(primary_target)
+        if isinstance(oa, dict):
+            inferred = oa.get("inferred_type")
+            if inferred:
+                target_block["inferred_type"] = str(inferred)
+            n_unique = oa.get("n_unique")
+            if n_unique is not None:
+                target_block["n_unique"] = n_unique
+        miss = missingness.get(primary_target)
+        if miss is not None:
+            target_block["missing_rate"] = round(float(miss), 4)
+
+    # --- 2. Special columns ---
+    id_candidates = list(dataset_semantics.get("id_candidates") or [])
+    split_cols: List[str] = []
+    for sc in (data_profile.get("split_candidates") or []):
+        if isinstance(sc, dict):
+            col = sc.get("column")
+            if col:
+                split_cols.append(str(col))
+        elif isinstance(sc, str):
+            split_cols.append(sc)
+
+    special = set(id_candidates) | set(split_cols)
+    if primary_target:
+        special.add(primary_target)
+
+    # --- 3. Column types (grouped) ---
+    _LOW_CARDINALITY_THRESHOLD = 15
+    type_groups: Dict[str, List[str]] = {
+        "numeric": [],
+        "low_cardinality": [],
+        "high_cardinality": [],
+        "constant": [],
+    }
+    for col in columns:
+        if col in special:
+            continue
+        card_info = cardinality.get(col)
+        n_unique = card_info.get("unique") if isinstance(card_info, dict) else None
+        if n_unique is not None:
+            if n_unique <= 1:
+                type_groups["constant"].append(col)
+            elif n_unique <= _LOW_CARDINALITY_THRESHOLD:
+                type_groups["low_cardinality"].append(col)
+            else:
+                type_groups["numeric"].append(col)
+        else:
+            type_groups["numeric"].append(col)
+
+    # Remove empty groups
+    type_groups = {k: v for k, v in type_groups.items() if v}
+
+    # --- 4. Per-column stats (capped) ---
+    priority_cols: List[str] = []
+    if primary_target and primary_target in columns:
+        priority_cols.append(primary_target)
+    remaining = [c for c in columns if c != primary_target]
+    remaining.sort(key=lambda c: (-float(missingness.get(c, 0)), c))
+    priority_cols.extend(remaining)
+    priority_cols = priority_cols[:max_cols]
+
+    col_stats: List[Dict[str, Any]] = []
+    for col in priority_cols:
+        entry: Dict[str, Any] = {"name": col, "dtype": str(dtypes.get(col, "unknown"))}
+        miss = missingness.get(col)
+        if miss is not None:
+            entry["missing_rate"] = round(float(miss), 4)
+        card_info = cardinality.get(col)
+        if isinstance(card_info, dict):
+            n_unique = card_info.get("unique")
+            if n_unique is not None:
+                entry["cardinality"] = n_unique
+            if isinstance(n_unique, int) and n_unique <= _LOW_CARDINALITY_THRESHOLD:
+                top_vals = card_info.get("top_values") or []
+                entry["top_values"] = [
+                    str(tv.get("value", "")) for tv in top_vals[:5]
+                    if isinstance(tv, dict)
+                ]
+        num = numeric_summary.get(col)
+        if isinstance(num, dict) and num:
+            for k in ("min", "max", "mean", "std"):
+                v = num.get(k)
+                if v is not None:
+                    try:
+                        entry[k] = round(float(v), 2)
+                    except (TypeError, ValueError):
+                        pass
+        col_stats.append(entry)
+
+    # --- 5. Quality flags ---
+    quality_flags: Dict[str, Any] = {}
+    high_card = data_profile.get("high_cardinality_columns") or []
+    if isinstance(high_card, list) and high_card:
+        quality_flags["high_cardinality"] = [
+            str(item.get("column", item)) if isinstance(item, dict) else str(item)
+            for item in high_card
+        ]
+    constant_cols = data_profile.get("constant_columns") or []
+    if isinstance(constant_cols, list) and constant_cols:
+        quality_flags["constant"] = constant_cols
+    high_missing = [
+        {"column": col, "missing_rate": round(float(frac), 4)}
+        for col, frac in sorted(missingness.items(), key=lambda x: -float(x[1]))
+        if float(frac) > 0.3
+    ][:15]
+    if high_missing:
+        quality_flags["high_missing"] = high_missing
+
+    return {
+        "target": target_block,
+        "split_column": split_cols[0] if split_cols else None,
+        "id_columns": id_candidates or [],
+        "column_types": type_groups,
+        "column_stats": col_stats,
+        "quality_flags": quality_flags,
+    }
+
+
 def _compact_basic_stats_for_llm(basic_stats: Dict[str, Any], max_cols: int = 60) -> Dict[str, Any]:
     """Compact basic_stats to prevent prompt bloat on wide datasets."""
     if not isinstance(basic_stats, dict):

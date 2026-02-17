@@ -9783,6 +9783,15 @@ def run_strategist(state: AgentState) -> AgentState:
                 value = compute_hints.get(key)
                 if value is not None:
                     compute_constraints[key] = value
+    # Build structured column metadata for strategist
+    from src.utils.data_profile_compact import build_column_metadata_for_strategist
+    _data_profile_for_meta = state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {}
+    _ds_semantics_for_meta = state.get("dataset_semantics") if isinstance(state.get("dataset_semantics"), dict) else {}
+    column_metadata = build_column_metadata_for_strategist(
+        data_profile=_data_profile_for_meta,
+        dataset_semantics=_ds_semantics_for_meta,
+    )
+
     result = strategist.generate_strategies(
         data_summary,
         user_context,
@@ -9790,6 +9799,7 @@ def run_strategist(state: AgentState) -> AgentState:
         column_sets=column_sets,
         column_manifest=column_manifest if isinstance(column_manifest, dict) else {},
         compute_constraints=compute_constraints,
+        column_metadata=column_metadata,
     )
     run_id = state.get("run_id")
     if run_id:
@@ -9955,8 +9965,8 @@ def run_domain_expert(state: AgentState) -> AgentState:
         }
         enriched_strategies.append(enriched)
 
-    # Deliberation Step
-    evaluation = domain_expert.evaluate_strategies(
+    # Deliberation Step — deterministic scoring (no LLM call)
+    evaluation = domain_expert.evaluate_deterministic(
         data_summary,
         business_objective,
         enriched_strategies,

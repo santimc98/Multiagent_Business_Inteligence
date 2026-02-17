@@ -414,6 +414,64 @@ Output schema:
             "minimum_selectable_score": 3.0,
         }
 
+    def evaluate_deterministic(
+        self,
+        data_summary: str,
+        business_objective: str,
+        strategies: List[Dict[str, Any]],
+        *,
+        compute_constraints: Dict[str, Any] | None = None,
+        dataset_memory_context: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Deterministic-only strategy evaluation — no LLM call.
+
+        Scores strategies using structural/feasibility heuristics
+        (_score_deterministic), then applies the same consistency guard
+        and selectability policy as the LLM path.
+
+        Returns the same shape as evaluate_strategies() for full
+        downstream compatibility.
+        """
+        normalized_strategies = self._normalize_strategies(strategies)
+        deterministic_reviews = self._score_deterministic(
+            strategies=normalized_strategies,
+            business_objective=business_objective,
+            compute_constraints=compute_constraints or {},
+        )
+
+        # Apply consistency guard (critical risk + high score → cap)
+        for review in deterministic_reviews:
+            risks = review.get("risks") or []
+            score = _safe_float(review.get("score"), 0.0)
+            critical_risk = any(
+                tok in " ".join(risks).lower()
+                for tok in ("critical", "leakage", "not feasible", "infeasible", "invalid required")
+            )
+            if critical_risk and score >= 8.0:
+                review["score"] = 5.5
+                review["reasoning"] = (
+                    f"{review.get('reasoning', '')} Score adjusted by consistency guard due to critical risks."
+                )
+
+            # Selectability policy: score >= 3.0
+            review["selectable"] = bool(_safe_float(review.get("score"), 0.0) >= 3.0)
+
+        strategy_count = len(normalized_strategies)
+        return {
+            "reviews": deterministic_reviews,
+            "review_validation": {
+                "status": "ok" if len(deterministic_reviews) == strategy_count else "partial",
+                "strategy_count": strategy_count,
+                "reviews_count": len(deterministic_reviews),
+                "llm_reviews_received": 0,
+                "llm_reviews_used": 0,
+                "fallback_reviews_used": len(deterministic_reviews),
+                "minimum_selectable_score": 3.0,
+                "mode": "deterministic",
+            },
+        }
+
     def _clean_json(self, text: str) -> str:
         text = re.sub(r"```json", "", text)
         text = re.sub(r"```", "", text)

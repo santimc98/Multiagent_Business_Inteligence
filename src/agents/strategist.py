@@ -142,11 +142,11 @@ class StrategistAgent:
         return max(12000, min(value, 400000))
 
     def _get_strategy_count(self) -> int:
-        raw = os.getenv("STRATEGIST_STRATEGY_COUNT", "3")
+        raw = os.getenv("STRATEGIST_STRATEGY_COUNT", "1")
         try:
             value = int(raw)
         except Exception:
-            value = 3
+            value = 1
         return 1 if value <= 1 else 3
 
     def _get_diversity_threshold(self) -> float:
@@ -577,6 +577,7 @@ $payload_json
         column_sets: Optional[Dict[str, Any]] = None,
         column_manifest: Optional[Dict[str, Any]] = None,
         compute_constraints: Optional[Dict[str, Any]] = None,
+        column_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generates a single strategy based on the data summary and user request.
@@ -625,6 +626,10 @@ $payload_json
             if isinstance(compute_constraints, dict)
             else {}
         )
+        column_metadata_payload = json.dumps(
+            column_metadata if isinstance(column_metadata, dict) else {},
+            ensure_ascii=False,
+        )
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Chief Data Strategist inside a multi-agent system. Your goal is to craft ONE optimal strategy
@@ -644,6 +649,18 @@ $payload_json
 
         *** COLUMN MANIFEST (OPTIONAL, MAY BE EMPTY) ***
         $column_manifest
+
+        *** COLUMN METADATA (STRUCTURED) ***
+        $column_metadata
+
+        This metadata provides:
+        - "target": The explicit prediction target column (DO NOT guess — use this).
+        - "split_column": The train/test split column (exclude from model features).
+        - "id_columns": Identifier columns (exclude from model features).
+        - "column_types": Columns grouped by type (numeric vs low_cardinality/categorical).
+        - "column_stats": Per-column statistics (dtype, missing_rate, cardinality, numeric ranges, top values for low-cardinality).
+        - "quality_flags": Data quality issues (high missingness, constant columns).
+        Use this to make informed decisions about feature engineering, model choice, and validation strategy.
 
         *** SCHEMA MODE GUIDANCE ***
         $wide_schema_guidance
@@ -842,6 +859,7 @@ $payload_json
             authorized_column_inventory=inventory_payload,
             column_sets=json.dumps(column_sets_payload, ensure_ascii=False),
             column_manifest=json.dumps(column_manifest_payload, ensure_ascii=False),
+            column_metadata=column_metadata_payload,
             wide_schema_guidance=wide_schema_guidance,
             required_columns_budget_guidance=required_columns_budget_guidance,
             compute_constraints=json.dumps(compute_constraints_payload, ensure_ascii=False),
