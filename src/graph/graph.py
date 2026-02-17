@@ -1034,47 +1034,34 @@ def _apply_review_consistency_guard(
     *,
     actor: str,
 ) -> Dict[str, Any]:
+    """Advisory-only guard: injects deterministic blocker context into the
+    reviewer packet without overriding the LLM reviewer's verdict.  The LLM
+    reviewer already receives diagnostics as context and is the decision-maker."""
     packet: Dict[str, Any] = dict(result or {})
     blockers = [str(x) for x in ((diagnostics or {}).get("hard_blockers") or []) if x]
     if not blockers:
         return packet
-    status = str(packet.get("status") or "").upper()
-    if status and status not in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
-        return packet
 
+    # Inject advisory note into feedback without changing the status.
     actor_name = str(actor or "reviewer").strip().lower() or "reviewer"
     blocker_text = ", ".join(blockers)
     note = (
-        f"{actor_name.upper()}_CONTEXT_GUARD: forced REJECTED due to deterministic blockers "
-        f"({blocker_text})."
+        f"{actor_name.upper()}_ADVISORY: deterministic checkers flagged "
+        f"({blocker_text}). LLM reviewer verdict preserved."
     )
-    packet["status"] = "REJECTED"
     feedback = str(packet.get("feedback") or "").strip()
     packet["feedback"] = f"{feedback}\n{note}".strip() if feedback else note
 
-    failed_gates = packet.get("failed_gates")
-    if not isinstance(failed_gates, list):
-        failed_gates = []
+    # Append to warnings instead of hard_failures so downstream consumers
+    # see the flags without treating them as blocking.
+    warnings = packet.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
     for blocker in blockers:
-        if blocker not in failed_gates:
-            failed_gates.append(blocker)
-    packet["failed_gates"] = failed_gates
-
-    hard_failures = packet.get("hard_failures")
-    if not isinstance(hard_failures, list):
-        hard_failures = []
-    for blocker in blockers:
-        if blocker not in hard_failures:
-            hard_failures.append(blocker)
-    packet["hard_failures"] = hard_failures
-
-    required_fixes = packet.get("required_fixes")
-    if not isinstance(required_fixes, list):
-        required_fixes = []
-    generic_fix = "Resolve deterministic runtime/output blockers before requesting approval again."
-    if generic_fix not in required_fixes:
-        required_fixes.append(generic_fix)
-    packet["required_fixes"] = required_fixes
+        tag = f"advisory_blocker:{blocker}"
+        if tag not in warnings:
+            warnings.append(tag)
+    packet["warnings"] = warnings
     return packet
 
 

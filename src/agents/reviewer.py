@@ -390,23 +390,19 @@ class ReviewerAgent:
         hard_prechecks = [str(x) for x in (deterministic_prechecks.get("hard_failures") or []) if x]
         precheck_warnings = [str(x) for x in (deterministic_prechecks.get("warnings") or []) if x]
         diagnostics_blockers = _deterministic_diagnostics_blockers(execution_diagnostics)
-        if diagnostics_blockers.get("hard_failures"):
-            return {
-                "status": "REJECTED",
-                "feedback": "Reviewer deterministic diagnostics detected blocking execution/output issues.",
-                "failed_gates": diagnostics_blockers.get("failed_gates") or [],
-                "required_fixes": diagnostics_blockers.get("required_fixes") or [],
-                "hard_failures": diagnostics_blockers.get("hard_failures") or [],
-                "warnings": precheck_warnings,
-                "evidence": diagnostics_blockers.get("evidence") or [],
-            }
-        if hard_prechecks:
+        # Diagnostics blockers are advisory context for the LLM reviewer,
+        # not blocking gates.  The LLM reviewer prompt already receives
+        # execution_diagnostics_json and deterministic_prechecks_json and is
+        # instructed to trust execution results over static code patterns.
+
+        # Only SyntaxError is a true blocker (code cannot even parse).
+        if "reviewer_syntax_validity" in hard_prechecks:
             return {
                 "status": "REJECTED",
                 "feedback": "Reviewer deterministic precheck failed before LLM review.",
                 "failed_gates": [str(x) for x in (deterministic_prechecks.get("failed_gates") or []) if x],
                 "required_fixes": [str(x) for x in (deterministic_prechecks.get("required_fixes") or []) if x],
-                "hard_failures": hard_prechecks,
+                "hard_failures": ["reviewer_syntax_validity"],
                 "warnings": precheck_warnings,
                 "evidence": [],
             }

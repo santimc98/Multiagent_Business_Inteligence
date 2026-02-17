@@ -2842,6 +2842,9 @@ def build_contract_min(
     steward_identifiers = _coerce_list(steward_semantics.get("identifier_columns"))
     steward_time_cols = _coerce_list(steward_semantics.get("time_columns"))
     steward_categorical = _coerce_list(steward_semantics.get("categorical_columns"))
+    steward_split_cols = _coerce_list(steward_semantics.get("split_candidates"))
+    if not steward_split_cols:
+        steward_split_cols = _coerce_list(data_profile.get("split_candidates")) if data_profile else []
 
     # Also check data_profile top-level for backward compatibility
     if not steward_identifiers:
@@ -2912,6 +2915,15 @@ def build_contract_min(
             if col not in model_features:
                 model_features.append(col)
     forbidden_features = list(dict.fromkeys(outcome_cols + audit_only_cols))
+
+    # Exclude split/partition columns from model_features — they are structural
+    # (constant in training set) and provide no predictive signal.
+    if steward_split_cols:
+        filtered_model = [col for col in model_features if col not in steward_split_cols]
+        removed_splits = [col for col in model_features if col in steward_split_cols]
+        if removed_splits:
+            model_features = filtered_model
+            print(f"SPLIT_COLUMN_GUARD: Excluded split columns from model_features: {removed_splits}")
 
     allowed_sets_full = contract.get("allowed_feature_sets")
     if not isinstance(allowed_sets_full, dict):
@@ -3259,10 +3271,29 @@ def build_contract_min(
 
     validation_requirements = contract.get("validation_requirements")
     if not isinstance(validation_requirements, dict) or not validation_requirements:
+        # Build from strategy instead of hardcoding holdout/accuracy
+        _strat_metric = _normalize_kpi_metric(strategy_dict.get("success_metric"))
+        if not _strat_metric:
+            _strat_metric = _extract_kpi_from_list(strategy_dict.get("recommended_evaluation_metrics"))
+        if not _strat_metric:
+            _strat_metric = _extract_kpi_from_text(business_objective_hint or "")
+        _strat_metric = _strat_metric or "accuracy"
+
+        _strat_validation = str(strategy_dict.get("validation_strategy") or "").strip().lower()
+        _strat_method = "holdout"
+        if "k-fold" in _strat_validation or "kfold" in _strat_validation or "cross" in _strat_validation:
+            _strat_method = "cross_validation"
+
+        _metrics_to_report = [_strat_metric]
+        for m in _coerce_list(strategy_dict.get("recommended_evaluation_metrics")):
+            _m_norm = _normalize_kpi_metric(m)
+            if _m_norm and _m_norm not in _metrics_to_report:
+                _metrics_to_report.append(_m_norm)
+
         validation_requirements = {
-            "method": "holdout",
-            "metrics_to_report": ["accuracy"],
-            "primary_metric": "accuracy",
+            "method": _strat_method,
+            "metrics_to_report": _metrics_to_report,
+            "primary_metric": _strat_metric,
         }
 
     objective_analysis = contract.get("objective_analysis")
