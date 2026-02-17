@@ -281,12 +281,16 @@ def launch_local_runner_job(
     raw_error_payload = error_payload
     status_arbitration: Dict[str, Any] | None = None
 
-    if status_ok and not missing_artifacts and (job_failed or error_payload):
+    # Defence-in-depth: when the runner reports ok=true, trust its verdict even
+    # if the launcher detects missing artifacts (they may belong to a different
+    # pipeline stage, e.g. data/cleaned_data.csv is a DE artifact).
+    if status_ok and (job_failed or error_payload):
         status_arbitration = {
             "applied": True,
-            "reason": "status_ok_with_required_artifacts",
+            "reason": "status_ok_override",
             "ignored_error_payload": bool(error_payload),
             "ignored_job_failure": bool(job_failed),
+            "missing_artifacts_at_arbitration": list(missing_artifacts),
         }
         job_failed = False
         job_error_msg = ""

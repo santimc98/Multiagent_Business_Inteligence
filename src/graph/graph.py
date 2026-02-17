@@ -17570,7 +17570,12 @@ def execute_code(state: AgentState) -> AgentState:
 
             decisioning_names = _extract_decisioning_required_names(contract)
 
-            required_artifacts = _resolve_required_outputs(contract, state)
+            # Filter required artifacts by owner so the ML engineer launcher
+            # only checks for ML outputs, not DE artifacts like cleaned_data.csv.
+            from src.utils.contract_accessors import get_required_outputs_by_owner as _get_ro_owner
+            required_artifacts = _get_ro_owner(contract, "ml_engineer")
+            if not required_artifacts:
+                required_artifacts = _resolve_required_outputs(contract, state)
             if not isinstance(required_artifacts, list):
                 required_artifacts = []
             required_artifacts = [
