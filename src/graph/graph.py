@@ -8723,6 +8723,160 @@ def _build_iteration_handoff(
         }
     return handoff
 
+
+def _prepare_improvement_iteration(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Prepare an improvement iteration: compare metrics, update patience, build handoff."""
+    imp_count = int(state.get("improvement_attempt_count", 0))
+    best_metric = state.get("improvement_best_metric")
+
+    # Read current metrics from the latest execution
+    current_metrics = _load_json_safe("data/metrics.json") or {}
+    primary_metric_name = current_metrics.get("primary_metric", "roc_auc")
+    # Try cv_ prefixed first, then raw
+    current_value = current_metrics.get(f"cv_{primary_metric_name}")
+    if current_value is None:
+        current_value = current_metrics.get(primary_metric_name)
+    # Fallback: check primary_metric_snapshot from state
+    if current_value is None:
+        snapshot = state.get("primary_metric_snapshot") or {}
+        if isinstance(snapshot, dict):
+            current_value = snapshot.get("primary_metric_value")
+            if not primary_metric_name or primary_metric_name == "roc_auc":
+                primary_metric_name = snapshot.get("primary_metric_name") or primary_metric_name
+
+    # Coerce to float
+    try:
+        current_value = float(current_value) if current_value is not None else None
+    except (TypeError, ValueError):
+        current_value = None
+
+    # Determine if metric improved
+    improved = False
+    result: Dict[str, Any] = {}
+    if current_value is not None:
+        if best_metric is None or current_value > float(best_metric):
+            improved = True
+            result["improvement_best_metric"] = current_value
+            result["improvement_best_attempt_id"] = imp_count
+            result["improvement_patience_counter"] = 0
+
+            # Snapshot best attempt artifacts
+            artifact_paths = list(state.get("artifact_paths", []) or [])
+            oc_report = state.get("output_contract_report") or {}
+            artifact_index = state.get("artifact_index") or []
+            execution_output = state.get("execution_output") or ""
+            plots_local = list(state.get("plots_local", []) or [])
+            diagnostics = state.get("artifact_content_diagnostics") or {}
+            dest = _snapshot_best_attempt(
+                attempt_id=imp_count + 1,
+                artifact_paths=artifact_paths,
+                output_contract_report=oc_report if isinstance(oc_report, dict) else {},
+                artifact_index=artifact_index if isinstance(artifact_index, list) else [],
+                execution_output=execution_output,
+                plots_local=plots_local,
+                diagnostics=diagnostics if isinstance(diagnostics, dict) else {},
+            )
+            if dest:
+                result["best_attempt_dir"] = dest
+                result["best_attempt_score"] = state.get("last_attempt_score")
+                result["best_attempt_id"] = imp_count + 1
+                result["best_attempt_artifact_index"] = artifact_index
+                result["best_attempt_output_contract_report"] = oc_report
+                result["best_attempt_execution_output"] = execution_output
+                result["best_attempt_plots"] = plots_local
+        else:
+            result["improvement_patience_counter"] = int(state.get("improvement_patience_counter", 0)) + 1
+
+    result["improvement_attempt_count"] = imp_count + 1
+
+    # Build improvement history
+    history = list(state.get("improvement_metrics_history", []) or [])
+    history.append({"attempt": imp_count, "metric": current_value, "improved": improved})
+    result["improvement_metrics_history"] = history
+
+    # Read feature importance if available
+    feat_imp = _load_json_safe("data/feature_importance.json")
+    if not feat_imp:
+        feat_imp = _load_json_safe("reports/feature_importance_shap.json")
+    if not isinstance(feat_imp, dict):
+        feat_imp = {}
+    # Trim to top 20 features if it's a flat dict of name->importance
+    if feat_imp and all(isinstance(v, (int, float)) for v in feat_imp.values()):
+        sorted_feats = sorted(feat_imp.items(), key=lambda x: abs(float(x[1])), reverse=True)[:20]
+        feat_imp = dict(sorted_feats)
+
+    # Build improvement handoff
+    reviewer_feedback = str(state.get("review_feedback") or state.get("reviewer_last_result", {}).get("feedback", "") or "")
+
+    # Extract consolidated improvement suggestions from review board
+    consolidated_imp = state.get("consolidated_improvement_suggestions") or {}
+    if not isinstance(consolidated_imp, dict):
+        consolidated_imp = {}
+    consolidated_techniques = consolidated_imp.get("techniques", []) if isinstance(consolidated_imp.get("techniques"), list) else []
+
+    # Extract strategy techniques and fallback chain for improvement guidance
+    strategy = state.get("selected_strategy") or {}
+    if not isinstance(strategy, dict):
+        strategy = {}
+    strategy_techniques = [str(t) for t in (strategy.get("techniques") or []) if t]
+    strategy_fallback_chain = [str(f) for f in (strategy.get("fallback_chain") or []) if f]
+    strategy_feature_families = strategy.get("feature_families") or []
+    strategy_hypothesis = str(strategy.get("hypothesis") or "")
+
+    # Build smart patch_objectives from consolidated suggestions + strategy
+    patch_objectives = list(consolidated_techniques[:5])  # Prioritize reviewer/evaluator suggestions
+    # Add strategy-derived objectives if not already covered
+    if strategy_fallback_chain and len(patch_objectives) < 6:
+        for fallback in strategy_fallback_chain:
+            obj = f"Strategy fallback option: {fallback}"
+            if obj not in patch_objectives:
+                patch_objectives.append(obj)
+            if len(patch_objectives) >= 6:
+                break
+    # Default objectives if nothing specific came from reviewers
+    if not patch_objectives:
+        patch_objectives = [
+            "Improve primary metric through feature engineering, ensemble, or tuning",
+            "Add feature interactions if not already present",
+            "Consider ensemble averaging if using single model",
+            "Optimize hyperparameters if using defaults",
+        ]
+
+    result["iteration_handoff"] = {
+        "mode": "improve",
+        "improvement_attempt": imp_count + 1,
+        "metric_focus": {
+            "primary_metric": primary_metric_name,
+            "current_value": current_value,
+            "best_value": result.get("improvement_best_metric", best_metric),
+            "history": history,
+        },
+        "feature_importance": feat_imp,
+        "reviewer_suggestions": reviewer_feedback,
+        "consolidated_techniques": consolidated_techniques,
+        "strategy_context": {
+            "techniques": strategy_techniques[:10],
+            "fallback_chain": strategy_fallback_chain[:5],
+            "feature_families": strategy_feature_families[:6] if isinstance(strategy_feature_families, list) else [],
+            "hypothesis": strategy_hypothesis[:500] if strategy_hypothesis else "",
+        },
+        "must_preserve": [
+            "All contract-required output paths",
+            "Data loading and CSV dialect handling",
+            "Train/test split logic",
+            "Cross-validation structure",
+        ],
+        "patch_objectives": patch_objectives,
+    }
+
+    # Mark iteration type so check_evaluation routes correctly
+    result["last_iteration_type"] = "metric"
+
+    print(f"IMPROVEMENT_PREPARED: attempt={imp_count+1} current={current_value} best={result.get('improvement_best_metric', best_metric)} improved={improved} patience={result.get('improvement_patience_counter', 0)}")
+
+    return result
+
+
 def _suggest_next_actions(
     preflight_issues: List[str],
     outputs_missing: List[str],
@@ -18448,6 +18602,18 @@ def retry_handler(state: AgentState) -> AgentState:
     }
     route_reason = "policy_not_evaluated"
 
+    # If this is an improvement iteration, prepare improvement context and skip strategy reselection
+    if state.get("last_iteration_type") == "metric" and int(state.get("improvement_attempt_count", 0)) >= 0:
+        imp_result = _prepare_improvement_iteration(state if isinstance(state, dict) else {})
+        result.update(imp_result)
+        current_history.append(
+            f"IMPROVEMENT_ITERATION: attempt={imp_result.get('improvement_attempt_count', '?')} "
+            f"patience={imp_result.get('improvement_patience_counter', 0)}"
+        )
+        result["feedback_history"] = current_history[-20:]
+        print(f"RETRY_HANDLER: improvement iteration prepared, routing to engineer")
+        return result
+
     try:
         state_dict = state if isinstance(state, dict) else {}
         strategies_wrapper = state_dict.get("strategies") if isinstance(state_dict.get("strategies"), dict) else {}
@@ -18882,6 +19048,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
     retry_worth_it = eval_result.get("retry_worth_it") if isinstance(eval_result, dict) else None
+    eval_improvement_suggestions = eval_result.get("improvement_suggestions") if isinstance(eval_result, dict) else None
 
     new_history = list(state.get('feedback_history', []))
     has_deterministic_error = runtime_failure_detected
@@ -19671,6 +19838,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "failed_gates": review_result.get("failed_gates", []),
             "required_fixes": review_result.get("required_fixes", []),
             "hard_failures": review_result.get("hard_failures", []),
+            "improvement_suggestions": review_result.get("improvement_suggestions"),
         }
     if retry_worth_it is not None:
         result_state["review_retry_worth_it"] = bool(retry_worth_it)
@@ -19683,6 +19851,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         result_state["budget_counters"] = review_counters
     if metric_iteration_disabled:
         result_state["stop_reason"] = "METRIC_ITERATION_DISABLED"
+    # Preserve improvement suggestions from evaluator for the improvement loop
+    if isinstance(eval_improvement_suggestions, dict):
+        result_state["eval_improvement_suggestions"] = eval_improvement_suggestions
 
     # NOTE: results_advisor.generate_ml_advice block REMOVED.
     # Metric iteration is disabled, so this block was dead code.
@@ -20344,6 +20515,39 @@ def run_review_board(state: AgentState) -> AgentState:
     if merged_index:
         result["artifact_index"] = merged_index
         result["produced_artifact_index"] = merged_index
+
+    # Consolidate improvement suggestions from reviewer and evaluator packets
+    # and set reviewer_no_improvement_room flag for the improvement loop.
+    _reviewer_packet = board_context.get("reviewer") if isinstance(board_context.get("reviewer"), dict) else {}
+    _eval_packet = board_context.get("result_evaluator") if isinstance(board_context.get("result_evaluator"), dict) else {}
+    _reviewer_imp = _reviewer_packet.get("improvement_suggestions") if isinstance(_reviewer_packet.get("improvement_suggestions"), dict) else {}
+    _eval_imp = state.get("eval_improvement_suggestions") if isinstance(state.get("eval_improvement_suggestions"), dict) else {}
+    # Merge techniques from both sources (deduplicated)
+    _all_techniques: List[str] = []
+    for src_imp in (_reviewer_imp, _eval_imp):
+        for tech in (src_imp.get("techniques") if isinstance(src_imp.get("techniques"), list) else []):
+            tech_str = str(tech).strip()
+            if tech_str and tech_str not in _all_techniques:
+                _all_techniques.append(tech_str)
+    # Determine if there's room for improvement
+    _reviewer_no_room = bool(_reviewer_imp.get("no_further_improvement"))
+    _eval_no_room = bool(_eval_imp.get("no_further_improvement"))
+    _no_improvement_room = _reviewer_no_room and _eval_no_room
+    # Only set no_room if BOTH agree AND there are no techniques suggested
+    if _all_techniques:
+        _no_improvement_room = False
+    result["reviewer_no_improvement_room"] = _no_improvement_room
+    result["consolidated_improvement_suggestions"] = {
+        "techniques": _all_techniques[:8],
+        "no_further_improvement": _no_improvement_room,
+        "from_reviewer": bool(_reviewer_imp),
+        "from_evaluator": bool(_eval_imp),
+    }
+    if _all_techniques:
+        print(f"IMPROVEMENT_SUGGESTIONS: {len(_all_techniques)} techniques consolidated from reviewer/evaluator")
+    if _no_improvement_room:
+        print("IMPROVEMENT_SUGGESTIONS: Both reviewer and evaluator agree no further improvement possible")
+
     return result
 
 
@@ -20618,14 +20822,36 @@ def check_evaluation(state: AgentState):
             print(f"ITER_DECISION type=metric action=stop reason=CASE_ALIGNMENT_REGRESSED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
             return "approved"
 
-    # AIRBAG: Metric iteration is DISABLED. Never retry for metric-only issues.
-    # Even if somehow NEEDS_IMPROVEMENT with last_iteration_type="metric" reaches here,
-    # we force stop and proceed to translator.
+    # Improvement loop: after a successful execution, iterate to improve metrics.
     if last_iter_type == "metric":
-        print(f"AIRBAG_METRIC_STOP: Metric iteration disabled. Proceeding to report generation.")
-        print(f"ITER_DECISION type=metric action=stop reason=METRIC_ITERATION_DISABLED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
-        state["stop_reason"] = "METRIC_ITERATION_DISABLED"
-        return "approved"
+        imp_count = int(state.get("improvement_attempt_count", 0))
+        imp_max = int(state.get("max_improvement_attempts", 3))
+        imp_patience = int(state.get("improvement_patience_counter", 0))
+        imp_patience_max = int(state.get("improvement_patience", 2))
+
+        if imp_count >= imp_max:
+            print(f"IMPROVEMENT_STOP: Max improvement attempts ({imp_max}) reached.")
+            print(f"ITER_DECISION type=metric action=stop reason=IMPROVEMENT_MAX_REACHED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+            state["stop_reason"] = "IMPROVEMENT_MAX_REACHED"
+            return "approved"
+        if imp_patience >= imp_patience_max:
+            print(f"IMPROVEMENT_STOP: Patience exhausted ({imp_patience_max} consecutive non-improvements).")
+            print(f"ITER_DECISION type=metric action=stop reason=IMPROVEMENT_PATIENCE_EXHAUSTED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+            state["stop_reason"] = "IMPROVEMENT_PATIENCE_EXHAUSTED"
+            return "approved"
+
+        # Check reviewer suggestion for improvement
+        reviewer_sees_room = not state.get("reviewer_no_improvement_room", False)
+        if not reviewer_sees_room:
+            print(f"IMPROVEMENT_STOP: Reviewer sees no room for improvement.")
+            print(f"ITER_DECISION type=metric action=stop reason=REVIEWER_NO_IMPROVEMENT metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+            state["stop_reason"] = "REVIEWER_NO_IMPROVEMENT"
+            return "approved"
+
+        # Continue improving
+        print(f"IMPROVEMENT_CONTINUE: attempt={imp_count+1}/{imp_max} patience={imp_patience}/{imp_patience_max}")
+        print(f"ITER_DECISION type=metric action=retry reason=IMPROVEMENT_LOOP metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+        return "retry"
 
     if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
         if _is_blocking_retry_reason(state if isinstance(state, dict) else {}):
@@ -20634,9 +20860,55 @@ def check_evaluation(state: AgentState):
         print(f"ITER_DECISION type=other action=stop reason=ADVISORY_ONLY metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         state["stop_reason"] = "ADVISORY_ONLY"
         return "approved"
-    else:
-        print(f"ITER_DECISION type=other action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
-        return "approved"
+
+    # Improvement loop bootstrap: on first successful execution with a valid metric,
+    # initialize improvement tracking and trigger the first improvement iteration.
+    improvement_enabled = str(os.getenv("IMPROVEMENT_LOOP_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+    if (
+        improvement_enabled
+        and state.get("review_verdict") == "APPROVED"
+        and not state.get("execution_error")
+        and not state.get("sandbox_failed")
+        and state.get("improvement_attempt_count") is None
+        and _is_number(metric_value)
+    ):
+        imp_max = int(os.getenv("MAX_IMPROVEMENT_ATTEMPTS", "3"))
+        imp_patience = int(os.getenv("IMPROVEMENT_PATIENCE", "2"))
+        if imp_max > 0:
+            state["improvement_attempt_count"] = 0
+            state["improvement_best_metric"] = float(metric_value)
+            state["improvement_best_attempt_id"] = 0
+            state["improvement_patience_counter"] = 0
+            state["improvement_metrics_history"] = [{"attempt": 0, "metric": float(metric_value), "improved": True}]
+            state["max_improvement_attempts"] = imp_max
+            state["improvement_patience"] = imp_patience
+            state["last_iteration_type"] = "metric"
+
+            # Snapshot current outputs as baseline best attempt
+            artifact_paths = list(state.get("artifact_paths", []) or [])
+            oc_report = state.get("output_contract_report") or {}
+            artifact_index = state.get("artifact_index") or []
+            execution_output = state.get("execution_output") or ""
+            plots_local = list(state.get("plots_local", []) or [])
+            diagnostics = state.get("artifact_content_diagnostics") or {}
+            dest = _snapshot_best_attempt(
+                attempt_id=1,
+                artifact_paths=artifact_paths,
+                output_contract_report=oc_report if isinstance(oc_report, dict) else {},
+                artifact_index=artifact_index if isinstance(artifact_index, list) else [],
+                execution_output=execution_output,
+                plots_local=plots_local,
+                diagnostics=diagnostics if isinstance(diagnostics, dict) else {},
+            )
+            if dest:
+                state["best_attempt_dir"] = dest
+
+            print(f"IMPROVEMENT_BOOTSTRAP: Initialized improvement loop. baseline_metric={metric_value} max_attempts={imp_max} patience={imp_patience}")
+            print(f"ITER_DECISION type=metric action=retry reason=IMPROVEMENT_BOOTSTRAP metric={metric_name}:{metric_value} best={metric_value} budget_left={imp_max}")
+            return "retry"
+
+    print(f"ITER_DECISION type=other action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+    return "approved"
 
 def run_translator(state: AgentState) -> AgentState:
     print("--- [6] Translator: Generating Report ---")
@@ -20664,6 +20936,13 @@ def run_translator(state: AgentState) -> AgentState:
                 promote_best = True
         except Exception:
             pass
+    # Improvement loop: promote best attempt if the last attempt was not the best
+    imp_best_id = state.get("improvement_best_attempt_id")
+    imp_count = state.get("improvement_attempt_count")
+    if imp_best_id is not None and imp_count is not None and state.get("best_attempt_dir"):
+        if int(imp_best_id) < int(imp_count):
+            promote_best = True
+            print(f"IMPROVEMENT_PROMOTE: Best attempt was #{imp_best_id}, last was #{imp_count}. Promoting best.")
     if promote_best:
         updates = _promote_best_attempt(state)
         if updates:

@@ -378,8 +378,18 @@ class ReviewerAgent:
             "required_fixes": ["List", "of", "specific", "instructions", "for", "the", "engineer"],
             "evidence": [
                 {"claim": "Short claim", "source": "artifact_path#key_or_script_path:line or missing"}
-            ]
+            ],
+            "improvement_suggestions": {
+                "techniques": ["List of specific ML techniques to try next, e.g. 'ensemble averaging of CatBoost+LightGBM+XGBoost', 'add polynomial interaction features between top features', 'tune learning_rate and max_depth via grid search'"],
+                "no_further_improvement": false
+            }
         }
+
+        IMPORTANT for improvement_suggestions:
+        - ALWAYS populate this field, even when status is APPROVED.
+        - "techniques": 2-5 concrete, actionable suggestions for improving the primary metric. Be specific (name models, features, hyperparameters).
+        - "no_further_improvement": set to true ONLY if the code already uses advanced techniques (ensemble, feature engineering, tuning) AND the metric is near theoretical maximum. Otherwise false.
+        - Focus on: ensemble methods, feature engineering, hyperparameter tuning, validation improvements.
         """
 
         from src.utils.prompting import render_prompt
@@ -668,8 +678,20 @@ class ReviewerAgent:
             "retry_worth_it": true | false,
             "evidence": [
                 {"claim": "Short claim", "source": "artifact_path#key_or_script_path:line or missing"}
-            ]
+            ],
+            "improvement_suggestions": {
+                "techniques": ["List of 2-5 specific ML techniques to improve the metric"],
+                "no_further_improvement": false
+            }
         }
+
+        IMPORTANT for improvement_suggestions:
+        - ALWAYS populate this field, even when status is APPROVED.
+        - "techniques": 2-5 concrete, actionable suggestions for improving the primary metric.
+          Be specific: name models, feature engineering approaches, hyperparameters to tune.
+          Examples: "Add ensemble averaging of CatBoost+LightGBM+XGBoost predictions",
+          "Engineer interaction features between age and max_hr", "Tune regularization (l2_leaf_reg) via cross-validated grid search".
+        - "no_further_improvement": set to true ONLY if the code already uses advanced ensemble + feature engineering + tuning AND the metric appears near theoretical maximum. Otherwise false.
         """
 
         # Truncate with head+tail for better context preservation.

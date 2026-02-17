@@ -2564,6 +2564,46 @@ $strategy_json
         3) Return the full updated script (not a diff, not snippets).
         """
 
+        USER_IMPROVE_TEMPLATE = """
+        MODE: IMPROVE
+        Your previous code executed successfully and was approved by the reviewer.
+        Your task is to IMPROVE the metric, not fix bugs.
+
+        CURRENT RESULTS:
+        $metrics_summary
+
+        IMPROVEMENT HISTORY:
+        $improvement_history
+
+        RECOMMENDED TECHNIQUES (from reviewer/evaluator):
+        $consolidated_techniques
+
+        STRATEGY CONTEXT (original plan):
+        $strategy_context
+
+        REVIEWER FEEDBACK:
+        $improvement_suggestions
+
+        FEATURE IMPORTANCE (top features, if available):
+        $feature_importance
+
+        ITERATION_HANDOFF:
+        $iteration_handoff_json
+
+        PREVIOUS APPROVED SCRIPT:
+        $previous_code
+
+        Instructions:
+        1) Your code WORKS. Do NOT break what already works.
+        2) Apply the RECOMMENDED TECHNIQUES above to increase $primary_metric.
+        3) Prioritize in order: ensemble methods > feature engineering > hyperparameter tuning.
+        4) Return the full updated script (not a diff, not snippets).
+        5) Keep all contract-required outputs and paths intact.
+        6) If you add new models for ensemble, keep the original model as fallback.
+        7) Preserve data loading, CSV dialect, train/test split, and cross-validation logic.
+        8) Use feature importance to guide feature engineering (interact top features, drop useless ones).
+        """
+
         # Construct User Message with Patch Mode Logic
         handoff_payload = self._normalize_iteration_handoff(
             iteration_handoff=iteration_handoff,
@@ -2571,8 +2611,65 @@ $strategy_json
             required_deliverables=required_deliverables,
         )
         handoff_payload_json = json.dumps(compress_long_lists(handoff_payload)[0], indent=2)
-        patch_mode_active = bool(previous_code and (gate_context or handoff_payload.get("mode") == "patch"))
-        if patch_mode_active:
+        improve_mode_active = bool(previous_code and handoff_payload.get("mode") == "improve")
+        patch_mode_active = bool(not improve_mode_active and previous_code and (gate_context or handoff_payload.get("mode") == "patch"))
+        if improve_mode_active:
+            # Build improve prompt from handoff
+            metric_focus = handoff_payload.get("metric_focus", {})
+            primary_metric = str(metric_focus.get("primary_metric", "roc_auc"))
+            current_value = metric_focus.get("current_value", "N/A")
+            best_value = metric_focus.get("best_value", "N/A")
+            history_items = metric_focus.get("history", [])
+            metrics_summary = f"Primary metric: {primary_metric}\nCurrent value: {current_value}\nBest value so far: {best_value}"
+            improvement_history = "\n".join(
+                [f"  Attempt {h.get('attempt', '?')}: {h.get('metric', 'N/A')} {'(improved)' if h.get('improved') else '(no improvement)'}"
+                 for h in (history_items if isinstance(history_items, list) else [])]
+            ) or "No previous improvement attempts."
+            feat_imp = handoff_payload.get("feature_importance", {})
+            if isinstance(feat_imp, dict) and feat_imp:
+                feat_imp_text = json.dumps(feat_imp, indent=2)[:3000]
+            else:
+                feat_imp_text = "Not available."
+            improvement_suggestions = str(handoff_payload.get("reviewer_suggestions", "")) or "No specific suggestions."
+            # Build consolidated techniques text
+            consolidated_techs = handoff_payload.get("consolidated_techniques", [])
+            if isinstance(consolidated_techs, list) and consolidated_techs:
+                consolidated_techniques_text = "\n".join([f"  - {t}" for t in consolidated_techs])
+            else:
+                consolidated_techniques_text = "No specific techniques suggested. Apply general ML improvement practices."
+            # Build strategy context text
+            strat_ctx = handoff_payload.get("strategy_context", {})
+            if isinstance(strat_ctx, dict) and strat_ctx:
+                strat_parts = []
+                if strat_ctx.get("techniques"):
+                    strat_parts.append("Techniques: " + ", ".join(strat_ctx["techniques"][:6]))
+                if strat_ctx.get("fallback_chain"):
+                    strat_parts.append("Fallback chain: " + " -> ".join(strat_ctx["fallback_chain"][:4]))
+                if strat_ctx.get("feature_families"):
+                    for fam in strat_ctx["feature_families"][:4]:
+                        if isinstance(fam, dict):
+                            strat_parts.append(f"Feature family '{fam.get('family', '?')}': {fam.get('rationale', '')}")
+                if strat_ctx.get("hypothesis"):
+                    strat_parts.append(f"Hypothesis: {strat_ctx['hypothesis']}")
+                strategy_context_text = "\n".join(strat_parts) if strat_parts else "No strategy context available."
+            else:
+                strategy_context_text = "No strategy context available."
+            previous_code_block = self._truncate_code_for_patch(previous_code)
+            user_message = render_prompt(
+                USER_IMPROVE_TEMPLATE,
+                metrics_summary=metrics_summary,
+                improvement_history=improvement_history,
+                improvement_suggestions=improvement_suggestions,
+                consolidated_techniques=consolidated_techniques_text,
+                strategy_context=strategy_context_text,
+                iteration_handoff_json=handoff_payload_json,
+                feature_importance=feat_imp_text,
+                previous_code=previous_code_block,
+                primary_metric=primary_metric,
+                strategy_title=strategy.get('title', 'Unknown'),
+                data_path=data_path,
+            )
+        elif patch_mode_active:
             gate_ctx = gate_context if isinstance(gate_context, dict) else {}
             required_fixes = gate_ctx.get('required_fixes', [])
             feedback_text = gate_ctx.get('feedback', '')
@@ -2637,7 +2734,10 @@ $strategy_json
 
         base_temp = _env_float("ML_ENGINEER_TEMPERATURE", 0.1)
         retry_temp = _env_float("ML_ENGINEER_TEMPERATURE_RETRY", 0.0)
-        if previous_code and (gate_context or handoff_payload.get("mode") == "patch"):
+        improve_temp = _env_float("ML_ENGINEER_TEMPERATURE_IMPROVE", 0.2)
+        if improve_mode_active:
+            current_temp = improve_temp
+        elif previous_code and (gate_context or handoff_payload.get("mode") == "patch"):
             current_temp = retry_temp
         else:
             current_temp = base_temp
