@@ -2690,6 +2690,13 @@ def build_contract_min(
     contract_canonical = contract.get("canonical_columns")
     if isinstance(contract_canonical, list) and contract_canonical:
         canonical_columns = [str(col) for col in contract_canonical if col]
+        # Guard: if contract canonical_columns covers < 50% of inventory,
+        # the LLM output was likely truncated. Enrich with inventory columns.
+        if inventory and len(canonical_columns) < len(inventory) * 0.5:
+            print(f"CANONICAL_COLUMNS_GUARD: Contract canonical ({len(canonical_columns)}) covers <50% of inventory ({len(inventory)}). Enriching.")
+            for col in inventory:
+                if col not in canonical_columns:
+                    canonical_columns.append(col)
     else:
         for col in (relevant_columns or []):
             if not col:

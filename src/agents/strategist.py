@@ -28,11 +28,15 @@ class _OpenRouterModelShim:
         self._agent = agent
 
     def generate_content(self, prompt: str) -> _TextResponse:
+        call_kwargs: dict = {"temperature": self._agent._pending_temperature}
+        max_tokens = self._agent._max_tokens
+        if max_tokens and max_tokens > 0:
+            call_kwargs["max_tokens"] = max_tokens
         response, model_used = call_chat_with_fallback(
             llm_client=self._agent.client,
             messages=[{"role": "user", "content": prompt}],
             model_chain=self._agent.model_chain,
-            call_kwargs={"temperature": self._agent._pending_temperature},
+            call_kwargs=call_kwargs,
             logger=self._agent.logger,
             context_tag=self._agent._pending_context_tag,
         )
@@ -40,6 +44,14 @@ class _OpenRouterModelShim:
         if not content:
             raise ValueError("EMPTY_COMPLETION")
         self._agent.last_model_used = model_used
+        # Capture finish_reason for truncation detection
+        self._agent._last_finish_reason = None
+        try:
+            choices = getattr(response, "choices", None)
+            if choices:
+                self._agent._last_finish_reason = getattr(choices[0], "finish_reason", None)
+        except Exception:
+            pass
         return _TextResponse(str(content))
 
 
@@ -94,6 +106,12 @@ class StrategistAgent:
         self.last_model_used = None
         self._pending_temperature = 0.1
         self._pending_context_tag = "strategist_generate"
+        self._last_finish_reason = None
+        _max_tokens_raw = os.getenv("STRATEGIST_MAX_TOKENS", "8192")
+        try:
+            self._max_tokens = max(1024, int(_max_tokens_raw))
+        except (ValueError, TypeError):
+            self._max_tokens = 8192
         self.model = _OpenRouterModelShim(self)
 
     def _call_model(self, prompt: str, *, temperature: float, context_tag: str) -> str:
@@ -270,7 +288,9 @@ class StrategistAgent:
         Constraints:
         - Preserve existing strategy meaning, titles, metrics, and reasoning whenever present.
         - Keep the same top-level schema: {"strategies":[...]}.
-        - If the tail is truncated, complete missing brackets/objects using existing context.
+        - If the tail is truncated (unclosed brackets/strings), complete ALL missing fields using context.
+        - CRITICAL: Each strategy MUST have a non-empty "techniques" array with at least 2-3 ML techniques.
+        - CRITICAL: Each strategy MUST have a non-empty "required_columns" array listing columns from the data.
         - Remove dangling commas and invalid tokens.
 
         *** USER REQUEST ***
@@ -871,11 +891,27 @@ $payload_json
         self.last_prompt = system_prompt
         
         try:
-            content = self._call_model(
-                system_prompt,
-                temperature=0.1,
-                context_tag="strategist_generate",
-            )
+            # --- Truncation-aware generation with retry ---
+            _max_generation_attempts = 2
+            content = None
+            for _gen_attempt in range(1, _max_generation_attempts + 1):
+                content = self._call_model(
+                    system_prompt,
+                    temperature=0.1,
+                    context_tag="strategist_generate",
+                )
+                _fr = str(self._last_finish_reason or "").lower()
+                _is_truncated = _fr in ("length", "max_tokens")
+                if _is_truncated and _gen_attempt < _max_generation_attempts:
+                    print(
+                        f"STRATEGIST_TRUNCATION_DETECTED: finish_reason={self._last_finish_reason}, "
+                        f"response_len={len(content or '')}, attempt={_gen_attempt}/{_max_generation_attempts}. "
+                        f"Retrying with higher max_tokens."
+                    )
+                    # Bump max_tokens for retry
+                    self._max_tokens = min(self._max_tokens * 2, 32768)
+                    continue
+                break
             self.last_response = content
             cleaned_content = self._clean_json(content)
             parsed, json_repair_meta = self._parse_with_json_repair(
