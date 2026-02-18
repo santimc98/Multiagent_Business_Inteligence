@@ -72,6 +72,40 @@ def test_validate_contract_readonly_rejects_non_path_required_outputs():
     assert "contract.required_outputs_path" in rules
 
 
+def test_validate_contract_readonly_accepts_required_outputs_object_entries():
+    contract = _base_contract()
+    contract["required_outputs"] = [
+        {
+            "path": "data/metrics.json",
+            "required": True,
+            "owner": "ml_engineer",
+            "kind": "metrics",
+        },
+        {
+            "path": "data/scored_rows.csv",
+            "required": True,
+            "owner": "ml_engineer",
+            "kind": "predictions",
+        },
+    ]
+
+    result = validate_contract_readonly(contract)
+
+    assert result.get("accepted") is True
+    assert result.get("status") in {"ok", "warning"}
+
+
+def test_validate_contract_readonly_rejects_required_outputs_object_without_path():
+    contract = _base_contract()
+    contract["required_outputs"] = [{"output": "data/metrics.json"}]
+
+    result = validate_contract_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.required_outputs_path" in rules
+
+
 def test_validate_contract_readonly_rejects_alias_role_key():
     contract = deepcopy(_base_contract())
     contract["column_roles"] = {

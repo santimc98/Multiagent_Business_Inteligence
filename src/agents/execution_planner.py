@@ -94,7 +94,13 @@ Minimal contract interface:
 - business_objective: string
 - output_dialect: object (csv sep/decimal/encoding when known)
 - canonical_columns: list[str]
-- required_outputs: list[str] file paths
+- required_outputs: list[object] artifact outputs
+  - each object MUST include at least:
+    - path: string file path
+    - required: boolean
+  - recommended fields: owner, kind, description
+  - optional field: id
+  - legacy list[str] may appear in inputs; normalize it to object form in output
 - column_roles: object mapping role -> list[str]
   Role definitions (ML execution context):
   - outcome: ONLY the target variable(s) the model predicts (usually one column).
@@ -6067,26 +6073,70 @@ class ExecutionPlannerAgent:
             spec = contract.get("spec_extraction")
             if not isinstance(spec, dict):
                 spec = {}
+
+            def _normalize_path(p: str) -> str:
+                known = ["metrics.json", "alignment_check.json", "scored_rows.csv", "cleaned_data.csv"]
+                base = os.path.basename(str(p))
+                if base in known and not str(p).startswith("data/"):
+                    return f"data/{base}"
+                return str(p).replace("\\", "/")
+
+            def _extract_required_paths(raw_outputs: Any) -> set[str]:
+                paths: set[str] = set()
+                if not isinstance(raw_outputs, list):
+                    return paths
+                for item in raw_outputs:
+                    path: Any = ""
+                    if isinstance(item, str):
+                        path = item
+                    elif isinstance(item, dict):
+                        path = item.get("path") or item.get("output") or item.get("artifact")
+                    if not path:
+                        continue
+                    normalized = _normalize_path(str(path).strip())
+                    if normalized:
+                        paths.add(normalized)
+                return paths
+
             legacy_required = contract.get("required_outputs", []) or []
+            legacy_required_paths = _extract_required_paths(legacy_required)
             derived = _derive_deliverables(_infer_objective_type(), strategy or {}, spec)
             legacy = _normalize_deliverables(legacy_required, default_required=True)
-            existing = _normalize_deliverables(spec.get("deliverables"), default_required=True, required_paths=set(legacy_required))
+            existing = _normalize_deliverables(
+                spec.get("deliverables"),
+                default_required=True,
+                required_paths=legacy_required_paths,
+            )
             deliverables = _merge_deliverables(derived, legacy)
             deliverables = _merge_deliverables(deliverables, existing)
             deliverables = _ensure_unique_deliverable_ids(deliverables)
             spec["deliverables"] = deliverables
             contract["spec_extraction"] = spec
 
-            # Auto-sync: required_outputs = paths of required deliverables (List[str] for compat)
-            def _normalize_path(p: str) -> str:
-                known = ["metrics.json", "alignment_check.json", "scored_rows.csv", "cleaned_data.csv"]
-                import os
-                base = os.path.basename(p)
-                if base in known and not p.startswith("data/"):
-                    return f"data/{base}"
-                return p
-
-            contract["required_outputs"] = [_normalize_path(d["path"]) for d in deliverables if d.get("required")]
+            # Auto-sync: required_outputs = required deliverables in canonical object format.
+            required_outputs_payload: List[Dict[str, Any]] = []
+            required_output_paths: set[str] = set()
+            for deliverable in deliverables:
+                if not isinstance(deliverable, dict) or not deliverable.get("required"):
+                    continue
+                normalized_path = _normalize_path(deliverable.get("path") or "")
+                if not normalized_path:
+                    continue
+                path_key = normalized_path.lower()
+                if path_key in required_output_paths:
+                    continue
+                required_output_paths.add(path_key)
+                normalized_deliverable = _build_deliverable(
+                    path=normalized_path,
+                    required=True,
+                    kind=deliverable.get("kind"),
+                    description=deliverable.get("description"),
+                    deliverable_id=deliverable.get("id"),
+                    owner=deliverable.get("owner"),
+                )
+                if normalized_deliverable:
+                    required_outputs_payload.append(normalized_deliverable)
+            contract["required_outputs"] = required_outputs_payload
 
             artifact_reqs = contract.get("artifact_requirements", {})
             if isinstance(artifact_reqs, dict):
@@ -6105,8 +6155,22 @@ class ExecutionPlannerAgent:
                             if os.path.isabs(expected)
                             else os.path.normpath(os.path.join(outputs_dir, expected))
                         )
-                        if plot_path not in contract["required_outputs"]:
-                            contract["required_outputs"].append(plot_path)
+                        normalized_plot_path = _normalize_path(str(plot_path))
+                        if not is_probably_path(normalized_plot_path):
+                            continue
+                        plot_key = normalized_plot_path.lower()
+                        if plot_key in required_output_paths:
+                            continue
+                        required_output_paths.add(plot_key)
+                        plot_entry = _build_deliverable(
+                            path=normalized_plot_path,
+                            required=True,
+                            kind="plot",
+                            description="Required visualization artifact.",
+                            owner="ml_engineer",
+                        )
+                        if plot_entry:
+                            contract["required_outputs"].append(plot_entry)
 
             return contract
 
@@ -6199,8 +6263,15 @@ class ExecutionPlannerAgent:
         def _has_deliverable(contract: Dict[str, Any], path: str) -> bool:
             if not isinstance(contract, dict):
                 return False
-            if path in (contract.get("required_outputs") or []):
-                return True
+            required_outputs = contract.get("required_outputs")
+            if isinstance(required_outputs, list):
+                for item in required_outputs:
+                    if isinstance(item, dict):
+                        item_path = item.get("path") or item.get("output") or item.get("artifact")
+                    else:
+                        item_path = item
+                    if str(item_path or "") == path:
+                        return True
             spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
             deliverables = spec.get("deliverables")
             if isinstance(deliverables, list):
@@ -8484,9 +8555,21 @@ class ExecutionPlannerAgent:
 
                 outputs = payload.get("required_outputs")
                 if isinstance(outputs, list):
-                    invalid_outputs = [
-                        item for item in outputs if not isinstance(item, str) or not is_file_path(str(item).strip())
-                    ]
+                    invalid_outputs: List[Any] = []
+                    for item in outputs:
+                        if isinstance(item, str):
+                            output_path = item.strip()
+                        elif isinstance(item, dict):
+                            output_path = ""
+                            for key in ("path", "output", "artifact"):
+                                candidate = item.get(key)
+                                if isinstance(candidate, str) and candidate.strip():
+                                    output_path = candidate.strip()
+                                    break
+                        else:
+                            output_path = ""
+                        if not output_path or not is_file_path(output_path):
+                            invalid_outputs.append(item)
                     if invalid_outputs:
                         errors.append(
                             f"{section_id}: required_outputs entries must be file paths; invalid={invalid_outputs[:5]}"
@@ -8772,7 +8855,8 @@ class ExecutionPlannerAgent:
                 "Use only data from ORIGINAL INPUTS; do not invent columns.\n"
                 "Use downstream_consumer_interface and evidence_policy from ORIGINAL INPUTS.\n"
                 "Keep semantics aligned with strategy/business objective.\n"
-                "required_outputs MUST be a list of artifact file paths (never logical labels/column names).\n"
+                "required_outputs MUST be a list of artifact objects with file-like paths (never logical labels/column names).\n"
+                "Each required_outputs entry must include at least {\"path\": \"<file_path>\", \"required\": true|false}; optional: owner/kind/description/id.\n"
                 "column_dtype_targets values MUST use key target_dtype (never key type).\n"
                 "Example: {\"age\": {\"target_dtype\": \"float64\", \"nullable\": false}}.\n"
                 "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
@@ -8843,7 +8927,10 @@ class ExecutionPlannerAgent:
                             "Use canonical column_roles buckets and include at least outcome + pre_decision coverage.",
                         )
                     if "required_outputs" in low:
-                        _add("required_outputs", "Keep required_outputs as artifact file paths only.")
+                        _add(
+                            "required_outputs",
+                            "Keep required_outputs as artifact objects with file-like path values only.",
+                        )
                     if "required_columns" in low and "selector" in low:
                         _add(
                             "required_columns_selector",
@@ -8920,7 +9007,7 @@ class ExecutionPlannerAgent:
                 "Use ORIGINAL INPUTS as source of truth and keep compatibility with CURRENT CONTRACT DRAFT.\n"
                 "Use downstream_consumer_interface and evidence_policy from ORIGINAL INPUTS.\n"
                 "Do not invent columns not present in column_inventory.\n\n"
-                "Use artifact file paths for required_outputs.\n\n"
+                "Use required_outputs as list[object] entries with at least path/required.\n\n"
                 "column_dtype_targets values MUST use key target_dtype (never key type).\n"
                 "Example: {\"age\": {\"target_dtype\": \"float64\", \"nullable\": false}}.\n"
                 "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"

@@ -101,6 +101,35 @@ def test_validate_contract_minimal_readonly_accepts_executable_views_contract():
     assert str(result.get("status")).lower() in {"ok", "warning"}
 
 
+def test_validate_contract_minimal_readonly_accepts_required_outputs_objects():
+    contract = _base_full_pipeline_contract()
+    contract["required_outputs"] = [
+        {"path": path, "required": True, "owner": "ml_engineer"}
+        for path in contract["required_outputs"]
+    ]
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is True
+    assert str(result.get("status")).lower() in {"ok", "warning"}
+
+
+def test_validate_contract_minimal_readonly_rejects_required_outputs_object_without_path():
+    contract = _base_full_pipeline_contract()
+    contract["required_outputs"] = [
+        {"output": "data/cleaned_data.csv"},
+        {"path": "data/cleaning_manifest.json", "required": True},
+        {"path": "reports/performance_metrics.json", "required": True},
+        {"path": "outputs/risk_scores_and_decisions.csv", "required": True},
+    ]
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.required_outputs_path" in rules
+
+
 def test_validate_contract_minimal_readonly_allows_missing_iteration_policy_with_warning():
     contract = _base_full_pipeline_contract()
     contract.pop("iteration_policy", None)

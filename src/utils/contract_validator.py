@@ -253,6 +253,41 @@ def is_column_name(value: str) -> bool:
     return True
 
 
+def _extract_required_output_path(item: Any) -> Tuple[str, Optional[str]]:
+    """
+    Extract a required output path from supported entry formats.
+
+    Supported formats:
+      - "data/file.csv" (legacy string)
+      - {"path": "data/file.csv", ...} (canonical object)
+
+    Returns:
+      (path, error_code) where error_code is None when valid.
+    """
+    if isinstance(item, str):
+        path = item.strip()
+        if not path:
+            return "", "empty_path"
+        return path, None
+
+    if isinstance(item, dict):
+        if "path" not in item:
+            return "", "missing_path"
+        path_value = item.get("path")
+        if not isinstance(path_value, str):
+            return "", "path_not_string"
+        path = path_value.strip()
+        if not path:
+            return "", "empty_path"
+        return path, None
+
+    return "", "invalid_type"
+
+
+def _normalize_required_output_path(path: str) -> str:
+    return str(path or "").replace("\\", "/").strip().lower()
+
+
 def detect_output_ambiguity(
     required_outputs: List[Any]
 ) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
@@ -2064,18 +2099,48 @@ def validate_contract_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
         seen_paths: set[str] = set()
         duplicate_paths: List[str] = []
         for item in required_outputs:
-            if not isinstance(item, str):
+            path, path_error = _extract_required_output_path(item)
+            if path_error == "invalid_type":
                 issues.append(
                     _strict_issue(
                         "contract.required_outputs_type",
                         "error",
-                        "required_outputs entries must be strings (artifact file paths).",
+                        "required_outputs entries must be strings or objects with a non-empty 'path'.",
                         item,
                     )
                 )
                 continue
-            path = item.strip()
-            if not path or not is_file_path(path):
+            if path_error == "missing_path":
+                issues.append(
+                    _strict_issue(
+                        "contract.required_outputs_path",
+                        "error",
+                        "required_outputs object entries must include a non-empty string field 'path'.",
+                        item,
+                    )
+                )
+                continue
+            if path_error == "path_not_string":
+                issues.append(
+                    _strict_issue(
+                        "contract.required_outputs_path",
+                        "error",
+                        "required_outputs object field 'path' must be a string.",
+                        item,
+                    )
+                )
+                continue
+            if path_error == "empty_path":
+                issues.append(
+                    _strict_issue(
+                        "contract.required_outputs_path",
+                        "error",
+                        "required_outputs entries must not contain empty path values.",
+                        item,
+                    )
+                )
+                continue
+            if not is_file_path(path):
                 issues.append(
                     _strict_issue(
                         "contract.required_outputs_path",
@@ -2085,7 +2150,7 @@ def validate_contract_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
                     )
                 )
                 continue
-            normalized_path = path.replace("\\", "/").strip().lower()
+            normalized_path = _normalize_required_output_path(path)
             if normalized_path in seen_paths:
                 duplicate_paths.append(path)
             else:
@@ -3086,22 +3151,52 @@ def validate_contract_minimal_readonly(
             _strict_issue(
                 "contract.required_outputs",
                 "error",
-                "required_outputs must be a non-empty list of artifact file paths.",
+                "required_outputs must be a non-empty list of artifact outputs (string paths or objects with 'path').",
                 required_outputs,
             )
         )
     else:
-        invalid_outputs: List[Any] = []
+        invalid_outputs: List[Dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        duplicate_paths: List[str] = []
         for output in required_outputs:
-            if not isinstance(output, str) or not is_file_path(output.strip()):
-                invalid_outputs.append(output)
+            path, path_error = _extract_required_output_path(output)
+            if path_error == "invalid_type":
+                invalid_outputs.append({"entry": output, "reason": "invalid_type"})
+                continue
+            if path_error == "missing_path":
+                invalid_outputs.append({"entry": output, "reason": "missing_path"})
+                continue
+            if path_error == "path_not_string":
+                invalid_outputs.append({"entry": output, "reason": "path_not_string"})
+                continue
+            if path_error == "empty_path":
+                invalid_outputs.append({"entry": output, "reason": "empty_path"})
+                continue
+            if not is_file_path(path):
+                invalid_outputs.append({"entry": output, "reason": "not_file_like"})
+                continue
+            normalized_path = _normalize_required_output_path(path)
+            if normalized_path in seen_paths:
+                duplicate_paths.append(path)
+            else:
+                seen_paths.add(normalized_path)
         if invalid_outputs:
             issues.append(
                 _strict_issue(
                     "contract.required_outputs_path",
                     "error",
-                    "required_outputs entries must be file-like paths.",
+                    "required_outputs entries must be file-like paths and objects must include a non-empty string 'path'.",
                     invalid_outputs[:10],
+                )
+            )
+        if duplicate_paths:
+            issues.append(
+                _strict_issue(
+                    "contract.required_outputs_duplicates",
+                    "warning",
+                    "required_outputs contains duplicate artifact paths.",
+                    sorted(list(dict.fromkeys(duplicate_paths))),
                 )
             )
 
