@@ -69,3 +69,23 @@ def test_results_advisor_primary_metric_prefers_explicit_metric_field(tmp_path, 
         }
     )
     assert str(insights.get("primary_metric") or "").lower() == "rmsle"
+
+
+def test_results_advisor_triggers_improve_mode_after_first_baseline():
+    advisor = ResultsAdvisorAgent(api_key="")
+    insights = advisor.generate_insights(
+        {
+            "artifact_index": [],
+            "review_verdict": "APPROVED",
+            "data_adequacy_report": {"status": "adequate"},
+            "execution_contract": {
+                "feature_engineering_tasks": [
+                    {"technique": "interaction", "input_columns": ["a", "b"], "output_column_name": "a_x_b"}
+                ]
+            },
+            "metric_history": [{"primary_metric_name": "roc_auc", "primary_metric_value": 0.71}],
+        }
+    )
+    recommendation = insights.get("iteration_recommendation") or {}
+    assert recommendation.get("action") == "RETRY"
+    assert recommendation.get("mode") == "improve"

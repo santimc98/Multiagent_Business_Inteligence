@@ -20004,6 +20004,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         results_packet["status"] = "APPROVE_WITH_WARNINGS"
     result_state["results_last_result"] = {
         "status": results_packet.get("status"),
+        "iteration_recommendation": (
+            results_packet.get("iteration_recommendation")
+            if isinstance(results_packet.get("iteration_recommendation"), dict)
+            else {}
+        ),
         "failed_gates": [],
         "required_fixes": [],
         "hard_failures": [],
@@ -20734,6 +20739,66 @@ def check_evaluation(state: AgentState):
         best_value = snapshot.get("baseline_value", "N/A")
         return metric_name, metric_value, best_value
 
+    def _extract_results_advisor_iteration_recommendation() -> Dict[str, Any]:
+        results_last = state.get("results_last_result")
+        if isinstance(results_last, dict):
+            rec = results_last.get("iteration_recommendation")
+            if isinstance(rec, dict) and rec:
+                return dict(rec)
+        review_stack = state.get("ml_review_stack")
+        if isinstance(review_stack, dict):
+            results_packet = review_stack.get("results_advisor")
+            if isinstance(results_packet, dict):
+                rec = results_packet.get("iteration_recommendation")
+                if isinstance(rec, dict) and rec:
+                    return dict(rec)
+        return {}
+
+    def _bootstrap_improvement_loop(reason_tag: str, metric_name: Any, metric_value: Any) -> str | None:
+        imp_max = int(os.getenv("MAX_IMPROVEMENT_ATTEMPTS", "3"))
+        imp_patience = int(os.getenv("IMPROVEMENT_PATIENCE", "2"))
+        if imp_max <= 0:
+            return None
+
+        baseline_value = float(metric_value)
+        state["improvement_attempt_count"] = 0
+        state["improvement_best_metric"] = baseline_value
+        state["improvement_best_attempt_id"] = 0
+        state["improvement_patience_counter"] = 0
+        state["improvement_metrics_history"] = [{"attempt": 0, "metric": baseline_value, "improved": True}]
+        state["max_improvement_attempts"] = imp_max
+        state["improvement_patience"] = imp_patience
+        state["last_iteration_type"] = "metric"
+
+        # Snapshot current outputs as baseline best attempt
+        artifact_paths = list(state.get("artifact_paths", []) or [])
+        oc_report = state.get("output_contract_report") or {}
+        artifact_index = state.get("artifact_index") or []
+        execution_output = state.get("execution_output") or ""
+        plots_local = list(state.get("plots_local", []) or [])
+        diagnostics = state.get("artifact_content_diagnostics") or {}
+        dest = _snapshot_best_attempt(
+            attempt_id=1,
+            artifact_paths=artifact_paths,
+            output_contract_report=oc_report if isinstance(oc_report, dict) else {},
+            artifact_index=artifact_index if isinstance(artifact_index, list) else [],
+            execution_output=execution_output,
+            plots_local=plots_local,
+            diagnostics=diagnostics if isinstance(diagnostics, dict) else {},
+        )
+        if dest:
+            state["best_attempt_dir"] = dest
+
+        print(
+            f"IMPROVEMENT_BOOTSTRAP[{reason_tag}]: Initialized improvement loop. "
+            f"baseline_metric={metric_value} max_attempts={imp_max} patience={imp_patience}"
+        )
+        print(
+            f"ITER_DECISION type=metric action=retry reason={reason_tag} "
+            f"metric={metric_name}:{metric_value} best={metric_value} budget_left={imp_max}"
+        )
+        return "retry"
+
     if state.get("runtime_fix_terminal"):
         metric_name, metric_value, best_value = _get_metric_info()
         print(
@@ -20749,6 +20814,9 @@ def check_evaluation(state: AgentState):
     metric_max = policy.get("metric_improvement_max") if policy else None
     budget_left = (metric_max - metric_iters) if metric_max else "unlimited"
     metric_name, metric_value, best_value = _get_metric_info()
+    advisor_iteration = _extract_results_advisor_iteration_recommendation()
+    advisor_action = str(advisor_iteration.get("action") or "").strip().upper()
+    advisor_mode = str(advisor_iteration.get("mode") or "").strip().lower()
 
     if policy:
         compliance_max = policy.get("compliance_bootstrap_max")
@@ -20867,6 +20935,32 @@ def check_evaluation(state: AgentState):
         state["stop_reason"] = "ADVISORY_ONLY"
         return "approved"
 
+    # Results advisor can explicitly route an approved/warning run into improve mode.
+    if (
+        advisor_action == "RETRY"
+        and advisor_mode == "improve"
+        and state.get("review_verdict") in {"APPROVED", "APPROVE_WITH_WARNINGS"}
+        and not state.get("execution_error")
+        and not state.get("sandbox_failed")
+        and state.get("improvement_attempt_count") is None
+        and _is_number(metric_value)
+    ):
+        decision = _bootstrap_improvement_loop("RESULTS_ADVISOR_IMPROVE", metric_name, metric_value)
+        if decision:
+            return decision
+
+    # Respect explicit stop recommendation from results advisor.
+    if (
+        advisor_action == "STOP"
+        and state.get("review_verdict") in {"APPROVED", "APPROVE_WITH_WARNINGS"}
+    ):
+        state["stop_reason"] = "RESULTS_ADVISOR_STOP"
+        print(
+            f"ITER_DECISION type=other action=stop reason=RESULTS_ADVISOR_STOP "
+            f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
+        )
+        return "approved"
+
     # Improvement loop bootstrap: on first successful execution with a valid metric,
     # initialize improvement tracking and trigger the first improvement iteration.
     improvement_enabled = str(os.getenv("IMPROVEMENT_LOOP_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
@@ -20877,41 +20971,11 @@ def check_evaluation(state: AgentState):
         and not state.get("sandbox_failed")
         and state.get("improvement_attempt_count") is None
         and _is_number(metric_value)
+        and advisor_action != "STOP"
     ):
-        imp_max = int(os.getenv("MAX_IMPROVEMENT_ATTEMPTS", "3"))
-        imp_patience = int(os.getenv("IMPROVEMENT_PATIENCE", "2"))
-        if imp_max > 0:
-            state["improvement_attempt_count"] = 0
-            state["improvement_best_metric"] = float(metric_value)
-            state["improvement_best_attempt_id"] = 0
-            state["improvement_patience_counter"] = 0
-            state["improvement_metrics_history"] = [{"attempt": 0, "metric": float(metric_value), "improved": True}]
-            state["max_improvement_attempts"] = imp_max
-            state["improvement_patience"] = imp_patience
-            state["last_iteration_type"] = "metric"
-
-            # Snapshot current outputs as baseline best attempt
-            artifact_paths = list(state.get("artifact_paths", []) or [])
-            oc_report = state.get("output_contract_report") or {}
-            artifact_index = state.get("artifact_index") or []
-            execution_output = state.get("execution_output") or ""
-            plots_local = list(state.get("plots_local", []) or [])
-            diagnostics = state.get("artifact_content_diagnostics") or {}
-            dest = _snapshot_best_attempt(
-                attempt_id=1,
-                artifact_paths=artifact_paths,
-                output_contract_report=oc_report if isinstance(oc_report, dict) else {},
-                artifact_index=artifact_index if isinstance(artifact_index, list) else [],
-                execution_output=execution_output,
-                plots_local=plots_local,
-                diagnostics=diagnostics if isinstance(diagnostics, dict) else {},
-            )
-            if dest:
-                state["best_attempt_dir"] = dest
-
-            print(f"IMPROVEMENT_BOOTSTRAP: Initialized improvement loop. baseline_metric={metric_value} max_attempts={imp_max} patience={imp_patience}")
-            print(f"ITER_DECISION type=metric action=retry reason=IMPROVEMENT_BOOTSTRAP metric={metric_name}:{metric_value} best={metric_value} budget_left={imp_max}")
-            return "retry"
+        decision = _bootstrap_improvement_loop("IMPROVEMENT_BOOTSTRAP", metric_name, metric_value)
+        if decision:
+            return decision
 
     print(f"ITER_DECISION type=other action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
     return "approved"

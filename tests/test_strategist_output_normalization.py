@@ -51,6 +51,20 @@ class TestStrategistNormalization:
         assert len(normalized["strategies"]) == 1
         assert normalized["strategies"][0]["title"] == "A"
 
+    def test_normalize_feature_engineering_aliases(self):
+        parsed = {
+            "strategies": [
+                {
+                    "title": "A",
+                    "feature_engineering_strategy": [{"technique": "interaction", "columns": ["x", "y"]}],
+                }
+            ]
+        }
+        normalized = self.agent._normalize_strategist_output(parsed)
+        strategy = normalized["strategies"][0]
+        assert isinstance(strategy.get("feature_engineering"), list)
+        assert strategy.get("feature_engineering") == strategy.get("feature_engineering_strategy")
+
     def test_normalize_garbage(self):
         """Case: parsed = 'garbage' or None -> empty strategies"""
         assert self.agent._normalize_strategist_output("garbage")["strategies"] == []
@@ -89,6 +103,24 @@ class TestStrategistNormalization:
 
         assert spec.get("target_columns") == ["churn_flag"]
         assert (spec.get("evaluation_plan") or {}).get("target_columns") == ["churn_flag"]
+
+    def test_build_strategy_spec_reads_feature_engineering_alias(self):
+        payload = {
+            "strategies": [
+                {
+                    "title": "FE Plan",
+                    "objective_type": "predictive",
+                    "feature_engineering": [{"technique": "log_transform", "columns": ["income"]}],
+                }
+            ]
+        }
+        spec = self.agent._build_strategy_spec_from_llm(
+            payload,
+            data_summary="{}",
+            user_request="Predict value",
+        )
+        assert isinstance(spec.get("feature_engineering"), list)
+        assert (spec.get("evaluation_plan") or {}).get("feature_engineering") == spec.get("feature_engineering")
 
     @patch.dict("os.environ", {"STRATEGIST_COLUMN_REPAIR_ATTEMPTS": "1"})
     def test_generate_strategies_repairs_required_columns_with_inventory(self):

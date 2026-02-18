@@ -96,6 +96,30 @@ def test_artifact_requirements_allows_derived_columns():
     assert len(result['unknowns']) == 0
 
 
+def test_artifact_requirements_allows_derived_columns_from_mapping():
+    """Test that derived_columns mapping is normalized and accepted."""
+    contract = {
+        'canonical_columns': ['col1', 'col2'],
+        'derived_columns': {
+            'is_success': {'source_column': 'status'},
+            'risk_bucket': {'source_column': 'score'}
+        },
+        'available_columns': ['col1', 'col2', 'status', 'score'],
+        'artifact_requirements': {
+            'schema_binding': {
+                'required_columns': ['col1', 'is_success']
+            }
+        },
+        'unknowns': []
+    }
+
+    result = validate_artifact_requirements(contract)
+
+    required_columns = result['artifact_requirements']['schema_binding']['required_columns']
+    assert set(required_columns) == {'col1', 'is_success'}
+    assert len(result['unknowns']) == 0
+
+
 def test_artifact_requirements_case_insensitive_matching():
     """Test that column matching is case-insensitive."""
     contract = {

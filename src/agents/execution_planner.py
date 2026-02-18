@@ -101,6 +101,7 @@ Minimal contract interface:
     Do NOT include ordinary features here even if they are binary/categorical.
   - pre_decision: ALL model input features available before prediction/decision.
     Includes numeric, categorical, binary, and engineered predictor inputs.
+    Include standard derived columns (e.g. date parts). Experimental features should go in feature_engineering_tasks, NOT here.
   - decision: Decision/action output columns emitted by policy/model (often empty in contract stage).
     - If strategy implies optimization (e.g. "optimize price"), include the decision variable here.
   - identifiers: Entity keys/ids used for joins/traceability (non-predictive).
@@ -114,6 +115,17 @@ Minimal contract interface:
 - outlier_policy (optional): object for robust outlier handling when strategy/data justify it.
   - recommended fields: enabled(bool), apply_stage("data_engineer"|"ml_engineer"|"both"),
     target_columns(list[str]), methods/treatment(object|list), report_path(file path), strict(bool).
+  - recommended fields: enabled(bool), apply_stage("data_engineer"|"ml_engineer"|"both"),
+    target_columns(list[str]), methods/treatment(object|list), report_path(file path), strict(bool).
+- feature_engineering_tasks: list of objects representing transformations.
+  - items should have: "technique", "input_columns", "output_column_name" (or prefix), "rationale".
+  - REQUIRED if strategy.feature_engineering_strategy is present.
+  - You MUST map strategy.feature_engineering_strategy items to this list.
+  - Use this to formalize the Strategist's feature engineering request.
+- derived_columns: list[str] OR object mapping new_column_name -> definition/source.
+  - REQUIRED if feature_engineering_tasks imply creation of new columns.
+  - Use to declare columns that do not exist in the raw data but will be created.
+  - Downstream normalization may convert this field to a list of derived column names.
 
 Scope-dependent required fields:
 - If scope includes cleaning ("cleaning_only" or "full_pipeline"):
@@ -264,7 +276,9 @@ CONTRACT_EVIDENCE_POLICY_V1 = {
     "direct_evidence": "Field value is explicitly present in provided inputs.",
     "grounded_inference": (
         "Field value is deduced from strategy + business objective + column inventory + data profile; "
-        "no invented columns, paths, or unsupported claims."
+        "no invented columns, paths, or unsupported claims. "
+        "EXCEPTION: derived_columns are ALLOWED if supported by strategy.feature_engineering "
+        "(or strategy.evaluation_plan.feature_engineering)."
     ),
     "assumption_last_resort": (
         "Use only when required field cannot be left empty. Keep assumption conservative and record it under "
@@ -2390,6 +2404,56 @@ def _infer_selector_type_from_payload(selector: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_derived_column_names(value: Any) -> List[str]:
+    """Normalize derived_columns payload into a stable list of column names."""
+    names: List[str] = []
+
+    if isinstance(value, str):
+        token = value.strip()
+        if token:
+            names.append(token)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                token = item.strip()
+                if token:
+                    names.append(token)
+            elif isinstance(item, dict):
+                candidate = (
+                    item.get("name")
+                    or item.get("canonical_name")
+                    or item.get("column")
+                    or item.get("output_column_name")
+                )
+                if isinstance(candidate, str) and candidate.strip():
+                    names.append(candidate.strip())
+    elif isinstance(value, dict):
+        for key, payload in value.items():
+            key_name = str(key).strip() if key is not None else ""
+            if key_name:
+                names.append(key_name)
+                continue
+            if isinstance(payload, dict):
+                candidate = (
+                    payload.get("name")
+                    or payload.get("canonical_name")
+                    or payload.get("column")
+                    or payload.get("output_column_name")
+                )
+                if isinstance(candidate, str) and candidate.strip():
+                    names.append(candidate.strip())
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for name in names:
+        norm = _normalize_column_identifier(name)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(name)
+    return deduped
+
+
 def _deterministic_repair_column_dtype_targets(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return contract
@@ -2597,12 +2661,6 @@ def _deterministic_repair_gate_lists(contract: Dict[str, Any]) -> Dict[str, Any]
 def _deterministic_repair_scope(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return contract
-    scope_raw = contract.get("scope")
-    scope = normalize_contract_scope(scope_raw) if scope_raw is not None else ""
-    if scope in {"cleaning_only", "ml_only", "full_pipeline"}:
-        contract["scope"] = scope
-        return contract
-
     artifact_requirements = contract.get("artifact_requirements")
     clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
     has_cleaning = bool(
@@ -2617,12 +2675,38 @@ def _deterministic_repair_scope(contract: Dict[str, Any]) -> Dict[str, Any]:
         or contract.get("ml_engineer_runbook")
     )
 
+    # Always prefer structural evidence over the raw scope string:
+    # if the contract encodes both cleaning and ML requirements, it is a full_pipeline contract,
+    # regardless of what the LLM wrote into the scope field.
     if has_cleaning and has_ml:
         contract["scope"] = "full_pipeline"
-    elif has_cleaning:
+        return contract
+
+    # If only one side of the pipeline is specified, infer the narrowest coherent scope.
+    if has_cleaning and not has_ml:
         contract["scope"] = "cleaning_only"
-    elif has_ml:
+        return contract
+    if has_ml and not has_cleaning:
         contract["scope"] = "ml_only"
+        return contract
+
+    # No strong structural signal – fall back to an existing, valid scope if present,
+    # otherwise default to full_pipeline to keep downstream views maximally informed.
+    scope_raw = contract.get("scope")
+    scope = normalize_contract_scope(scope_raw) if scope_raw is not None else ""
+    if scope in {"cleaning_only", "ml_only", "full_pipeline"}:
+        contract["scope"] = scope
+    else:
+        contract["scope"] = "full_pipeline"
+    return contract
+
+
+def _deterministic_repair_derived_columns(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+
+    normalized = _extract_derived_column_names(contract.get("derived_columns"))
+    contract["derived_columns"] = normalized
     return contract
 
 
@@ -2665,6 +2749,7 @@ def _apply_deterministic_repairs(contract: Dict[str, Any] | None) -> Dict[str, A
     repaired = _deterministic_repair_gate_lists(repaired)
     repaired = _deterministic_repair_required_feature_selectors(repaired)
     repaired = _deterministic_repair_column_dtype_targets(repaired)
+    repaired = _deterministic_repair_derived_columns(repaired)
     return repaired
 
 
@@ -3510,13 +3595,11 @@ def validate_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
 
     # Get canonical and derived columns
     canonical_columns = contract.get("canonical_columns", [])
-    derived_columns = contract.get("derived_columns", [])
+    derived_columns = _extract_derived_column_names(contract.get("derived_columns"))
     available_columns = contract.get("available_columns", [])
 
     if not isinstance(canonical_columns, list):
         canonical_columns = []
-    if not isinstance(derived_columns, list):
-        derived_columns = []
     if not isinstance(available_columns, list):
         available_columns = []
 
@@ -9265,6 +9348,7 @@ class ExecutionPlannerAgent:
                 "outlier_policy",
                 "reporting_policy",
                 "feature_engineering_plan",
+                "feature_engineering_tasks",
                 "data_analysis",
                 "missing_columns_handling",
                 "execution_constraints",
@@ -10738,7 +10822,7 @@ domain_expert_critique:
         leakage_execution_plan = contract.get("leakage_execution_plan", {})
         allowed_feature_sets = contract.get("allowed_feature_sets", {})
         canonical_columns = contract.get("canonical_columns", [])
-        derived_columns = contract.get("derived_columns", [])
+        derived_columns = _extract_derived_column_names(contract.get("derived_columns"))
         required_outputs = contract.get("required_outputs", [])
         data_limited_mode = contract.get("data_limited_mode", {})
         
@@ -10752,7 +10836,7 @@ domain_expert_critique:
             "leakage_execution_plan": leakage_execution_plan if isinstance(leakage_execution_plan, dict) else {},
             "allowed_feature_sets": allowed_feature_sets if isinstance(allowed_feature_sets, dict) else {},
             "canonical_columns": canonical_columns if isinstance(canonical_columns, list) else [],
-            "derived_columns": derived_columns if isinstance(derived_columns, list) else [],
+            "derived_columns": derived_columns,
             "required_outputs": required_outputs if isinstance(required_outputs, list) else [],
             "data_limited_mode": data_limited_mode if isinstance(data_limited_mode, dict) else {},
             "confidence": 0.9,

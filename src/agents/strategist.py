@@ -818,7 +818,31 @@ $payload_json
            - Simple holdout (70/15/15) is often sufficient
            - Consider computational cost of cross-validation
 
-        *** STEP 5: EVALUATE APPROPRIATE METRICS ***
+        *** STEP 5: FEATURE ENGINEERING REASONING (THE "SECRET SAUCE") ***
+        A Senior Data Scientist doesn't just use raw columns. They CREATE signal.
+        Reason through the data semantics to propose HIGH-VALUE transformations:
+
+        1. **INTERACTIONS**: Do two columns multiply or divide to create meaning?
+           - e.g. Price * Quantity = Revenue
+           - e.g. Weight / Height^2 = BMI
+           - e.g. Debt / Income = DTI Ratio
+
+        2. **TEMPORAL EXTRACTION**: Do dates hide cycles?
+           - e.g. DayOfWeek (weekend vs weekday behavior)
+           - e.g. HourOfDay (morning vs night patterns)
+           - e.g. DaysSinceLastEvent (recency)
+
+        3. **DISTRIBUTIONAL TRANSFORMS**: Do distributions hurt the model?
+           - High Skew -> Log Transform
+           - Heavy Tails -> Winsorization / Clipping
+           - Cardinality > 50 -> Target Encoding / Count Encoding / Embedding
+
+        4. **DOMAIN SPECIFIC**:
+           - Medical: Age groups, Risk scores
+           - Finance: Moving averages, Volatility
+           - E-commerce: Cart abandonment rate, Session duration
+
+        *** STEP 6: EVALUATE APPROPRIATE METRICS ***
         Based on your objective_type, reason through what metrics best measure success.
         DO NOT use pre-defined metric lists. Instead, think:
         - What does the business care about? (revenue, accuracy, interpretability, coverage)
@@ -850,6 +874,13 @@ $payload_json
             "required_columns": ["exact", "column", "names", "from", "summary"],
             "feature_families": [{"family": "optional", "rationale": "optional", "selector_hint": "optional"}],
             "techniques": ["list", "of", "data science techniques"],
+            "feature_engineering_strategy": [
+              {
+                "technique": "Name of technique (e.g. Interaction, Log Transform, Target Encoding)",
+                "columns": ["List", "of", "involved", "columns"],
+                "rationale": "WHY this transformation creates value/signal for this specific objective"
+              }
+            ],
             "feasibility_analysis": {
               "statistical_power": "Assessment of n/p ratio and sample adequacy",
               "signal_quality": "Assessment of data quality for proposed method",
@@ -1012,7 +1043,11 @@ $payload_json
         strategies = payload.get("strategies")
         if not isinstance(strategies, list):
             strategies = []
-        strategies = [s for s in strategies if isinstance(s, dict)]
+        strategies = [
+            self._normalize_feature_engineering_aliases(s)
+            for s in strategies
+            if isinstance(s, dict)
+        ]
         if strategy_count <= 1:
             payload["strategies"] = strategies[:1]
             return payload
@@ -1027,6 +1062,39 @@ $payload_json
         payload["strategies"] = strategies
         return payload
 
+    def _normalize_feature_engineering_aliases(self, strategy: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize FE naming across legacy/new strategist schemas."""
+        if not isinstance(strategy, dict):
+            return {}
+
+        normalized = dict(strategy)
+        top_level_fe = normalized.get("feature_engineering")
+        legacy_fe = normalized.get("feature_engineering_strategy")
+        eval_plan = normalized.get("evaluation_plan")
+        eval_plan_fe = (
+            eval_plan.get("feature_engineering")
+            if isinstance(eval_plan, dict) and isinstance(eval_plan.get("feature_engineering"), list)
+            else None
+        )
+
+        resolved_fe: List[Any] = []
+        if isinstance(top_level_fe, list):
+            resolved_fe = list(top_level_fe)
+        elif isinstance(legacy_fe, list):
+            resolved_fe = list(legacy_fe)
+        elif isinstance(eval_plan_fe, list):
+            resolved_fe = list(eval_plan_fe)
+
+        if resolved_fe:
+            normalized["feature_engineering"] = resolved_fe
+            normalized["feature_engineering_strategy"] = resolved_fe
+            if isinstance(eval_plan, dict):
+                eval_plan_copy = dict(eval_plan)
+                eval_plan_copy["feature_engineering"] = resolved_fe
+                normalized["evaluation_plan"] = eval_plan_copy
+
+        return normalized
+
     def _normalize_strategist_output(self, parsed: Any) -> Dict[str, Any]:
         """
         Normalize the LLM output into a stable dictionary structure.
@@ -1036,14 +1104,18 @@ $payload_json
             raw_strategies = parsed.get("strategies")
             if isinstance(raw_strategies, list):
                 # Filter non-dict elements
-                strategies = [s for s in raw_strategies if isinstance(s, dict)]
+                strategies = [
+                    self._normalize_feature_engineering_aliases(s)
+                    for s in raw_strategies
+                    if isinstance(s, dict)
+                ]
                 parsed["strategies"] = strategies
                 return parsed
             elif raw_strategies is None:
                 # Interpret the dict itself as a single strategy if explicit "strategies" key is missing
-                strategies = [parsed]
+                strategies = [self._normalize_feature_engineering_aliases(parsed)]
             elif isinstance(raw_strategies, dict):
-                 strategies = [raw_strategies]
+                 strategies = [self._normalize_feature_engineering_aliases(raw_strategies)]
             else:
                  strategies = []
             
@@ -1056,7 +1128,11 @@ $payload_json
             return parsed
         
         elif isinstance(parsed, list):
-            strategies = [elem for elem in parsed if isinstance(elem, dict)]
+            strategies = [
+                self._normalize_feature_engineering_aliases(elem)
+                for elem in parsed
+                if isinstance(elem, dict)
+            ]
             return {"strategies": strategies}
         
         else:
@@ -1415,6 +1491,19 @@ $payload_json
 
         expected_lift = primary.get("expected_lift", "Not quantified - baseline comparison recommended")
 
+        # Extract context-aware Feature Engineering strategy (support naming aliases).
+        feature_engineering_strategy = primary.get("feature_engineering_strategy", [])
+        if not isinstance(feature_engineering_strategy, list) or not feature_engineering_strategy:
+            candidate = primary.get("feature_engineering")
+            if isinstance(candidate, list):
+                feature_engineering_strategy = candidate
+        if not isinstance(feature_engineering_strategy, list) or not feature_engineering_strategy:
+            eval_plan_primary = primary.get("evaluation_plan")
+            if isinstance(eval_plan_primary, dict) and isinstance(eval_plan_primary.get("feature_engineering"), list):
+                feature_engineering_strategy = eval_plan_primary.get("feature_engineering")
+        if not isinstance(feature_engineering_strategy, list):
+            feature_engineering_strategy = []
+
         evaluation_plan = {
             "objective_type": objective_type,
             "metrics": metrics,
@@ -1423,6 +1512,7 @@ $payload_json
                 "strategy": validation_strategy,
                 "rationale": validation_rationale,
             },
+            "feature_engineering": feature_engineering_strategy,
             "feasibility": feasibility_analysis,
             "fallback_chain": fallback_chain,
             "expected_lift": expected_lift,
@@ -1449,6 +1539,7 @@ $payload_json
         return {
             "objective_type": objective_type,
             "target_columns": target_columns,
+            "feature_engineering": feature_engineering_strategy,
             "evaluation_plan": evaluation_plan,
             "leakage_risks": leakage_risks,
             "recommended_artifacts": recommended_artifacts,

@@ -708,6 +708,21 @@ class ResultsAdvisorAgent:
                 }
             status = data_adequacy.get("status")
             if review_verdict in {"APPROVED", "APPROVE_WITH_WARNINGS"} and status not in {"data_limited", "insufficient_signal", "unknown"}:
+                # Check for pending feature engineering to upgrade baseline
+                execution_contract = context.get("execution_contract")
+                fe_tasks = execution_contract.get("feature_engineering_tasks") if isinstance(execution_contract, dict) else []
+                # metric_history already includes the current run snapshot in graph flow.
+                # First successful baseline run is usually history size 1 (or 0 in edge cases).
+                # Only trigger feature engineering ONCE, after the baseline.
+                if fe_tasks and len(metric_history) <= 1:
+                    return {
+                        "action": "RETRY",
+                        "reason": "Baseline approved. Proceeding to implement planned feature engineering tasks.",
+                        "next_changes": ["Implement feature_engineering_tasks from contract."],
+                        "review_verdict": review_verdict,
+                        "mode": "improve"
+                    }
+
                 next_changes = self._suggest_next_changes(review_feedback) if review_feedback else []
                 return {
                     "action": "STOP",

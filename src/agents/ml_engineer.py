@@ -355,6 +355,7 @@ class MLEngineerAgent:
             "ml_engineer_runbook",
             "derived_columns",
             "iteration_policy",
+            "feature_engineering_tasks",
         ]
 
         compact: Dict[str, Any] = {}
@@ -2511,6 +2512,9 @@ $strategy_json
         - Apply training/validation/evaluation exactly from contract + ML view.
         - Produce required outputs at exact contract paths.
         - Include alignment evidence artifact when required.
+        - IGNORE complex feature_engineering_tasks from the contract in this first pass. 
+          Focus on a robust BASELINE model only (simple cleaning/imputation/encoding).
+
 
         Return Python code only.
         """
@@ -2588,12 +2592,13 @@ $strategy_json
         Instructions:
         1) Your code WORKS. Do NOT break what already works.
         2) Apply the RECOMMENDED TECHNIQUES above to increase $primary_metric.
-        3) Prioritize in order: ensemble methods > feature engineering > hyperparameter tuning.
+        3) Prioritize in order: feature_engineering_tasks (from contract) > ensemble methods > specialized feature engineering > hyperparameter tuning.
         4) Return the full updated script (not a diff, not snippets).
         5) Keep all contract-required outputs and paths intact.
-        6) If you add new models for ensemble, keep the original model as fallback.
-        7) Preserve data loading, CSV dialect, train/test split, and cross-validation logic.
-        8) Use feature importance to guide feature engineering (interact top features, drop useless ones).
+        6) IMPLEMENT feature_engineering_tasks from the contract now. Valid data-driven features are the best way to improve.
+        7) If you add new models for ensemble, keep the original model as fallback.
+        8) Preserve data loading, CSV dialect, train/test split, and cross-validation logic.
+        9) Use feature importance to guide feature engineering (interact top features, drop useless ones).
         """
 
         # Construct User Message with Patch Mode Logic

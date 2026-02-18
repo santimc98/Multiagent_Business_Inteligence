@@ -252,3 +252,54 @@ def test_check_evaluation_advisory_needs_improvement_stops_without_retry():
     }
     assert graph_mod.check_evaluation(state) == "approved"
     assert state.get("stop_reason") == "ADVISORY_ONLY"
+
+
+def test_check_evaluation_results_advisor_improve_retry_routes_to_retry(monkeypatch):
+    monkeypatch.setenv("IMPROVEMENT_LOOP_ENABLED", "1")
+    monkeypatch.setenv("MAX_IMPROVEMENT_ATTEMPTS", "2")
+    monkeypatch.setenv("IMPROVEMENT_PATIENCE", "1")
+
+    state = {
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "execution_output": "OK",
+        "last_iteration_type": None,
+        "execution_error": False,
+        "sandbox_failed": False,
+        "results_last_result": {
+            "iteration_recommendation": {"action": "RETRY", "mode": "improve"}
+        },
+        "primary_metric_snapshot": {
+            "primary_metric_name": "roc_auc",
+            "primary_metric_value": 0.71,
+            "baseline_value": 0.71,
+        },
+    }
+
+    assert graph_mod.check_evaluation(state) == "retry"
+    assert state.get("last_iteration_type") == "metric"
+    assert state.get("improvement_attempt_count") == 0
+
+
+def test_check_evaluation_results_advisor_stop_blocks_improvement_bootstrap(monkeypatch):
+    monkeypatch.setenv("IMPROVEMENT_LOOP_ENABLED", "1")
+    monkeypatch.setenv("MAX_IMPROVEMENT_ATTEMPTS", "3")
+    monkeypatch.setenv("IMPROVEMENT_PATIENCE", "2")
+
+    state = {
+        "review_verdict": "APPROVED",
+        "execution_output": "OK",
+        "last_iteration_type": None,
+        "execution_error": False,
+        "sandbox_failed": False,
+        "results_last_result": {
+            "iteration_recommendation": {"action": "STOP"}
+        },
+        "primary_metric_snapshot": {
+            "primary_metric_name": "roc_auc",
+            "primary_metric_value": 0.73,
+            "baseline_value": 0.73,
+        },
+    }
+
+    assert graph_mod.check_evaluation(state) == "approved"
+    assert state.get("stop_reason") == "RESULTS_ADVISOR_STOP"
