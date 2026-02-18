@@ -327,6 +327,77 @@ def test_ml_view_required_outputs_merge_contract_min_and_full():
     assert "static/plots/confidence_distribution.png" in outputs
 
 
+def test_ml_and_reviewer_views_extract_paths_from_required_outputs_dict_entries():
+    contract_min = {
+        "canonical_columns": ["feature_a", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "outcome": ["target"],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature_a"],
+            "segmentation_features": [],
+            "forbidden_features": [],
+        },
+        "required_outputs": [
+            {"path": "data/metrics.json", "required": True},
+            {"path": "data/scored_rows.csv", "required": True},
+        ],
+        "qa_gates": [{"name": "benchmark_metric", "severity": "HARD"}],
+        "reviewer_gates": [{"name": "runtime_success", "severity": "HARD"}],
+    }
+
+    ml_view = build_ml_view({}, contract_min, [])
+    reviewer_view = build_reviewer_view({}, contract_min, [])
+
+    for view in (ml_view, reviewer_view):
+        outputs = view.get("required_outputs") or []
+        assert all(isinstance(path, str) for path in outputs)
+        assert "data/metrics.json" in outputs
+        assert "data/scored_rows.csv" in outputs
+        assert not any("{'path':" in path for path in outputs)
+
+
+def test_projection_views_keep_required_outputs_as_paths_with_rich_metadata_present():
+    contract = {
+        "scope": "full_pipeline",
+        "canonical_columns": ["feature_a", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "outcome": ["target"],
+        },
+        "required_outputs": ["data/metrics.json", "data/scored_rows.csv"],
+        "required_output_artifacts": [
+            {"path": "data/metrics.json", "required": True, "owner": "ml_engineer", "kind": "metrics"},
+            {"path": "data/scored_rows.csv", "required": True, "owner": "ml_engineer", "kind": "predictions"},
+        ],
+        "spec_extraction": {
+            "deliverables": [
+                {"path": "data/metrics.json", "required": True, "owner": "ml_engineer", "kind": "metrics"},
+                {"path": "data/scored_rows.csv", "required": True, "owner": "ml_engineer", "kind": "predictions"},
+            ]
+        },
+        "qa_gates": [{"name": "benchmark_metric", "severity": "HARD"}],
+        "reviewer_gates": [{"name": "runtime_success", "severity": "HARD"}],
+        "validation_requirements": {"primary_metric": "accuracy"},
+        "ml_engineer_runbook": {"steps": ["train", "validate"]},
+        "artifact_requirements": {
+            "clean_dataset": {
+                "output_path": "data/cleaned_data.csv",
+                "manifest_path": "data/cleaning_manifest.json",
+            }
+        },
+    }
+
+    projected = build_contract_views_projection(contract, artifact_index=[])
+    for view_key in ("ml_view", "reviewer_view"):
+        outputs = (projected.get(view_key) or {}).get("required_outputs") or []
+        assert all(isinstance(path, str) for path in outputs)
+        assert "data/metrics.json" in outputs
+        assert "data/scored_rows.csv" in outputs
+        assert not any("{'path':" in path for path in outputs)
+
+
 def test_translator_view_includes_decisioning_requirements():
     contract_full = {
         "strategy_title": "Decision Strategy",

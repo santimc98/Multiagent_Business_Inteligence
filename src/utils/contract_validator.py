@@ -491,7 +491,44 @@ def normalize_artifact_requirements(
             path = _extract_path(entry)
             if path and is_probably_path(path):
                 combined_outputs.append(path)
-    contract["required_outputs"] = list(dict.fromkeys(combined_outputs))
+
+    combined_output_paths = list(dict.fromkeys(combined_outputs))
+    required_outputs_current = contract.get("required_outputs")
+    required_output_artifacts = contract.get("required_output_artifacts")
+    spec_extraction = contract.get("spec_extraction")
+    deliverables = spec_extraction.get("deliverables") if isinstance(spec_extraction, dict) else None
+    has_rich_parallel = bool(required_output_artifacts) if isinstance(required_output_artifacts, list) else False
+    has_deliverables = bool(deliverables) if isinstance(deliverables, list) else False
+    has_rich_required_outputs = (
+        isinstance(required_outputs_current, list)
+        and any(isinstance(item, dict) for item in required_outputs_current)
+    )
+
+    # Keep rich metadata payloads untouched; only backfill required_outputs when missing/empty.
+    if not isinstance(required_outputs_current, list) or not required_outputs_current:
+        contract["required_outputs"] = combined_output_paths
+    elif has_rich_required_outputs or has_rich_parallel or has_deliverables:
+        # Preserve rich required_outputs and/or parallel rich sources as-is.
+        pass
+    else:
+        # Keep existing list[str] contract interface without forcing conversion from other formats.
+        normalized_required_outputs: List[str] = []
+        seen_required: set[str] = set()
+        for item in required_outputs_current:
+            if not isinstance(item, str):
+                continue
+            path = item.strip()
+            if not path or not is_probably_path(path):
+                continue
+            key = path.lower()
+            if key in seen_required:
+                continue
+            seen_required.add(key)
+            normalized_required_outputs.append(path)
+        if normalized_required_outputs:
+            contract["required_outputs"] = normalized_required_outputs
+        elif combined_output_paths:
+            contract["required_outputs"] = combined_output_paths
 
     return artifact_requirements, warnings
 

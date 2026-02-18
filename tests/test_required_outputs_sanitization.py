@@ -25,6 +25,21 @@ def test_get_required_outputs_ignores_concepts() -> None:
     assert "Priority ranking" not in outputs
 
 
+def test_get_required_outputs_extracts_dict_path_only() -> None:
+    contract = {
+        "required_outputs": [
+            {"path": "data/metrics.json", "id": "metrics_artifact"},
+            {"id": "should_not_be_path"},
+        ]
+    }
+
+    outputs = get_required_outputs(contract)
+
+    assert "data/metrics.json" in outputs
+    assert "should_not_be_path" not in outputs
+    assert not any("{'path':" in path for path in outputs)
+
+
 def test_get_required_outputs_includes_visualization_required_plots() -> None:
     contract = {
         "required_outputs": ["data/metrics.json"],

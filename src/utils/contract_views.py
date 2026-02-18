@@ -269,13 +269,23 @@ def _resolve_required_outputs(contract_min: Dict[str, Any], contract_full: Dict[
     merged: List[str] = []
     seen: set[str] = set()
 
+    def _extract_path(item: Any) -> str:
+        if isinstance(item, str):
+            return item
+        if isinstance(item, dict):
+            for key in ("path", "output", "artifact"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+        return ""
+
     def _add(values: Any) -> None:
         if not isinstance(values, list):
             return
         for item in values:
             if not item:
                 continue
-            text = str(item).replace("\\", "/").strip()
+            text = _extract_path(item).replace("\\", "/").strip()
             if not text:
                 continue
             key = text.lower()
@@ -1628,10 +1638,21 @@ def _project_required_outputs(contract_full: Dict[str, Any]) -> List[str]:
         outputs = get_required_outputs(contract_full)
     normalized: List[str] = []
     seen: set[str] = set()
+
+    def _extract_path(item: Any) -> str:
+        if isinstance(item, str):
+            return item
+        if isinstance(item, dict):
+            for key in ("path", "output", "artifact"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+        return ""
+
     for item in outputs:
         if not item:
             continue
-        text = str(item).replace("\\", "/").strip()
+        text = _extract_path(item).replace("\\", "/").strip()
         if not text:
             continue
         key = text.lower()

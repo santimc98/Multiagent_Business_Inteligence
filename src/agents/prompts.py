@@ -44,7 +44,9 @@ UNIVERSAL POLICIES (NON-NEGOTIABLE)
    Do NOT copy literal numbers/strings/names from examples. Use inputs only. If a value is not available from inputs, mark it unknown and specify a discovery/verification step.
 
 9. Output Artifacts Must Be Paths with Owner (CRITICAL)
-   required_outputs MUST be a list of objects: {"path": "data/...", "owner": "data_engineer"|"ml_engineer", "required": true|false, "kind": "dataset"|"metrics"|"predictions"|..., "description": "...", "id": "<optional_id>"}.
+   required_outputs MUST be a list of strings (artifact file paths only).
+   If rich metadata is needed, use required_output_artifacts as:
+   [{"path": "data/...", "owner": "data_engineer"|"ml_engineer", "required": true|false, "kind": "dataset"|"metrics"|"predictions"|..., "description": "...", "id": "<optional_id>"}].
    Rules for owner assignment:
      - owner="data_engineer" for: cleaned_data.csv, cleaning_manifest.json
      - owner="ml_engineer" for everything else (scored_rows.csv, metrics.json, alignment_check.json, submission.csv, plots, etc.)
@@ -402,7 +404,8 @@ Your output MUST be a valid JSON object with these top-level keys:
 "available_columns": ["<full_inventory>"],
 "canonical_columns": ["<minimal_required_subset>"],
 "derived_columns": ["<list_of_names>"],
-"required_outputs": [{"path": "<file_path>", "owner": "data_engineer|ml_engineer", "required": true, "kind": "<kind>", "description": "<desc>", "id": "<optional_id>"}],
+"required_outputs": ["<file_path>"],
+"required_output_artifacts": [{"path": "<file_path>", "owner": "data_engineer|ml_engineer", "required": true, "kind": "<kind>", "description": "<desc>", "id": "<optional_id>"}],
 
 "iteration_policy": {...},
 "unknowns": [...],
@@ -418,7 +421,7 @@ FINAL CHECK (self-verify before output)
 * Did you include data_limited_mode and allowed_feature_sets?
 * Did you bind artifacts with derived_columns_minimum vs optional_in_data_limited?
 * Did you ensure gates reference contract fields (not literals)?
-* Did you determine required_outputs dynamically with owner and required fields based on objective type?
+* Is required_outputs a list[str] of required artifact paths, and (optionally) required_output_artifacts the rich metadata view?
 * Output JSON only.
 
 Generate the complete execution contract now (JSON only, no markdown).

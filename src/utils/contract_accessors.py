@@ -819,7 +819,7 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
         token = re.sub(r"[^0-9a-zA-Z]+", "_", str(value or "")).strip("_").lower()
         return token or fallback
 
-    def _extract_candidate(item: Any) -> str:
+    def _extract_candidate(item: Any, *, allow_name_fallback: bool = True) -> str:
         if not item:
             return ""
         if isinstance(item, dict):
@@ -835,10 +835,11 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
                 value = item.get(key)
                 if value:
                     return str(value)
-            for key in ("plot_id", "id", "name", "title"):
-                value = item.get(key)
-                if value:
-                    return str(value)
+            if allow_name_fallback:
+                for key in ("plot_id", "id", "name", "title"):
+                    value = item.get(key)
+                    if value:
+                        return str(value)
             return ""
         return str(item)
 
@@ -900,7 +901,7 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     required_files = artifacts.get("required_files")
     if isinstance(required_files, list):
         for entry in required_files:
-            _append_if_path(_extract_candidate(entry))
+            _append_if_path(_extract_candidate(entry, allow_name_fallback=False))
     required_plots = artifacts.get("required_plots")
     if isinstance(required_plots, list):
         for idx, entry in enumerate(required_plots, start=1):
@@ -920,7 +921,7 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
                 item_required = entry.get("required")
                 if not visual_required and item_required is not True:
                     continue
-                candidate = _extract_candidate(entry)
+                candidate = _extract_candidate(entry, allow_name_fallback=True)
                 normalized = _normalize_plot_path(candidate, str(visual_outputs_dir), f"visual_item_{idx}")
                 _append_if_path(normalized)
 
@@ -937,7 +938,7 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
         top_outputs_dir = visualization_requirements.get("outputs_dir") or visual_outputs_dir
         if isinstance(top_required_plots, list):
             for idx, entry in enumerate(top_required_plots, start=1):
-                candidate = _extract_candidate(entry)
+                candidate = _extract_candidate(entry, allow_name_fallback=True)
                 normalized = _normalize_plot_path(candidate, str(top_outputs_dir), f"viz_required_plot_{idx}")
                 _append_if_path(normalized)
     
@@ -945,7 +946,11 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     top_level = contract.get("required_outputs")
     if isinstance(top_level, list):
         for entry in top_level:
-            _append_if_path(_extract_candidate(entry))
+            if isinstance(entry, dict):
+                candidate = entry.get("path")
+                _append_if_path(candidate if isinstance(candidate, str) else "")
+            else:
+                _append_if_path(entry)
     
     # Normalize and deduplicate
     seen = set()

@@ -85,6 +85,45 @@ class TestAmbiguityDetection:
         assert len(warnings) > 0
         assert any("predicted_value" in w.get("item", "") for w in warnings)
 
+    def test_normalize_artifact_requirements_preserves_rich_output_metadata(self):
+        contract = {
+            "required_outputs": [
+                {"path": "data/metrics.json", "required": True, "owner": "ml_engineer", "kind": "metrics"},
+            ],
+            "required_output_artifacts": [
+                {"path": "data/metrics.json", "required": True, "owner": "ml_engineer", "kind": "metrics"},
+            ],
+            "spec_extraction": {
+                "deliverables": [
+                    {"path": "data/metrics.json", "required": True, "owner": "ml_engineer", "kind": "metrics"},
+                ]
+            },
+        }
+
+        normalize_artifact_requirements(contract)
+
+        assert isinstance(contract.get("required_outputs"), list)
+        assert isinstance(contract["required_outputs"][0], dict)
+        assert isinstance(contract.get("required_output_artifacts"), list)
+        assert contract["required_output_artifacts"][0].get("owner") == "ml_engineer"
+        spec = contract.get("spec_extraction", {})
+        assert isinstance(spec.get("deliverables"), list)
+        assert spec["deliverables"][0].get("path") == "data/metrics.json"
+
+    def test_normalize_artifact_requirements_backfills_required_outputs_as_paths(self):
+        contract = {
+            "artifact_requirements": {
+                "required_files": [{"path": "data/custom_output.csv"}],
+            }
+        }
+
+        normalize_artifact_requirements(contract)
+
+        required_outputs = contract.get("required_outputs", [])
+        assert isinstance(required_outputs, list)
+        assert all(isinstance(path, str) for path in required_outputs)
+        assert "data/custom_output.csv" in required_outputs
+
 
 class TestContractValidation:
     """Test P1.2: Contract Self-Consistency Gate."""
