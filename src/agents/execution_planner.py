@@ -45,6 +45,7 @@ from src.utils.contract_schema_registry import (
     get_contract_schema_repair_action,
     apply_contract_schema_registry_repairs,
 )
+from src.utils.contract_response_schema import EXECUTION_CONTRACT_V41_MIN_SCHEMA
 
 load_dotenv()
 
@@ -5083,6 +5084,8 @@ class ExecutionPlannerAgent:
             "response_mime_type": "application/json",
             "max_output_tokens": self._default_max_output_tokens,
         }
+        schema_flag = str(os.getenv("EXECUTION_PLANNER_USE_RESPONSE_SCHEMA", "0")).strip().lower()
+        self._use_response_schema = schema_flag not in {"0", "false", "no", "off", ""}
         self._safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -5128,7 +5131,25 @@ class ExecutionPlannerAgent:
             budgeted_max = min(self._default_max_output_tokens, max(floor, int(available)))
         config = dict(self._generation_config)
         config["max_output_tokens"] = int(budgeted_max)
+        if self._use_response_schema:
+            config["response_schema"] = copy.deepcopy(EXECUTION_CONTRACT_V41_MIN_SCHEMA)
         return config
+
+    @staticmethod
+    def _is_response_schema_unsupported_error(err: Exception) -> bool:
+        message = str(err or "").lower()
+        if "response_schema" not in message:
+            return False
+        unsupported_tokens = (
+            "unknown field",
+            "unknown name",
+            "not supported",
+            "unsupported",
+            "unrecognized",
+            "no such field",
+            "schema not supported",
+        )
+        return any(token in message for token in unsupported_tokens)
 
     def _generate_content_with_budget(self, model_client: Any, prompt: str, output_token_floor: int = 1024):
         generation_config = self._generation_config_for_prompt(prompt, output_token_floor=output_token_floor)
@@ -5137,6 +5158,20 @@ class ExecutionPlannerAgent:
         except TypeError:
             # Some mocks/stubs only accept the positional prompt argument.
             response = model_client.generate_content(prompt)
+        except Exception as err:
+            if (
+                "response_schema" in generation_config
+                and self._is_response_schema_unsupported_error(err)
+            ):
+                retry_config = dict(generation_config)
+                retry_config.pop("response_schema", None)
+                try:
+                    response = model_client.generate_content(prompt, generation_config=retry_config)
+                except TypeError:
+                    response = model_client.generate_content(prompt)
+                generation_config = retry_config
+            else:
+                raise
         return response, generation_config
 
     def _build_model_client(self, model_name: str) -> Any:
