@@ -3615,7 +3615,13 @@ def validate_contract_minimal_readonly(
                 if col and col.lower() not in target_norm
             ]
             if unexpected_outcomes:
-                severity = "error" if len(unexpected_outcomes) >= 3 else "warning"
+                steward_target_candidates: List[str] = []
+                for key in ("primary_target", "primary_targets", "target_column", "target_columns"):
+                    steward_targets, _ = _normalize_nonempty_str_list(steward_semantics.get(key))
+                    for col in steward_targets:
+                        if col not in steward_target_candidates:
+                            steward_target_candidates.append(col)
+                severity = "error" if steward_target_candidates or len(unexpected_outcomes) >= 3 else "warning"
                 issues.append(
                     _strict_issue(
                         "contract.outcome_columns_sanity",

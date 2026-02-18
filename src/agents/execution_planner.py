@@ -10099,13 +10099,17 @@ class ExecutionPlannerAgent:
                         "Do NOT regenerate the full contract.\n"
                         "Keep required_outputs as list[str].\n"
                         "Preserve required_output_artifacts and spec_extraction.deliverables if present.\n"
-                        f"Attempt {attempt}/2.\n\n"
-                        "Top repair hints:\n"
-                        f"{hints_lines}\n\n"
-                        "Validation issues:\n"
-                        f"{validation_feedback}\n\n"
-                        "Current contract:\n"
-                        f"{contract_compact}"
+                        + "Attempt "
+                        + str(attempt)
+                        + "/2.\n\n"
+                        + "Top repair hints:\n"
+                        + hints_lines
+                        + "\n\n"
+                        + "Validation issues:\n"
+                        + validation_feedback
+                        + "\n\n"
+                        + "Current contract:\n"
+                        + contract_compact
                     )
                     try:
                         response, _ = self._generate_content_with_budget(

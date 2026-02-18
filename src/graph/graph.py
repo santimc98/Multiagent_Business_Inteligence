@@ -1034,34 +1034,32 @@ def _apply_review_consistency_guard(
     *,
     actor: str,
 ) -> Dict[str, Any]:
-    """Advisory-only guard: injects deterministic blocker context into the
-    reviewer packet without overriding the LLM reviewer's verdict.  The LLM
-    reviewer already receives diagnostics as context and is the decision-maker."""
+    """Inject deterministic blocker context into reviewer packets."""
     packet: Dict[str, Any] = dict(result or {})
     blockers = [str(x) for x in ((diagnostics or {}).get("hard_blockers") or []) if x]
     if not blockers:
         return packet
 
-    # Inject advisory note into feedback without changing the status.
-    actor_name = str(actor or "reviewer").strip().lower() or "reviewer"
     blocker_text = ", ".join(blockers)
-    note = (
-        f"{actor_name.upper()}_ADVISORY: deterministic checkers flagged "
-        f"({blocker_text}). LLM reviewer verdict preserved."
-    )
+    note = f"CONTEXT_GUARD: deterministic hard blockers detected ({blocker_text})."
     feedback = str(packet.get("feedback") or "").strip()
-    packet["feedback"] = f"{feedback}\n{note}".strip() if feedback else note
+    packet["feedback"] = f"{note}\n{feedback}".strip() if feedback else note
 
-    # Append to warnings instead of hard_failures so downstream consumers
-    # see the flags without treating them as blocking.
-    warnings = packet.get("warnings")
-    if not isinstance(warnings, list):
-        warnings = []
-    for blocker in blockers:
-        tag = f"advisory_blocker:{blocker}"
-        if tag not in warnings:
-            warnings.append(tag)
-    packet["warnings"] = warnings
+    if str(packet.get("status") or "").strip().upper() == "APPROVED":
+        packet["status"] = "REJECTED"
+
+        failed_gates = [str(item) for item in (packet.get("failed_gates") or []) if item]
+        for blocker in blockers:
+            if blocker not in failed_gates:
+                failed_gates.append(blocker)
+        packet["failed_gates"] = failed_gates
+
+        hard_failures = [str(item) for item in (packet.get("hard_failures") or []) if item]
+        for blocker in blockers:
+            if blocker not in hard_failures:
+                hard_failures.append(blocker)
+        packet["hard_failures"] = hard_failures
+
     return packet
 
 
@@ -17571,12 +17569,12 @@ def execute_code(state: AgentState) -> AgentState:
 
             decisioning_names = _extract_decisioning_required_names(contract)
 
-            # Filter required artifacts by owner so the ML engineer launcher
-            # only checks for ML outputs, not DE artifacts like cleaned_data.csv.
-            from src.utils.contract_accessors import get_required_outputs_by_owner as _get_ro_owner
-            required_artifacts = _get_ro_owner(contract, "ml_engineer")
+            # Heavy-runner request must include all contract-required outputs.
+            # Keep owner-filtered fallback only when the canonical list is absent.
+            required_artifacts = _resolve_required_outputs(contract, state)
             if not required_artifacts:
-                required_artifacts = _resolve_required_outputs(contract, state)
+                from src.utils.contract_accessors import get_required_outputs_by_owner as _get_ro_owner
+                required_artifacts = _get_ro_owner(contract, "ml_engineer")
             if not isinstance(required_artifacts, list):
                 required_artifacts = []
             required_artifacts = [

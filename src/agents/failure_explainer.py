@@ -89,9 +89,15 @@ class FailureExplainerAgent:
             "missing columns, incorrect file path, stale artifacts, wrong import, etc.). "
             "If uncertain, propose a minimal diagnostic check to confirm the cause. "
             "Do NOT include code. Do NOT restate the full traceback.\n\n"
-            f"CODE:\n{code_snippet}\n\n"
-            f"ERROR:\n{error_snippet}\n\n"
-            f"CONTEXT:\n{context_snippet}\n"
+            + "CODE:\n"
+            + code_snippet
+            + "\n\n"
+            + "ERROR:\n"
+            + error_snippet
+            + "\n\n"
+            + "CONTEXT:\n"
+            + context_snippet
+            + "\n"
         )
 
         try:
@@ -130,9 +136,15 @@ class FailureExplainerAgent:
             "If multiple errors appear, address the first causal one. "
             "If uncertain, propose a minimal diagnostic check to confirm the cause. "
             "Do NOT include code. Do NOT restate the full traceback.\n\n"
-            f"CODE:\n{code_snippet}\n\n"
-            f"ERROR:\n{error_snippet}\n\n"
-            f"CONTEXT:\n{context_snippet}\n"
+            + "CODE:\n"
+            + code_snippet
+            + "\n\n"
+            + "ERROR:\n"
+            + error_snippet
+            + "\n\n"
+            + "CONTEXT:\n"
+            + context_snippet
+            + "\n"
         )
 
         try:
