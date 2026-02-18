@@ -86,6 +86,9 @@ DEFAULT_PLAN: Dict[str, Any] = {
     "plan_source": "fallback",
 }
 
+UNIVERSAL_PROLOGUE_START = "# ML_ENGINEER_UNIVERSAL_PROLOGUE_START"
+UNIVERSAL_PROLOGUE_END = "# ML_ENGINEER_UNIVERSAL_PROLOGUE_END"
+
 
 class MLEngineerAgent:
     def __init__(self, api_key: str = None):
@@ -587,6 +590,174 @@ class MLEngineerAgent:
             "must_preserve": must_preserve[:8],
             "patch_objectives": patch_objectives[:8],
         }
+
+    def _collect_editor_feedback_text(
+        self,
+        gate_context: Dict[str, Any] | None,
+        handoff_payload: Dict[str, Any] | None,
+        feedback_history: List[str] | None,
+    ) -> str:
+        gate_context = gate_context if isinstance(gate_context, dict) else {}
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        chunks: List[str] = []
+
+        feedback = str(gate_context.get("feedback") or "").strip()
+        if feedback:
+            chunks.append(feedback)
+
+        runtime_payload = gate_context.get("runtime_error")
+        if isinstance(runtime_payload, dict) and runtime_payload:
+            try:
+                chunks.append(json.dumps(runtime_payload, ensure_ascii=False))
+            except Exception:
+                chunks.append(str(runtime_payload))
+
+        traceback_text = str(
+            gate_context.get("traceback")
+            or gate_context.get("execution_output_tail")
+            or ""
+        ).strip()
+        if traceback_text:
+            chunks.append(traceback_text)
+
+        handoff_feedback = handoff_payload.get("feedback")
+        if isinstance(handoff_feedback, dict):
+            tail = str(handoff_feedback.get("runtime_error_tail") or "").strip()
+            reviewer = str(handoff_feedback.get("reviewer") or "").strip()
+            qa = str(handoff_feedback.get("qa") or "").strip()
+            for item in (tail, reviewer, qa):
+                if item:
+                    chunks.append(item)
+
+        if isinstance(feedback_history, list):
+            for item in feedback_history[-3:]:
+                text = str(item or "").strip()
+                if text:
+                    chunks.append(text)
+
+        if not chunks:
+            return ""
+        merged = "\n\n".join(chunks)
+        return self._truncate_prompt_text(
+            merged,
+            max_len=6000,
+            head_len=4000,
+            tail_len=1500,
+        )
+
+    def _should_use_editor_mode(
+        self,
+        gate_context: Dict[str, Any] | None,
+        handoff_payload: Dict[str, Any] | None,
+        feedback_history: List[str] | None = None,
+    ) -> bool:
+        gate_context = gate_context if isinstance(gate_context, dict) else {}
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        quality_focus = handoff_payload.get("quality_focus")
+        quality_focus = quality_focus if isinstance(quality_focus, dict) else {}
+
+        source = str(gate_context.get("source") or handoff_payload.get("source") or "").strip().lower()
+        failed_gates: List[str] = []
+        for values in (
+            gate_context.get("failed_gates"),
+            quality_focus.get("failed_gates"),
+            gate_context.get("hard_failures"),
+            quality_focus.get("hard_failures"),
+        ):
+            if isinstance(values, list):
+                failed_gates.extend([str(item).strip().lower() for item in values if str(item).strip()])
+
+        feedback_blob = self._collect_editor_feedback_text(
+            gate_context=gate_context,
+            handoff_payload=handoff_payload,
+            feedback_history=feedback_history,
+        ).lower()
+        has_runtime_signal = bool(
+            gate_context.get("runtime_error")
+            or "traceback" in feedback_blob
+            or "runtime error" in feedback_blob
+            or "runtime_failure" in feedback_blob
+            or "runtime_fix" in source
+            or any("runtime" in gate for gate in failed_gates)
+        )
+        has_qa_signal = bool(
+            "qa" in source
+            or any("qa" in gate for gate in failed_gates)
+            or "qa team feedback" in feedback_blob
+            or "qa_code_audit" in feedback_blob
+        )
+        return bool(has_runtime_signal or has_qa_signal)
+
+    def _classify_editor_phase(
+        self,
+        gate_context: Dict[str, Any] | None,
+        handoff_payload: Dict[str, Any] | None,
+        feedback_text: str,
+    ) -> str:
+        gate_context = gate_context if isinstance(gate_context, dict) else {}
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        quality_focus = handoff_payload.get("quality_focus")
+        quality_focus = quality_focus if isinstance(quality_focus, dict) else {}
+
+        failed_tokens: List[str] = []
+        for values in (
+            gate_context.get("failed_gates"),
+            quality_focus.get("failed_gates"),
+            gate_context.get("required_fixes"),
+            quality_focus.get("required_fixes"),
+        ):
+            if isinstance(values, list):
+                failed_tokens.extend([str(item).strip().lower() for item in values if str(item).strip()])
+
+        combined = " ".join(failed_tokens + [str(feedback_text or "").lower()])
+        persistence_tokens = [
+            "output_contract",
+            "required output",
+            "required artifact",
+            "missing artifact",
+            "alignment_check",
+            "scored_rows",
+            "metrics.json",
+            "manifest",
+            "json serialization",
+            "serialization",
+            "file not found",
+            "no such file",
+            "permission denied",
+            "to_csv",
+            "persist",
+            "write artifact",
+        ]
+        if any(token in combined for token in persistence_tokens):
+            return "persistence"
+        return "training"
+
+    def _build_last_run_memory_block(
+        self,
+        last_run_memory: List[Dict[str, Any]] | None,
+    ) -> str:
+        if not isinstance(last_run_memory, list) or not last_run_memory:
+            return "[]"
+        compact_entries: List[Dict[str, Any]] = []
+        for entry in last_run_memory[-5:]:
+            if not isinstance(entry, dict):
+                continue
+            compact_entries.append(
+                {
+                    "iter": entry.get("iter"),
+                    "attempt": entry.get("attempt"),
+                    "event": entry.get("event"),
+                    "phase": entry.get("phase"),
+                    "error_signature": entry.get("error_signature"),
+                    "changes_summary": entry.get("changes_summary"),
+                }
+            )
+        return self._serialize_json_for_prompt(
+            compact_entries,
+            max_chars=2800,
+            max_str_len=350,
+            max_list_items=8,
+        )
 
     def _extract_decisioning_context(
         self,
@@ -1152,6 +1323,185 @@ class MLEngineerAgent:
                 break
 
         return code
+
+    def _build_universal_prologue(
+        self,
+        csv_sep: str,
+        csv_decimal: str,
+        csv_encoding: str,
+    ) -> str:
+        sep_literal = json.dumps(csv_sep or ",")
+        decimal_literal = json.dumps(csv_decimal or ".")
+        encoding_literal = json.dumps(csv_encoding or "utf-8")
+        return (
+            UNIVERSAL_PROLOGUE_START
+            + "\n"
+            + "import os\n"
+            + "import json\n"
+            + "import numpy as np\n"
+            + "import pandas as pd\n"
+            + "from pathlib import Path\n\n"
+            + "os.makedirs(\"data\", exist_ok=True)\n\n"
+            + f"sep = {sep_literal}\n"
+            + f"decimal = {decimal_literal}\n"
+            + f"encoding = {encoding_literal}\n\n"
+            + "def json_default(obj):\n"
+            + "    if isinstance(obj, np.bool_):\n"
+            + "        return bool(obj)\n"
+            + "    if isinstance(obj, np.generic):\n"
+            + "        return obj.item()\n"
+            + "    if isinstance(obj, pd.Timestamp):\n"
+            + "        return obj.isoformat()\n"
+            + "    if isinstance(obj, Path):\n"
+            + "        return str(obj)\n"
+            + "    return str(obj)\n\n"
+            + "_json_default = json_default\n"
+            + UNIVERSAL_PROLOGUE_END
+            + "\n\n"
+        )
+
+    def _strip_existing_universal_prologue(self, code: str) -> str:
+        text = str(code or "")
+        pattern = re.compile(
+            re.escape(UNIVERSAL_PROLOGUE_START) + r".*?" + re.escape(UNIVERSAL_PROLOGUE_END) + r"\n*",
+            flags=re.DOTALL,
+        )
+        return re.sub(pattern, "", text, count=1)
+
+    def _has_universal_prologue(self, code: str) -> bool:
+        try:
+            tree = ast.parse(code)
+        except Exception:
+            return False
+        has_json_default = False
+        has_sep = False
+        has_decimal = False
+        has_encoding = False
+        has_makedirs = False
+        for node in getattr(tree, "body", []):
+            if isinstance(node, ast.FunctionDef) and node.name == "json_default":
+                has_json_default = True
+            if isinstance(node, ast.Assign):
+                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                if "sep" in targets:
+                    has_sep = True
+                if "decimal" in targets:
+                    has_decimal = True
+                if "encoding" in targets:
+                    has_encoding = True
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                call = node.value
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "os"
+                    and call.func.attr == "makedirs"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                    and call.args[0].value == "data"
+                ):
+                    has_makedirs = True
+        return bool(has_json_default and has_sep and has_decimal and has_encoding and has_makedirs)
+
+    def _inject_universal_prologue(
+        self,
+        code: str,
+        csv_sep: str,
+        csv_decimal: str,
+        csv_encoding: str,
+    ) -> str:
+        text = self._strip_existing_universal_prologue(code)
+        if self._has_universal_prologue(text):
+            return text
+        prologue = self._build_universal_prologue(csv_sep, csv_decimal, csv_encoding)
+        lines = text.splitlines(keepends=True)
+        insert_index = 0
+        try:
+            tree = ast.parse(text)
+            body = list(tree.body or [])
+            idx = 0
+            if body:
+                first = body[0]
+                if (
+                    isinstance(first, ast.Expr)
+                    and isinstance(getattr(first, "value", None), ast.Constant)
+                    and isinstance(first.value.value, str)
+                ):
+                    insert_index = int(getattr(first, "end_lineno", first.lineno))
+                    idx = 1
+            while idx < len(body):
+                node = body[idx]
+                if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+                    insert_index = int(getattr(node, "end_lineno", node.lineno))
+                    idx += 1
+                    continue
+                break
+        except Exception:
+            insert_index = 0
+            if lines and lines[0].startswith("#!"):
+                insert_index = 1
+            if insert_index < len(lines):
+                encoding_line = lines[insert_index].strip().lower()
+                if encoding_line.startswith("#") and "coding" in encoding_line:
+                    insert_index += 1
+
+        insert_index = max(0, min(insert_index, len(lines)))
+        before = "".join(lines[:insert_index])
+        after = "".join(lines[insert_index:])
+        if before and not before.endswith("\n"):
+            before += "\n"
+        if after and not after.startswith("\n"):
+            prologue = prologue + "\n"
+        return before + prologue + after
+
+    def _ensure_json_dump_default_serializer(self, code: str) -> str:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return code
+
+        class _JsonDumpDefaultFixer(ast.NodeTransformer):
+            def visit_Call(self, node: ast.Call) -> ast.AST:
+                self.generic_visit(node)
+                if not isinstance(node.func, ast.Attribute):
+                    return node
+                if not isinstance(node.func.value, ast.Name):
+                    return node
+                if node.func.value.id != "json" or node.func.attr != "dump":
+                    return node
+                has_default = False
+                for kw in node.keywords:
+                    if kw.arg == "default":
+                        kw.value = ast.Name(id="json_default", ctx=ast.Load())
+                        has_default = True
+                        break
+                if not has_default:
+                    node.keywords.append(
+                        ast.keyword(
+                            arg="default",
+                            value=ast.Name(id="json_default", ctx=ast.Load()),
+                        )
+                    )
+                return node
+
+        try:
+            fixed_tree = _JsonDumpDefaultFixer().visit(tree)
+            ast.fix_missing_locations(fixed_tree)
+            return ast.unparse(fixed_tree)
+        except Exception:
+            return code
+
+    def _apply_universal_script_guards(
+        self,
+        code: str,
+        csv_sep: str,
+        csv_decimal: str,
+        csv_encoding: str,
+    ) -> str:
+        guarded = self._inject_universal_prologue(code, csv_sep, csv_decimal, csv_encoding)
+        guarded = self._fix_to_csv_dialect_in_code(guarded)
+        guarded = self._ensure_json_dump_default_serializer(guarded)
+        return guarded
 
     def _fix_to_csv_dialect_in_code(self, code: str) -> str:
         try:
@@ -2092,6 +2442,9 @@ $strategy_json
         dataset_scale: Dict[str, Any] | None = None,
         dataset_scale_str: str | None = None,
         execution_profile: Dict[str, Any] | None = None,
+        last_run_memory: List[Dict[str, Any]] | None = None,
+        strategy_lock: Dict[str, Any] | None = None,
+        editor_mode: bool = False,
     ) -> str:
 
         SYSTEM_PROMPT_TEMPLATE = """
@@ -2216,7 +2569,7 @@ $strategy_json
         - Ensure output directories exist (data/ and static/plots/).
         - Write metrics and contract-required artifacts at exact paths.
         - Use a JSON serializer helper for numpy/pandas scalars, arrays, NaN, and bool types.
-        - Always write JSON using json.dump(..., default=_json_default).
+        - Always write JSON using json.dump(..., default=json_default).
         - Emit alignment_check when required and include evidence about feature usage and gate compliance.
 
         COMPUTE-AWARE EXECUTION
@@ -2560,6 +2913,43 @@ $strategy_json
         3) Return the full updated script (not a diff, not snippets).
         """
 
+        USER_EDITOR_TEMPLATE = """
+        MODE: CODE_EDITOR_MODE
+        You are in deterministic script-edit mode.
+        Do not regenerate a new solution from zero and do not re-plan strategy.
+
+        PHASE CLASSIFICATION:
+        $phase_classification
+
+        ERROR FEEDBACK:
+        $error_feedback
+
+        LAST RUN MEMORY (most recent attempts):
+        $last_run_memory
+
+        STRATEGY LOCK (immutable):
+        $strategy_lock
+
+        ITERATION HANDOFF:
+        $iteration_handoff_json
+
+        PATCH OBJECTIVES:
+        $patch_objectives
+
+        MUST PRESERVE:
+        $must_preserve
+
+        PREVIOUS SCRIPT:
+        $previous_code
+
+        EDITOR RULES:
+        1) Return ONLY the full updated Python script. No markdown, no explanation.
+        2) Keep script structure and change the minimum possible lines.
+        3) Keep strategy/objective/contract paths unchanged.
+        4) If phase is "persistence", do not modify training/model selection logic.
+           Only fix persistence/serialization/artifact-writing blocks.
+        """
+
         USER_IMPROVE_TEMPLATE = """
         MODE: IMPROVE
         Your previous code executed successfully and was approved by the reviewer.
@@ -2608,9 +2998,64 @@ $strategy_json
             required_deliverables=required_deliverables,
         )
         handoff_payload_json = json.dumps(compress_long_lists(handoff_payload)[0], indent=2)
-        improve_mode_active = bool(previous_code and handoff_payload.get("mode") == "improve")
-        patch_mode_active = bool(not improve_mode_active and previous_code and (gate_context or handoff_payload.get("mode") == "patch"))
-        if improve_mode_active:
+        gate_ctx = gate_context if isinstance(gate_context, dict) else {}
+        feedback_text = self._collect_editor_feedback_text(
+            gate_context=gate_ctx,
+            handoff_payload=handoff_payload,
+            feedback_history=feedback_history,
+        )
+        editor_mode_active = bool(
+            previous_code
+            and (
+                bool(editor_mode)
+                or self._should_use_editor_mode(
+                    gate_context=gate_ctx,
+                    handoff_payload=handoff_payload,
+                    feedback_history=feedback_history,
+                )
+            )
+        )
+        improve_mode_active = bool(
+            not editor_mode_active
+            and previous_code
+            and handoff_payload.get("mode") == "improve"
+        )
+        patch_mode_active = bool(
+            not editor_mode_active
+            and not improve_mode_active
+            and previous_code
+            and (gate_context or handoff_payload.get("mode") == "patch")
+        )
+        if editor_mode_active:
+            patch_objectives = handoff_payload.get("patch_objectives", [])
+            patch_objectives_block = "\n".join([f"- {item}" for item in patch_objectives]) if patch_objectives else "- Resolve runtime/QA feedback with minimal edits."
+            must_preserve = handoff_payload.get("must_preserve", [])
+            must_preserve_block = "\n".join([f"- {item}" for item in must_preserve]) if must_preserve else "- Preserve valid training and artifact logic."
+            phase_classification = self._classify_editor_phase(
+                gate_context=gate_ctx,
+                handoff_payload=handoff_payload,
+                feedback_text=feedback_text,
+            )
+            previous_code_block = self._truncate_code_for_patch(previous_code)
+            last_run_memory_block = self._build_last_run_memory_block(last_run_memory)
+            strategy_lock_block = self._serialize_json_for_prompt(
+                strategy_lock or {},
+                max_chars=1800,
+                max_str_len=260,
+                max_list_items=40,
+            )
+            user_message = render_prompt(
+                USER_EDITOR_TEMPLATE,
+                phase_classification=phase_classification,
+                error_feedback=feedback_text or "No structured feedback provided.",
+                last_run_memory=last_run_memory_block,
+                strategy_lock=strategy_lock_block,
+                iteration_handoff_json=handoff_payload_json,
+                patch_objectives=patch_objectives_block,
+                must_preserve=must_preserve_block,
+                previous_code=previous_code_block,
+            )
+        elif improve_mode_active:
             # Build improve prompt from handoff
             metric_focus = handoff_payload.get("metric_focus", {})
             primary_metric = str(metric_focus.get("primary_metric", "roc_auc"))
@@ -2667,11 +3112,7 @@ $strategy_json
                 data_path=data_path,
             )
         elif patch_mode_active:
-            gate_ctx = gate_context if isinstance(gate_context, dict) else {}
             required_fixes = gate_ctx.get('required_fixes', [])
-            feedback_text = gate_ctx.get('feedback', '')
-            if not feedback_text and isinstance(handoff_payload.get("feedback"), dict):
-                feedback_text = str(handoff_payload.get("feedback", {}).get("reviewer") or "")
             fixes_bullets = "\n".join(["- " + str(fix) for fix in required_fixes if str(fix).strip()])
             if not fixes_bullets:
                 fixes_bullets = "- Follow patch objectives from iteration handoff."
@@ -2734,7 +3175,7 @@ $strategy_json
         improve_temp = _env_float("ML_ENGINEER_TEMPERATURE_IMPROVE", 0.2)
         if improve_mode_active:
             current_temp = improve_temp
-        elif previous_code and (gate_context or handoff_payload.get("mode") == "patch"):
+        elif editor_mode_active or patch_mode_active:
             current_temp = retry_temp
         else:
             current_temp = base_temp
@@ -2949,7 +3390,12 @@ $strategy_json
 
             # Post-processing: Inject correct data_path if LLM used wrong path
             code = self._fix_data_path_in_code(code, data_path)
-            code = self._fix_to_csv_dialect_in_code(code)
+            code = self._apply_universal_script_guards(
+                code,
+                csv_sep=csv_sep,
+                csv_decimal=csv_decimal,
+                csv_encoding=csv_encoding,
+            )
             reasons = self._detect_forbidden_input_fallback(code, data_path)
             if reasons:
                 guard_system = (
@@ -2981,7 +3427,12 @@ $strategy_json
                         reasons = ["syntax_invalid_after_guardrail"]
                         continue
                     repaired = self._fix_data_path_in_code(repaired, data_path)
-                    repaired = self._fix_to_csv_dialect_in_code(repaired)
+                    repaired = self._apply_universal_script_guards(
+                        repaired,
+                        csv_sep=csv_sep,
+                        csv_decimal=csv_decimal,
+                        csv_encoding=csv_encoding,
+                    )
                     reasons = self._detect_forbidden_input_fallback(repaired, data_path)
                     if not reasons:
                         code = repaired
@@ -3047,7 +3498,12 @@ $strategy_json
                 repaired_valid = is_syntax_valid(repaired)
                 if repaired_valid:
                     repaired = self._fix_data_path_in_code(repaired, data_path)
-                    repaired = self._fix_to_csv_dialect_in_code(repaired)
+                    repaired = self._apply_universal_script_guards(
+                        repaired,
+                        csv_sep=csv_sep,
+                        csv_decimal=csv_decimal,
+                        csv_encoding=csv_encoding,
+                    )
                 remaining = self._check_training_policy_compliance(
                     code=repaired if repaired_valid else code,
                     execution_contract=execution_contract,
@@ -3071,6 +3527,13 @@ $strategy_json
                     }
                     print("ML_TRAINING_POLICY_WARNING: " + json.dumps(self.last_training_policy_warnings))
                     code = fallback_code
+            code = self._fix_data_path_in_code(code, data_path)
+            code = self._apply_universal_script_guards(
+                code,
+                csv_sep=csv_sep,
+                csv_decimal=csv_decimal,
+                csv_encoding=csv_encoding,
+            )
             return code
 
         except Exception as e:

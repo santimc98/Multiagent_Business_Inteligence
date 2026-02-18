@@ -138,6 +138,7 @@ from src.utils.dataset_memory import (
     record_dataset_memory,
     summarize_memory,
 )
+from src.utils.ml_engineer_memory import append_memory, load_recent_memory
 from src.utils.governance import write_governance_report, build_run_summary
 from src.utils.data_adequacy import (
     build_data_adequacy_report,
@@ -8121,6 +8122,66 @@ def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
     return {"type": "error", "message": line[:300]}
 
 
+def _should_use_ml_editor_mode(previous_code: str | None, gate_context: Dict[str, Any] | None) -> bool:
+    code_text = str(previous_code or "").strip()
+    if not code_text:
+        return False
+    gate = gate_context if isinstance(gate_context, dict) else {}
+    if not gate:
+        return False
+    source = str(gate.get("source") or "").strip().lower()
+    failed = [str(item).strip().lower() for item in (gate.get("failed_gates") or []) if str(item).strip()]
+    hard = [str(item).strip().lower() for item in (gate.get("hard_failures") or []) if str(item).strip()]
+    feedback_blob = " ".join(
+        [
+            source,
+            " ".join(failed),
+            " ".join(hard),
+            str(gate.get("feedback") or ""),
+            str(gate.get("traceback") or ""),
+            str(gate.get("execution_output_tail") or ""),
+        ]
+    ).lower()
+    has_runtime = bool(
+        gate.get("runtime_error")
+        or "traceback" in feedback_blob
+        or "runtime error" in feedback_blob
+        or "runtime_failure" in feedback_blob
+        or "execution runtime" in source
+        or any("runtime" in token for token in failed + hard)
+    )
+    has_qa = bool(
+        "qa" in source
+        or any("qa" in token for token in failed + hard)
+        or "qa team feedback" in feedback_blob
+    )
+    return bool(has_runtime or has_qa)
+
+
+def _classify_ml_memory_phase(failed_gates: List[str] | None, feedback: str | None) -> str:
+    tokens = [str(item).strip().lower() for item in (failed_gates or []) if str(item).strip()]
+    text = str(feedback or "").lower()
+    combined = " ".join(tokens + [text])
+    persistence_tokens = [
+        "output_contract",
+        "required output",
+        "required artifact",
+        "missing artifact",
+        "alignment_check",
+        "scored_rows",
+        "metrics.json",
+        "persist",
+        "serialization",
+        "json",
+        "file not found",
+        "no such file",
+        "permission denied",
+    ]
+    if any(token in combined for token in persistence_tokens):
+        return "persistence"
+    return "training"
+
+
 def _build_reviewer_evidence_packet(
     state: Dict[str, Any] | None,
     metrics_report: Dict[str, Any] | None,
@@ -16064,6 +16125,7 @@ def run_engineer(state: AgentState) -> AgentState:
     # V4.1: Removed legacy feature_availability and availability_summary
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
     iteration_memory_block = state.get("ml_iteration_memory_block", "")
+    last_run_memory = load_recent_memory(run_id, k=5) if run_id else []
     iter_id = int(state.get("iteration_count", 0)) + 1
     if run_id and iter_id >= 2:
         journal_entries = _load_ml_iteration_journal(run_id)
@@ -16076,8 +16138,9 @@ def run_engineer(state: AgentState) -> AgentState:
         data_audit_context = _merge_de_audit_override(data_audit_context, checklist_payload)
 
     # Patch Mode Inputs
-    previous_code = state.get('last_generated_code')
+    previous_code = state.get('generated_code') or state.get('last_generated_code')
     gate_context = state.get('last_gate_context')
+    editor_mode_active = _should_use_ml_editor_mode(previous_code, gate_context)
     iteration_handoff = state.get("iteration_handoff")
     if previous_code and gate_context and not isinstance(iteration_handoff, dict):
         iteration_handoff = _build_iteration_handoff(
@@ -16093,6 +16156,12 @@ def run_engineer(state: AgentState) -> AgentState:
         previous_code = None
         gate_context = None
         iteration_handoff = None
+        editor_mode_active = False
+
+    if editor_mode_active:
+        print("ML_EDITOR_MODE: reusing previous code with runtime/QA feedback.")
+        if run_id:
+            log_run_event(run_id, "ml_editor_mode", {"attempt": ml_attempt, "iteration": iter_id})
 
     print(f"DEBUG: Generating code for strategy: {strategy['title']}")
 
@@ -16114,6 +16183,9 @@ def run_engineer(state: AgentState) -> AgentState:
             signal_summary={},
             iteration_memory=iteration_memory,
             iteration_memory_block=iteration_memory_block,
+            last_run_memory=last_run_memory,
+            strategy_lock=strategy_lock_snapshot,
+            editor_mode=editor_mode_active,
         )
         sig = inspect.signature(ml_engineer.generate_code)
         if "execution_contract" in sig.parameters:
@@ -16144,6 +16216,12 @@ def run_engineer(state: AgentState) -> AgentState:
             kwargs["ml_plan"] = ml_plan_for_gen or {}
         if "cleaned_data_summary_min" in sig.parameters:
             kwargs["cleaned_data_summary_min"] = cleaned_data_summary_min or {}
+        if "last_run_memory" not in sig.parameters:
+            kwargs.pop("last_run_memory", None)
+        if "strategy_lock" not in sig.parameters:
+            kwargs.pop("strategy_lock", None)
+        if "editor_mode" not in sig.parameters:
+            kwargs.pop("editor_mode", None)
         aliasing = {}
         derived_present = []
         sample_context = ""
@@ -16372,7 +16450,7 @@ def run_engineer(state: AgentState) -> AgentState:
         # SENIOR REASONING: Generate ml_plan.json on first iteration
         ml_plan = state.get("ml_plan")
         iter_count = int(state.get("iteration_count", 0))
-        if not ml_plan and iter_count == 0:
+        if not ml_plan and iter_count == 0 and not editor_mode_active:
             try:
                 from src.utils.data_profile_compact import compact_data_profile_for_llm
                 data_profile = state.get("data_profile")
@@ -20100,6 +20178,40 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             state.get("ml_journal_written_ids"),
         )
         result_state["ml_journal_written_ids"] = written_ids
+        try:
+            if status in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+                memory_event = "attempt_success"
+            elif qa_rejected or qa_failed_gates:
+                memory_event = "qa_reject"
+            else:
+                memory_event = "attempt_reject"
+            error_signature = ""
+            if status == "NEEDS_IMPROVEMENT":
+                if failed_gates:
+                    error_signature = str(failed_gates[0])
+                elif review_feedback:
+                    error_signature = str(review_feedback).strip().splitlines()[0]
+            phase = _classify_ml_memory_phase(failed_gates, review_feedback)
+            changes_summary = str(gate_context.get("edit_instructions") or "")
+            if not changes_summary:
+                changes_summary = "; ".join([str(item) for item in (required_fixes or []) if str(item).strip()][:3])
+            if not changes_summary:
+                changes_summary = str(review_feedback or "")[:320]
+            append_memory(
+                run_id,
+                {
+                    "iter": int(iter_id),
+                    "attempt": int(state.get("execution_attempt", 0) or 0),
+                    "event": memory_event,
+                    "error_signature": error_signature[:220],
+                    "phase": phase,
+                    "changes_summary": changes_summary[:400],
+                    "metrics": primary_metric_snapshot if isinstance(primary_metric_snapshot, dict) else {},
+                    "artifacts_present": outputs_state["present"][:30],
+                },
+            )
+        except Exception:
+            pass
 
     if status == "NEEDS_IMPROVEMENT":
         result_state["iteration_count"] = state.get("iteration_count", 0) + 1
@@ -20690,10 +20802,11 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
         reviewer_feedback = state.get("review_feedback") or ""
         reviewer_reasons = _normalize_reason_tags(reviewer_feedback, [])
         next_actions = _suggest_next_actions([], outputs_state["missing"], reviewer_reasons, [])
+        runtime_summary = _summarize_runtime_error(output)
         entry = _build_ml_iteration_journal_entry(
             state,
             preflight_issues=[],
-            runtime_error=_summarize_runtime_error(output),
+            runtime_error=runtime_summary,
             outputs_present=outputs_state["present"],
             outputs_missing=outputs_state["missing"],
             reviewer_verdict=state.get("review_verdict"),
@@ -20708,6 +20821,28 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
             entry,
             state.get("ml_journal_written_ids"),
         )
+        try:
+            phase = _classify_ml_memory_phase(["runtime_failure"], output)
+            error_signature = ""
+            if isinstance(runtime_summary, dict):
+                error_signature = str(runtime_summary.get("message") or runtime_summary.get("type") or "")
+            if not error_signature:
+                error_signature = str(output or "").strip().splitlines()[-1] if str(output or "").strip() else "runtime_failure"
+            append_memory(
+                run_id,
+                {
+                    "iter": int(state.get("iteration_count", 0) or 0) + 1,
+                    "attempt": int(state.get("execution_attempt", 0) or 0) + 1,
+                    "event": "runtime_error",
+                    "error_signature": error_signature[:220],
+                    "phase": phase,
+                    "changes_summary": "Runtime crash detected; apply minimal targeted fix.",
+                    "metrics": state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {},
+                    "artifacts_present": outputs_state["present"][:20],
+                },
+            )
+        except Exception:
+            pass
     else:
         written_ids = state.get("ml_journal_written_ids")
 
