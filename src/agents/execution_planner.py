@@ -2,7 +2,7 @@ import json
 import os
 import ast
 import copy
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Callable
 from string import Template
 import re
 import difflib
@@ -2764,6 +2764,240 @@ def _apply_deterministic_repairs(contract: Dict[str, Any] | None) -> Dict[str, A
     repaired = _deterministic_repair_column_dtype_targets(repaired)
     repaired = _deterministic_repair_derived_columns(repaired)
     return repaired
+
+
+def _validation_result_accepted(validation_result: Dict[str, Any] | None) -> bool:
+    if not isinstance(validation_result, dict):
+        return False
+    if not bool(validation_result.get("accepted", False)):
+        return False
+    if str(validation_result.get("status") or "").lower() == "error":
+        return False
+    summary = validation_result.get("summary")
+    if isinstance(summary, dict):
+        try:
+            if int(summary.get("error_count", 0) or 0) > 0:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _build_contract_repair_hints(
+    validation_result: Dict[str, Any] | None,
+    max_hints: int = 5,
+) -> List[str]:
+    if not isinstance(validation_result, dict):
+        return []
+    issues = validation_result.get("issues")
+    if not isinstance(issues, list):
+        return []
+
+    severity_rank = {"error": 0, "fail": 0, "warning": 1, "info": 2}
+    ranked: List[Tuple[int, str, str]] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        rule = str(issue.get("rule") or "").strip()
+        if not rule:
+            continue
+        severity = str(issue.get("severity") or "warning").lower()
+        message = str(issue.get("message") or "").strip()
+        ranked.append((severity_rank.get(severity, 3), rule, message))
+
+    ranked.sort(key=lambda row: row[0])
+    hints: List[str] = []
+    seen_rules: set[str] = set()
+    for _, rule, message in ranked:
+        if rule in seen_rules:
+            continue
+        seen_rules.add(rule)
+        action = get_contract_schema_repair_action(rule)
+        hint_text = action or message or "Apply minimal structural fix for this rule."
+        hints.append(f"{rule}: {hint_text}")
+        if len(hints) >= max(3, min(max_hints, 5)):
+            break
+    return hints
+
+
+def _decode_json_pointer_token(token: str) -> str:
+    return str(token).replace("~1", "/").replace("~0", "~")
+
+
+def _apply_json_patch_ops(document: Dict[str, Any], patch_ops: List[Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = copy.deepcopy(document) if isinstance(document, dict) else {}
+    if not isinstance(patch_ops, list):
+        return result
+
+    for op in patch_ops:
+        if not isinstance(op, dict):
+            continue
+        action = str(op.get("op") or "").strip().lower()
+        path = str(op.get("path") or "").strip()
+        if action not in {"add", "replace", "remove"} or not path.startswith("/"):
+            continue
+        tokens = [_decode_json_pointer_token(tok) for tok in path.lstrip("/").split("/") if tok != ""]
+        if not tokens:
+            continue
+        parent: Any = result
+        for token in tokens[:-1]:
+            if isinstance(parent, dict):
+                nxt = parent.get(token)
+                if not isinstance(nxt, (dict, list)):
+                    if action in {"add", "replace"}:
+                        parent[token] = {}
+                        nxt = parent[token]
+                    else:
+                        parent = None
+                        break
+                parent = nxt
+            elif isinstance(parent, list):
+                try:
+                    index = int(token)
+                except Exception:
+                    parent = None
+                    break
+                if index < 0 or index >= len(parent):
+                    parent = None
+                    break
+                parent = parent[index]
+            else:
+                parent = None
+                break
+        if parent is None:
+            continue
+
+        leaf = tokens[-1]
+        if isinstance(parent, dict):
+            if action in {"add", "replace"}:
+                parent[leaf] = copy.deepcopy(op.get("value"))
+            elif action == "remove":
+                parent.pop(leaf, None)
+            continue
+
+        if isinstance(parent, list):
+            if leaf == "-":
+                index = len(parent)
+            else:
+                try:
+                    index = int(leaf)
+                except Exception:
+                    continue
+            if action == "add":
+                if 0 <= index <= len(parent):
+                    parent.insert(index, copy.deepcopy(op.get("value")))
+            elif action == "replace":
+                if 0 <= index < len(parent):
+                    parent[index] = copy.deepcopy(op.get("value"))
+            elif action == "remove":
+                if 0 <= index < len(parent):
+                    parent.pop(index)
+
+    return result
+
+
+def _apply_minimal_contract_patch(contract: Dict[str, Any], patch_payload: Any) -> Dict[str, Any]:
+    base = copy.deepcopy(contract) if isinstance(contract, dict) else {}
+    if isinstance(patch_payload, list):
+        return _apply_json_patch_ops(base, patch_payload)
+    if not isinstance(patch_payload, dict):
+        return base
+    if {"op", "path"}.issubset(set(patch_payload.keys())):
+        return _apply_json_patch_ops(base, [patch_payload])
+    patch_ops = patch_payload.get("patch")
+    if isinstance(patch_ops, list):
+        return _apply_json_patch_ops(base, patch_ops)
+    changes = patch_payload.get("changes")
+    if isinstance(changes, dict):
+        return _deep_merge_contract_override(base, changes)
+    return _deep_merge_contract_override(base, patch_payload)
+
+
+def _validate_repair_revalidate_loop(
+    contract: Dict[str, Any] | None,
+    validator_fn: Callable[[Dict[str, Any]], Dict[str, Any]],
+    repair_provider: Callable[[Dict[str, Any], Dict[str, Any], List[str], int], Any] | None = None,
+    max_iterations: int = 2,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    working = copy.deepcopy(contract) if isinstance(contract, dict) else {}
+    trace: List[Dict[str, Any]] = []
+    last_validation: Dict[str, Any] = {
+        "status": "error",
+        "accepted": False,
+        "issues": [{"rule": "contract.invalid", "severity": "error", "message": "Invalid contract payload"}],
+        "summary": {"error_count": 1, "warning_count": 0},
+    }
+
+    preserved_deliverables = None
+    spec = working.get("spec_extraction")
+    if isinstance(spec, dict) and isinstance(spec.get("deliverables"), list):
+        preserved_deliverables = copy.deepcopy(spec.get("deliverables"))
+    preserved_rich_outputs = (
+        copy.deepcopy(working.get("required_output_artifacts"))
+        if isinstance(working.get("required_output_artifacts"), list)
+        else None
+    )
+
+    attempts = max(0, int(max_iterations)) + 1
+    for attempt in range(1, attempts + 1):
+        working = apply_contract_schema_registry_repairs(working)
+        working = normalize_artifact_requirements(working)
+        if preserved_deliverables is not None:
+            spec_obj = working.get("spec_extraction")
+            if not isinstance(spec_obj, dict):
+                spec_obj = {}
+            spec_obj["deliverables"] = copy.deepcopy(preserved_deliverables)
+            working["spec_extraction"] = spec_obj
+        if preserved_rich_outputs is not None:
+            working["required_output_artifacts"] = copy.deepcopy(preserved_rich_outputs)
+
+        try:
+            last_validation = validator_fn(copy.deepcopy(working))
+        except Exception as err:
+            last_validation = {
+                "status": "error",
+                "accepted": False,
+                "issues": [
+                    {
+                        "rule": "contract.validation_exception",
+                        "severity": "error",
+                        "message": str(err),
+                    }
+                ],
+                "summary": {"error_count": 1, "warning_count": 0},
+            }
+
+        accepted = _validation_result_accepted(last_validation)
+        trace.append(
+            {
+                "attempt": attempt,
+                "accepted": accepted,
+                "status": str(last_validation.get("status") or "unknown"),
+                "hints": [],
+            }
+        )
+        if accepted:
+            break
+        if attempt >= attempts or repair_provider is None:
+            break
+
+        hints = _build_contract_repair_hints(last_validation, max_hints=5)
+        trace[-1]["hints"] = hints
+        patch_payload = repair_provider(copy.deepcopy(working), copy.deepcopy(last_validation), hints, attempt)
+        if patch_payload in (None, "", [], {}):
+            break
+        working = _apply_minimal_contract_patch(working, patch_payload)
+
+    if preserved_deliverables is not None:
+        spec_obj = working.get("spec_extraction")
+        if not isinstance(spec_obj, dict):
+            spec_obj = {}
+        spec_obj["deliverables"] = copy.deepcopy(preserved_deliverables)
+        working["spec_extraction"] = spec_obj
+    if preserved_rich_outputs is not None:
+        working["required_output_artifacts"] = copy.deepcopy(preserved_rich_outputs)
+
+    return working, last_validation, trace
 
 
 def build_contract_min(
@@ -9796,7 +10030,93 @@ class ExecutionPlannerAgent:
                         final_errors = _lint_deliverable_invariants(contract, obj_type)
                         if final_errors:
                             print(f"DELIVERABLE_LINT: {len(final_errors)} errors persist after replan")
+                contract = apply_contract_schema_registry_repairs(contract)
                 contract = normalize_artifact_requirements(contract)
+
+                def _llm_minimal_repair_provider(
+                    current_contract: Dict[str, Any],
+                    validation_result: Dict[str, Any],
+                    hints: List[str],
+                    attempt: int,
+                ) -> Any:
+                    if not self.client:
+                        return None
+                    try:
+                        model_client = self._build_model_client(self.model_name)
+                    except Exception:
+                        return None
+                    if model_client is None:
+                        return None
+
+                    hints_lines = "\n".join(f"- {hint}" for hint in (hints or [])[:5]) or "- apply minimal fixes"
+                    validation_feedback = _compact_validation_feedback(validation_result, max_issues=6)
+                    contract_compact = _compress_text_preserve_ends(
+                        json.dumps(current_contract, ensure_ascii=False, indent=2),
+                        max_chars=12000,
+                        head=8000,
+                        tail=4000,
+                    )
+                    repair_prompt = (
+                        "Repair this execution contract with MINIMAL edits.\n"
+                        "Return ONLY valid JSON.\n"
+                        "Preferred shape: {\"changes\": {...}} (minimal nested fields only).\n"
+                        "Alternative shape: {\"patch\": [{\"op\":\"replace\",\"path\":\"/a/b\",\"value\":...}]}\n"
+                        "Do NOT regenerate the full contract.\n"
+                        "Keep required_outputs as list[str].\n"
+                        "Preserve required_output_artifacts and spec_extraction.deliverables if present.\n"
+                        f"Attempt {attempt}/2.\n\n"
+                        "Top repair hints:\n"
+                        f"{hints_lines}\n\n"
+                        "Validation issues:\n"
+                        f"{validation_feedback}\n\n"
+                        "Current contract:\n"
+                        f"{contract_compact}"
+                    )
+                    try:
+                        response, _ = self._generate_content_with_budget(
+                            model_client,
+                            repair_prompt,
+                            output_token_floor=768,
+                        )
+                    except Exception:
+                        return None
+
+                    response_text = getattr(response, "text", "") or ""
+                    if not response_text.strip():
+                        return None
+                    parsed, _ = _parse_json_response(response_text)
+                    if isinstance(parsed, list):
+                        return {"patch": parsed}
+                    if not isinstance(parsed, dict):
+                        return None
+                    if isinstance(parsed.get("patch"), list):
+                        return {"patch": parsed.get("patch")}
+                    if isinstance(parsed.get("changes"), dict):
+                        return {"changes": parsed.get("changes")}
+                    if isinstance(parsed.get("judgment_patch"), dict):
+                        return {"changes": parsed.get("judgment_patch")}
+                    return {"changes": parsed}
+
+                contract, post_validation, post_repair_trace = _validate_repair_revalidate_loop(
+                    contract=contract,
+                    validator_fn=lambda payload: _validate_contract_quality(payload),
+                    repair_provider=_llm_minimal_repair_provider,
+                    max_iterations=2,
+                )
+                if isinstance(post_repair_trace, list) and post_repair_trace:
+                    if len(post_repair_trace) > 1:
+                        print(
+                            "POST_FINAL_REPAIR_LOOP: "
+                            + ", ".join(
+                                [
+                                    f"attempt={row.get('attempt')} accepted={row.get('accepted')}"
+                                    for row in post_repair_trace
+                                    if isinstance(row, dict)
+                                ]
+                            )
+                        )
+                    if isinstance(post_validation, dict) and _validation_result_accepted(post_validation):
+                        llm_success = True if self.client else llm_success
             diagnostics = _build_contract_diagnostics(contract if isinstance(contract, dict) else {}, where, llm_success)
             self.last_contract_diagnostics = diagnostics
             _persist_contracts(
