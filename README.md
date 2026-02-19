@@ -164,7 +164,7 @@ MIMO_API_KEY=your_api_key_here
 # DEEPSEEK_API_KEY=your_api_key_here
 ```
 
-### 4. Run The Insight Foundry
+### 4. Run The StrategyEngine AI
 ```bash
 streamlit run app.py
 ```
