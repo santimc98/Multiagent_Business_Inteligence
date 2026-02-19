@@ -713,33 +713,20 @@ def _expr_has_split_fabrication(node: ast.AST) -> bool:
     return visitor.found
 
 
-def _condition_checks_nunique_le_one(test_node: ast.AST) -> bool:
-    if not isinstance(test_node, ast.Compare):
-        return False
-    left = test_node.left
-    if not isinstance(left, ast.Call):
-        return False
-    func = left.func
-    if not (isinstance(func, ast.Attribute) and func.attr == "nunique"):
-        return False
-    valid_op = any(isinstance(op, (ast.LtE, ast.Lt, ast.Eq)) for op in test_node.ops)
-    comparator_consts = [
-        comp
-        for comp in test_node.comparators
-        if isinstance(comp, ast.Constant) and isinstance(comp.value, (int, float))
-    ]
-    if not comparator_consts:
-        return False
-    for op, comp in zip(test_node.ops, comparator_consts):
-        if isinstance(op, ast.Eq) and comp.value == 1:
-            return True
-        if isinstance(op, ast.LtE) and comp.value <= 1:
-            return True
-        if isinstance(op, ast.Lt) and comp.value <= 2:
-            return True
-    # Fallback: accept any <=1 threshold
-    threshold_match = any(const.value <= 1 for const in comparator_consts)
-    return valid_op and threshold_match
+def _numeric_literal_value(node: ast.AST) -> Optional[float]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        if isinstance(node.value, bool):
+            return None
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant):
+        raw = node.operand.value
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            return None
+        if isinstance(node.op, ast.USub):
+            return -float(raw)
+        if isinstance(node.op, ast.UAdd):
+            return float(raw)
+    return None
 
 
 def _if_has_value_error_raise(body_nodes) -> bool:
@@ -761,6 +748,9 @@ class _StaticQAScanner(ast.NodeVisitor):
         self.has_random_target_noise = False
         self.has_split_fabrication = False
         self.has_variance_guard = False
+        self.nunique_aliases: set[str] = set()
+        self.var_aliases: set[str] = set()
+        self.std_aliases: set[str] = set()
         self.has_leakage_assert = False
         self.has_regression_model = False
         self.has_regression_metric = False
@@ -859,13 +849,14 @@ class _StaticQAScanner(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_If(self, node: ast.If):
-        if _condition_checks_nunique_le_one(node.test) and _if_has_value_error_raise(node.body):
+        if self._condition_checks_variance_guard(node.test) and _if_has_value_error_raise(node.body):
             self.has_variance_guard = True
         self.generic_visit(node)
 
     def _handle_assignment(self, targets, value):
         if value is None:
             return
+        self._track_variance_guard_aliases(targets, value)
         if _expr_has_random_call(value):
             for tgt in targets:
                 name = _extract_target_name(tgt)
@@ -876,6 +867,82 @@ class _StaticQAScanner(ast.NodeVisitor):
                     self.has_random_target_noise = True
         if _expr_has_split_fabrication(value):
             self.has_split_fabrication = True
+
+    def _iter_target_names(self, targets: List[ast.AST]) -> List[str]:
+        names: List[str] = []
+
+        def _walk(node: ast.AST) -> None:
+            if isinstance(node, ast.Name):
+                names.append(node.id)
+                return
+            if isinstance(node, (ast.Tuple, ast.List)):
+                for child in node.elts:
+                    _walk(child)
+
+        for target in targets:
+            _walk(target)
+        return names
+
+    def _track_variance_guard_aliases(self, targets: List[ast.AST], value: ast.AST) -> None:
+        target_names = self._iter_target_names(targets)
+        if not target_names:
+            return
+
+        for name in target_names:
+            self.nunique_aliases.discard(name)
+            self.var_aliases.discard(name)
+            self.std_aliases.discard(name)
+
+        if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Attribute):
+            return
+        attr = str(value.func.attr or "").strip()
+        if not attr:
+            return
+        if attr == "nunique":
+            self.nunique_aliases.update(target_names)
+        elif attr == "var":
+            self.var_aliases.update(target_names)
+        elif attr == "std":
+            self.std_aliases.update(target_names)
+
+    def _guard_stat_kind_from_expr(self, expr: ast.AST) -> Optional[str]:
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+            attr = str(expr.func.attr or "").strip()
+            if attr in {"nunique", "var", "std"}:
+                return attr
+        if isinstance(expr, ast.Name):
+            name = expr.id
+            if name in self.nunique_aliases:
+                return "nunique"
+            if name in self.var_aliases:
+                return "var"
+            if name in self.std_aliases:
+                return "std"
+        return None
+
+    def _condition_checks_variance_guard(self, test_node: ast.AST) -> bool:
+        if not isinstance(test_node, ast.Compare):
+            return False
+        stat_kind = self._guard_stat_kind_from_expr(test_node.left)
+        if not stat_kind:
+            return False
+        for op, comp in zip(test_node.ops, test_node.comparators):
+            value = _numeric_literal_value(comp)
+            if value is None:
+                continue
+            if stat_kind == "nunique":
+                if isinstance(op, ast.LtE) and value <= 1:
+                    return True
+                if isinstance(op, ast.Lt) and value <= 2:
+                    return True
+                if isinstance(op, ast.Eq) and value == 1:
+                    return True
+            if stat_kind in {"var", "std"}:
+                if isinstance(op, ast.Eq) and value == 0:
+                    return True
+                if isinstance(op, ast.LtE) and value <= 0:
+                    return True
+        return False
 
 
 
