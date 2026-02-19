@@ -18813,8 +18813,12 @@ def retry_handler(state: AgentState) -> AgentState:
     }
     route_reason = "policy_not_evaluated"
 
-    # If this is an improvement iteration, prepare improvement context and skip strategy reselection
-    if state.get("last_iteration_type") == "metric" and int(state.get("improvement_attempt_count", 0)) >= 0:
+    # Legacy improvement loop compatibility: only run when explicitly active.
+    if (
+        state.get("last_iteration_type") == "metric"
+        and not bool(state.get("ml_improvement_round_active"))
+        and state.get("improvement_attempt_count") is not None
+    ):
         imp_result = _prepare_improvement_iteration(state if isinstance(state, dict) else {})
         result.update(imp_result)
         current_history.append(
@@ -21410,51 +21414,6 @@ def check_evaluation(state: AgentState):
                     return dict(rec)
         return {}
 
-    def _bootstrap_improvement_loop(reason_tag: str, metric_name: Any, metric_value: Any) -> str | None:
-        imp_max = int(os.getenv("MAX_IMPROVEMENT_ATTEMPTS", "3"))
-        imp_patience = int(os.getenv("IMPROVEMENT_PATIENCE", "2"))
-        if imp_max <= 0:
-            return None
-
-        baseline_value = float(metric_value)
-        state["improvement_attempt_count"] = 0
-        state["improvement_best_metric"] = baseline_value
-        state["improvement_best_attempt_id"] = 0
-        state["improvement_patience_counter"] = 0
-        state["improvement_metrics_history"] = [{"attempt": 0, "metric": baseline_value, "improved": True}]
-        state["max_improvement_attempts"] = imp_max
-        state["improvement_patience"] = imp_patience
-        state["last_iteration_type"] = "metric"
-
-        # Snapshot current outputs as baseline best attempt
-        artifact_paths = list(state.get("artifact_paths", []) or [])
-        oc_report = state.get("output_contract_report") or {}
-        artifact_index = state.get("artifact_index") or []
-        execution_output = state.get("execution_output") or ""
-        plots_local = list(state.get("plots_local", []) or [])
-        diagnostics = state.get("artifact_content_diagnostics") or {}
-        dest = _snapshot_best_attempt(
-            attempt_id=1,
-            artifact_paths=artifact_paths,
-            output_contract_report=oc_report if isinstance(oc_report, dict) else {},
-            artifact_index=artifact_index if isinstance(artifact_index, list) else [],
-            execution_output=execution_output,
-            plots_local=plots_local,
-            diagnostics=diagnostics if isinstance(diagnostics, dict) else {},
-        )
-        if dest:
-            state["best_attempt_dir"] = dest
-
-        print(
-            f"IMPROVEMENT_BOOTSTRAP[{reason_tag}]: Initialized improvement loop. "
-            f"baseline_metric={metric_value} max_attempts={imp_max} patience={imp_patience}"
-        )
-        print(
-            f"ITER_DECISION type=metric action=retry reason={reason_tag} "
-            f"metric={metric_name}:{metric_value} best={metric_value} budget_left={imp_max}"
-        )
-        return "retry"
-
     if state.get("runtime_fix_terminal"):
         metric_name, metric_value, best_value = _get_metric_info()
         print(
@@ -21602,20 +21561,6 @@ def check_evaluation(state: AgentState):
         )
         return "retry"
 
-    # Results advisor can explicitly route an approved/warning run into improve mode.
-    if (
-        advisor_action == "RETRY"
-        and advisor_mode == "improve"
-        and state.get("review_verdict") in {"APPROVED", "APPROVE_WITH_WARNINGS"}
-        and not state.get("execution_error")
-        and not state.get("sandbox_failed")
-        and state.get("improvement_attempt_count") is None
-        and _is_number(metric_value)
-    ):
-        decision = _bootstrap_improvement_loop("RESULTS_ADVISOR_IMPROVE", metric_name, metric_value)
-        if decision:
-            return decision
-
     # Respect explicit stop recommendation from results advisor.
     if (
         advisor_action == "STOP"
@@ -21627,22 +21572,6 @@ def check_evaluation(state: AgentState):
             f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
         )
         return "approved"
-
-    # Improvement loop bootstrap: on first successful execution with a valid metric,
-    # initialize improvement tracking and trigger the first improvement iteration.
-    improvement_enabled = str(os.getenv("IMPROVEMENT_LOOP_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
-    if (
-        improvement_enabled
-        and state.get("review_verdict") == "APPROVED"
-        and not state.get("execution_error")
-        and not state.get("sandbox_failed")
-        and state.get("improvement_attempt_count") is None
-        and _is_number(metric_value)
-        and advisor_action != "STOP"
-    ):
-        decision = _bootstrap_improvement_loop("IMPROVEMENT_BOOTSTRAP", metric_name, metric_value)
-        if decision:
-            return decision
 
     print(f"ITER_DECISION type=other action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
     return "approved"
