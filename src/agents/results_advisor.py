@@ -83,6 +83,53 @@ class ResultsAdvisorAgent:
         self.last_response = content
         return (content or "").strip()
 
+    def generate_feature_engineering_advice(self, context: Dict[str, Any]) -> str:
+        """
+        Deterministic FE coach for editor mode.
+        Returns short actionable bullets (no STOP/CONTINUE decisions).
+        """
+        if not isinstance(context, dict):
+            return "- No-op suggestions: keep baseline script and only ensure required outputs/metrics persist."
+
+        baseline_metrics = context.get("baseline_metrics")
+        if not isinstance(baseline_metrics, dict):
+            baseline_metrics = {}
+        primary_metric = str(context.get("primary_metric_name") or "primary_metric").strip() or "primary_metric"
+        baseline_snippet = str(context.get("baseline_ml_script_snippet") or "").strip()
+        fe_plan = context.get("feature_engineering_plan")
+        if not isinstance(fe_plan, dict):
+            fe_plan = {}
+
+        techniques_raw = fe_plan.get("techniques")
+        techniques: List[Any] = techniques_raw if isinstance(techniques_raw, list) else []
+        plan_notes = str(fe_plan.get("notes") or "").strip()
+        current_metric = self._extract_metric_value_for_name(baseline_metrics, primary_metric)
+
+        lines: List[str] = []
+        metric_value_text = "n/a" if current_metric is None else f"{current_metric:.6f}".rstrip("0").rstrip(".")
+        lines.append(f"- Objetivo: subir {primary_metric} desde baseline={metric_value_text} con cambios minimos al script actual.")
+        lines.append("- Punto de insercion: crea o extiende `build_features(df)` y llamala antes del split/CV.")
+        lines.append("- Guardrail: cualquier transformacion aprendida (encoders/imputers/grouping) debe ajustarse dentro de cada fold de CV.")
+
+        if techniques:
+            for technique_line in self._render_plan_technique_lines(techniques):
+                lines.append(technique_line)
+        else:
+            fallback_lines = self._build_universal_fallback_fe_lines(context)
+            lines.extend(fallback_lines)
+
+        if "build_features(" in baseline_snippet:
+            lines.append("- Reusa la funcion `build_features` existente y modifica solo bloques internos, sin reestructurar training/persistencia.")
+        else:
+            lines.append("- Si no existe `build_features`, agrega una funcion compacta y deja intacto el resto del pipeline.")
+
+        if plan_notes:
+            lines.append(f"- Nota del plan: {plan_notes[:180]}")
+
+        # Deterministic, short payload: max ~12 lines.
+        compact = [line for line in lines if isinstance(line, str) and line.strip()]
+        return "\n".join(compact[:12])
+
     def generate_insights(self, context: Dict[str, Any]) -> Dict[str, Any]:
         produced_index = (
             context.get("produced_artifact_index")
@@ -229,6 +276,107 @@ class ResultsAdvisorAgent:
         if len(text) <= max_len:
             return text
         return text[:max_len]
+
+    def _normalize_metric_token(self, value: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z]+", "", str(value or "").lower())
+
+    def _extract_metric_value_for_name(self, metrics: Dict[str, Any], metric_name: str) -> Optional[float]:
+        if not isinstance(metrics, dict):
+            return None
+        target = self._normalize_metric_token(metric_name)
+        if not target:
+            return None
+        flat = self._flatten_numeric_metrics(metrics)
+        ranked_keys: List[str] = []
+        for key in flat.keys():
+            norm = self._normalize_metric_token(key)
+            if not norm:
+                continue
+            if norm == target:
+                ranked_keys.insert(0, key)
+            elif target in norm:
+                ranked_keys.append(key)
+        for key in ranked_keys:
+            val = flat.get(key)
+            if isinstance(val, (int, float)):
+                return float(val)
+        # Generic fallback
+        for key in ("primary_metric_value", "metric_value", "score", "value"):
+            val = metrics.get(key)
+            num = self._coerce_number(val, ".")
+            if num is not None:
+                return float(num)
+        return None
+
+    def _render_plan_technique_lines(self, techniques: List[Any]) -> List[str]:
+        lines: List[str] = []
+        seen: set[str] = set()
+        for item in techniques:
+            if len(lines) >= 5:
+                break
+            if isinstance(item, dict):
+                technique = str(item.get("technique") or item.get("name") or "").strip()
+                columns = item.get("columns")
+                if isinstance(columns, list) and columns:
+                    col_text = ", ".join(str(col) for col in columns[:4])
+                else:
+                    col_text = ""
+            else:
+                technique = str(item or "").strip()
+                col_text = ""
+            if not technique:
+                continue
+            key = self._normalize_metric_token(technique)
+            if key in seen:
+                continue
+            seen.add(key)
+            if col_text:
+                lines.append(f"- Tecnica: {technique}. Aplicala en columnas [{col_text}] dentro de `build_features(df)`.")
+            else:
+                lines.append(f"- Tecnica: {technique}. Integrala en `build_features(df)` con validacion dentro de CV.")
+        return lines
+
+    def _build_universal_fallback_fe_lines(self, context: Dict[str, Any]) -> List[str]:
+        dataset_profile = context.get("dataset_profile")
+        if not isinstance(dataset_profile, dict):
+            dataset_profile = {}
+        missingness = self._has_missingness_signal(dataset_profile)
+        high_cardinality = self._has_high_cardinality_signal(dataset_profile)
+        lines: List[str] = []
+        if missingness:
+            lines.append("- Fallback #1: agrega missing indicators (`col_is_missing`) para columnas con nulos relevantes.")
+        if high_cardinality:
+            lines.append("- Fallback #2: agrupa categorias raras en `__OTHER__` antes del encoding para reducir ruido.")
+        if not lines:
+            lines.append("- No-op suggestions: no hay senales fuertes para FE adicional; conserva baseline y robustece validacion.")
+        return lines[:2]
+
+    def _has_missingness_signal(self, profile: Dict[str, Any]) -> bool:
+        if not isinstance(profile, dict):
+            return False
+        if profile.get("features_with_nulls"):
+            return True
+        missing = profile.get("missingness")
+        if isinstance(missing, dict) and missing:
+            return True
+        ratio = self._coerce_number(profile.get("missing_ratio"), ".")
+        if ratio is not None and ratio > 0:
+            return True
+        return False
+
+    def _has_high_cardinality_signal(self, profile: Dict[str, Any]) -> bool:
+        if not isinstance(profile, dict):
+            return False
+        candidates = [
+            profile.get("high_cardinality_columns"),
+            profile.get("high_cardinality"),
+        ]
+        for entry in candidates:
+            if isinstance(entry, list) and entry:
+                return True
+            if isinstance(entry, dict) and entry:
+                return True
+        return False
 
     def _safe_load_json(self, path: str) -> Any:
         try:

@@ -874,13 +874,17 @@ $payload_json
             "required_columns": ["exact", "column", "names", "from", "summary"],
             "feature_families": [{"family": "optional", "rationale": "optional", "selector_hint": "optional"}],
             "techniques": ["list", "of", "data science techniques"],
-            "feature_engineering_strategy": [
-              {
-                "technique": "Name of technique (e.g. Interaction, Log Transform, Target Encoding)",
-                "columns": ["List", "of", "involved", "columns"],
-                "rationale": "WHY this transformation creates value/signal for this specific objective"
-              }
-            ],
+            "feature_engineering_strategy": {
+              "techniques": [
+                {
+                  "technique": "Name of technique (e.g. Interaction, Log Transform, Target Encoding)",
+                  "columns": ["List", "of", "involved", "columns"],
+                  "rationale": "WHY this transformation creates value/signal for this specific objective"
+                }
+              ],
+              "notes": "",
+              "risk_level": "low|med|high"
+            },
             "feasibility_analysis": {
               "statistical_power": "Assessment of n/p ratio and sample adequacy",
               "signal_quality": "Assessment of data quality for proposed method",
@@ -1071,27 +1075,52 @@ $payload_json
         top_level_fe = normalized.get("feature_engineering")
         legacy_fe = normalized.get("feature_engineering_strategy")
         eval_plan = normalized.get("evaluation_plan")
-        eval_plan_fe = (
-            eval_plan.get("feature_engineering")
-            if isinstance(eval_plan, dict) and isinstance(eval_plan.get("feature_engineering"), list)
-            else None
-        )
+        eval_plan_fe = eval_plan.get("feature_engineering") if isinstance(eval_plan, dict) else None
 
-        resolved_fe: List[Any] = []
-        if isinstance(top_level_fe, list):
-            resolved_fe = list(top_level_fe)
-        elif isinstance(legacy_fe, list):
-            resolved_fe = list(legacy_fe)
-        elif isinstance(eval_plan_fe, list):
-            resolved_fe = list(eval_plan_fe)
+        resolved_techniques: List[Any] = []
+        notes = ""
+        risk_level = "low"
 
-        if resolved_fe:
-            normalized["feature_engineering"] = resolved_fe
-            normalized["feature_engineering_strategy"] = resolved_fe
-            if isinstance(eval_plan, dict):
-                eval_plan_copy = dict(eval_plan)
-                eval_plan_copy["feature_engineering"] = resolved_fe
-                normalized["evaluation_plan"] = eval_plan_copy
+        # Preferred shape: object with techniques/notes/risk_level
+        if isinstance(legacy_fe, dict):
+            techniques = legacy_fe.get("techniques")
+            if isinstance(techniques, list):
+                resolved_techniques = list(techniques)
+            notes_raw = legacy_fe.get("notes")
+            if isinstance(notes_raw, str):
+                notes = notes_raw.strip()
+            risk_raw = str(legacy_fe.get("risk_level") or "").strip().lower()
+            if risk_raw in {"low", "med", "high"}:
+                risk_level = risk_raw
+            elif risk_raw == "medium":
+                risk_level = "med"
+
+        # Legacy alias: list
+        if not resolved_techniques:
+            if isinstance(top_level_fe, list):
+                resolved_techniques = list(top_level_fe)
+            elif isinstance(legacy_fe, list):
+                resolved_techniques = list(legacy_fe)
+            elif isinstance(eval_plan_fe, list):
+                resolved_techniques = list(eval_plan_fe)
+            elif isinstance(eval_plan_fe, dict):
+                techniques = eval_plan_fe.get("techniques")
+                if isinstance(techniques, list):
+                    resolved_techniques = list(techniques)
+
+        fe_strategy_obj = {
+            "techniques": resolved_techniques if isinstance(resolved_techniques, list) else [],
+            "notes": notes,
+            "risk_level": risk_level,
+        }
+        normalized["feature_engineering_strategy"] = fe_strategy_obj
+        # Backward-compatible alias for current downstream consumers.
+        normalized["feature_engineering"] = list(fe_strategy_obj.get("techniques") or [])
+
+        if isinstance(eval_plan, dict):
+            eval_plan_copy = dict(eval_plan)
+            eval_plan_copy["feature_engineering"] = list(fe_strategy_obj.get("techniques") or [])
+            normalized["evaluation_plan"] = eval_plan_copy
 
         return normalized
 
@@ -1493,6 +1522,9 @@ $payload_json
 
         # Extract context-aware Feature Engineering strategy (support naming aliases).
         feature_engineering_strategy = primary.get("feature_engineering_strategy", [])
+        if isinstance(feature_engineering_strategy, dict):
+            techniques = feature_engineering_strategy.get("techniques")
+            feature_engineering_strategy = techniques if isinstance(techniques, list) else []
         if not isinstance(feature_engineering_strategy, list) or not feature_engineering_strategy:
             candidate = primary.get("feature_engineering")
             if isinstance(candidate, list):

@@ -280,7 +280,7 @@ def test_check_evaluation_results_advisor_improve_retry_routes_to_retry(monkeypa
     assert state.get("improvement_attempt_count") == 0
 
 
-def test_check_evaluation_results_advisor_stop_blocks_improvement_bootstrap(monkeypatch):
+def test_check_evaluation_results_advisor_stop_does_not_block_improvement_round(monkeypatch):
     monkeypatch.setenv("IMPROVEMENT_LOOP_ENABLED", "1")
     monkeypatch.setenv("MAX_IMPROVEMENT_ATTEMPTS", "3")
     monkeypatch.setenv("IMPROVEMENT_PATIENCE", "2")
@@ -301,5 +301,5 @@ def test_check_evaluation_results_advisor_stop_blocks_improvement_bootstrap(monk
         },
     }
 
-    assert graph_mod.check_evaluation(state) == "approved"
-    assert state.get("stop_reason") == "RESULTS_ADVISOR_STOP"
+    assert graph_mod.check_evaluation(state) == "retry"
+    assert state.get("ml_improvement_round_active") is True

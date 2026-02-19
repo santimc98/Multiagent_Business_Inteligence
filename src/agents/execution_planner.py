@@ -451,6 +451,125 @@ def normalize_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     return contract
 
 
+def _normalize_strategy_feature_engineering_payload(strategy: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(strategy, dict):
+        return {"techniques": [], "notes": "", "risk_level": "low"}
+
+    raw = strategy.get("feature_engineering_strategy")
+    techniques: List[Any] = []
+    notes = ""
+    risk_level = "low"
+
+    if isinstance(raw, dict):
+        candidate = raw.get("techniques")
+        if isinstance(candidate, list):
+            techniques = list(candidate)
+        raw_notes = raw.get("notes")
+        if isinstance(raw_notes, str):
+            notes = raw_notes.strip()
+        raw_risk = str(raw.get("risk_level") or "").strip().lower()
+        if raw_risk in {"low", "med", "high"}:
+            risk_level = raw_risk
+        elif raw_risk == "medium":
+            risk_level = "med"
+    elif isinstance(raw, list):
+        techniques = list(raw)
+
+    if not techniques:
+        candidate = strategy.get("feature_engineering")
+        if isinstance(candidate, list):
+            techniques = list(candidate)
+
+    if not techniques:
+        eval_plan = strategy.get("evaluation_plan")
+        if isinstance(eval_plan, dict):
+            candidate = eval_plan.get("feature_engineering")
+            if isinstance(candidate, list):
+                techniques = list(candidate)
+
+    return {
+        "techniques": techniques if isinstance(techniques, list) else [],
+        "notes": notes,
+        "risk_level": risk_level,
+    }
+
+
+def _extract_derived_columns_from_fe_techniques(techniques: List[Any]) -> List[str]:
+    derived: List[str] = []
+    seen: set[str] = set()
+    if not isinstance(techniques, list):
+        return derived
+    for item in techniques:
+        if not isinstance(item, dict):
+            continue
+        candidate = (
+            item.get("output_column_name")
+            or item.get("output_column")
+            or item.get("derived_column")
+            or item.get("name")
+        )
+        if not isinstance(candidate, str):
+            continue
+        name = candidate.strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        derived.append(name)
+    return derived
+
+
+def _ensure_feature_engineering_plan_from_strategy(
+    contract: Dict[str, Any],
+    strategy: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+
+    normalized_fe = _normalize_strategy_feature_engineering_payload(strategy)
+    existing = contract.get("feature_engineering_plan")
+    if not isinstance(existing, dict):
+        existing = {}
+
+    techniques = normalized_fe.get("techniques") if isinstance(normalized_fe.get("techniques"), list) else []
+    existing_derived_raw = existing.get("derived_columns")
+    existing_entries: List[Any] = list(existing_derived_raw) if isinstance(existing_derived_raw, list) else []
+    existing_names = _extract_derived_column_names(existing_entries)
+    inferred_derived = _extract_derived_columns_from_fe_techniques(techniques)
+    seen_derived: set[str] = {str(name).strip().lower() for name in existing_names if str(name).strip()}
+    merged_derived_entries: List[Any] = list(existing_entries)
+    for name in inferred_derived:
+        candidate = str(name or "").strip()
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen_derived:
+            continue
+        seen_derived.add(key)
+        merged_derived_entries.append(candidate)
+    if not merged_derived_entries:
+        merged_derived_entries = []
+
+    notes = str(existing.get("notes") or normalized_fe.get("notes") or "").strip()
+    constraints = existing.get("constraints")
+    if not isinstance(constraints, dict):
+        constraints = {}
+    if isinstance(strategy, dict):
+        raw_constraints = strategy.get("feature_engineering_constraints")
+        if isinstance(raw_constraints, dict) and raw_constraints:
+            constraints = dict(raw_constraints)
+
+    contract["feature_engineering_plan"] = {
+        "techniques": techniques,
+        "derived_columns": merged_derived_entries,
+        "constraints": constraints,
+        "notes": notes,
+    }
+    return contract
+
+
 def _merge_scored_rows_schema(
     base_schema: Dict[str, Any] | None,
     incoming_schema: Dict[str, Any] | None,
@@ -10048,6 +10167,10 @@ class ExecutionPlannerAgent:
                     contract=contract,
                     strategy=strategy if isinstance(strategy, dict) else {},
                     business_objective=business_objective,
+                )
+                contract = _ensure_feature_engineering_plan_from_strategy(
+                    contract,
+                    strategy if isinstance(strategy, dict) else {},
                 )
                 # Apply deliverables canonicalization + auto-sync
                 contract = _apply_deliverables(contract)

@@ -62,8 +62,12 @@ class TestStrategistNormalization:
         }
         normalized = self.agent._normalize_strategist_output(parsed)
         strategy = normalized["strategies"][0]
+        fe_strategy = strategy.get("feature_engineering_strategy")
         assert isinstance(strategy.get("feature_engineering"), list)
-        assert strategy.get("feature_engineering") == strategy.get("feature_engineering_strategy")
+        assert isinstance(fe_strategy, dict)
+        assert isinstance(fe_strategy.get("techniques"), list)
+        assert fe_strategy.get("risk_level") in {"low", "med", "high"}
+        assert strategy.get("feature_engineering") == fe_strategy.get("techniques")
 
     def test_normalize_garbage(self):
         """Case: parsed = 'garbage' or None -> empty strategies"""

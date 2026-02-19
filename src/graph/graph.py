@@ -21034,6 +21034,345 @@ def finalize_runtime_failure(state: AgentState) -> AgentState:
     result["runtime_fix_terminal"] = True
     return result
 
+
+def _metric_improvement_policy(contract: Dict[str, Any] | None) -> Tuple[int, float]:
+    policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
+    if not isinstance(policy, dict):
+        policy = {}
+    rounds_raw = policy.get("metric_improvement_rounds", 1)
+    min_delta_raw = policy.get("metric_min_delta", 0.0005)
+    try:
+        rounds = int(rounds_raw)
+    except Exception:
+        rounds = 1
+    try:
+        min_delta = float(min_delta_raw)
+    except Exception:
+        min_delta = 0.0005
+    if rounds < 0:
+        rounds = 0
+    if min_delta < 0:
+        min_delta = 0.0
+    # Universal policy for this flow: at most one extra round.
+    rounds = min(rounds, 1)
+    return rounds, min_delta
+
+
+def _is_data_limited_mode_active(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
+    data_limited = contract.get("data_limited_mode") if isinstance(contract, dict) else {}
+    if isinstance(data_limited, bool):
+        return bool(data_limited)
+    if isinstance(data_limited, dict):
+        if bool(data_limited.get("is_active")):
+            return True
+        status = str(data_limited.get("status") or "").strip().lower()
+        if status in {"data_limited", "insufficient_signal"}:
+            return True
+    report = state.get("data_adequacy_report")
+    if isinstance(report, dict):
+        status = str(report.get("status") or "").strip().lower()
+        if status in {"data_limited", "insufficient_signal"}:
+            return True
+    return False
+
+
+def _should_run_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
+    if not isinstance(state, dict) or not isinstance(contract, dict):
+        return False
+    verdict = normalize_review_status(state.get("review_verdict"))
+    if verdict not in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+        return False
+    if bool(state.get("execution_error")) or bool(state.get("sandbox_failed")):
+        return False
+    if bool(state.get("ml_improvement_attempted")) or bool(state.get("ml_improvement_round_active")):
+        return False
+    if _is_data_limited_mode_active(state, contract):
+        return False
+    rounds, _ = _metric_improvement_policy(contract)
+    if rounds <= 0:
+        return False
+    done = int(state.get("ml_improvement_round_count", 0) or 0)
+    return done < rounds
+
+
+def _flatten_numeric_metrics_for_improvement(payload: Any, prefix: str = "") -> List[Tuple[str, float]]:
+    items: List[Tuple[str, float]] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            next_key = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, (int, float)):
+                items.append((next_key, float(value)))
+            elif isinstance(value, dict):
+                items.extend(_flatten_numeric_metrics_for_improvement(value, next_key))
+    return items
+
+
+def _extract_primary_metric(metrics_json: Dict[str, Any], metric_name: str) -> Optional[float]:
+    if not isinstance(metrics_json, dict):
+        return None
+    metric = str(metric_name or "").strip()
+    preferred_keys: List[str] = []
+    if metric:
+        preferred_keys.extend(
+            [
+                metric,
+                f"cv_{metric}",
+                f"{metric}_mean",
+                f"mean_{metric}",
+                f"primary_{metric}",
+            ]
+        )
+    preferred_keys.extend(["primary_metric_value", "metric_value", "score", "value", "cv_mean"])
+
+    flat = _flatten_numeric_metrics_for_improvement(metrics_json)
+
+    def _norm(text: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z]+", "", str(text or "").lower())
+
+    preferred_norm = [_norm(key) for key in preferred_keys if key]
+    for key, value in flat:
+        key_norm = _norm(key)
+        if any(token and token == key_norm for token in preferred_norm):
+            return float(value)
+    for key, value in flat:
+        key_norm = _norm(key)
+        if any(token and token in key_norm for token in preferred_norm):
+            return float(value)
+    return None
+
+
+def _is_improvement(
+    baseline_val: Optional[float],
+    improved_val: Optional[float],
+    higher_is_better: bool,
+    min_delta: float,
+) -> bool:
+    if baseline_val is None or improved_val is None:
+        return False
+    delta = float(improved_val) - float(baseline_val)
+    if not higher_is_better:
+        delta = -delta
+    return bool(delta >= float(min_delta))
+
+
+def _resolve_ml_outputs_for_metric_round(contract: Dict[str, Any], state: Dict[str, Any]) -> List[str]:
+    if not isinstance(contract, dict):
+        return []
+    outputs = _resolve_ml_heavy_runner_required_outputs(contract, state)
+    if not outputs:
+        try:
+            outputs = _normalize_output_path_list(get_required_outputs(contract))
+        except Exception:
+            outputs = []
+        excluded = _resolve_ml_de_input_exclusions(state)
+        outputs = [path for path in outputs if str(path or "").lower() not in excluded]
+
+    extras = ["data/metrics.json", "data/submission.csv", "data/scored_rows.csv"]
+    seen = {str(path).lower() for path in outputs}
+    for path in extras:
+        if path.lower() in seen:
+            continue
+        if os.path.exists(path):
+            outputs.append(path)
+            seen.add(path.lower())
+    return _normalize_output_path_list(outputs)
+
+
+def _snapshot_ml_outputs(output_paths: List[str], snapshot_dir: Path) -> None:
+    snapshot_root = Path(snapshot_dir)
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    manifest: Dict[str, Any] = {"paths": []}
+    for rel_path in _normalize_output_path_list(output_paths):
+        src = Path(rel_path)
+        exists = src.exists() and src.is_file()
+        manifest["paths"].append({"path": rel_path, "exists": bool(exists)})
+        if not exists:
+            continue
+        dst = snapshot_root / rel_path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    try:
+        with open(snapshot_root / "_snapshot_manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=True, indent=2)
+    except Exception:
+        pass
+
+
+def _restore_ml_outputs(snapshot_dir: Path, output_paths: List[str]) -> None:
+    snapshot_root = Path(snapshot_dir)
+    manifest_paths: List[str] = []
+    manifest_file = snapshot_root / "_snapshot_manifest.json"
+    if manifest_file.exists():
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            entries = payload.get("paths") if isinstance(payload, dict) else []
+            if isinstance(entries, list):
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    path = entry.get("path")
+                    if isinstance(path, str) and path.strip():
+                        manifest_paths.append(path.strip())
+        except Exception:
+            manifest_paths = []
+    candidates = _normalize_output_path_list((manifest_paths or []) + (output_paths or []))
+    for rel_path in candidates:
+        src = snapshot_root / rel_path
+        dst = Path(rel_path)
+        if src.exists() and src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        else:
+            if dst.exists() and dst.is_file():
+                try:
+                    dst.unlink()
+                except Exception:
+                    pass
+
+
+def _build_metric_improvement_feedback_block(
+    *,
+    feature_engineering_plan: Dict[str, Any],
+    advisor_advice: str,
+) -> str:
+    plan_compact = compress_long_lists(feature_engineering_plan or {})[0]
+    plan_text = json.dumps(plan_compact, ensure_ascii=True)
+    advice_text = str(advisor_advice or "").strip() or "- No-op suggestions: keep baseline."
+    return (
+        "\n\n# IMPROVEMENT_ROUND\n"
+        + "FEATURE_ENGINEERING_PLAN: "
+        + plan_text
+        + "\nRESULTS_ADVISOR_ADVICE:\n"
+        + advice_text
+    )
+
+
+def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
+    if not _should_run_metric_improvement_round(state, contract):
+        return False
+
+    metric_name = _resolve_contract_primary_metric_name(state, contract) or "roc_auc"
+    baseline_metrics = _load_json_safe("data/metrics.json")
+    if not isinstance(baseline_metrics, dict):
+        baseline_metrics = {}
+
+    baseline_value = _extract_primary_metric(baseline_metrics, metric_name)
+    if baseline_value is None:
+        snapshot = state.get("primary_metric_snapshot")
+        if isinstance(snapshot, dict):
+            baseline_value = _coerce_float(snapshot.get("primary_metric_value"))
+            snap_name = snapshot.get("primary_metric_name")
+            if isinstance(snap_name, str) and snap_name.strip():
+                metric_name = snap_name.strip()
+    if baseline_value is None:
+        return False
+
+    output_paths = _resolve_ml_outputs_for_metric_round(contract, state)
+    snapshot_dir = Path("work") / "ml_baseline_snapshot"
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    feature_engineering_plan = contract.get("feature_engineering_plan")
+    if not isinstance(feature_engineering_plan, dict):
+        feature_engineering_plan = {"techniques": [], "derived_columns": [], "notes": ""}
+
+    baseline_code = str(state.get("generated_code") or state.get("last_generated_code") or "")
+    advisor_context = {
+        "baseline_metrics": baseline_metrics,
+        "primary_metric_name": metric_name,
+        "feature_engineering_plan": feature_engineering_plan,
+        "baseline_ml_script_snippet": baseline_code[:4000],
+        "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
+        "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
+    }
+    advisor_advice = results_advisor.generate_feature_engineering_advice(advisor_context)
+    feedback_block = _build_metric_improvement_feedback_block(
+        feature_engineering_plan=feature_engineering_plan,
+        advisor_advice=advisor_advice,
+    )
+
+    history = list(state.get("feedback_history", []) or [])
+    history.append(feedback_block)
+    state["feedback_history"] = history[-25:]
+
+    existing_gate = state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+    gate_feedback = str(existing_gate.get("feedback") or "")
+    merged_feedback = (gate_feedback + feedback_block).strip() if gate_feedback else feedback_block.strip()
+    state["last_gate_context"] = {
+        **existing_gate,
+        "source": "qa_improvement_round",
+        "status": "REJECTED",
+        "failed_gates": list(existing_gate.get("failed_gates") or []) or ["metric_improvement_round"],
+        "required_fixes": list(existing_gate.get("required_fixes") or []) or ["Apply feature engineering plan incrementally."],
+        "feedback": merged_feedback,
+        "feature_engineering_plan": feature_engineering_plan,
+    }
+
+    rounds, min_delta = _metric_improvement_policy(contract)
+    state["ml_improvement_round_active"] = True
+    state["ml_improvement_round_count"] = int(state.get("ml_improvement_round_count", 0) or 0) + 1
+    state["ml_improvement_attempted"] = False
+    state["ml_improvement_kept"] = "pending"
+    state["ml_improvement_snapshot_dir"] = str(snapshot_dir)
+    state["ml_improvement_output_paths"] = output_paths
+    state["ml_improvement_primary_metric_name"] = metric_name
+    state["ml_improvement_baseline_metric"] = float(baseline_value)
+    state["ml_improvement_baseline_metrics"] = baseline_metrics
+    state["ml_improvement_baseline_review_verdict"] = normalize_review_status(state.get("review_verdict"))
+    state["ml_improvement_higher_is_better"] = bool(_metric_higher_is_better(metric_name))
+    state["ml_improvement_min_delta"] = float(min_delta)
+    state["ml_improvement_rounds_allowed"] = int(rounds)
+    state["last_iteration_type"] = "metric"
+    state["improvement_attempt_count"] = 0
+    return True
+
+
+def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> str:
+    metric_name = str(
+        state.get("ml_improvement_primary_metric_name")
+        or _resolve_contract_primary_metric_name(state, contract)
+        or "roc_auc"
+    ).strip()
+    baseline_value = _coerce_float(state.get("ml_improvement_baseline_metric"))
+    min_delta = float(state.get("ml_improvement_min_delta", 0.0005) or 0.0005)
+    higher_is_better = bool(state.get("ml_improvement_higher_is_better"))
+    output_paths = state.get("ml_improvement_output_paths") if isinstance(state.get("ml_improvement_output_paths"), list) else []
+    snapshot_dir = Path(str(state.get("ml_improvement_snapshot_dir") or Path("work") / "ml_baseline_snapshot"))
+    baseline_verdict = normalize_review_status(state.get("ml_improvement_baseline_review_verdict") or "APPROVED")
+    current_metrics = _load_json_safe("data/metrics.json")
+    if not isinstance(current_metrics, dict):
+        current_metrics = {}
+    improved_value = _extract_primary_metric(current_metrics, metric_name)
+    if improved_value is None:
+        snapshot = state.get("primary_metric_snapshot")
+        if isinstance(snapshot, dict):
+            improved_value = _coerce_float(snapshot.get("primary_metric_value"))
+
+    verdict = normalize_review_status(state.get("review_verdict"))
+    approved = verdict in {"APPROVED", "APPROVE_WITH_WARNINGS"}
+    improved = approved and _is_improvement(baseline_value, improved_value, higher_is_better, min_delta)
+
+    if not improved:
+        _restore_ml_outputs(snapshot_dir, output_paths)
+        state["ml_improvement_kept"] = "baseline"
+        state["review_verdict"] = baseline_verdict
+        state["stop_reason"] = "IMPROVEMENT_ROUND_RESTORE_BASELINE"
+    else:
+        state["ml_improvement_kept"] = "improved"
+        state["stop_reason"] = "IMPROVEMENT_ROUND_KEPT_IMPROVED"
+
+    decision_note = (
+        f"METRIC_IMPROVEMENT_ROUND: metric={metric_name} baseline={baseline_value} "
+        f"improved={improved_value} min_delta={min_delta} kept={state.get('ml_improvement_kept')}"
+    )
+    _append_feedback_history(state, decision_note)
+
+    state["ml_improvement_attempted"] = True
+    state["ml_improvement_round_active"] = False
+    state["last_iteration_type"] = None
+    return "approved"
+
+
 def check_evaluation(state: AgentState):
     # Helper to get metric info for logging
     def _get_metric_info():
@@ -21111,6 +21450,10 @@ def check_evaluation(state: AgentState):
         )
         state["stop_reason"] = "TERMINAL_RUNTIME_FAILURE"
         return "approved"
+
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    if state.get("ml_improvement_round_active"):
+        return _finalize_metric_improvement_round(state, contract)
 
     policy = _get_iteration_policy(state)
     last_iter_type = state.get("last_iteration_type")
@@ -21238,6 +21581,13 @@ def check_evaluation(state: AgentState):
         print(f"ITER_DECISION type=other action=stop reason=ADVISORY_ONLY metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         state["stop_reason"] = "ADVISORY_ONLY"
         return "approved"
+
+    if _bootstrap_metric_improvement_round(state, contract):
+        print(
+            f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT_ROUND "
+            f"metric={metric_name}:{metric_value} best={best_value} budget_left=1"
+        )
+        return "retry"
 
     # Results advisor can explicitly route an approved/warning run into improve mode.
     if (
