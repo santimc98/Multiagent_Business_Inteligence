@@ -3055,6 +3055,131 @@ def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | 
     return resolved
 
 
+def _extract_output_path_candidate(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for key in ("path", "output", "artifact", "output_path", "file"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return ""
+
+
+def _normalize_output_path_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in values:
+        candidate = _extract_output_path_candidate(item)
+        if not candidate:
+            continue
+        path = _normalize_output_path(candidate)
+        if not path:
+            continue
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(path)
+    return normalized
+
+
+def _path_match_variants(path: Any) -> List[str]:
+    text = str(path or "").strip()
+    if not text:
+        return []
+    variants: List[str] = []
+    primary = _normalize_output_path(text)
+    if primary:
+        variants.append(primary)
+    if os.path.isabs(text):
+        try:
+            rel = _normalize_output_path(os.path.relpath(text, "."))
+            if rel and not rel.startswith("../") and rel not in variants:
+                variants.append(rel)
+        except Exception:
+            pass
+    return variants
+
+
+def _resolve_ml_de_input_exclusions(state: Dict[str, Any] | None) -> set[str]:
+    excluded: set[str] = set()
+    for item in (CANONICAL_CLEANED_REL, CANONICAL_MANIFEST_REL, "data/cleaned_full.csv"):
+        for variant in _path_match_variants(item):
+            excluded.add(variant.lower())
+    if isinstance(state, dict):
+        de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+        if isinstance(de_view, dict):
+            for key in ("output_path", "output_manifest_path", "manifest_path"):
+                value = de_view.get(key)
+                for variant in _path_match_variants(value):
+                    excluded.add(variant.lower())
+    return excluded
+
+
+def _resolve_artifact_requirement_outputs(contract: Dict[str, Any]) -> List[str]:
+    artifact_requirements = get_artifact_requirements(contract) if isinstance(contract, dict) else {}
+    if not isinstance(artifact_requirements, dict):
+        artifact_requirements = {}
+    candidates: List[Any] = []
+    for key in ("required_outputs", "required_files"):
+        values = artifact_requirements.get(key)
+        if isinstance(values, list):
+            candidates.extend(values)
+    return _normalize_output_path_list(candidates)
+
+
+def _resolve_ml_heavy_runner_required_outputs(
+    contract: Dict[str, Any],
+    state: Dict[str, Any] | None = None,
+) -> List[str]:
+    """
+    Resolve ML heavy-runner required outputs with a single source of truth:
+    1) owner-filtered contract.required_outputs for ml_engineer
+    2) canonical required_outputs fallback
+    3) artifact_requirements fallback
+
+    DE pipeline inputs (cleaned_data/manifest) are excluded deterministically.
+    """
+    if not isinstance(contract, dict):
+        return []
+
+    owner_filtered: List[str] = []
+    try:
+        from src.utils.contract_accessors import get_required_outputs_by_owner
+        owner_filtered = get_required_outputs_by_owner(contract, "ml_engineer")
+    except Exception:
+        owner_filtered = []
+
+    candidates_by_priority: List[List[str]] = [
+        _normalize_output_path_list(owner_filtered),
+        _resolve_required_outputs(contract, state),
+        _resolve_artifact_requirement_outputs(contract),
+    ]
+    excluded = _resolve_ml_de_input_exclusions(state)
+
+    for candidates in candidates_by_priority:
+        if not candidates:
+            continue
+        filtered: List[str] = []
+        seen: set[str] = set()
+        for path in candidates:
+            normalized = _normalize_output_path(path)
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in excluded or key in seen:
+                continue
+            seen.add(key)
+            filtered.append(normalized)
+        if filtered:
+            return filtered
+
+    return []
+
+
 def _resolve_optional_runtime_downloads(contract: Dict[str, Any]) -> List[str]:
     """
     Resolve non-blocking artifacts that should be pulled from sandbox outputs when present.
@@ -17533,11 +17658,7 @@ def execute_code(state: AgentState) -> AgentState:
             csv_decimal = dialect["decimal"]
             csv_encoding = dialect["encoding"]
             eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
-            # Filter required_outputs by owner so ML engineer is only checked
-            # against ML artifacts (not DE artifacts like cleaned_data.csv).
-            from src.utils.contract_accessors import get_required_outputs_by_owner
-            ml_required = get_required_outputs_by_owner(contract, "ml_engineer")
-            required_outputs = ml_required if ml_required else _resolve_required_outputs(contract, state)
+            required_outputs = _resolve_ml_heavy_runner_required_outputs(contract, state)
             expected_outputs = _resolve_expected_output_paths(contract, state)
             preserve_paths = []
             ml_candidate_paths = _candidate_ml_input_paths(state if isinstance(state, dict) else {})
@@ -17667,19 +17788,7 @@ def execute_code(state: AgentState) -> AgentState:
 
             decisioning_names = _extract_decisioning_required_names(contract)
 
-            # Heavy-runner request must include all contract-required outputs.
-            # Keep owner-filtered fallback only when the canonical list is absent.
-            required_artifacts = _resolve_required_outputs(contract, state)
-            if not required_artifacts:
-                from src.utils.contract_accessors import get_required_outputs_by_owner as _get_ro_owner
-                required_artifacts = _get_ro_owner(contract, "ml_engineer")
-            if not isinstance(required_artifacts, list):
-                required_artifacts = []
-            required_artifacts = [
-                str(path).strip().lstrip("/").replace("\\", "/")
-                for path in required_artifacts
-                if path
-            ]
+            required_artifacts = list(required_outputs)
             optional_download_artifacts = _resolve_optional_runtime_downloads(contract)
             optional_download_artifacts = [
                 str(path).strip().lstrip("/").replace("\\", "/")

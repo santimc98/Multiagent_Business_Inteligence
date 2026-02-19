@@ -130,4 +130,5 @@ def test_manifest_patching_logic(tmp_path, monkeypatch):
     assert len(launched_requests) > 0, "Heavy runner should have been launched"
     required_in_request = launched_requests[0].get("required_outputs", [])
     assert "data/metrics.json" in required_in_request
-    assert "data/cleaning_manifest.json" in required_in_request
+    assert "data/cleaning_manifest.json" not in required_in_request
+    assert "data/cleaned_data.csv" not in required_in_request
