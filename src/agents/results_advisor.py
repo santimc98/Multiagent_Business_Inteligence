@@ -10,6 +10,7 @@ from openai import OpenAI
 
 from src.utils.retries import call_with_retries
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
+from src.utils.reviewer_llm import init_reviewer_llm
 
 load_dotenv()
 
@@ -20,7 +21,8 @@ class ResultsAdvisorAgent:
     """
 
     def __init__(self, api_key: Any = None):
-        self.api_key = api_key or os.getenv("MIMO_API_KEY")
+        explicit_api_key = api_key
+        self.api_key = explicit_api_key if explicit_api_key is not None else os.getenv("MIMO_API_KEY")
         if not self.api_key:
             self.client = None
         else:
@@ -32,6 +34,29 @@ class ResultsAdvisorAgent:
         self.model_name = "mimo-v2-flash"
         self.last_prompt = None
         self.last_response = None
+        self.fe_advice_mode = self._normalize_fe_advice_mode(
+            os.getenv("RESULTS_ADVISOR_FE_MODE", "hybrid")
+        )
+        self.fe_provider = "none"
+        self.fe_client = None
+        self.fe_model_name = None
+        self.fe_model_warning = None
+        self.last_fe_advice_meta: Dict[str, Any] = {
+            "mode": self.fe_advice_mode,
+            "source": "deterministic",
+            "provider": "none",
+            "model": None,
+        }
+        # Tests frequently instantiate with api_key="" to force non-network mode.
+        if explicit_api_key is not None and str(explicit_api_key).strip() == "":
+            return
+        if self.fe_advice_mode in {"llm", "hybrid"}:
+            (
+                self.fe_provider,
+                self.fe_client,
+                self.fe_model_name,
+                self.fe_model_warning,
+            ) = init_reviewer_llm(None)
 
     def generate_ml_advice(self, context: Dict[str, Any]) -> str:
         if not context:
@@ -84,6 +109,123 @@ class ResultsAdvisorAgent:
         return (content or "").strip()
 
     def generate_feature_engineering_advice(self, context: Dict[str, Any]) -> str:
+        """
+        FE coach for editor mode (deterministic/llm/hybrid).
+        Returns short actionable bullets (no STOP/CONTINUE decisions).
+        """
+        deterministic = self._generate_feature_engineering_advice_deterministic(context)
+        mode = self.fe_advice_mode
+        self.last_fe_advice_meta = {
+            "mode": mode,
+            "source": "deterministic",
+            "provider": self.fe_provider,
+            "model": self.fe_model_name,
+        }
+        if mode == "deterministic":
+            return deterministic
+
+        llm_text = self._generate_feature_engineering_advice_llm(context)
+        if llm_text:
+            self.last_fe_advice_meta = {
+                "mode": mode,
+                "source": "llm",
+                "provider": self.fe_provider,
+                "model": self.fe_model_name,
+            }
+            return llm_text
+
+        self.last_fe_advice_meta = {
+            "mode": mode,
+            "source": "deterministic_fallback",
+            "provider": self.fe_provider,
+            "model": self.fe_model_name,
+        }
+        return deterministic
+
+    def _normalize_fe_advice_mode(self, raw: Any) -> str:
+        value = str(raw or "").strip().lower()
+        if value in {"llm", "hybrid", "deterministic"}:
+            return value
+        return "hybrid"
+
+    def _generate_feature_engineering_advice_llm(self, context: Dict[str, Any]) -> str:
+        if not isinstance(context, dict):
+            return ""
+        if not self.fe_client or self.fe_provider == "none":
+            return ""
+
+        primary_metric = str(context.get("primary_metric_name") or "primary_metric").strip() or "primary_metric"
+        payload = {
+            "primary_metric_name": primary_metric,
+            "baseline_metrics": context.get("baseline_metrics") if isinstance(context.get("baseline_metrics"), dict) else {},
+            "feature_engineering_plan": context.get("feature_engineering_plan") if isinstance(context.get("feature_engineering_plan"), dict) else {},
+            "dataset_profile": context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {},
+            "column_roles": context.get("column_roles") if isinstance(context.get("column_roles"), dict) else {},
+            "baseline_ml_script_snippet": self._truncate(str(context.get("baseline_ml_script_snippet") or ""), 5000),
+        }
+        compact_payload = self._truncate(json.dumps(payload, ensure_ascii=True), 14000)
+        system_prompt = (
+            "You are a senior ML feature-engineering coach. "
+            "Return ONLY concise bullet points in plain text (max 12 lines). "
+            "Do not decide STOP/CONTINUE. "
+            "Give incremental script-edit guidance for editor mode. "
+            "Focus on: where to edit, leakage guards, CV-safe fitting, and contract alignment."
+        )
+        user_prompt = (
+            "CONTEXT_JSON:\n"
+            + compact_payload
+            + "\n\nINSTRUCTIONS:\n"
+            "- Keep existing script structure and change the minimum necessary.\n"
+            "- If plan techniques exist, prioritize them.\n"
+            "- If plan is empty, provide up to 2 universal low-cost techniques only if signals exist.\n"
+            "- Mention where to edit (e.g., build_features, preprocessing block).\n"
+        )
+
+        try:
+            if self.fe_provider == "gemini":
+                response = self.fe_client.generate_content(system_prompt + "\n\n" + user_prompt)
+                content = response.text
+            else:
+                response = self.fe_client.chat.completions.create(
+                    model=self.fe_model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.1,
+                )
+                content = response.choices[0].message.content
+        except Exception:
+            return ""
+
+        return self._normalize_llm_advice_bullets(content)
+
+    def _normalize_llm_advice_bullets(self, raw_text: Any) -> str:
+        text = str(raw_text or "").strip()
+        if not text:
+            return ""
+        text = text.replace("```text", "").replace("```", "").strip()
+        lines: List[str] = []
+        for raw_line in text.splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            lowered = line.lower()
+            if lowered in {"advice:", "suggestions:", "output:"}:
+                continue
+            if line.startswith(("- ", "* ")):
+                cleaned = "- " + line[2:].strip()
+            elif re.match(r"^\d+\.\s+", line):
+                cleaned = "- " + re.sub(r"^\d+\.\s+", "", line).strip()
+            else:
+                cleaned = "- " + line
+            if cleaned not in lines:
+                lines.append(cleaned)
+            if len(lines) >= 12:
+                break
+        return "\n".join(lines[:12]).strip()
+
+    def _generate_feature_engineering_advice_deterministic(self, context: Dict[str, Any]) -> str:
         """
         Deterministic FE coach for editor mode.
         Returns short actionable bullets (no STOP/CONTINUE decisions).

@@ -21286,6 +21286,19 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
     }
     advisor_advice = results_advisor.generate_feature_engineering_advice(advisor_context)
+    advisor_meta = (
+        results_advisor.last_fe_advice_meta
+        if isinstance(getattr(results_advisor, "last_fe_advice_meta", None), dict)
+        else {}
+    )
+    if advisor_meta:
+        print(
+            "RESULTS_ADVISOR_FE_ADVICE: "
+            + f"mode={advisor_meta.get('mode')} "
+            + f"source={advisor_meta.get('source')} "
+            + f"provider={advisor_meta.get('provider')} "
+            + f"model={advisor_meta.get('model')}"
+        )
     feedback_block = _build_metric_improvement_feedback_block(
         feature_engineering_plan=feature_engineering_plan,
         advisor_advice=advisor_advice,

@@ -38,3 +38,76 @@ def test_generate_feature_engineering_advice_fallback_is_universal_and_bounded()
     assert any("missing indicators" in line.lower() for line in lines)
     assert any("categorias raras" in line.lower() for line in lines)
     assert len(lines) <= 12
+
+
+class _FakeGeminiResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _FakeGeminiClient:
+    def __init__(self, text: str = "", error: Exception | None = None) -> None:
+        self._text = text
+        self._error = error
+
+    def generate_content(self, prompt: str):
+        if self._error is not None:
+            raise self._error
+        return _FakeGeminiResponse(self._text)
+
+
+def test_generate_feature_engineering_advice_hybrid_uses_llm_when_available(monkeypatch) -> None:
+    monkeypatch.setenv("RESULTS_ADVISOR_FE_MODE", "hybrid")
+
+    def _fake_init(_api_key):
+        return (
+            "gemini",
+            _FakeGeminiClient("- Edita build_features con tecnica A\n- Manten CV-safe fit"),
+            "gemini-3-flash-preview",
+            None,
+        )
+
+    monkeypatch.setattr("src.agents.results_advisor.init_reviewer_llm", _fake_init)
+
+    advisor = ResultsAdvisorAgent()
+    advice = advisor.generate_feature_engineering_advice(
+        {
+            "baseline_metrics": {"model_performance": {"roc_auc": 0.70}},
+            "primary_metric_name": "roc_auc",
+            "feature_engineering_plan": {"techniques": [{"technique": "interaction"}]},
+            "baseline_ml_script_snippet": "def build_features(df):\n    return df\n",
+            "dataset_profile": {},
+            "column_roles": {},
+        }
+    )
+    assert "tecnica A".lower() in advice.lower()
+    assert advisor.last_fe_advice_meta.get("source") == "llm"
+    assert advisor.last_fe_advice_meta.get("model") == "gemini-3-flash-preview"
+
+
+def test_generate_feature_engineering_advice_hybrid_fallbacks_to_deterministic_on_llm_error(monkeypatch) -> None:
+    monkeypatch.setenv("RESULTS_ADVISOR_FE_MODE", "hybrid")
+
+    def _fake_init(_api_key):
+        return (
+            "gemini",
+            _FakeGeminiClient(error=RuntimeError("llm unavailable")),
+            "gemini-3-flash-preview",
+            None,
+        )
+
+    monkeypatch.setattr("src.agents.results_advisor.init_reviewer_llm", _fake_init)
+
+    advisor = ResultsAdvisorAgent()
+    advice = advisor.generate_feature_engineering_advice(
+        {
+            "baseline_metrics": {"model_performance": {"roc_auc": 0.70}},
+            "primary_metric_name": "roc_auc",
+            "feature_engineering_plan": {"techniques": [{"technique": "interaction"}]},
+            "baseline_ml_script_snippet": "def train():\n    pass\n",
+            "dataset_profile": {},
+            "column_roles": {},
+        }
+    )
+    assert "build_features" in advice
+    assert advisor.last_fe_advice_meta.get("source") == "deterministic_fallback"
