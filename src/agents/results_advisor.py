@@ -3,6 +3,7 @@ import json
 import csv
 import re
 from statistics import median
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -11,6 +12,7 @@ from openai import OpenAI
 from src.utils.retries import call_with_retries
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 from src.utils.reviewer_llm import init_reviewer_llm
+from src.utils.actor_critic_schemas import validate_advisor_critique_packet
 
 load_dotenv()
 
@@ -41,12 +43,22 @@ class ResultsAdvisorAgent:
         self.fe_client = None
         self.fe_model_name = None
         self.fe_model_warning = None
+        self.critique_mode = self._normalize_critique_mode(
+            os.getenv("RESULTS_ADVISOR_CRITIQUE_MODE", "hybrid")
+        )
         self.last_fe_advice_meta: Dict[str, Any] = {
             "mode": self.fe_advice_mode,
             "source": "deterministic",
             "provider": "none",
             "model": None,
         }
+        self.last_critique_meta: Dict[str, Any] = {
+            "mode": self.critique_mode,
+            "source": "deterministic",
+            "provider": "none",
+            "model": None,
+        }
+        self.last_critique_packet: Dict[str, Any] = {}
         # Tests frequently instantiate with api_key="" to force non-network mode.
         if explicit_api_key is not None and str(explicit_api_key).strip() == "":
             return
@@ -147,6 +159,426 @@ class ResultsAdvisorAgent:
         if value in {"llm", "hybrid", "deterministic"}:
             return value
         return "hybrid"
+
+    def _normalize_critique_mode(self, raw: Any) -> str:
+        value = str(raw or "").strip().lower()
+        if value in {"llm", "hybrid", "deterministic"}:
+            return value
+        return "hybrid"
+
+    def generate_critique_packet(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        deterministic = self._generate_critique_packet_deterministic(context)
+        mode = self.critique_mode
+        self.last_critique_meta = {
+            "mode": mode,
+            "source": "deterministic",
+            "provider": self.fe_provider,
+            "model": self.fe_model_name,
+        }
+        if mode == "deterministic":
+            self.last_critique_packet = deterministic
+            return deterministic
+
+        llm_packet = self._generate_critique_packet_llm(context)
+        valid_packet, validation_errors = validate_advisor_critique_packet(llm_packet)
+        if valid_packet:
+            self.last_critique_meta = {
+                "mode": mode,
+                "source": "llm",
+                "provider": self.fe_provider,
+                "model": self.fe_model_name,
+            }
+            self.last_critique_packet = llm_packet
+            return llm_packet
+
+        self.last_critique_meta = {
+            "mode": mode,
+            "source": "deterministic_fallback",
+            "provider": self.fe_provider,
+            "model": self.fe_model_name,
+            "validation_errors": validation_errors[:6],
+        }
+        self.last_critique_packet = deterministic
+        return deterministic
+
+    def _generate_critique_packet_llm(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(context, dict):
+            return {}
+        if not self.fe_client or self.fe_provider == "none":
+            return {}
+
+        payload = {
+            "run_id": str(context.get("run_id") or "unknown_run"),
+            "iteration": int(context.get("iteration") or 0),
+            "primary_metric_name": str(context.get("primary_metric_name") or "primary_metric"),
+            "higher_is_better": bool(context.get("higher_is_better", True)),
+            "min_delta": float(context.get("min_delta", 0.0005) or 0.0005),
+            "baseline_metrics": context.get("baseline_metrics") if isinstance(context.get("baseline_metrics"), dict) else {},
+            "candidate_metrics": context.get("candidate_metrics") if isinstance(context.get("candidate_metrics"), dict) else {},
+            "active_gates_context": context.get("active_gates_context") if isinstance(context.get("active_gates_context"), list) else [],
+            "dataset_profile": context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {},
+            "column_roles": context.get("column_roles") if isinstance(context.get("column_roles"), dict) else {},
+        }
+        compact_payload = self._truncate(json.dumps(payload, ensure_ascii=True), 14000)
+        system_prompt = (
+            "You are a strict ML critic. Return ONLY a JSON object with no markdown. "
+            "Do not provide code advice. Focus on metric deltas, validation signals, and error modes."
+        )
+        user_prompt = (
+            "Return JSON with this exact contract:\n"
+            "{packet_type:'advisor_critique_packet',packet_version:'1.0',run_id,iteration,timestamp_utc,"
+            "primary_metric_name,higher_is_better,metric_comparison:{baseline_value,candidate_value,delta_abs,delta_rel,min_delta_required,meets_min_delta},"
+            "validation_signals:{validation_mode,cv?,holdout?,generalization_gap?},"
+            "error_modes:[{id,severity,confidence,evidence,affected_scope,metric_impact_direction}],"
+            "risk_flags:[...],active_gates_context:[...],analysis_summary,strictly_no_code_advice:true}\n"
+            "Max 5 error_modes, analysis_summary max 280 chars.\n"
+            "CONTEXT_JSON:\n"
+            + compact_payload
+        )
+
+        try:
+            if self.fe_provider == "gemini":
+                response = self.fe_client.generate_content(system_prompt + "\n\n" + user_prompt)
+                raw_text = response.text
+            else:
+                response = self.fe_client.chat.completions.create(
+                    model=self.fe_model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.0,
+                )
+                raw_text = response.choices[0].message.content
+        except Exception:
+            return {}
+
+        return self._parse_json_object(raw_text)
+
+    def _parse_json_object(self, raw_text: Any) -> Dict[str, Any]:
+        text = str(raw_text or "").strip()
+        if not text:
+            return {}
+        cleaned = text.replace("```json", "").replace("```", "").strip()
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(cleaned[start : end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+        return {}
+
+    def _metric_higher_is_better_name(self, metric_name: str) -> bool:
+        token = self._normalize_metric_token(metric_name)
+        lower_is_better_tokens = {
+            "rmse",
+            "mae",
+            "mse",
+            "mape",
+            "smape",
+            "loss",
+            "logloss",
+            "error",
+        }
+        return token not in lower_is_better_tokens
+
+    def _extract_cv_fold_count(self, metrics_payload: Dict[str, Any]) -> int:
+        for key in ("cv_folds", "n_folds", "fold_count", "cv_fold_count"):
+            value = metrics_payload.get(key)
+            try:
+                parsed = int(value)
+            except Exception:
+                continue
+            if parsed >= 2:
+                return parsed
+        return 5
+
+    def _extract_cv_and_holdout_signals(
+        self,
+        metrics_payload: Dict[str, Any],
+        metric_name: str,
+        dataset_profile: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        flat = self._flatten_numeric_metrics(metrics_payload or {})
+        metric_token = self._normalize_metric_token(metric_name)
+
+        cv_metric_value = None
+        holdout_metric_value = None
+        cv_std_value = None
+        for key, value in flat.items():
+            key_token = self._normalize_metric_token(key)
+            if not key_token:
+                continue
+            if metric_token and metric_token in key_token:
+                if cv_metric_value is None and ("cv" in key_token or "cross" in key_token):
+                    cv_metric_value = float(value)
+                if holdout_metric_value is None and any(
+                    token in key_token for token in ("holdout", "validation", "val", "test")
+                ):
+                    holdout_metric_value = float(value)
+            if cv_std_value is None and "cv" in key_token and "std" in key_token:
+                cv_std_value = float(value)
+
+        if cv_std_value is None:
+            fallback_std = metrics_payload.get("cv_std")
+            if isinstance(fallback_std, (int, float)):
+                cv_std_value = float(fallback_std)
+        if cv_metric_value is None:
+            cv_metric_value = self._extract_metric_value_for_name(metrics_payload, metric_name)
+        if holdout_metric_value is None:
+            for holdout_key in ("holdout_score", "validation_score", "val_score", "test_score"):
+                value = metrics_payload.get(holdout_key)
+                if isinstance(value, (int, float)):
+                    holdout_metric_value = float(value)
+                    break
+
+        validation_mode = "unknown"
+        validation_signals: Dict[str, Any] = {}
+        if cv_metric_value is not None and holdout_metric_value is not None:
+            validation_mode = "cv_and_holdout"
+        elif cv_metric_value is not None:
+            validation_mode = "cv"
+        elif holdout_metric_value is not None:
+            validation_mode = "holdout"
+        validation_signals["validation_mode"] = validation_mode
+
+        if cv_metric_value is not None:
+            cv_std = abs(float(cv_std_value)) if isinstance(cv_std_value, (int, float)) else 0.0
+            variance_level = "low"
+            if cv_std >= 0.03:
+                variance_level = "high"
+            elif cv_std >= 0.015:
+                variance_level = "medium"
+            validation_signals["cv"] = {
+                "cv_mean": float(cv_metric_value),
+                "cv_std": float(cv_std),
+                "fold_count": int(self._extract_cv_fold_count(metrics_payload)),
+                "variance_level": variance_level,
+            }
+
+        if holdout_metric_value is not None:
+            sample_count = None
+            for key in ("holdout_sample_count", "sample_count", "validation_rows"):
+                value = context.get(key)
+                try:
+                    parsed = int(value)
+                except Exception:
+                    continue
+                if parsed > 0:
+                    sample_count = parsed
+                    break
+            if sample_count is None:
+                rows = dataset_profile.get("n_rows") if isinstance(dataset_profile, dict) else None
+                try:
+                    parsed_rows = int(rows)
+                except Exception:
+                    parsed_rows = 0
+                sample_count = max(1, parsed_rows) if parsed_rows > 0 else 1
+            validation_signals["holdout"] = {
+                "metric_value": float(holdout_metric_value),
+                "split_name": str(context.get("holdout_split_name") or "holdout"),
+                "sample_count": int(sample_count),
+                "class_distribution_shift": str(
+                    context.get("class_distribution_shift") or "unknown"
+                ),
+            }
+
+        if cv_metric_value is not None and holdout_metric_value is not None:
+            validation_signals["generalization_gap"] = float(holdout_metric_value - cv_metric_value)
+        return validation_signals
+
+    def _build_critique_error_modes(
+        self,
+        *,
+        metrics_payload: Dict[str, Any],
+        validation_signals: Dict[str, Any],
+        meets_min_delta: bool,
+    ) -> List[Dict[str, Any]]:
+        error_modes: List[Dict[str, Any]] = []
+        flat = self._flatten_numeric_metrics(metrics_payload or {})
+
+        minority_recall = None
+        for key, value in flat.items():
+            token = self._normalize_metric_token(key)
+            if "minority" in token and "recall" in token:
+                minority_recall = float(value)
+                break
+        if minority_recall is not None and minority_recall < 0.35:
+            error_modes.append(
+                {
+                    "id": "minority_class_recall_low",
+                    "severity": "high",
+                    "confidence": 0.85,
+                    "evidence": "Minority-class recall below 0.35 in validation outputs.",
+                    "affected_scope": "minority_class",
+                    "metric_impact_direction": "negative",
+                }
+            )
+
+        cv_block = validation_signals.get("cv") if isinstance(validation_signals.get("cv"), dict) else {}
+        cv_std = cv_block.get("cv_std")
+        if isinstance(cv_std, (int, float)) and float(cv_std) >= 0.03:
+            error_modes.append(
+                {
+                    "id": "fold_instability",
+                    "severity": "medium",
+                    "confidence": 0.78,
+                    "evidence": "Cross-validation std indicates high fold variance.",
+                    "affected_scope": "cross_validation",
+                    "metric_impact_direction": "negative",
+                }
+            )
+
+        gap = validation_signals.get("generalization_gap")
+        if isinstance(gap, (int, float)) and abs(float(gap)) >= 0.02:
+            error_modes.append(
+                {
+                    "id": "generalization_gap_high",
+                    "severity": "medium",
+                    "confidence": 0.72,
+                    "evidence": "Large CV-holdout gap suggests unstable generalization.",
+                    "affected_scope": "holdout",
+                    "metric_impact_direction": "negative",
+                }
+            )
+
+        if not bool(meets_min_delta):
+            error_modes.append(
+                {
+                    "id": "delta_below_threshold",
+                    "severity": "low",
+                    "confidence": 0.8,
+                    "evidence": "Metric delta does not meet configured minimum threshold.",
+                    "affected_scope": "primary_metric",
+                    "metric_impact_direction": "negative",
+                }
+            )
+        return error_modes[:5]
+
+    def _generate_critique_packet_deterministic(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        context = context if isinstance(context, dict) else {}
+        run_id = str(context.get("run_id") or "unknown_run")
+        try:
+            iteration = int(context.get("iteration") or 0)
+        except Exception:
+            iteration = 0
+        primary_metric_name = str(context.get("primary_metric_name") or "primary_metric").strip() or "primary_metric"
+        higher_is_better = bool(
+            context.get("higher_is_better")
+            if context.get("higher_is_better") is not None
+            else self._metric_higher_is_better_name(primary_metric_name)
+        )
+        min_delta = self._coerce_number(context.get("min_delta"), ".")
+        if min_delta is None:
+            min_delta = 0.0005
+        min_delta = max(0.0, float(min_delta))
+
+        baseline_metrics = context.get("baseline_metrics")
+        if not isinstance(baseline_metrics, dict):
+            baseline_metrics = {}
+        candidate_metrics = context.get("candidate_metrics")
+        if not isinstance(candidate_metrics, dict):
+            candidate_metrics = baseline_metrics
+
+        baseline_value = self._extract_metric_value_for_name(baseline_metrics, primary_metric_name)
+        candidate_value = self._extract_metric_value_for_name(candidate_metrics, primary_metric_name)
+        if baseline_value is None:
+            baseline_value = 0.0
+        if candidate_value is None:
+            candidate_value = baseline_value
+        delta_abs = float(candidate_value - baseline_value)
+        baseline_abs = abs(float(baseline_value)) if abs(float(baseline_value)) > 1e-9 else 1.0
+        delta_rel = float(delta_abs / baseline_abs)
+        if higher_is_better:
+            meets_min_delta = delta_abs >= min_delta
+        else:
+            meets_min_delta = (-delta_abs) >= min_delta
+
+        dataset_profile = context.get("dataset_profile")
+        if not isinstance(dataset_profile, dict):
+            dataset_profile = {}
+        validation_signals = self._extract_cv_and_holdout_signals(
+            candidate_metrics,
+            primary_metric_name,
+            dataset_profile,
+            context,
+        )
+        error_modes = self._build_critique_error_modes(
+            metrics_payload=candidate_metrics,
+            validation_signals=validation_signals,
+            meets_min_delta=meets_min_delta,
+        )
+        risk_flags: List[str] = []
+        for mode in error_modes:
+            mode_id = str(mode.get("id") or "")
+            if mode_id == "minority_class_recall_low":
+                risk_flags.append("class_imbalance_sensitivity")
+            elif mode_id == "fold_instability":
+                risk_flags.append("potential_overfitting")
+            elif mode_id == "generalization_gap_high":
+                risk_flags.append("generalization_instability")
+        if not risk_flags and not meets_min_delta:
+            risk_flags.append("no_material_metric_gain")
+
+        active_gates = context.get("active_gates_context")
+        if not isinstance(active_gates, list):
+            active_gates = []
+        active_gates = [str(item) for item in active_gates if str(item).strip()][:30]
+
+        summary_parts = []
+        summary_parts.append("No material gain vs baseline." if not meets_min_delta else "Candidate meets min delta.")
+        if any(mode.get("id") == "minority_class_recall_low" for mode in error_modes):
+            summary_parts.append("Minority-class signal remains weak.")
+        if any(mode.get("id") == "fold_instability" for mode in error_modes):
+            summary_parts.append("Cross-validation variance is elevated.")
+        analysis_summary = " ".join(summary_parts).strip() or "Deterministic critique packet generated."
+        analysis_summary = analysis_summary[:280]
+
+        packet: Dict[str, Any] = {
+            "packet_type": "advisor_critique_packet",
+            "packet_version": "1.0",
+            "run_id": run_id,
+            "iteration": iteration,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "primary_metric_name": primary_metric_name,
+            "higher_is_better": higher_is_better,
+            "metric_comparison": {
+                "baseline_value": float(baseline_value),
+                "candidate_value": float(candidate_value),
+                "delta_abs": float(delta_abs),
+                "delta_rel": float(delta_rel),
+                "min_delta_required": float(min_delta),
+                "meets_min_delta": bool(meets_min_delta),
+            },
+            "validation_signals": validation_signals,
+            "error_modes": error_modes,
+            "risk_flags": list(dict.fromkeys(risk_flags)),
+            "active_gates_context": active_gates,
+            "analysis_summary": analysis_summary,
+            "strictly_no_code_advice": True,
+        }
+        valid_packet, errors = validate_advisor_critique_packet(packet)
+        if valid_packet:
+            return packet
+        packet["error_modes"] = []
+        packet["risk_flags"] = ["critique_schema_repair_applied"]
+        packet["analysis_summary"] = "Deterministic critique packet generated with limited diagnostics."
+        packet["validation_signals"] = {"validation_mode": "unknown"}
+        packet["strictly_no_code_advice"] = True
+        _, _ = validate_advisor_critique_packet(packet)
+        if errors:
+            packet["_validation_warnings"] = errors[:4]
+        return packet
 
     def _generate_feature_engineering_advice_llm(self, context: Dict[str, Any]) -> str:
         if not isinstance(context, dict):

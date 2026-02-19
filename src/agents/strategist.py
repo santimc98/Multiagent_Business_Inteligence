@@ -3,12 +3,19 @@ import json
 import re
 import hashlib
 import logging
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 from src.utils.senior_protocol import SENIOR_STRATEGY_PROTOCOL
 from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
+from src.utils.actor_critic_schemas import (
+    build_noop_iteration_hypothesis_packet,
+    normalize_target_columns,
+    validate_iteration_hypothesis_packet,
+)
+from src.utils.experiment_tracker import build_hypothesis_signature
 
 load_dotenv()
 
@@ -112,6 +119,15 @@ class StrategistAgent:
             self._max_tokens = max(1024, int(_max_tokens_raw))
         except (ValueError, TypeError):
             self._max_tokens = 8192
+        self.iteration_mode = self._normalize_iteration_mode(
+            os.getenv("STRATEGIST_ITERATION_MODE", "deterministic")
+        )
+        self.last_iteration_hypothesis: Dict[str, Any] = {}
+        self.last_iteration_meta: Dict[str, Any] = {
+            "mode": self.iteration_mode,
+            "source": "deterministic",
+            "model": None,
+        }
         self.model = _OpenRouterModelShim(self)
 
     def _call_model(self, prompt: str, *, temperature: float, context_tag: str) -> str:
@@ -126,6 +142,340 @@ class StrategistAgent:
         if not self.last_model_used:
             self.last_model_used = self.model_name
         return content
+
+    def _normalize_iteration_mode(self, raw: Any) -> str:
+        value = str(raw or "").strip().lower()
+        if value in {"llm", "hybrid", "deterministic"}:
+            return value
+        return "deterministic"
+
+    def generate_iteration_hypothesis(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        deterministic_packet = self._generate_iteration_hypothesis_deterministic(context)
+        mode = self.iteration_mode
+        self.last_iteration_meta = {
+            "mode": mode,
+            "source": "deterministic",
+            "model": None,
+        }
+        if mode == "deterministic":
+            self.last_iteration_hypothesis = deterministic_packet
+            return deterministic_packet
+
+        llm_packet = self._generate_iteration_hypothesis_llm(context)
+        valid_packet, errors = validate_iteration_hypothesis_packet(llm_packet)
+        if valid_packet:
+            self.last_iteration_meta = {
+                "mode": mode,
+                "source": "llm",
+                "model": self.last_model_used or self.model_name,
+            }
+            self.last_iteration_hypothesis = llm_packet
+            return llm_packet
+
+        self.last_iteration_meta = {
+            "mode": mode,
+            "source": "deterministic_fallback",
+            "model": self.last_model_used or self.model_name,
+            "validation_errors": errors[:6],
+        }
+        self.last_iteration_hypothesis = deterministic_packet
+        return deterministic_packet
+
+    def _parse_json_object(self, raw_text: Any) -> Dict[str, Any]:
+        text = str(raw_text or "").strip()
+        if not text:
+            return {}
+        cleaned = self._clean_json(text)
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(cleaned[start : end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+        return {}
+
+    def _collect_tracker_signatures(self, tracker_entries: Any) -> set[str]:
+        signatures: set[str] = set()
+        if not isinstance(tracker_entries, list):
+            return signatures
+        for entry in tracker_entries:
+            if not isinstance(entry, dict):
+                continue
+            direct = str(entry.get("signature") or entry.get("hypothesis_signature") or "").strip()
+            if direct:
+                signatures.add(direct)
+            tracker_ctx = entry.get("tracker_context")
+            if isinstance(tracker_ctx, dict):
+                nested = str(tracker_ctx.get("signature") or "").strip()
+                if nested:
+                    signatures.add(nested)
+        return signatures
+
+    def _candidate_techniques_from_plan(self, feature_engineering_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+        techniques_raw = feature_engineering_plan.get("techniques")
+        if not isinstance(techniques_raw, list):
+            techniques_raw = []
+        candidates: List[Dict[str, Any]] = []
+        for item in techniques_raw:
+            if isinstance(item, dict):
+                technique = str(item.get("technique") or item.get("name") or "").strip()
+                if not technique:
+                    continue
+                candidates.append(
+                    {
+                        "technique": technique,
+                        "target_columns": normalize_target_columns(item.get("columns")),
+                        "feature_scope": str(item.get("feature_scope") or "model_features"),
+                        "params": item.get("params") if isinstance(item.get("params"), dict) else {},
+                        "objective": str(item.get("rationale") or "").strip(),
+                    }
+                )
+                continue
+            technique = str(item or "").strip()
+            if not technique:
+                continue
+            candidates.append(
+                {
+                    "technique": technique,
+                    "target_columns": ["ALL_NUMERIC"],
+                    "feature_scope": "model_features",
+                    "params": {},
+                    "objective": "",
+                }
+            )
+        return candidates
+
+    def _fallback_candidates_from_critique(self, critique_packet: Dict[str, Any]) -> List[Dict[str, Any]]:
+        error_modes = critique_packet.get("error_modes") if isinstance(critique_packet.get("error_modes"), list) else []
+        ids = [str(item.get("id") or "") for item in error_modes if isinstance(item, dict)]
+        out: List[Dict[str, Any]] = []
+        if "minority_class_recall_low" in ids:
+            out.append(
+                {
+                    "technique": "rare_category_grouping",
+                    "target_columns": ["ALL_CATEGORICAL"],
+                    "feature_scope": "model_features",
+                    "params": {"min_frequency": 0.01},
+                    "objective": "Reduce noise in long-tail categories affecting minority-class recall.",
+                }
+            )
+        if "fold_instability" in ids:
+            out.append(
+                {
+                    "technique": "missing_indicators",
+                    "target_columns": ["ALL_NUMERIC"],
+                    "feature_scope": "model_features",
+                    "params": {"indicator_suffix": "_is_missing"},
+                    "objective": "Stabilize fold behavior with robust missingness signals.",
+                }
+            )
+        if not out:
+            out.append(
+                {
+                    "technique": "missing_indicators",
+                    "target_columns": ["ALL_NUMERIC"],
+                    "feature_scope": "model_features",
+                    "params": {"indicator_suffix": "_is_missing"},
+                    "objective": "Low-cost baseline feature engineering refinement.",
+                }
+            )
+        return out
+
+    def _generate_iteration_hypothesis_llm(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(context, dict):
+            return {}
+        critique_packet = context.get("critique_packet")
+        if not isinstance(critique_packet, dict):
+            critique_packet = {}
+        feature_engineering_plan = context.get("feature_engineering_plan")
+        if not isinstance(feature_engineering_plan, dict):
+            feature_engineering_plan = {}
+        tracker_entries = context.get("experiment_tracker")
+        if not isinstance(tracker_entries, list):
+            tracker_entries = []
+
+        llm_prompt = (
+            "Return ONLY JSON for one iteration_hypothesis_packet. "
+            "No markdown. No extra text.\n"
+            "Rules: exactly one hypothesis; action APPLY or NO_OP; "
+            "if duplicate signature then action must be NO_OP.\n"
+            "Allowed target macros: ALL_NUMERIC, ALL_CATEGORICAL, ALL_TEXT, ALL_DATETIME, ALL_BOOLEAN.\n"
+            "Use this context:\n"
+            + json.dumps(
+                {
+                    "run_id": context.get("run_id"),
+                    "iteration": context.get("iteration"),
+                    "primary_metric_name": context.get("primary_metric_name"),
+                    "min_delta": context.get("min_delta"),
+                    "critique_packet": critique_packet,
+                    "feature_engineering_plan": feature_engineering_plan,
+                    "experiment_tracker": tracker_entries[-10:],
+                },
+                ensure_ascii=False,
+            )
+        )
+        try:
+            content = self._call_model(
+                llm_prompt,
+                temperature=0.0,
+                context_tag="strategist_iteration_hypothesis",
+            )
+        except Exception:
+            return {}
+        return self._parse_json_object(content)
+
+    def _generate_iteration_hypothesis_deterministic(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        context = context if isinstance(context, dict) else {}
+        run_id = str(context.get("run_id") or "unknown_run")
+        try:
+            iteration = int(context.get("iteration") or 1)
+        except Exception:
+            iteration = 1
+        if iteration <= 0:
+            iteration = 1
+        primary_metric_name = str(context.get("primary_metric_name") or "primary_metric").strip() or "primary_metric"
+        try:
+            min_delta = float(context.get("min_delta", 0.0005) or 0.0005)
+        except Exception:
+            min_delta = 0.0005
+        if min_delta < 0:
+            min_delta = 0.0
+
+        critique_packet = context.get("critique_packet")
+        if not isinstance(critique_packet, dict):
+            critique_packet = {}
+        feature_engineering_plan = context.get("feature_engineering_plan")
+        if not isinstance(feature_engineering_plan, dict):
+            feature_engineering_plan = {}
+        tracker_entries = context.get("experiment_tracker")
+        if not isinstance(tracker_entries, list):
+            tracker_entries = []
+        known_signatures = self._collect_tracker_signatures(tracker_entries)
+
+        candidates = self._candidate_techniques_from_plan(feature_engineering_plan)
+        if not candidates:
+            candidates = self._fallback_candidates_from_critique(critique_packet)
+
+        selected_candidate = None
+        selected_signature = ""
+        for candidate in candidates:
+            signature = build_hypothesis_signature(
+                technique=candidate.get("technique"),
+                target_columns=candidate.get("target_columns"),
+                feature_scope=candidate.get("feature_scope"),
+                params=candidate.get("params"),
+            )
+            if signature not in known_signatures:
+                selected_candidate = candidate
+                selected_signature = signature
+                break
+
+        duplicate_of = None
+        action = "APPLY"
+        if selected_candidate is None:
+            selected_candidate = candidates[0] if candidates else {
+                "technique": "NO_OP",
+                "target_columns": ["ALL_NUMERIC"],
+                "feature_scope": "model_features",
+                "params": {},
+                "objective": "No actionable candidate found.",
+            }
+            selected_signature = build_hypothesis_signature(
+                technique=selected_candidate.get("technique"),
+                target_columns=selected_candidate.get("target_columns"),
+                feature_scope=selected_candidate.get("feature_scope"),
+                params=selected_candidate.get("params"),
+            )
+            if selected_signature in known_signatures:
+                duplicate_of = selected_signature
+            action = "NO_OP"
+
+        target_columns = normalize_target_columns(selected_candidate.get("target_columns"))
+        technique = str(selected_candidate.get("technique") or "NO_OP").strip() or "NO_OP"
+        feature_scope = str(selected_candidate.get("feature_scope") or "model_features").strip() or "model_features"
+        params = selected_candidate.get("params") if isinstance(selected_candidate.get("params"), dict) else {}
+        objective = str(selected_candidate.get("objective") or "").strip()
+        if not objective:
+            objective = "Apply one focused feature-engineering change aligned to critique findings."
+
+        error_modes = critique_packet.get("error_modes")
+        if not isinstance(error_modes, list):
+            error_modes = []
+        target_error_modes = [
+            str(item.get("id"))
+            for item in error_modes
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ][:3]
+        if not target_error_modes:
+            target_error_modes = ["metric_stagnation"]
+
+        packet = {
+            "packet_type": "iteration_hypothesis_packet",
+            "packet_version": "1.0",
+            "run_id": run_id,
+            "iteration": iteration,
+            "hypothesis_id": "h_" + hashlib.sha1(selected_signature.encode("utf-8")).hexdigest()[:8],
+            "action": action,
+            "hypothesis": {
+                "technique": technique if action == "APPLY" else "NO_OP",
+                "objective": objective,
+                "target_columns": target_columns,
+                "feature_scope": feature_scope,
+                "params": params,
+                "expected_effect": {
+                    "target_error_modes": target_error_modes,
+                    "direction": "positive" if action == "APPLY" else "neutral",
+                },
+            },
+            "application_constraints": {
+                "edit_mode": "incremental",
+                "max_code_regions_to_change": 3,
+                "forbid_replanning": True,
+                "forbid_model_family_switch": True,
+                "must_keep": ["data_split_logic", "cv_protocol", "output_paths_contract"],
+            },
+            "success_criteria": {
+                "primary_metric_name": primary_metric_name,
+                "min_delta": float(min_delta),
+                "must_pass_active_gates": True,
+            },
+            "tracker_context": {
+                "signature": selected_signature,
+                "is_duplicate": bool(duplicate_of),
+                "duplicate_of": duplicate_of,
+            },
+            "explanation": (
+                "Single hypothesis selected from feature_engineering_plan and critique packet."
+                if action == "APPLY"
+                else "No-op hypothesis because selected signature already exists in experiment tracker."
+            )[:280],
+            "fallback_if_not_applicable": "NO_OP",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        valid_packet, errors = validate_iteration_hypothesis_packet(packet)
+        if valid_packet:
+            return packet
+        return build_noop_iteration_hypothesis_packet(
+            run_id=run_id,
+            iteration=iteration,
+            signature=selected_signature or "noop_signature",
+            duplicate_of=duplicate_of or selected_signature or "noop_signature",
+            primary_metric_name=primary_metric_name,
+            min_delta=min_delta,
+            explanation=(
+                "Schema fallback to no-op hypothesis."
+                + (" Validation: " + "; ".join(errors[:2]) if errors else "")
+            )[:280],
+        )
 
     def _get_wide_schema_threshold(self) -> int:
         raw = os.getenv("STRATEGIST_WIDE_SCHEMA_THRESHOLD", "240")

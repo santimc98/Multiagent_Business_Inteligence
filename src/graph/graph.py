@@ -139,6 +139,7 @@ from src.utils.dataset_memory import (
     summarize_memory,
 )
 from src.utils.ml_engineer_memory import append_memory, load_recent_memory
+from src.utils.experiment_tracker import append_experiment_entry, load_recent_experiment_entries
 from src.utils.error_hints import append_repair_hints
 from src.utils.contract_first_gates import apply_contract_first_gate_policy
 from src.utils.governance import write_governance_report, build_run_summary
@@ -21238,18 +21239,42 @@ def _restore_ml_outputs(snapshot_dir: Path, output_paths: List[str]) -> None:
 def _build_metric_improvement_feedback_block(
     *,
     feature_engineering_plan: Dict[str, Any],
-    advisor_advice: str,
+    critique_packet: Dict[str, Any],
+    hypothesis_packet: Dict[str, Any],
 ) -> str:
     plan_compact = compress_long_lists(feature_engineering_plan or {})[0]
     plan_text = json.dumps(plan_compact, ensure_ascii=True)
-    advice_text = str(advisor_advice or "").strip() or "- No-op suggestions: keep baseline."
+    critique_text = json.dumps(compress_long_lists(critique_packet or {})[0], ensure_ascii=True)
+    hypothesis_text = json.dumps(compress_long_lists(hypothesis_packet or {})[0], ensure_ascii=True)
     return (
         "\n\n# IMPROVEMENT_ROUND\n"
         + "FEATURE_ENGINEERING_PLAN: "
         + plan_text
-        + "\nRESULTS_ADVISOR_ADVICE:\n"
-        + advice_text
+        + "\nADVISOR_CRITIQUE_PACKET: "
+        + critique_text
+        + "\nITERATION_HYPOTHESIS_PACKET: "
+        + hypothesis_text
     )
+
+
+def _build_metric_improvement_patch_objectives(hypothesis_packet: Dict[str, Any]) -> List[str]:
+    hypothesis_packet = hypothesis_packet if isinstance(hypothesis_packet, dict) else {}
+    hypothesis = hypothesis_packet.get("hypothesis") if isinstance(hypothesis_packet.get("hypothesis"), dict) else {}
+    technique = str(hypothesis.get("technique") or "NO_OP")
+    target_columns = hypothesis.get("target_columns") if isinstance(hypothesis.get("target_columns"), list) else []
+    targets_text = ", ".join([str(item) for item in target_columns[:6]]) if target_columns else "ALL_NUMERIC"
+    action = str(hypothesis_packet.get("action") or "NO_OP").upper()
+
+    objectives: List[str] = []
+    if action == "APPLY" and technique and technique != "NO_OP":
+        objectives.append(
+            "Apply hypothesis technique '" + technique + "' incrementally on target columns: " + targets_text + "."
+        )
+        objectives.append("Keep training logic stable; edit only the minimum blocks needed for hypothesis injection.")
+    else:
+        objectives.append("No-op hypothesis selected; preserve baseline logic and keep outputs contract-compliant.")
+    objectives.append("Preserve CV/data-split protocol and all contract output paths.")
+    return objectives[:8]
 
 
 def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
@@ -21272,6 +21297,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     if baseline_value is None:
         return False
 
+    rounds, min_delta = _metric_improvement_policy(contract)
     output_paths = _resolve_ml_outputs_for_metric_round(contract, state)
     snapshot_dir = Path("work") / "ml_baseline_snapshot"
     _snapshot_ml_outputs(output_paths, snapshot_dir)
@@ -21289,23 +21315,65 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
         "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
     }
-    advisor_advice = results_advisor.generate_feature_engineering_advice(advisor_context)
-    advisor_meta = (
-        results_advisor.last_fe_advice_meta
-        if isinstance(getattr(results_advisor, "last_fe_advice_meta", None), dict)
+    advisor_context["run_id"] = str(state.get("run_id") or "")
+    advisor_context["iteration"] = int(state.get("iteration_count", 0) or 0)
+    advisor_context["higher_is_better"] = bool(_metric_higher_is_better(metric_name))
+    advisor_context["min_delta"] = float(min_delta)
+    advisor_context["candidate_metrics"] = baseline_metrics
+    active_gate_names: List[str] = []
+    for gate in (get_qa_gates(contract) or []):
+        if isinstance(gate, dict) and gate.get("name"):
+            active_gate_names.append(str(gate.get("name")))
+    for gate in (get_reviewer_gates(contract) or []):
+        if isinstance(gate, dict) and gate.get("name"):
+            active_gate_names.append(str(gate.get("name")))
+    advisor_context["active_gates_context"] = list(dict.fromkeys(active_gate_names))
+
+    critique_packet = results_advisor.generate_critique_packet(advisor_context)
+    critique_meta = (
+        results_advisor.last_critique_meta
+        if isinstance(getattr(results_advisor, "last_critique_meta", None), dict)
         else {}
     )
-    if advisor_meta:
+    if critique_meta:
         print(
-            "RESULTS_ADVISOR_FE_ADVICE: "
-            + f"mode={advisor_meta.get('mode')} "
-            + f"source={advisor_meta.get('source')} "
-            + f"provider={advisor_meta.get('provider')} "
-            + f"model={advisor_meta.get('model')}"
+            "RESULTS_ADVISOR_CRITIQUE: "
+            + f"mode={critique_meta.get('mode')} "
+            + f"source={critique_meta.get('source')} "
+            + f"provider={critique_meta.get('provider')} "
+            + f"model={critique_meta.get('model')}"
         )
+
+    run_id = str(state.get("run_id") or "")
+    tracker_entries = load_recent_experiment_entries(run_id, k=20) if run_id else []
+    strategist_context = {
+        "run_id": run_id,
+        "iteration": int(state.get("iteration_count", 0) or 0) + 1,
+        "primary_metric_name": metric_name,
+        "min_delta": float(min_delta),
+        "feature_engineering_plan": feature_engineering_plan,
+        "critique_packet": critique_packet,
+        "experiment_tracker": tracker_entries,
+    }
+    hypothesis_packet = strategist.generate_iteration_hypothesis(strategist_context)
+    hypothesis_meta = (
+        strategist.last_iteration_meta
+        if isinstance(getattr(strategist, "last_iteration_meta", None), dict)
+        else {}
+    )
+    if hypothesis_meta:
+        print(
+            "STRATEGIST_ITERATION_HYPOTHESIS: "
+            + f"mode={hypothesis_meta.get('mode')} "
+            + f"source={hypothesis_meta.get('source')} "
+            + f"model={hypothesis_meta.get('model')}"
+        )
+
+    patch_objectives = _build_metric_improvement_patch_objectives(hypothesis_packet)
     feedback_block = _build_metric_improvement_feedback_block(
         feature_engineering_plan=feature_engineering_plan,
-        advisor_advice=advisor_advice,
+        critique_packet=critique_packet,
+        hypothesis_packet=hypothesis_packet,
     )
 
     history = list(state.get("feedback_history", []) or [])
@@ -21320,12 +21388,49 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "source": "qa_improvement_round",
         "status": "REJECTED",
         "failed_gates": list(existing_gate.get("failed_gates") or []) or ["metric_improvement_round"],
-        "required_fixes": list(existing_gate.get("required_fixes") or []) or ["Apply feature engineering plan incrementally."],
+        "required_fixes": list(existing_gate.get("required_fixes") or []) or patch_objectives,
         "feedback": merged_feedback,
         "feature_engineering_plan": feature_engineering_plan,
+        "advisor_critique_packet": critique_packet,
+        "iteration_hypothesis_packet": hypothesis_packet,
     }
 
-    rounds, min_delta = _metric_improvement_policy(contract)
+    state["iteration_handoff"] = {
+        "handoff_version": "v1",
+        "mode": "patch",
+        "source": "actor_critic_metric_improvement",
+        "from_iteration": int(state.get("iteration_count", 0) or 0),
+        "next_iteration": int(state.get("iteration_count", 0) or 0) + 1,
+        "contract_focus": {
+            "required_outputs": output_paths[:12],
+            "present_outputs": [],
+            "missing_outputs": [],
+        },
+        "quality_focus": {
+            "status": "NEEDS_IMPROVEMENT",
+            "failed_gates": ["metric_improvement_round"],
+            "required_fixes": patch_objectives,
+            "hard_failures": [],
+            "evidence": [],
+        },
+        "feedback": {
+            "reviewer": feedback_block.strip(),
+            "qa": "",
+            "runtime_error_tail": "",
+            "evidence": [],
+        },
+        "must_preserve": [
+            "data_split_logic",
+            "cv_protocol",
+            "output_paths_contract",
+        ],
+        "patch_objectives": patch_objectives,
+        "critic_packet": critique_packet,
+        "hypothesis_packet": hypothesis_packet,
+    }
+
+    state["ml_improvement_critique_packet"] = critique_packet
+    state["ml_improvement_hypothesis_packet"] = hypothesis_packet
     state["ml_improvement_round_active"] = True
     state["ml_improvement_round_count"] = int(state.get("ml_improvement_round_count", 0) or 0) + 1
     state["ml_improvement_attempted"] = False
@@ -21341,6 +21446,26 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     state["ml_improvement_rounds_allowed"] = int(rounds)
     state["last_iteration_type"] = "metric"
     state["improvement_attempt_count"] = 0
+    if run_id:
+        tracker_context = hypothesis_packet.get("tracker_context") if isinstance(hypothesis_packet.get("tracker_context"), dict) else {}
+        append_experiment_entry(
+            run_id,
+            {
+                "iter": int(state.get("iteration_count", 0) or 0),
+                "event": "hypothesis_proposed",
+                "phase": "metric_improvement_round",
+                "action": hypothesis_packet.get("action"),
+                "signature": tracker_context.get("signature"),
+                "duplicate_of": tracker_context.get("duplicate_of"),
+                "technique": (
+                    hypothesis_packet.get("hypothesis", {}).get("technique")
+                    if isinstance(hypothesis_packet.get("hypothesis"), dict)
+                    else None
+                ),
+                "primary_metric_name": metric_name,
+                "baseline_metric": float(baseline_value),
+            },
+        )
     return True
 
 
@@ -21383,6 +21508,30 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         f"improved={improved_value} min_delta={min_delta} kept={state.get('ml_improvement_kept')}"
     )
     _append_feedback_history(state, decision_note)
+
+    run_id = str(state.get("run_id") or "")
+    if run_id:
+        hypothesis_packet = state.get("ml_improvement_hypothesis_packet")
+        hypothesis_packet = hypothesis_packet if isinstance(hypothesis_packet, dict) else {}
+        tracker_context = hypothesis_packet.get("tracker_context") if isinstance(hypothesis_packet.get("tracker_context"), dict) else {}
+        append_experiment_entry(
+            run_id,
+            {
+                "iter": int(state.get("iteration_count", 0) or 0),
+                "event": "candidate_evaluated",
+                "phase": "metric_improvement_round",
+                "kept": state.get("ml_improvement_kept"),
+                "approved": approved,
+                "primary_metric_name": metric_name,
+                "baseline_metric": baseline_value,
+                "candidate_metric": improved_value,
+                "delta": None
+                if baseline_value is None or improved_value is None
+                else float(improved_value - baseline_value),
+                "signature": tracker_context.get("signature"),
+                "action": hypothesis_packet.get("action"),
+            },
+        )
 
     state["ml_improvement_attempted"] = True
     state["ml_improvement_round_active"] = False

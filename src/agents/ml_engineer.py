@@ -517,6 +517,16 @@ class MLEngineerAgent:
         contract_focus = raw.get("contract_focus") if isinstance(raw.get("contract_focus"), dict) else {}
         quality_focus = raw.get("quality_focus") if isinstance(raw.get("quality_focus"), dict) else {}
         feedback = raw.get("feedback") if isinstance(raw.get("feedback"), dict) else {}
+        critic_packet = raw.get("critic_packet") if isinstance(raw.get("critic_packet"), dict) else {}
+        if not critic_packet:
+            critic_packet = raw.get("advisor_critique_packet") if isinstance(raw.get("advisor_critique_packet"), dict) else {}
+        hypothesis_packet = raw.get("hypothesis_packet") if isinstance(raw.get("hypothesis_packet"), dict) else {}
+        if not hypothesis_packet:
+            hypothesis_packet = (
+                raw.get("iteration_hypothesis_packet")
+                if isinstance(raw.get("iteration_hypothesis_packet"), dict)
+                else {}
+            )
 
         required_outputs = self._normalize_handoff_items(
             contract_focus.get("required_outputs") or required_deliverables,
@@ -589,6 +599,8 @@ class MLEngineerAgent:
             },
             "must_preserve": must_preserve[:8],
             "patch_objectives": patch_objectives[:8],
+            "critic_packet": critic_packet if isinstance(critic_packet, dict) else {},
+            "hypothesis_packet": hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
         }
 
     def _collect_editor_feedback_text(
@@ -2933,6 +2945,12 @@ $strategy_json
         ITERATION HANDOFF:
         $iteration_handoff_json
 
+        STRUCTURED CRITIQUE PACKET:
+        $critic_packet_json
+
+        STRUCTURED HYPOTHESIS PACKET (apply one hypothesis only):
+        $hypothesis_packet_json
+
         PATCH OBJECTIVES:
         $patch_objectives
 
@@ -3044,6 +3062,18 @@ $strategy_json
                 max_str_len=260,
                 max_list_items=40,
             )
+            critic_packet_block = self._serialize_json_for_prompt(
+                handoff_payload.get("critic_packet") if isinstance(handoff_payload.get("critic_packet"), dict) else {},
+                max_chars=2200,
+                max_str_len=260,
+                max_list_items=30,
+            )
+            hypothesis_packet_block = self._serialize_json_for_prompt(
+                handoff_payload.get("hypothesis_packet") if isinstance(handoff_payload.get("hypothesis_packet"), dict) else {},
+                max_chars=2200,
+                max_str_len=260,
+                max_list_items=30,
+            )
             user_message = render_prompt(
                 USER_EDITOR_TEMPLATE,
                 phase_classification=phase_classification,
@@ -3051,6 +3081,8 @@ $strategy_json
                 last_run_memory=last_run_memory_block,
                 strategy_lock=strategy_lock_block,
                 iteration_handoff_json=handoff_payload_json,
+                critic_packet_json=critic_packet_block,
+                hypothesis_packet_json=hypothesis_packet_block,
                 patch_objectives=patch_objectives_block,
                 must_preserve=must_preserve_block,
                 previous_code=previous_code_block,
