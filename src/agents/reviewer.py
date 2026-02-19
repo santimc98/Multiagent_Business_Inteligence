@@ -380,7 +380,7 @@ class ReviewerAgent:
                 {"claim": "Short claim", "source": "artifact_path#key_or_script_path:line or missing"}
             ],
             "improvement_suggestions": {
-                "techniques": ["List of specific ML techniques to try next, e.g. 'ensemble averaging of CatBoost+LightGBM+XGBoost', 'add polynomial interaction features between top features', 'tune learning_rate and max_depth via grid search'"],
+                "techniques": ["List of specific ML techniques to try next, e.g. 'ensemble averaging of multiple boosting models', 'add polynomial interaction features between top features', 'tune learning_rate and max_depth via grid search'"],
                 "no_further_improvement": false
             }
         }
@@ -698,7 +698,7 @@ class ReviewerAgent:
         - ALWAYS populate this field, even when status is APPROVED.
         - "techniques": 2-5 concrete, actionable suggestions for improving the primary metric.
           Be specific: name models, feature engineering approaches, hyperparameters to tune.
-          Examples: "Add ensemble averaging of CatBoost+LightGBM+XGBoost predictions",
+          Examples: "Add ensemble averaging of multiple boosting model predictions",
           "Engineer interaction features between age and max_hr", "Tune regularization (l2_leaf_reg) via cross-validated grid search".
         - "no_further_improvement": set to true ONLY if the code already uses advanced ensemble + feature engineering + tuning AND the metric appears near theoretical maximum. Otherwise false.
         """

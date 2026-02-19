@@ -2489,7 +2489,7 @@ $strategy_json
         FORBIDDEN CALLS (HARD):
         - os.remove, os.unlink, pathlib.Path.unlink, shutil.rmtree, os.rmdir
         - Never use file deletion as a validation strategy.
-        ALLOWED imports: pandas, numpy, sklearn, scipy, xgboost, catboost, lightgbm,
+        ALLOWED imports: pandas, numpy, sklearn, scipy, xgboost, lightgbm,
         matplotlib, seaborn, json, os.path, os.makedirs, csv, math, statistics,
         collections, itertools, functools, typing, warnings, re, datetime, pathlib.Path, uuid
         If you need sys.stdout or sys.exit, use print() and raise SystemExit instead.

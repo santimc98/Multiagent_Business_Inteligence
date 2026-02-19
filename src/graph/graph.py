@@ -10462,7 +10462,6 @@ def _get_heavy_runner_config() -> Dict[str, Any] | None:
 _TECHNIQUE_PACKAGE_HINTS: Dict[str, List[str]] = {
     "xgboost": ["xgboost"],
     "lightgbm": ["lightgbm"],
-    "catboost": ["catboost"],
     "pytorch": ["torch"],
     "torch": ["torch"],
     "tensorflow": ["tensorflow"],
@@ -10817,7 +10816,7 @@ def _estimate_heavy_script_timeout(
         complexity_bonus += 900
         tags.append("n_estimators_ge_2000")
 
-    if _contains_any_pattern(code, ["lightgbm", "xgboost", "catboost"]):
+    if _contains_any_pattern(code, ["lightgbm", "xgboost"]):
         complexity_bonus += 240
         tags.append("boosting_detected")
 

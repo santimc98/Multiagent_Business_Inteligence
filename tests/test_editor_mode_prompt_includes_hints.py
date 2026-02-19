@@ -26,7 +26,7 @@ def test_editor_mode_prompt_includes_repair_hints(monkeypatch):
     feedback_with_hints = (
         "Runtime error observed.\n\n"
         "REPAIR_HINTS (deterministic, no-autopatch):\n"
-        "- CatBoost: castea columnas categóricas a string o Int64 y define cat_features por nombre/índice; no pases floats (0.0/1.0) como categorías."
+        "- Tipo invalido en columnas categoricas: convierte las categorias a string o Int64 antes de entrenar; evita floats (0.0/1.0) como categorias y pasa las columnas categoricas como lo requiera tu stack (por nombre/indice/selector)."
     )
     _ = agent.generate_code(
         strategy={"title": "Test Strategy", "analysis_type": "predictive", "required_columns": []},
@@ -47,4 +47,4 @@ def test_editor_mode_prompt_includes_repair_hints(monkeypatch):
     )
 
     assert "REPAIR_HINTS (deterministic, no-autopatch):" in str(agent.last_prompt or "")
-    assert "CatBoost" in str(agent.last_prompt or "")
+    assert "Tipo invalido en columnas categoricas" in str(agent.last_prompt or "")

@@ -514,7 +514,7 @@ class DataEngineerAgent:
         - sys, subprocess, socket, requests, httpx, urllib, ftplib
         - paramiko, selenium, playwright, openai, google.generativeai, builtins
         - eval(), exec(), compile(), __import__()
-        ALLOWED imports: pandas, numpy, sklearn, scipy, xgboost, catboost, lightgbm,
+        ALLOWED imports: pandas, numpy, sklearn, scipy, xgboost, lightgbm,
         matplotlib, seaborn, json, os.path, os.makedirs, csv, math, statistics,
         collections, itertools, functools, typing, warnings, re, datetime, pathlib.Path
         If you need sys.stdout or sys.exit, use print() and raise SystemExit instead.

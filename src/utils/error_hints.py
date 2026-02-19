@@ -15,13 +15,27 @@ def _normalize_error_text(error_text: str) -> str:
     return text
 
 
-def _match_catboost_invalid_cat_feature(text: str) -> bool:
-    patterns = [
+def _match_invalid_categorical_feature_type(text: str) -> bool:
+    invalid_type_patterns = [
         r"invalid type for cat_feature",
-        r"catboosterror:.*cat_feature",
-        r"cat_features?.*(float|real number|0\.0|1\.0)",
+        r"invalid type for categorical feature",
     ]
-    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+    strong_semantic_combo = bool(
+        re.search(
+            r"(categorical|category|categoric).*must be.*(integer|int|string)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        and re.search(r"(float|real number|0\.0|1\.0)", text, flags=re.IGNORECASE)
+    )
+    auxiliary_patterns = [
+        r"(cat_features?|categorical features?).*(float|real number|0\.0|1\.0)",
+    ]
+    return bool(
+        any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in invalid_type_patterns)
+        or strong_semantic_combo
+        or any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in auxiliary_patterns)
+    )
 
 
 def _match_nameerror_dialect_vars(text: str) -> bool:
@@ -50,8 +64,8 @@ def derive_repair_hints(error_text: str) -> List[str]:
     text = _normalize_error_text(error_text)
     prioritized_rules = [
         (
-            _match_catboost_invalid_cat_feature,
-            "CatBoost: castea columnas categóricas a string o Int64 y define cat_features por nombre/índice; no pases floats (0.0/1.0) como categorías.",
+            _match_invalid_categorical_feature_type,
+            "Tipo invalido en columnas categoricas: convierte las categorias a string o Int64 antes de entrenar; evita floats (0.0/1.0) como categorias y pasa las columnas categoricas como lo requiera tu stack (por nombre/indice/selector).",
         ),
         (
             _match_nameerror_dialect_vars,
@@ -59,7 +73,7 @@ def derive_repair_hints(error_text: str) -> List[str]:
         ),
         (
             _match_json_not_serializable,
-            "Serialización JSON: usa json.dump(..., default=json_default) y/o convierte np.generic con .item() y Timestamps a str/ISO.",
+            "Serializacion JSON: usa json.dump(..., default=json_default) y/o convierte np.generic con .item() y Timestamps a str/ISO.",
         ),
     ]
     hints: List[str] = []

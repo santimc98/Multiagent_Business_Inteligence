@@ -637,7 +637,7 @@ def _looks_like_regressor(name: str) -> bool:
     if not name:
         return False
     simple = name.split(".")[-1]
-    # Convention: sklearn/xgboost/lightgbm/catboost regressors end in "Regressor"
+    # Convention: sklearn/xgboost/lightgbm regressors end in "Regressor"
     if simple.endswith("Regressor"):
         return True
     # Convention: SVR/LinearSVR are support vector regressors

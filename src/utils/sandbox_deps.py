@@ -33,7 +33,6 @@ CLOUDRUN_NATIVE_ALLOWLIST = [
 CLOUDRUN_OPTIONAL_ALLOWLIST = [
     "xgboost",
     "lightgbm",
-    "catboost",
     "shap",
     "optuna",
     "imblearn",
@@ -87,7 +86,6 @@ PIP_CLOUDRUN_NATIVE = {
 PIP_CLOUDRUN_OPTIONAL = {
     "xgboost": "xgboost",
     "lightgbm": "lightgbm",
-    "catboost": "catboost",
     "shap": "shap",
     "optuna": "optuna",
     "imblearn": "imbalanced-learn",
@@ -219,7 +217,6 @@ def check_dependency_precheck(
             "sentence_transformers",
             "xgboost",
             "lightgbm",
-            "catboost",
             "shap",
             "optuna",
             "imblearn",
