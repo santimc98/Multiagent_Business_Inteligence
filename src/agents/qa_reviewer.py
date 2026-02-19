@@ -238,6 +238,7 @@ class QAReviewerAgent:
         qa_gate_specs, contract_source_used, gate_warnings = resolve_qa_gates(evaluation_spec)
         qa_gate_names = _gate_names(qa_gate_specs)
         qa_gates_json = json.dumps(qa_gate_specs, indent=2, ensure_ascii=True)
+        active_qa_gates_json = json.dumps(qa_gate_names, indent=2, ensure_ascii=True)
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are the Lead QA Engineer.
@@ -281,6 +282,7 @@ class QAReviewerAgent:
         - Evaluation Spec (JSON): $evaluation_spec_json
         - ML Dataset Path: $ml_data_path
         - QA Gates (contract-driven, with severity/params): $qa_gates
+        - ACTIVE_QA_GATES (names only): $active_qa_gates
         - Execution Diagnostics (JSON): $execution_diagnostics_json
         
         INSTRUCTIONS:
@@ -292,6 +294,8 @@ class QAReviewerAgent:
         - Do not request stylistic changes. Focus on correctness and safety.
         - Only fail gates listed in QA Gates; otherwise mention as warnings.
         - When listing failed_gates, use the gate "name" values from QA Gates.
+        - failed_gates/hard_failures MUST be an exact subset of ACTIVE_QA_GATES.
+        - Never invent gates. Non-active findings go only to feedback/warnings (no gate failure).
         
         EVIDENCE REQUIREMENT:
         - Any REJECT or warning must cite evidence from the provided artifacts or code.
@@ -316,6 +320,7 @@ class QAReviewerAgent:
             evaluation_spec_json=eval_spec_json,
             ml_data_path=ml_data_path,
             qa_gates=qa_gates_json,
+            active_qa_gates=active_qa_gates_json,
             execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2, ensure_ascii=True),
             output_format_instructions=output_format_instructions,
             senior_evidence_rule=SENIOR_EVIDENCE_RULE,

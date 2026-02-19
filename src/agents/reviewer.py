@@ -424,6 +424,11 @@ class ReviewerAgent:
         view_gates = reviewer_view.get("reviewer_gates")
         if isinstance(view_gates, list) and view_gates:
             reviewer_gates = view_gates
+        active_reviewer_gates = [
+            name
+            for name in (_normalize_reviewer_gate_name(item) for item in reviewer_gates)
+            if name
+        ]
         allowed_columns = []
         if isinstance(evaluation_spec, dict):
             for key in ("allowed_columns", "canonical_columns", "required_columns", "contract_columns"):
@@ -450,6 +455,7 @@ class ReviewerAgent:
         - Evaluation Spec (JSON): $evaluation_spec_json
         - Reviewer View (JSON): $reviewer_view_json
         - Reviewer Gates (only these can fail): $reviewer_gates
+        - ACTIVE_REVIEWER_GATES (names only): $active_reviewer_gates_json
         - Allowed Columns (if provided): $allowed_columns_json
         - Expected Metrics (if provided): $expected_metrics_json
         - Execution Diagnostics (JSON): $execution_diagnostics_json
@@ -492,6 +498,8 @@ class ReviewerAgent:
         ### SPEC-DRIVEN EVALUATION (MANDATORY)
         - Only fail gates that appear in Reviewer Gates.
         - If a rule is NOT present in Reviewer Gates, you may mention it as a warning but MUST NOT reject for it.
+        - failed_gates/hard_failures MUST be an exact subset of ACTIVE_REVIEWER_GATES.
+        - Never invent reviewer gates; non-active findings are warning-only feedback.
         - If Reviewer Gates is empty, fall back to the general criteria but prefer APPROVE_WITH_WARNINGS when uncertain.
 
         ### EVIDENCE REQUIREMENT
@@ -514,6 +522,7 @@ class ReviewerAgent:
             evaluation_spec_json=eval_spec_json,
             reviewer_view_json=json.dumps(reviewer_view, indent=2),
             reviewer_gates=reviewer_gates,
+            active_reviewer_gates_json=json.dumps(active_reviewer_gates, indent=2),
             allowed_columns_json=json.dumps(allowed_columns, indent=2),
             expected_metrics_json=json.dumps(expected_metrics, indent=2),
             execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2),

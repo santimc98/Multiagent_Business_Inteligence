@@ -139,6 +139,8 @@ from src.utils.dataset_memory import (
     summarize_memory,
 )
 from src.utils.ml_engineer_memory import append_memory, load_recent_memory
+from src.utils.error_hints import append_repair_hints
+from src.utils.contract_first_gates import apply_contract_first_gate_policy
 from src.utils.governance import write_governance_report, build_run_summary
 from src.utils.data_adequacy import (
     build_data_adequacy_report,
@@ -8180,6 +8182,25 @@ def _classify_ml_memory_phase(failed_gates: List[str] | None, feedback: str | No
     if any(token in combined for token in persistence_tokens):
         return "persistence"
     return "training"
+
+
+def _extract_gate_names(values: Any) -> List[str]:
+    names: List[str] = []
+    if not isinstance(values, list):
+        return names
+    for item in values:
+        candidate = ""
+        if isinstance(item, dict):
+            for key in ("name", "id", "gate", "rule", "check", "label", "title"):
+                raw = item.get(key)
+                if raw:
+                    candidate = str(raw).strip()
+                    break
+        else:
+            candidate = str(item or "").strip()
+        if candidate and candidate not in names:
+            names.append(candidate)
+    return names
 
 
 def _build_reviewer_evidence_packet(
@@ -19535,6 +19556,12 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         get_qa_gates(contract) if isinstance(contract, dict) else None,
         qa_context.get("qa_gates") if isinstance(qa_context, dict) else None,
     )
+    qa_active_gate_names = _extract_gate_names(
+        get_qa_gates(contract) if isinstance(contract, dict) else []
+    )
+    reviewer_active_gate_names = _extract_gate_names(
+        get_reviewer_gates(contract) if isinstance(contract, dict) else []
+    )
     hard_qa_gates: set[str] = {
         str(gate.get("name")).lower()
         for gate in qa_gate_specs
@@ -19596,6 +19623,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     review_diagnostics,
                     actor="reviewer",
                 )
+                review_result = apply_contract_first_gate_policy(
+                    review_result,
+                    reviewer_active_gate_names,
+                    actor="reviewer",
+                )
                 if run_id:
                     log_agent_snapshot(
                         run_id,
@@ -19633,6 +19665,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 qa_result = _apply_review_consistency_guard(
                     qa_result,
                     review_diagnostics,
+                    actor="qa_reviewer",
+                )
+                qa_result = apply_contract_first_gate_policy(
+                    qa_result,
+                    qa_active_gate_names,
                     actor="qa_reviewer",
                 )
                 if run_id:
@@ -19780,13 +19817,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         gate_source = "alignment_check"
     else:
         gate_source = "result_evaluator"
-    gate_context = {
-        "source": gate_source,
-        "status": status,
-        "feedback": feedback,
-        "failed_gates": failed_gates,
-        "required_fixes": required_fixes,
-    }
     gate_evidence: List[Dict[str, str]] = []
     for source in (
         eval_result.get("evidence") if isinstance(eval_result, dict) else None,
@@ -19796,6 +19826,26 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         for item in _normalize_handoff_evidence(source, max_items=12):
             if item not in gate_evidence:
                 gate_evidence.append(item)
+    runtime_tail_for_hints = str(state.get("last_runtime_error_tail") or state.get("execution_output") or "")[-1800:]
+    evidence_blob = ""
+    if gate_evidence:
+        try:
+            evidence_blob = json.dumps(gate_evidence[:12], ensure_ascii=True)
+        except Exception:
+            evidence_blob = str(gate_evidence[:12])
+    feedback, repair_hints = append_repair_hints(
+        feedback=str(feedback or ""),
+        error_text=str(feedback or "") + "\n" + runtime_tail_for_hints + "\n" + evidence_blob,
+    )
+    gate_context = {
+        "source": gate_source,
+        "status": status,
+        "feedback": feedback,
+        "failed_gates": failed_gates,
+        "required_fixes": required_fixes,
+    }
+    if repair_hints:
+        gate_context["repair_hints"] = repair_hints
     if gate_evidence:
         gate_context["evidence"] = gate_evidence[:12]
     ml_feedback_record = _set_latest_feedback_record(
@@ -19811,6 +19861,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         runtime_error_tail=str(state.get("last_runtime_error_tail") or state.get("execution_output") or "")[-1200:],
         evidence=gate_evidence[:12],
     )
+    if repair_hints and isinstance(ml_feedback_record, dict):
+        ml_feedback_record["repair_hints"] = repair_hints[:2]
     if ml_feedback_record:
         gate_context["feedback_record"] = ml_feedback_record
     existing_hard_failures = [str(h) for h in (state.get("hard_failures") or []) if h]
@@ -20795,6 +20847,17 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
                 print(f"Warning: failed to persist ml_engineer_failure_explainer.txt: {exp_err}")
     except Exception as expl_err:
         print(f"Warning: ML failure explainer failed during runtime fix: {expl_err}")
+
+    runtime_tail_for_hints = str(state.get("last_runtime_error_tail") or output or "")
+    runtime_feedback = str(error_context.get("feedback") or "")
+    enriched_feedback, repair_hints = append_repair_hints(
+        feedback=runtime_feedback,
+        error_text=runtime_tail_for_hints + "\n" + runtime_feedback,
+    )
+    error_context["feedback"] = enriched_feedback
+    if repair_hints:
+        error_context["repair_hints"] = repair_hints
+
     run_id = state.get("run_id")
     if run_id:
         contract = state.get("execution_contract", {}) or {}
