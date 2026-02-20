@@ -1104,90 +1104,6 @@ def _load_column_inventory_names(path: str = "data/column_inventory.json") -> Li
     return []
 
 
-def _expand_required_feature_selectors_for_review(
-    selectors: Any,
-    candidate_columns: List[str],
-) -> List[str]:
-    if not isinstance(selectors, list) or not selectors:
-        return []
-    if not candidate_columns:
-        return []
-
-    candidates = [str(col) for col in candidate_columns if col]
-    expanded: List[str] = []
-
-    def _add_many(items: List[str]) -> None:
-        for item in items:
-            if item and item in candidates and item not in expanded:
-                expanded.append(item)
-
-    for selector in selectors:
-        if not isinstance(selector, dict):
-            continue
-        selector_type = str(selector.get("type") or "").strip().lower()
-        try:
-            if selector_type in {"regex", "pattern"}:
-                pattern = str(selector.get("pattern") or "").strip()
-                if not pattern:
-                    continue
-                regex = re.compile(pattern, flags=re.IGNORECASE)
-                _add_many([col for col in candidates if regex.match(col)])
-                continue
-            if selector_type == "prefix":
-                prefix = str(selector.get("value") or selector.get("prefix") or "").strip().lower()
-                if not prefix:
-                    continue
-                _add_many([col for col in candidates if col.lower().startswith(prefix)])
-                continue
-            if selector_type == "suffix":
-                suffix = str(selector.get("value") or selector.get("suffix") or "").strip().lower()
-                if not suffix:
-                    continue
-                _add_many([col for col in candidates if col.lower().endswith(suffix)])
-                continue
-            if selector_type == "contains":
-                token = str(selector.get("value") or "").strip().lower()
-                if not token:
-                    continue
-                _add_many([col for col in candidates if token in col.lower()])
-                continue
-            if selector_type == "list":
-                cols = selector.get("columns")
-                if isinstance(cols, list):
-                    _add_many([str(col) for col in cols if col])
-                continue
-            if selector_type == "all_columns_except":
-                except_cols = selector.get("except_columns")
-                excluded = {str(col).lower() for col in except_cols if col} if isinstance(except_cols, list) else set()
-                _add_many([col for col in candidates if col.lower() not in excluded])
-                continue
-            if selector_type == "prefix_numeric_range":
-                prefix = str(selector.get("prefix") or "").strip()
-                start = selector.get("start")
-                end = selector.get("end")
-                if not prefix or not isinstance(start, int) or not isinstance(end, int):
-                    continue
-                lo = min(start, end)
-                hi = max(start, end)
-                rx = re.compile(rf"^{re.escape(prefix)}(\d+)$", flags=re.IGNORECASE)
-                matched: List[str] = []
-                for col in candidates:
-                    m = rx.match(col)
-                    if not m:
-                        continue
-                    try:
-                        pos = int(m.group(1))
-                    except Exception:
-                        continue
-                    if lo <= pos <= hi:
-                        matched.append(col)
-                _add_many(matched)
-        except Exception:
-            continue
-
-    return expanded
-
-
 def _resolve_required_columns_for_review(
     view: Dict[str, Any],
     manifest: Optional[Dict[str, Any]] = None,
@@ -1891,13 +1807,6 @@ def _normalize_llm_result(result: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _merge_gate_lists(primary: List[Any], secondary: List[Any], allowed: List[str]) -> List[str]:
-    allowed_norm = {_normalize_gate_name(name) for name in allowed if name}
-    merged = _dedupe_list([str(item) for item in primary + secondary if item])
-    filtered = [item for item in merged if _normalize_gate_name(item) in allowed_norm]
-    return filtered
-
-
 def _merge_gate_results(
     llm_results: List[Any],
     det_results: List[Any],
@@ -2137,77 +2046,6 @@ def _check_id_integrity(
     evidence["columns_checked"] = candidates
     evidence["column_evidence"] = column_evidence
     return issues, evidence
-
-
-# =============================================================================
-# DEPRECATED: Deterministic rescale detection functions
-# These functions are NO LONGER USED for gate evaluation.
-# The no_semantic_rescale gate is now DELEGATED TO THE LLM for contextual reasoning.
-#
-# Rationale: Threshold-based heuristics (e.g., "if max < 1.5, assume rescaled")
-# cause false positives on datasets with naturally low values (sparse pixel data,
-# pre-normalized features, etc.). The LLM can reason about code + data context.
-# =============================================================================
-
-def _check_no_semantic_rescale(
-    manifest: Dict[str, Any],
-    params: Dict[str, Any],
-    cleaned_header: List[str],
-    column_roles: Dict[str, List[str]],
-    raw_sample: Optional[pd.DataFrame],
-    cleaned_sample: Optional[pd.DataFrame],
-    dataset_profile: Optional[Dict[str, Any]] = None,
-    cleaning_code: Optional[str] = None,
-) -> List[str]:
-    """
-    DEPRECATED: This function is no longer used for gate evaluation.
-    The no_semantic_rescale gate is delegated to the LLM for contextual reasoning.
-
-    Kept for backwards compatibility but returns empty list.
-    """
-    # Delegated to LLM - return no deterministic issues
-    return []
-
-
-def _check_semantic_rescale_from_raw(
-    raw_sample: Optional[pd.DataFrame],
-    cleaned_sample: Optional[pd.DataFrame],
-    cleaned_header: List[str],
-    percent_like: set[str],
-    allow_percent_only: bool,
-    dataset_profile: Optional[Dict[str, Any]] = None,
-    cleaning_code: Optional[str] = None,
-) -> List[str]:
-    """
-    DEPRECATED: This function is no longer used for gate evaluation.
-    The no_semantic_rescale gate is delegated to the LLM for contextual reasoning.
-
-    Kept for backwards compatibility but returns empty list.
-    """
-    # Delegated to LLM - return no deterministic issues
-    return []
-
-
-def _scan_code_for_rescale_ops() -> List[str]:
-    """
-    DEPRECATED: This function is no longer used for gate evaluation.
-    The no_semantic_rescale gate is delegated to the LLM for contextual reasoning.
-
-    Kept for backwards compatibility but returns empty list.
-    """
-    # Delegated to LLM - return no deterministic issues
-    return []
-
-
-def _scan_code_for_rescale_ops_from_code(code: str) -> List[str]:
-    """
-    DEPRECATED: This function is no longer used for gate evaluation.
-    The no_semantic_rescale gate is delegated to the LLM for contextual reasoning.
-
-    Kept for backwards compatibility but returns empty list.
-    """
-    # Delegated to LLM - return no deterministic issues
-    return []
 
 
 def _check_no_synthetic_data(manifest: Dict[str, Any], cleaning_code: Optional[str] = None) -> List[str]:

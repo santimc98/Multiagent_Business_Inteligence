@@ -59,20 +59,6 @@ def is_transient_error_like(msg: str) -> bool:
     return any(pattern in error_lower for pattern in TRANSIENT_ERROR_PATTERNS)
 
 
-def _is_transient_error(msg: str) -> bool:
-    """
-    Check if an error message suggests a transient/temporary failure.
-
-    Args:
-        msg: The error message to check
-
-    Returns:
-        True if error appears transient
-    """
-    error_lower = msg.lower()
-    return any(pattern in error_lower for pattern in TRANSIENT_ERROR_PATTERNS)
-
-
 def _is_transient_sandbox_error(err: Exception) -> bool:
     """
     Check if an exception is a transient sandbox error.

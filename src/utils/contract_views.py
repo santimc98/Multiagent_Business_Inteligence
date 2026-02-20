@@ -895,23 +895,6 @@ def _cap_plot_spec(plot_spec: Dict[str, Any] | None, max_caption_chars: int = 40
     return capped
 
 
-def _json_equal(left: Any, right: Any) -> bool:
-    try:
-        return json.dumps(left, sort_keys=True, ensure_ascii=True) == json.dumps(
-            right,
-            sort_keys=True,
-            ensure_ascii=True,
-        )
-    except Exception:
-        return left == right
-
-
-def _resolve_policy_plot_spec(contract_full: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any] | None:
-    # Deprecated fallback kept for backward compatibility in callers.
-    # Plot source of truth is artifact_requirements.visual_requirements.plot_spec.
-    return None
-
-
 def _resolve_visual_context(
     contract_full: Dict[str, Any],
     contract_min: Dict[str, Any],

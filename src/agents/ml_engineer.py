@@ -700,6 +700,10 @@ class MLEngineerAgent:
         )
         return bool(has_runtime_signal or has_qa_signal)
 
+    def _is_actor_critic_improvement_strict_enabled(self) -> bool:
+        raw = str(os.getenv("ACTOR_CRITIC_IMPROVEMENT_STRICT", "1") or "").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
     def _classify_editor_phase(
         self,
         gate_context: Dict[str, Any] | None,
@@ -3037,6 +3041,7 @@ $strategy_json
             not editor_mode_active
             and previous_code
             and handoff_payload.get("mode") == "improve"
+            and not self._is_actor_critic_improvement_strict_enabled()
         )
         patch_mode_active = bool(
             not editor_mode_active

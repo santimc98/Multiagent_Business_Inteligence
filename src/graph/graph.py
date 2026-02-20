@@ -208,47 +208,6 @@ from src.graph.steps.handoff_utils import (
 )
 
 
-def _retry_sandbox_operations(sandbox_func, max_attempts: int = 2, run_id: Optional[str] = None, step: Optional[str] = None) -> Any:
-    """
-    Retry sandbox operations on transient errors.
-
-    Wraps sandbox_func (which must return a sandbox instance) with retry logic.
-    Returns sandbox instance and result.
-
-    Args:
-        sandbox_func: Function that creates and returns a sandbox instance
-        max_attempts: Number of attempts (default: 2)
-        run_id: Optional run ID for logging
-        step: Optional step name for logging
-
-    Returns:
-        (sandbox, result) where result is the result of sandbox_func
-    """
-    from src.utils.sandbox_resilience import is_transient_sandbox_error, run_cmd_with_retry
-
-    last_error = None
-
-    for attempt in range(max_attempts):
-        try:
-            # Call the sandbox creation function
-            sandbox, result = sandbox_func()
-            return sandbox, result
-        except Exception as e:
-            last_error = e
-            error_msg = str(e)
-
-            print(f"SANDBOX_ATTEMPT_{attempt + 1}/{max_attempts}: {error_msg}")
-
-            # Only retry if error is transient
-            if attempt < max_attempts - 1 and is_transient_sandbox_error(e):
-                print(f"RETRYING_SANDBOX step={step} attempt={attempt + 1}/{max_attempts}")
-                time.sleep(2 ** attempt)
-            else:
-                # Non-transient error or last attempt
-                raise
-
-    raise last_error
-
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
 
@@ -1148,20 +1107,6 @@ def _harmonize_review_packets_with_final_eval(
         return patched
 
     return _patch_packet(dict(reviewer_packet or {}), "reviewer"), _patch_packet(dict(qa_packet or {}), "qa_reviewer"), notes
-
-
-def _append_run_facts_block(text: str, state: Dict[str, Any]) -> str:
-    if not isinstance(state, dict):
-        return text
-    block = state.get("run_facts_block")
-    if not block:
-        _refresh_run_facts_pack(state)
-        block = state.get("run_facts_block")
-    if not block:
-        return text
-    if text:
-        return f"{text}\n\n{block}"
-    return block
 
 
 _RUN_FACTS_BLOCK_RE = re.compile(
@@ -2674,16 +2619,6 @@ def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     return filtered
 
 
-def _filter_contract_for_data_engineer(contract: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    V4.1: Data Engineer uses canonical_columns (inputs) and dialect.
-    No legacy data_requirements filtering needed.
-    """
-    if not isinstance(contract, dict):
-        return {}
-    return dict(contract)
-
-
 def build_de_objective(contract: Dict[str, Any]) -> str:
     objective = (
         "Clean dataset to satisfy contract canonical_columns; ensure numeric/date parsing; "
@@ -3353,106 +3288,6 @@ def _find_stale_outputs(required_outputs: List[str], start_ts: float) -> List[st
             continue
     return stale
 
-def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any] | None) -> Dict[str, Any]:
-    """
-    Build a minimal contract for ML Engineer prompt (V4.1-only).
-    Excludes legacy spec_extraction; uses normalized required_outputs.
-    """
-    if not isinstance(contract, dict):
-        contract = {}
-
-    eval_spec = evaluation_spec if isinstance(evaluation_spec, dict) else contract.get("evaluation_spec") or {}
-    alignment = contract.get("alignment_requirements") or (eval_spec.get("alignment_requirements") if isinstance(eval_spec, dict) else []) or []
-
-    # Get derived_columns from V4.1 location (feature_engineering_plan or direct)
-    fep = contract.get("feature_engineering_plan")
-    derived_cols = []
-    if isinstance(fep, dict):
-        derived_cols = fep.get("derived_columns", [])
-    if not derived_cols:
-        derived_cols = contract.get("derived_columns", [])
-
-    column_roles = contract.get("column_roles", {})
-    # V4.1: Use get_decision_columns accessor, NOT contract.get("decision_variables")
-    decision_variables = get_decision_columns(contract) or []
-    if not decision_variables:
-        # Fallback: infer from column_roles if accessor returns empty
-        roles = get_column_roles(contract) or {}
-        decision_variables = roles.get("decision", []) or []
-
-    allowed_sets_full = contract.get("allowed_feature_sets")
-    if not isinstance(allowed_sets_full, dict):
-        allowed_sets_full = {}
-
-    def _as_list(value: Any) -> List[str]:
-        if isinstance(value, list):
-            return [str(item) for item in value if item is not None]
-        return []
-
-    roles = get_column_roles(contract)
-    pre_decision = _as_list(roles.get("pre_decision"))
-    decision = _as_list(roles.get("decision"))
-    outcome = _as_list(roles.get("outcome"))
-    audit_only = _as_list(roles.get("post_decision_audit_only") or roles.get("audit_only"))
-
-    fallback_model = list(dict.fromkeys(pre_decision + decision))
-    fallback_seg = list(pre_decision)
-    fallback_forbidden = list(dict.fromkeys(outcome + audit_only))
-    fallback_audit = list(audit_only)
-
-    missing_sets: List[str] = []
-    model_features = _as_list(allowed_sets_full.get("model_features"))
-    if not model_features and "model_features" not in allowed_sets_full:
-        model_features = fallback_model
-        missing_sets.append("model_features")
-    segmentation_features = _as_list(allowed_sets_full.get("segmentation_features"))
-    if not segmentation_features and "segmentation_features" not in allowed_sets_full:
-        segmentation_features = fallback_seg
-        missing_sets.append("segmentation_features")
-    forbidden_features = _as_list(allowed_sets_full.get("forbidden_for_modeling"))
-    if not forbidden_features and "forbidden_for_modeling" not in allowed_sets_full:
-        if "forbidden_features" in allowed_sets_full:
-            forbidden_features = _as_list(allowed_sets_full.get("forbidden_features"))
-        else:
-            forbidden_features = fallback_forbidden
-            missing_sets.append("forbidden_for_modeling")
-    audit_only_features = _as_list(allowed_sets_full.get("audit_only_features"))
-    if not audit_only_features and "audit_only_features" not in allowed_sets_full:
-        audit_only_features = fallback_audit
-        missing_sets.append("audit_only_features")
-    if missing_sets:
-        print(f"FALLBACK_FEATURE_SETS: {', '.join(sorted(set(missing_sets)))}")
-
-    return {
-        "contract_version": contract.get("contract_version"),
-        "strategy_title": contract.get("strategy_title"),
-        "business_objective": contract.get("business_objective"),
-        # Use normalized required_outputs
-        "required_outputs": _resolve_required_outputs(contract),
-        # V4.1: No data_requirements - use canonical_columns instead
-        "alignment_requirements": alignment,
-        "canonical_columns": contract.get("canonical_columns", []) or [],
-        "column_roles": column_roles if isinstance(column_roles, dict) else {},
-        # V4.1: Use decision_columns from column_roles, NOT legacy decision_variables
-        "decision_columns": decision_variables if isinstance(decision_variables, list) else [],
-        "derived_columns": derived_cols if isinstance(derived_cols, list) else [],
-        # V4.1: Removed legacy keys (feature_availability, availability_summary)
-        "evaluation_spec": eval_spec,
-        # V4.1 fields
-        "artifact_requirements": contract.get("artifact_requirements", {}),
-        "qa_gates": eval_spec.get("qa_gates", []) if isinstance(eval_spec, dict) else [],
-        "reviewer_gates": eval_spec.get("reviewer_gates", []) if isinstance(eval_spec, dict) else [],
-        "allowed_feature_sets": {
-            "segmentation_features": segmentation_features,
-            "model_features": model_features,
-            "forbidden_features": forbidden_features,
-            "audit_only_features": audit_only_features,
-        },
-        "leakage_execution_plan": contract.get("leakage_execution_plan", {}),
-        "data_limited_mode": contract.get("data_limited_mode", False),
-        "ml_engineer_runbook": contract.get("ml_engineer_runbook", {}),
-    }
-
 def _infer_artifact_type(path: str, deliverable_kind: str | None = None) -> str:
     if deliverable_kind:
         return str(deliverable_kind)
@@ -3818,170 +3653,6 @@ def _infer_deliverable_kind(path: str) -> str:
     from src.utils.contract_accessors import _infer_kind_from_path
     return _infer_kind_from_path(path)
 
-def _infer_scored_rows_schema(
-    contract: Dict[str, Any],
-    evaluation_spec: Dict[str, Any] | None = None,
-) -> Dict[str, Any] | None:
-    """
-    UNIVERSAL: Infer schema for scored_rows.csv based on strategy type and contract.
-
-    Works for ANY objective type (prediction, optimization, clustering, descriptive)
-    with NO hardcoded column names or business logic.
-
-    Returns dict with:
-      - required_columns: list of canonical input columns (always included)
-      - derived_columns: list of derived output columns (based on strategy type)
-      - row_count: "must_match_input" (always)
-    """
-    if not isinstance(contract, dict):
-        return None
-
-    # Base schema: always include input columns
-    canonical_columns = contract.get("canonical_columns") or []
-    if not isinstance(canonical_columns, list):
-        canonical_columns = []
-
-    schema = {
-        "required_columns": canonical_columns.copy(),
-        "derived_columns": [],
-        "row_count": "must_match_input",
-        "description": "One row per input record with canonical columns plus derived outputs (predictions, scores, segments, optimal values as applicable)"
-    }
-
-    # Infer strategy type from contract
-    strategy_context = contract.get("strategy_context") or {}
-    analysis_type = str(strategy_context.get("analysis_type", "")).lower()
-
-    # Check if evaluation spec requires specific outputs
-    eval_spec = evaluation_spec or contract.get("evaluation_spec") or {}
-    objective_type = str(eval_spec.get("objective_type", "")).lower()
-    requires_target = bool(eval_spec.get("requires_target"))
-
-    # Derive output columns based on objective type (UNIVERSAL)
-    derived_cols = schema["derived_columns"]
-
-    # 1. Segmentation/Clustering outputs
-    segmentation = eval_spec.get("segmentation") or {}
-    if segmentation.get("required") or "segment" in analysis_type or "cluster" in analysis_type:
-        # Generic segment identifier (not hardcoded to specific name)
-        derived_cols.append("segment_id")  # or cluster_id
-
-    # 2. Predictive modeling outputs  
-    if "predict" in analysis_type or "predict" in objective_type or requires_target:
-        # Generic prediction columns (adapt to target type)
-        target_info = eval_spec.get("target") or {}
-        target_name = target_info.get("name", "target")
-
-        # Add prediction column (name based on target if available)
-        if target_name and target_name != "target":
-            derived_cols.append(f"predicted_{target_name}")
-        else:
-            derived_cols.append("predicted_value")  # generic
-
-        # Add probability for classification tasks
-        if requires_target:  # Likely binary/multi-class
-            derived_cols.append("predicted_probability")
-
-    # 3. Optimization/Prescriptive outputs
-    decision_var = eval_spec.get("decision_variable") or {}
-    decision_var_name = decision_var.get("name")
-
-    if decision_var_name or "optim" in analysis_type or "prescript" in objective_type:
-        # Add optimal value for decision variable (generic name)
-        if decision_var_name:
-            derived_cols.append(f"optimal_{decision_var_name}")
-        else:
-            derived_cols.append("optimal_value")  # fallback generic
-
-        # Optionally add expected outcome at optimal
-        if requires_target:
-            derived_cols.append("expected_outcome_at_optimal")
-
-    # 4. Ranking/Scoring outputs
-    if "rank" in analysis_type or "scor" in analysis_type:
-        derived_cols.append("score")
-        derived_cols.append("rank")
-
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_derived = []
-    for col in derived_cols:
-        if col not in seen:
-            seen.add(col)
-            unique_derived.append(col)
-    schema["derived_columns"] = unique_derived
-
-    return schema
-
-
-def _ensure_contract_deliverable(
-    contract: Dict[str, Any],
-    path: str,
-    required: bool = True,
-    kind: str | None = None,
-    description: str | None = None,
-    schema: Dict[str, Any] | None = None,  # ← NEW: optional schema
-) -> Dict[str, Any]:
-    """V4.1: Add required outputs to required_outputs only. No spec_extraction."""
-    if not isinstance(contract, dict):
-        return {}
-    if not path:
-        return contract
-
-    # V4.1: Use required_outputs directly, no spec_extraction
-    existing_outputs = contract.get("required_outputs")
-    if not isinstance(existing_outputs, list):
-        existing_outputs = []
-
-    seen: set[str] = set(_normalize_output_path(p) for p in existing_outputs if p)
-    merged_outputs = [_normalize_output_path(p) for p in existing_outputs if p]
-
-    # Add new required path if not already present
-    if required:
-        norm_path = _normalize_output_path(path)
-        if norm_path not in seen:
-            merged_outputs.append(norm_path)
-
-    contract["required_outputs"] = merged_outputs
-    return contract
-
-def _ensure_scored_rows_output(
-    contract: Dict[str, Any],
-    evaluation_spec: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
-    """V4.1: Ensure scored_rows.csv in required_outputs. No spec_extraction."""
-    if not isinstance(contract, dict):
-        return {}
-
-    required_outputs = contract.get("required_outputs", []) or []
-    requires_row_scoring = False
-    if isinstance(evaluation_spec, dict):
-        requires_row_scoring = bool(evaluation_spec.get("requires_row_scoring"))
-
-    explicit_required = "data/scored_rows.csv" in required_outputs
-
-    if explicit_required or requires_row_scoring:
-        # Generate universal schema for scored_rows.csv
-        scored_rows_schema = _infer_scored_rows_schema(contract, evaluation_spec)
-
-        contract = _ensure_contract_deliverable(
-            contract,
-            "data/scored_rows.csv",
-            required=True,
-            kind="dataset",
-            description="Row-level scores and key features.",
-            schema=scored_rows_schema,
-        )
-        return contract
-
-    # If not required, remove from required_outputs if present
-    if "data/scored_rows.csv" in required_outputs:
-        contract["required_outputs"] = [
-            path for path in required_outputs if path != "data/scored_rows.csv"
-        ]
-    return contract
-
-
 def _should_run_case_alignment(
     contract: Dict[str, Any] | None,
     evaluation_spec: Dict[str, Any] | None = None,
@@ -4044,46 +3715,6 @@ def _case_alignment_skip_reason(
             return ""
         return "case_key/case_columns missing"
     return ""
-
-def _ensure_alignment_check_output(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return {}
-    reqs = contract.get("alignment_requirements", [])
-    if not isinstance(reqs, list) or not reqs:
-        return contract
-    contract = _ensure_contract_deliverable(
-        contract,
-        "data/alignment_check.json",
-        required=True,
-        kind="report",
-        description="Alignment check results for contract requirements.",
-    )
-    return contract
-
-def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    V4.1 CUTOVER: Minimal normalization only.
-
-    Contract is now IMMUTABLE after Execution Planner generates it.
-    All V4.1 fields are preserved as-is. No legacy key handling.
-    """
-    if not isinstance(contract, dict):
-        return {}
-    normalized = dict(contract)
-
-    # V4.1: No legacy quality_gates normalization - use qa_gates instead
-
-    # Ensure basic required structures exist (non-invasive)
-    if not isinstance(normalized.get("business_alignment"), dict):
-        normalized["business_alignment"] = {}
-    if not isinstance(normalized.get("compliance_checklist"), list):
-        normalized["compliance_checklist"] = []
-    if not isinstance(normalized.get("alignment_requirements"), list):
-        normalized["alignment_requirements"] = []
-
-    # V4.1: Contract comes from Execution Planner with legacy keys already stripped
-
-    return normalized
 
 def _normalize_required_fixes(items: List[Any] | None) -> List[str]:
     fixes: List[str] = []
@@ -5409,58 +5040,6 @@ def _extract_named_string_list(code: str, names: List[str]) -> List[str]:
                         values.append(elt.value)
                 return values
     return []
-
-def _extract_dataframe_literal_columns(code: str) -> List[str]:
-    import ast
-
-    if not code:
-        return []
-    try:
-        tree = ast.parse(code)
-    except Exception:
-        return []
-
-    cols: set[str] = set()
-
-    def _collect_dict(node: ast.Dict) -> None:
-        for key in node.keys:
-            if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                cols.add(key.value)
-
-    def _is_dataframe_call(node: ast.AST) -> bool:
-        if not isinstance(node, ast.Call):
-            return False
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr == "DataFrame":
-            if isinstance(func.value, ast.Name) and func.value.id in {"pd", "pandas"}:
-                return True
-        if isinstance(func, ast.Name) and func.id == "DataFrame":
-            return True
-        return False
-
-    for node in ast.walk(tree):
-        if not _is_dataframe_call(node):
-            continue
-        if node.args:
-            arg0 = node.args[0]
-            if isinstance(arg0, ast.Dict):
-                _collect_dict(arg0)
-            elif isinstance(arg0, (ast.List, ast.Tuple)):
-                for elt in arg0.elts:
-                    if isinstance(elt, ast.Dict):
-                        _collect_dict(elt)
-        for kw in node.keywords:
-            if kw.arg != "data":
-                continue
-            value = kw.value
-            if isinstance(value, ast.Dict):
-                _collect_dict(value)
-            elif isinstance(value, (ast.List, ast.Tuple)):
-                for elt in value.elts:
-                    if isinstance(elt, ast.Dict):
-                        _collect_dict(elt)
-
-    return sorted(cols)
 
 def _extract_column_references(code: str) -> List[str]:
     import ast
@@ -7281,26 +6860,6 @@ def _extract_weights_from_obj(obj: Any) -> Dict[str, float]:
             return out
     return {}
 
-def _summarize_weight_uniformity(weights_obj: Dict[str, Any]) -> Dict[str, Any]:
-    weights = _extract_weights_from_obj(weights_obj)
-    if not weights:
-        return {"uniform": None}
-    vals = list(weights.values())
-    try:
-        max_val = max(vals)
-        min_val = min(vals)
-        mean_val = sum(vals) / len(vals)
-        spread = max_val - min_val
-    except Exception:
-        return {"uniform": None}
-    return {
-        "uniform": spread < 1e-6,
-        "min": float(min_val),
-        "max": float(max_val),
-        "mean": float(mean_val),
-        "spread": float(spread),
-    }
-
 def _normalize_metrics_from_weights(weights_obj: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(weights_obj, dict):
         return {}
@@ -8928,159 +8487,6 @@ def _build_iteration_handoff(
             "raw_tail": preflight_raw_tail,
         }
     return handoff
-
-
-def _prepare_improvement_iteration(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Prepare an improvement iteration: compare metrics, update patience, build handoff."""
-    imp_count = int(state.get("improvement_attempt_count", 0))
-    best_metric = state.get("improvement_best_metric")
-
-    # Read current metrics from the latest execution
-    current_metrics = _load_json_safe("data/metrics.json") or {}
-    primary_metric_name = current_metrics.get("primary_metric", "roc_auc")
-    # Try cv_ prefixed first, then raw
-    current_value = current_metrics.get(f"cv_{primary_metric_name}")
-    if current_value is None:
-        current_value = current_metrics.get(primary_metric_name)
-    # Fallback: check primary_metric_snapshot from state
-    if current_value is None:
-        snapshot = state.get("primary_metric_snapshot") or {}
-        if isinstance(snapshot, dict):
-            current_value = snapshot.get("primary_metric_value")
-            if not primary_metric_name or primary_metric_name == "roc_auc":
-                primary_metric_name = snapshot.get("primary_metric_name") or primary_metric_name
-
-    # Coerce to float
-    try:
-        current_value = float(current_value) if current_value is not None else None
-    except (TypeError, ValueError):
-        current_value = None
-
-    # Determine if metric improved
-    improved = False
-    result: Dict[str, Any] = {}
-    if current_value is not None:
-        if best_metric is None or current_value > float(best_metric):
-            improved = True
-            result["improvement_best_metric"] = current_value
-            result["improvement_best_attempt_id"] = imp_count
-            result["improvement_patience_counter"] = 0
-
-            # Snapshot best attempt artifacts
-            artifact_paths = list(state.get("artifact_paths", []) or [])
-            oc_report = state.get("output_contract_report") or {}
-            artifact_index = state.get("artifact_index") or []
-            execution_output = state.get("execution_output") or ""
-            plots_local = list(state.get("plots_local", []) or [])
-            diagnostics = state.get("artifact_content_diagnostics") or {}
-            dest = _snapshot_best_attempt(
-                attempt_id=imp_count + 1,
-                artifact_paths=artifact_paths,
-                output_contract_report=oc_report if isinstance(oc_report, dict) else {},
-                artifact_index=artifact_index if isinstance(artifact_index, list) else [],
-                execution_output=execution_output,
-                plots_local=plots_local,
-                diagnostics=diagnostics if isinstance(diagnostics, dict) else {},
-            )
-            if dest:
-                result["best_attempt_dir"] = dest
-                result["best_attempt_score"] = state.get("last_attempt_score")
-                result["best_attempt_id"] = imp_count + 1
-                result["best_attempt_artifact_index"] = artifact_index
-                result["best_attempt_output_contract_report"] = oc_report
-                result["best_attempt_execution_output"] = execution_output
-                result["best_attempt_plots"] = plots_local
-        else:
-            result["improvement_patience_counter"] = int(state.get("improvement_patience_counter", 0)) + 1
-
-    result["improvement_attempt_count"] = imp_count + 1
-
-    # Build improvement history
-    history = list(state.get("improvement_metrics_history", []) or [])
-    history.append({"attempt": imp_count, "metric": current_value, "improved": improved})
-    result["improvement_metrics_history"] = history
-
-    # Read feature importance if available
-    feat_imp = _load_json_safe("data/feature_importance.json")
-    if not feat_imp:
-        feat_imp = _load_json_safe("reports/feature_importance_shap.json")
-    if not isinstance(feat_imp, dict):
-        feat_imp = {}
-    # Trim to top 20 features if it's a flat dict of name->importance
-    if feat_imp and all(isinstance(v, (int, float)) for v in feat_imp.values()):
-        sorted_feats = sorted(feat_imp.items(), key=lambda x: abs(float(x[1])), reverse=True)[:20]
-        feat_imp = dict(sorted_feats)
-
-    # Build improvement handoff
-    reviewer_feedback = str(state.get("review_feedback") or state.get("reviewer_last_result", {}).get("feedback", "") or "")
-
-    # Extract consolidated improvement suggestions from review board
-    consolidated_imp = state.get("consolidated_improvement_suggestions") or {}
-    if not isinstance(consolidated_imp, dict):
-        consolidated_imp = {}
-    consolidated_techniques = consolidated_imp.get("techniques", []) if isinstance(consolidated_imp.get("techniques"), list) else []
-
-    # Extract strategy techniques and fallback chain for improvement guidance
-    strategy = state.get("selected_strategy") or {}
-    if not isinstance(strategy, dict):
-        strategy = {}
-    strategy_techniques = [str(t) for t in (strategy.get("techniques") or []) if t]
-    strategy_fallback_chain = [str(f) for f in (strategy.get("fallback_chain") or []) if f]
-    strategy_feature_families = strategy.get("feature_families") or []
-    strategy_hypothesis = str(strategy.get("hypothesis") or "")
-
-    # Build smart patch_objectives from consolidated suggestions + strategy
-    patch_objectives = list(consolidated_techniques[:5])  # Prioritize reviewer/evaluator suggestions
-    # Add strategy-derived objectives if not already covered
-    if strategy_fallback_chain and len(patch_objectives) < 6:
-        for fallback in strategy_fallback_chain:
-            obj = f"Strategy fallback option: {fallback}"
-            if obj not in patch_objectives:
-                patch_objectives.append(obj)
-            if len(patch_objectives) >= 6:
-                break
-    # Default objectives if nothing specific came from reviewers
-    if not patch_objectives:
-        patch_objectives = [
-            "Improve primary metric through feature engineering, ensemble, or tuning",
-            "Add feature interactions if not already present",
-            "Consider ensemble averaging if using single model",
-            "Optimize hyperparameters if using defaults",
-        ]
-
-    result["iteration_handoff"] = {
-        "mode": "improve",
-        "improvement_attempt": imp_count + 1,
-        "metric_focus": {
-            "primary_metric": primary_metric_name,
-            "current_value": current_value,
-            "best_value": result.get("improvement_best_metric", best_metric),
-            "history": history,
-        },
-        "feature_importance": feat_imp,
-        "reviewer_suggestions": reviewer_feedback,
-        "consolidated_techniques": consolidated_techniques,
-        "strategy_context": {
-            "techniques": strategy_techniques[:10],
-            "fallback_chain": strategy_fallback_chain[:5],
-            "feature_families": strategy_feature_families[:6] if isinstance(strategy_feature_families, list) else [],
-            "hypothesis": strategy_hypothesis[:500] if strategy_hypothesis else "",
-        },
-        "must_preserve": [
-            "All contract-required output paths",
-            "Data loading and CSV dialect handling",
-            "Train/test split logic",
-            "Cross-validation structure",
-        ],
-        "patch_objectives": patch_objectives,
-    }
-
-    # Mark iteration type so check_evaluation routes correctly
-    result["last_iteration_type"] = "metric"
-
-    print(f"IMPROVEMENT_PREPARED: attempt={imp_count+1} current={current_value} best={result.get('improvement_best_metric', best_metric)} improved={improved} patience={result.get('improvement_patience_counter', 0)}")
-
-    return result
 
 
 def _suggest_next_actions(
@@ -12418,39 +11824,6 @@ def _extract_error_snippet(code: str, error_details: str, *, context_lines: int 
         return "\n".join(snippet_lines)
     except Exception:
         return ""
-
-
-def _filter_scored_rows_required_columns(
-    artifact_requirements: Dict[str, Any],
-    decisioning_names: List[str],
-    canonical_columns: List[str],
-) -> Dict[str, Any]:
-    if not isinstance(artifact_requirements, dict):
-        return artifact_requirements
-    if not decisioning_names:
-        return artifact_requirements
-    scored_schema = artifact_requirements.get("scored_rows_schema")
-    if not isinstance(scored_schema, dict):
-        return artifact_requirements
-    required_cols = scored_schema.get("required_columns")
-    if not isinstance(required_cols, list) or not required_cols:
-        return artifact_requirements
-    decisioning_norm = {_norm_name(col) for col in decisioning_names if col}
-    canonical_norm = {_norm_name(col) for col in canonical_columns if col}
-    filtered: List[str] = []
-    for col in required_cols:
-        if not col:
-            continue
-        norm = _norm_name(col)
-        if norm in decisioning_norm or norm in canonical_norm or is_identifier_like(str(col)):
-            filtered.append(str(col))
-    if filtered == required_cols:
-        return artifact_requirements
-    updated_schema = dict(scored_schema)
-    updated_schema["required_columns"] = filtered
-    updated_artifacts = dict(artifact_requirements)
-    updated_artifacts["scored_rows_schema"] = updated_schema
-    return updated_artifacts
 
 
 def _extract_required_columns_from_contract(
@@ -18814,22 +18187,6 @@ def retry_handler(state: AgentState) -> AgentState:
     }
     route_reason = "policy_not_evaluated"
 
-    # Legacy improvement loop compatibility: only run when explicitly active.
-    if (
-        state.get("last_iteration_type") == "metric"
-        and not bool(state.get("ml_improvement_round_active"))
-        and state.get("improvement_attempt_count") is not None
-    ):
-        imp_result = _prepare_improvement_iteration(state if isinstance(state, dict) else {})
-        result.update(imp_result)
-        current_history.append(
-            f"IMPROVEMENT_ITERATION: attempt={imp_result.get('improvement_attempt_count', '?')} "
-            f"patience={imp_result.get('improvement_patience_counter', 0)}"
-        )
-        result["feedback_history"] = current_history[-20:]
-        print(f"RETRY_HANDLER: improvement iteration prepared, routing to engineer")
-        return result
-
     try:
         state_dict = state if isinstance(state, dict) else {}
         strategies_wrapper = state_dict.get("strategies") if isinstance(state_dict.get("strategies"), dict) else {}
@@ -20235,9 +19592,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "summary_lines": results_insights.get("summary_lines", []) if isinstance(results_insights, dict) else [],
         "risks": results_insights.get("risks", []) if isinstance(results_insights, dict) else [],
         "recommendations": results_insights.get("recommendations", []) if isinstance(results_insights, dict) else [],
-        "iteration_recommendation": (
-            results_insights.get("iteration_recommendation", {}) if isinstance(results_insights, dict) else {}
-        ),
+        "iteration_recommendation": {},
     }
     if status == "NEEDS_IMPROVEMENT":
         results_packet["status"] = "NEEDS_IMPROVEMENT"
@@ -21548,21 +20903,6 @@ def check_evaluation(state: AgentState):
         best_value = snapshot.get("baseline_value", "N/A")
         return metric_name, metric_value, best_value
 
-    def _extract_results_advisor_iteration_recommendation() -> Dict[str, Any]:
-        results_last = state.get("results_last_result")
-        if isinstance(results_last, dict):
-            rec = results_last.get("iteration_recommendation")
-            if isinstance(rec, dict) and rec:
-                return dict(rec)
-        review_stack = state.get("ml_review_stack")
-        if isinstance(review_stack, dict):
-            results_packet = review_stack.get("results_advisor")
-            if isinstance(results_packet, dict):
-                rec = results_packet.get("iteration_recommendation")
-                if isinstance(rec, dict) and rec:
-                    return dict(rec)
-        return {}
-
     if state.get("runtime_fix_terminal"):
         metric_name, metric_value, best_value = _get_metric_info()
         print(
@@ -21582,9 +20922,6 @@ def check_evaluation(state: AgentState):
     metric_max = policy.get("metric_improvement_max") if policy else None
     budget_left = (metric_max - metric_iters) if metric_max else "unlimited"
     metric_name, metric_value, best_value = _get_metric_info()
-    advisor_iteration = _extract_results_advisor_iteration_recommendation()
-    advisor_action = str(advisor_iteration.get("action") or "").strip().upper()
-    advisor_mode = str(advisor_iteration.get("mode") or "").strip().lower()
 
     if policy:
         compliance_max = policy.get("compliance_bootstrap_max")
@@ -21664,37 +21001,6 @@ def check_evaluation(state: AgentState):
             print(f"ITER_DECISION type=metric action=stop reason=CASE_ALIGNMENT_REGRESSED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
             return "approved"
 
-    # Improvement loop: after a successful execution, iterate to improve metrics.
-    if last_iter_type == "metric":
-        imp_count = int(state.get("improvement_attempt_count", 0))
-        imp_max = int(state.get("max_improvement_attempts", 3))
-        imp_patience = int(state.get("improvement_patience_counter", 0))
-        imp_patience_max = int(state.get("improvement_patience", 2))
-
-        if imp_count >= imp_max:
-            print(f"IMPROVEMENT_STOP: Max improvement attempts ({imp_max}) reached.")
-            print(f"ITER_DECISION type=metric action=stop reason=IMPROVEMENT_MAX_REACHED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
-            state["stop_reason"] = "IMPROVEMENT_MAX_REACHED"
-            return "approved"
-        if imp_patience >= imp_patience_max:
-            print(f"IMPROVEMENT_STOP: Patience exhausted ({imp_patience_max} consecutive non-improvements).")
-            print(f"ITER_DECISION type=metric action=stop reason=IMPROVEMENT_PATIENCE_EXHAUSTED metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
-            state["stop_reason"] = "IMPROVEMENT_PATIENCE_EXHAUSTED"
-            return "approved"
-
-        # Check reviewer suggestion for improvement
-        reviewer_sees_room = not state.get("reviewer_no_improvement_room", False)
-        if not reviewer_sees_room:
-            print(f"IMPROVEMENT_STOP: Reviewer sees no room for improvement.")
-            print(f"ITER_DECISION type=metric action=stop reason=REVIEWER_NO_IMPROVEMENT metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
-            state["stop_reason"] = "REVIEWER_NO_IMPROVEMENT"
-            return "approved"
-
-        # Continue improving
-        print(f"IMPROVEMENT_CONTINUE: attempt={imp_count+1}/{imp_max} patience={imp_patience}/{imp_patience_max}")
-        print(f"ITER_DECISION type=metric action=retry reason=IMPROVEMENT_LOOP metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
-        return "retry"
-
     if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
         if _is_blocking_retry_reason(state if isinstance(state, dict) else {}):
             print(f"ITER_DECISION type=other action=retry reason=COMPLIANCE_OR_RUNTIME metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
@@ -21709,18 +21015,6 @@ def check_evaluation(state: AgentState):
             f"metric={metric_name}:{metric_value} best={best_value} budget_left=1"
         )
         return "retry"
-
-    # Respect explicit stop recommendation from results advisor.
-    if (
-        advisor_action == "STOP"
-        and state.get("review_verdict") in {"APPROVED", "APPROVE_WITH_WARNINGS"}
-    ):
-        state["stop_reason"] = "RESULTS_ADVISOR_STOP"
-        print(
-            f"ITER_DECISION type=other action=stop reason=RESULTS_ADVISOR_STOP "
-            f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
-        )
-        return "approved"
 
     print(f"ITER_DECISION type=other action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
     return "approved"
@@ -21751,13 +21045,6 @@ def run_translator(state: AgentState) -> AgentState:
                 promote_best = True
         except Exception:
             pass
-    # Improvement loop: promote best attempt if the last attempt was not the best
-    imp_best_id = state.get("improvement_best_attempt_id")
-    imp_count = state.get("improvement_attempt_count")
-    if imp_best_id is not None and imp_count is not None and state.get("best_attempt_dir"):
-        if int(imp_best_id) < int(imp_count):
-            promote_best = True
-            print(f"IMPROVEMENT_PROMOTE: Best attempt was #{imp_best_id}, last was #{imp_count}. Promoting best.")
     if promote_best:
         updates = _promote_best_attempt(state)
         if updates:

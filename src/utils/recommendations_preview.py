@@ -1,4 +1,3 @@
-import csv
 import fnmatch
 import hashlib
 import json
@@ -15,26 +14,6 @@ def _safe_load_json(path: str) -> Any:
             return json.load(f)
     except Exception:
         return None
-
-
-def _safe_load_rows(path: str, max_rows: int = 500) -> Tuple[List[str], List[Dict[str, Any]]]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows: List[Dict[str, Any]] = []
-            for _, row in zip(range(max_rows), reader):
-                rows.append(row)
-            return reader.fieldnames or [], rows
-    except Exception:
-        return [], []
-
-
-def _is_number(value: Any) -> bool:
-    try:
-        float(str(value).replace(",", "."))
-        return True
-    except Exception:
-        return False
 
 
 def _normalize_reporting_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -305,73 +284,6 @@ def _extract_items_from_optimization(payload: Any, source_path: str) -> List[Dic
     return [_ensure_item_fields(item, source_path) for item in candidates]
 
 
-def _build_items_from_scored_rows(path: str, max_examples: int) -> List[Dict[str, Any]]:
-    columns, rows = _safe_load_rows(path, max_rows=max(200, max_examples * 40))
-    if not rows or not columns:
-        return []
-    candidate_cols = [
-        col for col in columns
-        if any(tok in str(col).lower() for tok in ["score", "prob", "pred", "risk"])
-    ]
-    candidate_cols = candidate_cols or columns
-    score_col = None
-    scored_rows = []
-    for col in candidate_cols:
-        values = []
-        for row in rows:
-            val = row.get(col)
-            if _is_number(val):
-                values.append(float(str(val).replace(",", ".")))
-        if values:
-            score_col = col
-            scored_rows = values
-            break
-    if not score_col:
-        return []
-    scored_pairs = []
-    for row in rows:
-        val = row.get(score_col)
-        if not _is_number(val):
-            continue
-        score = float(str(val).replace(",", "."))
-        scored_pairs.append((score, row))
-    if not scored_pairs:
-        return []
-    scored_pairs.sort(key=lambda item: item[0], reverse=True)
-    items: List[Dict[str, Any]] = []
-    for score, row in scored_pairs[:max_examples]:
-        segment = {}
-        segment_keys = [
-            key for key in columns
-            if any(tok in str(key).lower() for tok in ["segment", "cluster", "group", "tier", "band", "bucket", "category"])
-        ]
-        for key in segment_keys:
-            val = row.get(key)
-            if val not in (None, ""):
-                segment[key] = val
-        if not segment:
-            for key in columns:
-                if key == score_col:
-                    continue
-                val = row.get(key)
-                if val in (None, "") or _is_number(val):
-                    continue
-                segment[key] = val
-                if len(segment) >= 2:
-                    break
-        items.append(
-            _ensure_item_fields(
-                {
-                    "segment": segment,
-                    "score": score,
-                    "metric": score_col,
-                },
-                "data/scored_rows.csv",
-            )
-        )
-    return items
-
-
 def _load_iteration_journal(run_dir: str) -> List[Dict[str, Any]]:
     journal_path = os.path.join(run_dir, "report", "governance", "ml_iteration_journal.jsonl")
     if not os.path.exists(journal_path):
@@ -432,26 +344,6 @@ def _hash_code_text(code: str) -> str:
     if not code:
         return ""
     return hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:12]
-
-
-def _attempt_is_blocked(attempt_dir: str, journal_entries: List[Dict[str, Any]]) -> bool:
-    if not journal_entries:
-        return False
-    code_path = os.path.join(attempt_dir, "code_sent.py")
-    if not os.path.exists(code_path):
-        return False
-    try:
-        with open(code_path, "r", encoding="utf-8") as f_code:
-            code = f_code.read()
-    except Exception:
-        return False
-    code_hash = _hash_code_text(code)
-    if not code_hash:
-        return False
-    for entry in journal_entries:
-        if entry.get("code_hash") == code_hash and _entry_has_blocking_issue(entry):
-            return True
-    return False
 
 
 def _attempt_blocking_reasons(attempt_dir: str, journal_entries: List[Dict[str, Any]]) -> List[str]:
