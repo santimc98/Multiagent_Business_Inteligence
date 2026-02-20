@@ -7809,10 +7809,31 @@ def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
     return {"type": "error", "message": line[:300]}
 
 
-def _should_use_ml_editor_mode(previous_code: str | None, gate_context: Dict[str, Any] | None) -> bool:
+def _is_editable_ml_code(previous_code: str | None) -> bool:
     code_text = str(previous_code or "").strip()
     if not code_text:
         return False
+    lowered = code_text.lower()
+    non_editable_prefixes = ("# generation failed", "# error:")
+    if lowered.startswith(non_editable_prefixes):
+        return False
+    if "pipeline halted due to strategy/contract drift" in lowered:
+        return False
+    return True
+
+
+def _should_use_ml_editor_mode(
+    previous_code: str | None,
+    gate_context: Dict[str, Any] | None,
+    iteration_count: int = 0,
+) -> bool:
+    # Canonical policy: once baseline code exists, every subsequent ML iteration
+    # must be editor mode to patch the latest script rather than regenerate.
+    if not _is_editable_ml_code(previous_code):
+        return False
+    if int(iteration_count or 0) >= 1:
+        return True
+
     gate = gate_context if isinstance(gate_context, dict) else {}
     if not gate:
         return False
@@ -15659,7 +15680,11 @@ def run_engineer(state: AgentState) -> AgentState:
     # Patch Mode Inputs
     previous_code = state.get('generated_code') or state.get('last_generated_code')
     gate_context = state.get('last_gate_context')
-    editor_mode_active = _should_use_ml_editor_mode(previous_code, gate_context)
+    editor_mode_active = _should_use_ml_editor_mode(
+        previous_code,
+        gate_context,
+        iteration_count=int(state.get("iteration_count", 0) or 0),
+    )
     iteration_handoff = state.get("iteration_handoff")
     if previous_code and gate_context and not isinstance(iteration_handoff, dict):
         iteration_handoff = _build_iteration_handoff(
@@ -15678,7 +15703,7 @@ def run_engineer(state: AgentState) -> AgentState:
         editor_mode_active = False
 
     if editor_mode_active:
-        print("ML_EDITOR_MODE: reusing previous code with runtime/QA feedback.")
+        print("ML_EDITOR_MODE: reusing previous code with iterative feedback.")
         if run_id:
             log_run_event(run_id, "ml_editor_mode", {"attempt": ml_attempt, "iteration": iter_id})
 
