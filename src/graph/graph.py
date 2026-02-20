@@ -18703,6 +18703,35 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if run_id:
         log_run_event(run_id, "result_evaluator_start", {})
     contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
+    metric_improvement_round_active = bool(state.get("ml_improvement_round_active"))
+    metric_round_review_mode = _resolve_metric_round_review_mode(contract if isinstance(contract, dict) else {})
+    metric_round_review_guarded = metric_improvement_round_active and metric_round_review_mode in {
+        "hybrid_guarded",
+        "advisor_only",
+    }
+    metric_round_advisor_only = metric_improvement_round_active and metric_round_review_mode == "advisor_only"
+    if metric_improvement_round_active:
+        print(
+            "METRIC_IMPROVEMENT_REVIEW: active=true "
+            + "mode="
+            + metric_round_review_mode
+            + " reviewer_policy="
+            + ("skip_llm" if metric_round_advisor_only else ("non_blocking" if metric_round_review_guarded else "full"))
+        )
+        if run_id:
+            try:
+                log_run_event(
+                    run_id,
+                    "metric_improvement_round_review_mode",
+                    {
+                        "mode": metric_round_review_mode,
+                        "reviewer_policy": "skip_llm"
+                        if metric_round_advisor_only
+                        else ("non_blocking" if metric_round_review_guarded else "full"),
+                    },
+                )
+            except Exception:
+                pass
     artifact_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
     visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
     visuals_missing = bool(state.get("visuals_missing"))
@@ -19284,135 +19313,160 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         analysis_type = strategy.get("analysis_type", "predictive")
         evaluation_spec_code_audit = dict(evaluation_spec_for_review or {})
         evaluation_spec_code_audit["execution_diagnostics"] = review_diagnostics
-        try:
-            ok, counters, err_msg = _consume_budget(
-                budget_counter_state,
-                "reviewer_calls",
-                "max_reviewer_calls",
-                "Reviewer",
-            )
-            review_counters = counters
-            budget_counter_state["budget_counters"] = review_counters
-            if ok:
-                reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
-                if not isinstance(reviewer_view, dict) or not reviewer_view:
-                    projected_views = build_contract_views_projection(
-                        contract,
-                        state.get("artifact_index") or [],
+        if metric_round_advisor_only:
+            review_result = {
+                "status": "APPROVE_WITH_WARNINGS",
+                "feedback": "METRIC_IMPROVEMENT_REVIEW_MODE: reviewer LLM skipped (advisor_only).",
+                "failed_gates": [],
+                "required_fixes": [],
+                "hard_failures": [],
+            }
+            review_warnings.append(str(review_result.get("feedback")))
+        else:
+            try:
+                ok, counters, err_msg = _consume_budget(
+                    budget_counter_state,
+                    "reviewer_calls",
+                    "max_reviewer_calls",
+                    "Reviewer",
+                )
+                review_counters = counters
+                budget_counter_state["budget_counters"] = review_counters
+                if ok:
+                    reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
+                    if not isinstance(reviewer_view, dict) or not reviewer_view:
+                        projected_views = build_contract_views_projection(
+                            contract,
+                            state.get("artifact_index") or [],
+                        )
+                        reviewer_view = projected_views.get("reviewer_view") or {}
+                    reviewer_view, evaluation_spec_code_audit = _apply_ml_reviewer_output_scope(
+                        contract if isinstance(contract, dict) else {},
+                        state if isinstance(state, dict) else {},
+                        reviewer_view if isinstance(reviewer_view, dict) else {},
+                        evaluation_spec_code_audit if isinstance(evaluation_spec_code_audit, dict) else None,
                     )
-                    reviewer_view = projected_views.get("reviewer_view") or {}
-                reviewer_view, evaluation_spec_code_audit = _apply_ml_reviewer_output_scope(
-                    contract if isinstance(contract, dict) else {},
-                    state if isinstance(state, dict) else {},
-                    reviewer_view if isinstance(reviewer_view, dict) else {},
-                    evaluation_spec_code_audit if isinstance(evaluation_spec_code_audit, dict) else None,
-                )
-                if isinstance(reviewer_view, dict):
-                    reviewer_view = dict(reviewer_view)
-                    reviewer_view["execution_diagnostics"] = review_diagnostics
-                    ml_data_path_for_review = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
-                    if ml_data_path_for_review:
-                        reviewer_view["ml_data_path"] = ml_data_path_for_review
-                    reviewer_view = compress_long_lists(reviewer_view)[0]
-                review_result = reviewer.review_code(
-                    code,
-                    analysis_type,
-                    "",
-                    reviewer_view.get("strategy_summary") if isinstance(reviewer_view, dict) else "",
-                    evaluation_spec_code_audit,
-                    reviewer_view=reviewer_view,
-                )
-                review_result = _apply_review_consistency_guard(
-                    review_result,
-                    review_diagnostics,
-                    actor="reviewer",
-                )
-                review_result = apply_contract_first_gate_policy(
-                    review_result,
-                    reviewer_active_gate_names,
-                    actor="reviewer",
-                )
-                if run_id:
-                    log_agent_snapshot(
-                        run_id,
-                        "reviewer",
-                        prompt=getattr(reviewer, "last_prompt", None),
-                        response=getattr(reviewer, "last_response", None) or review_result,
-                        context={
-                            "analysis_type": analysis_type,
-                            "evaluation_spec": evaluation_spec_code_audit,
-                            "reviewer_view": reviewer_view,
-                            "execution_diagnostics": review_diagnostics,
-                        },
-                        verdicts=review_result,
-                        attempt=iter_id,
+                    if isinstance(reviewer_view, dict):
+                        reviewer_view = dict(reviewer_view)
+                        reviewer_view["execution_diagnostics"] = review_diagnostics
+                        ml_data_path_for_review = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
+                        if ml_data_path_for_review:
+                            reviewer_view["ml_data_path"] = ml_data_path_for_review
+                        reviewer_view = compress_long_lists(reviewer_view)[0]
+                    review_result = reviewer.review_code(
+                        code,
+                        analysis_type,
+                        "",
+                        reviewer_view.get("strategy_summary") if isinstance(reviewer_view, dict) else "",
+                        evaluation_spec_code_audit,
+                        reviewer_view=reviewer_view,
                     )
-                if review_result and review_result.get("status") != "APPROVED":
-                    review_warnings.append(
-                        f"REVIEWER_CODE_AUDIT[{review_result.get('status')}]: {review_result.get('feedback')}"
+                    review_result = _apply_review_consistency_guard(
+                        review_result,
+                        review_diagnostics,
+                        actor="reviewer",
                     )
-            else:
-                review_warnings.append(f"REVIEWER_CODE_AUDIT_SKIPPED: {err_msg}")
-        except Exception as review_err:
-            review_warnings.append(f"REVIEWER_CODE_AUDIT_ERROR: {review_err}")
-        try:
-            ok, counters, err_msg = _consume_budget(
-                budget_counter_state,
-                "qa_calls",
-                "max_qa_calls",
-                "QA Reviewer",
-            )
-            review_counters = counters
-            budget_counter_state["budget_counters"] = review_counters
-            if ok:
-                qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context_prompt)
-                qa_result = _apply_review_consistency_guard(
-                    qa_result,
-                    review_diagnostics,
-                    actor="qa_reviewer",
+                    review_result = apply_contract_first_gate_policy(
+                        review_result,
+                        reviewer_active_gate_names,
+                        actor="reviewer",
+                    )
+                    if metric_round_review_guarded:
+                        review_result = _coerce_review_packet_to_nonblocking(review_result, "reviewer")
+                    if run_id:
+                        log_agent_snapshot(
+                            run_id,
+                            "reviewer",
+                            prompt=getattr(reviewer, "last_prompt", None),
+                            response=getattr(reviewer, "last_response", None) or review_result,
+                            context={
+                                "analysis_type": analysis_type,
+                                "evaluation_spec": evaluation_spec_code_audit,
+                                "reviewer_view": reviewer_view,
+                                "execution_diagnostics": review_diagnostics,
+                                "metric_round_review_mode": metric_round_review_mode if metric_improvement_round_active else None,
+                            },
+                            verdicts=review_result,
+                            attempt=iter_id,
+                        )
+                    if review_result and review_result.get("status") != "APPROVED":
+                        review_warnings.append(
+                            f"REVIEWER_CODE_AUDIT[{review_result.get('status')}]: {review_result.get('feedback')}"
+                        )
+                else:
+                    review_warnings.append(f"REVIEWER_CODE_AUDIT_SKIPPED: {err_msg}")
+            except Exception as review_err:
+                review_warnings.append(f"REVIEWER_CODE_AUDIT_ERROR: {review_err}")
+        if metric_round_advisor_only:
+            qa_result = {
+                "status": "APPROVE_WITH_WARNINGS",
+                "feedback": "METRIC_IMPROVEMENT_REVIEW_MODE: qa_reviewer LLM skipped (advisor_only).",
+                "failed_gates": [],
+                "required_fixes": [],
+                "hard_failures": [],
+            }
+            review_warnings.append(str(qa_result.get("feedback")))
+        else:
+            try:
+                ok, counters, err_msg = _consume_budget(
+                    budget_counter_state,
+                    "qa_calls",
+                    "max_qa_calls",
+                    "QA Reviewer",
                 )
-                qa_result = apply_contract_first_gate_policy(
-                    qa_result,
-                    qa_active_gate_names,
-                    actor="qa_reviewer",
-                )
-                if run_id:
-                    log_agent_snapshot(
-                        run_id,
-                        "qa_reviewer",
-                        prompt=getattr(qa_reviewer, "last_prompt", None),
-                        response=getattr(qa_reviewer, "last_response", None) or qa_result,
-                        context=qa_context_prompt if isinstance(qa_context_prompt, dict) else {"qa_context": qa_context_prompt},
-                        verdicts=qa_result,
-                        attempt=iter_id,
+                review_counters = counters
+                budget_counter_state["budget_counters"] = review_counters
+                if ok:
+                    qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context_prompt)
+                    qa_result = _apply_review_consistency_guard(
+                        qa_result,
+                        review_diagnostics,
+                        actor="qa_reviewer",
                     )
-                if qa_result and qa_result.get("status") != "APPROVED":
-                    review_warnings.append(
-                        f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
+                    qa_result = apply_contract_first_gate_policy(
+                        qa_result,
+                        qa_active_gate_names,
+                        actor="qa_reviewer",
                     )
-                if qa_result:
-                    qa_status = qa_result.get("status")
-                    if qa_status == "REJECTED":
-                        qa_rejected = True
-                        audit_rejected = True
-                    qa_result_failed = qa_result.get("failed_gates", []) or []
-                    qa_result_required = qa_result.get("required_fixes", []) or []
-                    qa_result_hard = qa_result.get("hard_failures") or []
-                    qa_result_hard = [str(g) for g in qa_result_hard if g]
-                    for gate_name in qa_result_failed:
-                        if str(gate_name).lower() in hard_qa_gates and gate_name not in qa_result_hard:
-                            qa_result_hard.append(gate_name)
-                    if qa_result_hard:
-                        if any(str(g).lower() in hard_qa_gates for g in qa_result_hard):
-                            hard_qa_gate_reject = True
-                    qa_failed_gates.extend(qa_result_failed)
-                    qa_required_fixes.extend(qa_result_required)
-                    qa_hard_failures.extend(qa_result_hard)
-            else:
-                review_warnings.append(f"QA_CODE_AUDIT_SKIPPED: {err_msg}")
-                state["qa_budget_exceeded"] = True
-        except Exception as qa_err:
-            review_warnings.append(f"QA_CODE_AUDIT_ERROR: {qa_err}")
+                    if metric_round_review_guarded:
+                        qa_result = _coerce_review_packet_to_nonblocking(qa_result, "qa_reviewer")
+                    if run_id:
+                        log_agent_snapshot(
+                            run_id,
+                            "qa_reviewer",
+                            prompt=getattr(qa_reviewer, "last_prompt", None),
+                            response=getattr(qa_reviewer, "last_response", None) or qa_result,
+                            context=qa_context_prompt if isinstance(qa_context_prompt, dict) else {"qa_context": qa_context_prompt},
+                            verdicts=qa_result,
+                            attempt=iter_id,
+                        )
+                    if qa_result and qa_result.get("status") != "APPROVED":
+                        review_warnings.append(
+                            f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
+                        )
+                    if qa_result:
+                        qa_status = qa_result.get("status")
+                        if qa_status == "REJECTED":
+                            qa_rejected = True
+                            audit_rejected = True
+                        qa_result_failed = qa_result.get("failed_gates", []) or []
+                        qa_result_required = qa_result.get("required_fixes", []) or []
+                        qa_result_hard = qa_result.get("hard_failures") or []
+                        qa_result_hard = [str(g) for g in qa_result_hard if g]
+                        for gate_name in qa_result_failed:
+                            if str(gate_name).lower() in hard_qa_gates and gate_name not in qa_result_hard:
+                                qa_result_hard.append(gate_name)
+                        if qa_result_hard:
+                            if any(str(g).lower() in hard_qa_gates for g in qa_result_hard):
+                                hard_qa_gate_reject = True
+                        qa_failed_gates.extend(qa_result_failed)
+                        qa_required_fixes.extend(qa_result_required)
+                        qa_hard_failures.extend(qa_result_hard)
+                else:
+                    review_warnings.append(f"QA_CODE_AUDIT_SKIPPED: {err_msg}")
+                    state["qa_budget_exceeded"] = True
+            except Exception as qa_err:
+                review_warnings.append(f"QA_CODE_AUDIT_ERROR: {qa_err}")
         if qa_notes:
             review_warnings.extend(qa_notes)
             qa_notes_appended = True
@@ -19443,7 +19497,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         post_audit_summary = "\n".join([*review_warnings, *qa_notes]) if (review_warnings or qa_notes) else None
 
     post_audit_appended = False
-    if post_audit_context:
+    if post_audit_context and not metric_round_review_guarded:
         governance_context.update(post_audit_context)
         evaluation_spec_final = dict(evaluation_spec_for_review)
         evaluation_spec_final["governance_context"] = governance_context
@@ -19461,6 +19515,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     feedback = f"{feedback}\n{post_audit_summary}" if feedback else post_audit_summary
                     new_history.append(post_audit_summary)
                     post_audit_appended = True
+    elif post_audit_context and metric_round_review_guarded:
+        new_history.append(
+            "METRIC_IMPROVEMENT_REVIEW_MODE: reviewer/qa code-audit findings kept as advisory context only."
+        )
 
     if post_audit_summary and not post_audit_appended:
         feedback = f"{feedback}\n{post_audit_summary}" if feedback else post_audit_summary
@@ -19678,6 +19736,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "hard_qa_retry_count": hard_qa_retry_count,
         "iteration_handoff": iteration_handoff,
     }
+    if metric_improvement_round_active:
+        result_state["ml_improvement_review_mode"] = metric_round_review_mode
     if isinstance(gate_context.get("feedback_record"), dict):
         result_state["ml_feedback_record"] = gate_context.get("feedback_record")
     if merged_hard_failures:
@@ -19867,6 +19927,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "reviewer": reviewer_packet,
         "qa_reviewer": qa_packet,
         "results_advisor": results_packet,
+        "metric_improvement_context": {
+            "active": bool(metric_improvement_round_active),
+            "review_mode": metric_round_review_mode if metric_improvement_round_active else None,
+        },
         "iteration_handoff": iteration_handoff,
         "deterministic_facts": review_board_facts,
         "cross_review_alignment": {"notes": cross_review_notes},
@@ -20667,6 +20731,94 @@ def _metric_improvement_policy(contract: Dict[str, Any] | None) -> Tuple[int, fl
     return rounds, min_delta
 
 
+def _normalize_metric_round_review_mode(raw: Any) -> str:
+    token = str(raw or "").strip().lower()
+    if token in {"full", "hybrid_guarded", "advisor_only"}:
+        return token
+    return "hybrid_guarded"
+
+
+def _resolve_metric_round_review_mode(contract: Dict[str, Any] | None) -> str:
+    policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
+    if not isinstance(policy, dict):
+        policy = {}
+    contract_mode = policy.get("metric_round_review_mode")
+    if contract_mode is not None and str(contract_mode).strip():
+        return _normalize_metric_round_review_mode(contract_mode)
+    return _normalize_metric_round_review_mode(os.getenv("METRIC_ROUND_REVIEW_MODE", "hybrid_guarded"))
+
+
+def _coerce_review_packet_to_nonblocking(packet: Dict[str, Any], actor: str) -> Dict[str, Any]:
+    patched = dict(packet) if isinstance(packet, dict) else {}
+    original_status = str(patched.get("status") or "").strip().upper()
+    if original_status not in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+        patched["status"] = "APPROVE_WITH_WARNINGS"
+    elif not original_status:
+        patched["status"] = "APPROVE_WITH_WARNINGS"
+    patched["failed_gates"] = []
+    patched["required_fixes"] = []
+    patched["hard_failures"] = []
+    feedback = str(patched.get("feedback") or "").strip()
+    note = (
+        "METRIC_IMPROVEMENT_REVIEW_MODE: "
+        + str(actor or "reviewer")
+        + " findings are advisory-only in this round."
+    )
+    patched["feedback"] = f"{feedback}\n{note}".strip() if feedback else note
+    return patched
+
+
+def _collect_active_gate_names(contract: Dict[str, Any]) -> List[str]:
+    active: List[str] = []
+    for gate in (get_qa_gates(contract) or []):
+        if isinstance(gate, dict) and gate.get("name"):
+            active.append(str(gate.get("name")))
+    for gate in (get_reviewer_gates(contract) or []):
+        if isinstance(gate, dict) and gate.get("name"):
+            active.append(str(gate.get("name")))
+    return list(dict.fromkeys(active))
+
+
+def _metric_round_has_deterministic_blockers(
+    state: Dict[str, Any],
+    gate_context: Dict[str, Any] | None = None,
+) -> bool:
+    if not isinstance(state, dict):
+        return True
+    if bool(state.get("runtime_fix_terminal")) or bool(state.get("sandbox_failed")):
+        return True
+    if _has_runtime_failure_marker(state.get("execution_output")):
+        return True
+
+    oc_report = state.get("output_contract_report")
+    if isinstance(oc_report, dict):
+        if str(oc_report.get("overall_status") or "").strip().lower() == "error":
+            return True
+        if isinstance(oc_report.get("missing"), list) and any(str(x).strip() for x in oc_report.get("missing", [])):
+            return True
+        artifact_report = oc_report.get("artifact_requirements_report")
+        if isinstance(artifact_report, dict):
+            if str(artifact_report.get("status") or "").strip().lower() == "error":
+                return True
+
+    board_payload = state.get("review_board_verdict")
+    if isinstance(board_payload, dict):
+        blockers = [str(x) for x in (board_payload.get("deterministic_blockers") or []) if x]
+        if blockers:
+            return True
+
+    current_gate = gate_context if isinstance(gate_context, dict) else (
+        state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+    )
+    hard_failures = [str(x) for x in (current_gate.get("hard_failures") or []) if x]
+    if hard_failures:
+        return True
+    for gate in [str(x) for x in (current_gate.get("failed_gates") or []) if x]:
+        if _looks_blocking_retry_signal(gate):
+            return True
+    return False
+
+
 def _is_data_limited_mode_active(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
     data_limited = contract.get("data_limited_mode") if isinstance(contract, dict) else {}
     if isinstance(data_limited, bool):
@@ -20941,15 +21093,9 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     advisor_context["iteration"] = int(state.get("iteration_count", 0) or 0)
     advisor_context["higher_is_better"] = bool(_metric_higher_is_better(metric_name))
     advisor_context["min_delta"] = float(min_delta)
+    advisor_context["phase"] = "baseline_review"
     advisor_context["candidate_metrics"] = baseline_metrics
-    active_gate_names: List[str] = []
-    for gate in (get_qa_gates(contract) or []):
-        if isinstance(gate, dict) and gate.get("name"):
-            active_gate_names.append(str(gate.get("name")))
-    for gate in (get_reviewer_gates(contract) or []):
-        if isinstance(gate, dict) and gate.get("name"):
-            active_gate_names.append(str(gate.get("name")))
-    advisor_context["active_gates_context"] = list(dict.fromkeys(active_gate_names))
+    advisor_context["active_gates_context"] = _collect_active_gate_names(contract)
 
     critique_packet = results_advisor.generate_critique_packet(advisor_context)
     critique_meta = (
@@ -21056,6 +21202,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     state["ml_improvement_round_count"] = int(state.get("ml_improvement_round_count", 0) or 0) + 1
     state["ml_improvement_attempted"] = False
     state["ml_improvement_kept"] = "pending"
+    state["ml_improvement_review_mode"] = _resolve_metric_round_review_mode(contract)
     state["ml_improvement_snapshot_dir"] = str(snapshot_dir)
     state["ml_improvement_output_paths"] = output_paths
     state["ml_improvement_primary_metric_name"] = metric_name
@@ -21132,9 +21279,65 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         if isinstance(snapshot, dict):
             improved_value = _coerce_float(snapshot.get("primary_metric_value"))
 
+    active_gates_context = _collect_active_gate_names(contract if isinstance(contract, dict) else {})
+    baseline_metrics_payload = (
+        state.get("ml_improvement_baseline_metrics")
+        if isinstance(state.get("ml_improvement_baseline_metrics"), dict)
+        else {}
+    )
+    if not baseline_metrics_payload and baseline_value is not None:
+        baseline_metrics_payload = {
+            metric_name: float(baseline_value),
+            "primary_metric_value": float(baseline_value),
+        }
+    critique_context = {
+        "run_id": str(state.get("run_id") or "unknown_run"),
+        "iteration": int(state.get("iteration_count", 0) or 0),
+        "phase": "candidate_review",
+        "primary_metric_name": metric_name,
+        "higher_is_better": bool(higher_is_better),
+        "min_delta": float(min_delta),
+        "baseline_metrics": baseline_metrics_payload,
+        "candidate_metrics": current_metrics,
+        "active_gates_context": active_gates_context,
+        "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
+        "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
+    }
+    critique_packet: Dict[str, Any] = {}
+    critique_meta: Dict[str, Any] = {}
+    try:
+        critique_packet = results_advisor.generate_critique_packet(critique_context)
+        if not isinstance(critique_packet, dict):
+            critique_packet = {}
+    except Exception:
+        critique_packet = {}
+    meta_obj = getattr(results_advisor, "last_critique_meta", None)
+    if isinstance(meta_obj, dict):
+        critique_meta = dict(meta_obj)
+
+    metric_comparison = critique_packet.get("metric_comparison") if isinstance(critique_packet, dict) else {}
+    if isinstance(metric_comparison, dict):
+        baseline_from_packet = _coerce_float(metric_comparison.get("baseline_value"))
+        candidate_from_packet = _coerce_float(metric_comparison.get("candidate_value"))
+        if baseline_value is None and baseline_from_packet is not None:
+            baseline_value = baseline_from_packet
+        if improved_value is None and candidate_from_packet is not None:
+            improved_value = candidate_from_packet
+    meets_min_delta_packet = (
+        metric_comparison.get("meets_min_delta")
+        if isinstance(metric_comparison, dict) and isinstance(metric_comparison.get("meets_min_delta"), bool)
+        else None
+    )
+
     verdict = normalize_review_status(state.get("review_verdict"))
-    approved = verdict in {"APPROVED", "APPROVE_WITH_WARNINGS"}
-    improved = approved and _is_improvement(baseline_value, improved_value, higher_is_better, min_delta)
+    deterministic_blockers = _metric_round_has_deterministic_blockers(state)
+    approved = not deterministic_blockers
+    improved_by_metric = (
+        bool(meets_min_delta_packet)
+        if isinstance(meets_min_delta_packet, bool)
+        else _is_improvement(baseline_value, improved_value, higher_is_better, min_delta)
+    )
+    improved = approved and improved_by_metric
 
     if not improved:
         _restore_ml_outputs(snapshot_dir, output_paths)
@@ -21147,9 +21350,16 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
 
     decision_note = (
         f"METRIC_IMPROVEMENT_ROUND: metric={metric_name} baseline={baseline_value} "
-        f"improved={improved_value} min_delta={min_delta} kept={state.get('ml_improvement_kept')}"
+        f"improved={improved_value} min_delta={min_delta} "
+        f"meets_min_delta={improved_by_metric} deterministic_blockers={deterministic_blockers} "
+        f"kept={state.get('ml_improvement_kept')}"
     )
     _append_feedback_history(state, decision_note)
+    if isinstance(critique_packet, dict) and critique_packet:
+        state["ml_improvement_candidate_critique_packet"] = critique_packet
+        critique_summary = str(critique_packet.get("analysis_summary") or "").strip()
+        if critique_summary:
+            _append_feedback_history(state, "RESULTS_ADVISOR_CANDIDATE_REVIEW: " + critique_summary)
 
     run_id = str(state.get("run_id") or "")
     if run_id:
@@ -21172,12 +21382,28 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 else float(improved_value - baseline_value),
                 "signature": tracker_context.get("signature"),
                 "action": hypothesis_packet.get("action"),
+                "deterministic_blockers": bool(deterministic_blockers),
+                "advisor_meets_min_delta": bool(improved_by_metric),
             },
         )
         try:
             delta_value: Optional[float] = None
             if baseline_value is not None and improved_value is not None:
                 delta_value = float(improved_value - baseline_value)
+            if critique_packet:
+                log_run_event(
+                    run_id,
+                    "metric_improvement_candidate_critique",
+                    {
+                        "iteration": int(state.get("iteration_count", 0) or 0),
+                        "mode": critique_meta.get("mode"),
+                        "source": critique_meta.get("source"),
+                        "provider": critique_meta.get("provider"),
+                        "model": critique_meta.get("model"),
+                        "analysis_summary": str(critique_packet.get("analysis_summary") or "")[:280],
+                        "meets_min_delta": bool(improved_by_metric),
+                    },
+                )
             log_run_event(
                 run_id,
                 "metric_improvement_round_complete",
@@ -21191,6 +21417,8 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                     "higher_is_better": bool(higher_is_better),
                     "approved": bool(approved),
                     "improved": bool(improved),
+                    "improved_by_metric": bool(improved_by_metric),
+                    "deterministic_blockers": bool(deterministic_blockers),
                     "kept": state.get("ml_improvement_kept"),
                     "review_verdict": verdict,
                 },

@@ -207,9 +207,11 @@ class ResultsAdvisorAgent:
         if not self.fe_client or self.fe_provider == "none":
             return {}
 
+        phase = str(context.get("phase") or "baseline_review").strip() or "baseline_review"
         payload = {
             "run_id": str(context.get("run_id") or "unknown_run"),
             "iteration": int(context.get("iteration") or 0),
+            "phase": phase,
             "primary_metric_name": str(context.get("primary_metric_name") or "primary_metric"),
             "higher_is_better": bool(context.get("higher_is_better", True)),
             "min_delta": float(context.get("min_delta", 0.0005) or 0.0005),
@@ -222,7 +224,8 @@ class ResultsAdvisorAgent:
         compact_payload = self._truncate(json.dumps(payload, ensure_ascii=True), 14000)
         system_prompt = (
             "You are a strict ML critic. Return ONLY a JSON object with no markdown. "
-            "Do not provide code advice. Focus on metric deltas, validation signals, and error modes."
+            "Do not provide code advice. Focus on metric deltas, validation signals, and error modes. "
+            "Phase tells whether this is baseline assessment or candidate review."
         )
         user_prompt = (
             "Return JSON with this exact contract:\n"
@@ -468,6 +471,7 @@ class ResultsAdvisorAgent:
     def _generate_critique_packet_deterministic(self, context: Dict[str, Any]) -> Dict[str, Any]:
         context = context if isinstance(context, dict) else {}
         run_id = str(context.get("run_id") or "unknown_run")
+        phase = str(context.get("phase") or "baseline_review").strip() or "baseline_review"
         try:
             iteration = int(context.get("iteration") or 0)
         except Exception:
@@ -536,6 +540,10 @@ class ResultsAdvisorAgent:
         active_gates = [str(item) for item in active_gates if str(item).strip()][:30]
 
         summary_parts = []
+        if phase == "candidate_review":
+            summary_parts.append("Candidate round assessment.")
+        else:
+            summary_parts.append("Baseline assessment context.")
         summary_parts.append("No material gain vs baseline." if not meets_min_delta else "Candidate meets min delta.")
         if any(mode.get("id") == "minority_class_recall_low" for mode in error_modes):
             summary_parts.append("Minority-class signal remains weak.")
