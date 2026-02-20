@@ -204,6 +204,119 @@ def resolve_qa_gates(evaluation_spec: Dict[str, Any] | None) -> tuple[List[Dict[
 
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    token = str(raw).strip().lower()
+    return token not in {"0", "false", "no", "off", ""}
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+        if token in {"0", "false", "no", "off"}:
+            return False
+    return bool(default)
+
+
+def _is_augmentation_technique_name(name: Any) -> bool:
+    token = str(name or "").strip().lower()
+    if not token:
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", "_", token).strip("_")
+    direct_tokens = {
+        "data_augmentation",
+        "augmentation",
+        "oversampling",
+        "undersampling",
+        "resampling",
+        "bootstrap_augmentation",
+        "class_balancing",
+        "synthetic_minority_oversampling",
+    }
+    if normalized in direct_tokens:
+        return True
+    fuzzy_tokens = [
+        "augment",
+        "oversampl",
+        "undersampl",
+        "resampl",
+        "synthetic",
+        "bootstrap",
+        "class_balanc",
+    ]
+    return any(part in normalized for part in fuzzy_tokens)
+
+
+def _extract_hypothesis_technique(packet: Any) -> str:
+    if not isinstance(packet, dict):
+        return ""
+    hypothesis = packet.get("hypothesis")
+    if isinstance(hypothesis, dict):
+        tech = hypothesis.get("technique")
+        if isinstance(tech, str) and tech.strip():
+            return tech.strip()
+    direct = packet.get("technique")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    return ""
+
+
+def _extract_metric_round_context(evaluation_spec: Dict[str, Any] | None) -> Dict[str, bool]:
+    if not isinstance(evaluation_spec, dict):
+        return {"metric_round_active": False, "augmentation_requested": False}
+
+    metric_round_active = _coerce_bool(
+        evaluation_spec.get("metric_improvement_round_active")
+        or evaluation_spec.get("ml_improvement_round_active")
+        or False
+    )
+    augmentation_requested = _coerce_bool(evaluation_spec.get("augmentation_requested") or False)
+
+    iteration_handoff = evaluation_spec.get("iteration_handoff")
+    if isinstance(iteration_handoff, dict):
+        source = str(iteration_handoff.get("source") or "").strip().lower()
+        if "metric_improvement" in source:
+            metric_round_active = True
+        candidate_packets = [
+            iteration_handoff.get("hypothesis_packet"),
+            iteration_handoff.get("iteration_hypothesis_packet"),
+        ]
+        for packet in candidate_packets:
+            if _is_augmentation_technique_name(_extract_hypothesis_technique(packet)):
+                augmentation_requested = True
+                break
+
+    direct_packet = evaluation_spec.get("ml_improvement_hypothesis_packet")
+    if _is_augmentation_technique_name(_extract_hypothesis_technique(direct_packet)):
+        augmentation_requested = True
+
+    fe_plan = evaluation_spec.get("feature_engineering_plan")
+    if isinstance(fe_plan, dict):
+        techniques = fe_plan.get("techniques")
+        if isinstance(techniques, list):
+            for item in techniques:
+                if isinstance(item, dict):
+                    technique = item.get("technique") or item.get("name")
+                else:
+                    technique = item
+                if _is_augmentation_technique_name(technique):
+                    augmentation_requested = True
+                    break
+
+    return {
+        "metric_round_active": bool(metric_round_active),
+        "augmentation_requested": bool(augmentation_requested),
+    }
+
+
 def _resolve_ml_data_path(evaluation_spec: Dict[str, Any] | None) -> str:
     if not isinstance(evaluation_spec, dict):
         return ""
@@ -364,6 +477,9 @@ class QAReviewerAgent:
         qa_gate_names = _gate_names(qa_gate_specs)
         qa_gates_json = json.dumps(qa_gate_specs, indent=2, ensure_ascii=True)
         active_qa_gates_json = json.dumps(qa_gate_names, indent=2, ensure_ascii=True)
+        metric_round_context = _extract_metric_round_context(evaluation_spec)
+        metric_round_active = bool(metric_round_context.get("metric_round_active"))
+        augmentation_requested = bool(metric_round_context.get("augmentation_requested"))
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are the Lead QA Engineer.
@@ -409,6 +525,8 @@ class QAReviewerAgent:
         - QA Gates (contract-driven, with severity/params): $qa_gates
         - ACTIVE_QA_GATES (names only): $active_qa_gates
         - Execution Diagnostics (JSON): $execution_diagnostics_json
+        - Metric Improvement Round Active: $metric_round_active
+        - Augmentation Requested (from hypothesis/plan): $augmentation_requested
         
         INSTRUCTIONS:
         - Analyze the code line-by-line.
@@ -421,6 +539,9 @@ class QAReviewerAgent:
         - When listing failed_gates, use the gate "name" values from QA Gates.
         - failed_gates/hard_failures MUST be an exact subset of ACTIVE_QA_GATES.
         - Never invent gates. Non-active findings go only to feedback/warnings (no gate failure).
+        - IMPORTANT EXCEPTION: if Metric Improvement Round Active=true AND Augmentation Requested=true,
+          do NOT fail no_synthetic_data for controlled augmentation/resampling changes in this round.
+          Report any caution as warning text only.
         
         EVIDENCE REQUIREMENT:
         - Any REJECT or warning must cite evidence from the provided artifacts or code.
@@ -447,6 +568,8 @@ class QAReviewerAgent:
             qa_gates=qa_gates_json,
             active_qa_gates=active_qa_gates_json,
             execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2, ensure_ascii=True),
+            metric_round_active=str(metric_round_active).lower(),
+            augmentation_requested=str(augmentation_requested).lower(),
             output_format_instructions=output_format_instructions,
             senior_evidence_rule=SENIOR_EVIDENCE_RULE,
         )
@@ -1219,11 +1342,25 @@ def run_static_qa_checks(
     require_train_eval = train_eval_gate is not None
 
     allow_resampling_random = False
+    allow_synthetic_augmentation = False
     no_synth_spec = gate_lookup.get("no_synthetic_data")
     if isinstance(no_synth_spec, dict):
         params = no_synth_spec.get("params")
         if isinstance(params, dict):
             allow_resampling_random = bool(params.get("allow_resampling_random"))
+            allow_synthetic_augmentation = bool(
+                params.get("allow_synthetic_augmentation")
+                or params.get("allow_augmentation")
+                or params.get("allow_data_augmentation")
+            )
+    metric_round_context = _extract_metric_round_context(evaluation_spec)
+    metric_round_active = bool(metric_round_context.get("metric_round_active"))
+    augmentation_requested = bool(metric_round_context.get("augmentation_requested"))
+    dynamic_aug_relax = (
+        _env_flag("QA_RELAX_NO_SYNTH_FOR_AUGMENTATION", True)
+        and metric_round_active
+        and augmentation_requested
+    )
     synthetic_detected = _detect_synthetic_data_calls(tree, allow_resampling_random)
 
     warnings: List[str] = []
@@ -1274,11 +1411,17 @@ def run_static_qa_checks(
         )
 
     if require_no_synth and synthetic_detected:
-        _flag(
-            "no_synthetic_data",
-            "Synthetic data construction detected (random generators, make_* datasets, or literal DataFrame).",
-            "Remove synthetic data creation; load the real CSV and operate on contract columns only.",
-        )
+        if (allow_synthetic_augmentation and augmentation_requested) or dynamic_aug_relax:
+            warnings.append(
+                "NO_SYNTHETIC_DATA_RELAXED_FOR_AUGMENTATION: metric improvement round requested "
+                "controlled augmentation; synthetic-data gate enforced as warning only."
+            )
+        else:
+            _flag(
+                "no_synthetic_data",
+                "Synthetic data construction detected (random generators, make_* datasets, or literal DataFrame).",
+                "Remove synthetic data creation; load the real CSV and operate on contract columns only.",
+            )
 
     contract_columns = _resolve_contract_columns_for_qa(evaluation_spec)
     if not contract_columns:
@@ -1377,6 +1520,13 @@ def run_static_qa_checks(
     facts_payload = facts if isinstance(facts, dict) else collect_static_qa_facts(code)
     facts_payload["has_read_csv"] = scanner.has_read_csv
     facts_payload["has_synthetic_data"] = synthetic_detected
+    facts_payload["augmentation_requested"] = augmentation_requested
+    facts_payload["metric_round_active"] = metric_round_active
+    facts_payload["no_synth_relaxed_for_augmentation"] = bool(
+        synthetic_detected
+        and require_no_synth
+        and ((allow_synthetic_augmentation and augmentation_requested) or dynamic_aug_relax)
+    )
     facts_payload["has_contract_column_reference"] = has_contract_column_reference
     facts_payload["contract_columns_checked"] = contract_columns
     facts_payload["qa_gates_evaluated"] = qa_gate_names

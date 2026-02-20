@@ -16636,6 +16636,21 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         dataset_semantics_summary = state.get("dataset_semantics_summary")
         if dataset_semantics_summary:
             qa_context["dataset_semantics_summary"] = dataset_semantics_summary
+        iteration_handoff_ctx = state.get("iteration_handoff")
+        if isinstance(iteration_handoff_ctx, dict) and iteration_handoff_ctx:
+            qa_context["iteration_handoff"] = iteration_handoff_ctx
+        hypothesis_packet_ctx = state.get("ml_improvement_hypothesis_packet")
+        if isinstance(hypothesis_packet_ctx, dict) and hypothesis_packet_ctx:
+            qa_context["ml_improvement_hypothesis_packet"] = hypothesis_packet_ctx
+        metric_round_active_ctx = bool(state.get("ml_improvement_round_active"))
+        qa_context["metric_improvement_round_active"] = metric_round_active_ctx
+        qa_context["augmentation_requested"] = bool(
+            metric_round_active_ctx
+            and _resolve_metric_round_augmentation_requested(
+                state if isinstance(state, dict) else {},
+                contract if isinstance(contract, dict) else {},
+            )
+        )
         ml_data_path = state.get("ml_data_path")
         if not ml_data_path and isinstance(qa_context, dict):
             artifact_reqs = qa_context.get("artifact_requirements")
@@ -19280,6 +19295,21 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         qa_context["ml_data_path"] = ml_data_path
     if state.get("ml_training_policy_warnings"):
         qa_context["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings")
+    iteration_handoff_ctx = state.get("iteration_handoff")
+    if isinstance(iteration_handoff_ctx, dict) and iteration_handoff_ctx:
+        qa_context["iteration_handoff"] = iteration_handoff_ctx
+    hypothesis_packet_ctx = state.get("ml_improvement_hypothesis_packet")
+    if isinstance(hypothesis_packet_ctx, dict) and hypothesis_packet_ctx:
+        qa_context["ml_improvement_hypothesis_packet"] = hypothesis_packet_ctx
+    metric_round_active_ctx = bool(state.get("ml_improvement_round_active"))
+    qa_context["metric_improvement_round_active"] = metric_round_active_ctx
+    qa_context["augmentation_requested"] = bool(
+        metric_round_active_ctx
+        and _resolve_metric_round_augmentation_requested(
+            state if isinstance(state, dict) else {},
+            contract if isinstance(contract, dict) else {},
+        )
+    )
     qa_context["execution_diagnostics"] = review_diagnostics
     qa_context_prompt = compress_long_lists(qa_context)[0] if isinstance(qa_context, dict) else qa_context
 
@@ -20757,6 +20787,79 @@ def _resolve_metric_round_review_mode(contract: Dict[str, Any] | None) -> str:
 def _is_approved_review_status(value: Any) -> bool:
     normalized = _normalize_review_status(str(value or ""))
     return normalized in {"APPROVED", "APPROVE_WITH_WARNINGS"}
+
+
+def _is_augmentation_technique_name(value: Any) -> bool:
+    token = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    if not token:
+        return False
+    direct = {
+        "data_augmentation",
+        "augmentation",
+        "oversampling",
+        "undersampling",
+        "resampling",
+        "bootstrap_augmentation",
+        "class_balancing",
+        "synthetic_minority_oversampling",
+    }
+    if token in direct:
+        return True
+    fuzzy = ["augment", "oversampl", "undersampl", "resampl", "synthetic", "bootstrap", "class_balanc"]
+    return any(item in token for item in fuzzy)
+
+
+def _extract_hypothesis_technique(packet: Any) -> str:
+    if not isinstance(packet, dict):
+        return ""
+    hypothesis = packet.get("hypothesis")
+    if isinstance(hypothesis, dict):
+        technique = hypothesis.get("technique")
+        if isinstance(technique, str) and technique.strip():
+            return technique.strip()
+    direct = packet.get("technique")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    return ""
+
+
+def _resolve_metric_round_augmentation_requested(
+    state: Dict[str, Any],
+    contract: Dict[str, Any] | None = None,
+) -> bool:
+    if not isinstance(state, dict):
+        return False
+    packet_candidates: List[Any] = [
+        state.get("ml_improvement_hypothesis_packet"),
+        state.get("iteration_handoff", {}).get("hypothesis_packet")
+        if isinstance(state.get("iteration_handoff"), dict)
+        else None,
+        state.get("iteration_handoff", {}).get("iteration_hypothesis_packet")
+        if isinstance(state.get("iteration_handoff"), dict)
+        else None,
+        state.get("last_gate_context", {}).get("iteration_hypothesis_packet")
+        if isinstance(state.get("last_gate_context"), dict)
+        else None,
+    ]
+    for packet in packet_candidates:
+        if _is_augmentation_technique_name(_extract_hypothesis_technique(packet)):
+            return True
+
+    source_contract = contract if isinstance(contract, dict) else (
+        state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    )
+    fe_plan = source_contract.get("feature_engineering_plan") if isinstance(source_contract, dict) else {}
+    if isinstance(fe_plan, dict):
+        techniques = fe_plan.get("techniques")
+        if isinstance(techniques, list):
+            for item in techniques:
+                if isinstance(item, dict):
+                    technique = item.get("technique") or item.get("name")
+                else:
+                    technique = item
+                if _is_augmentation_technique_name(technique):
+                    return True
+    return False
 
 
 def _has_real_baseline_reviewer_approval(state: Dict[str, Any]) -> bool:
