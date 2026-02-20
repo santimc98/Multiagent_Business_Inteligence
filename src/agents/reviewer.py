@@ -2,11 +2,17 @@ import os
 import json
 import re
 import ast
+import copy
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from openai import OpenAI
 from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
+from src.utils.sandbox_paths import CANONICAL_CLEANED_REL, CANONICAL_MANIFEST_REL
+from src.utils.reviewer_response_schema import (
+    build_reviewer_eval_response_schema,
+    build_reviewer_response_schema,
+)
 
 load_dotenv()
 
@@ -43,6 +49,29 @@ def _extract_json_object(text: str) -> str | None:
             if depth == 0:
                 return text[start:i + 1]
     return None
+
+
+def _coerce_llm_response_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+    candidates = getattr(response, "candidates", None)
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None)
+            if not isinstance(parts, list):
+                continue
+            chunks: List[str] = []
+            for part in parts:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    chunks.append(part_text.strip())
+            if chunks:
+                return "\n".join(chunks)
+    return str(response or "")
 
 
 def _normalize_reviewer_gate_name(item: Any) -> str:
@@ -127,6 +156,81 @@ def _resolve_target_columns(
     return dedup
 
 
+def _normalize_output_path(path: Any) -> str:
+    text = str(path or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    return text.lstrip("/")
+
+
+def _extract_output_entry(item: Any) -> tuple[str, str]:
+    if isinstance(item, str):
+        return _normalize_output_path(item), ""
+    if not isinstance(item, dict):
+        return "", ""
+    candidate = (
+        item.get("path")
+        or item.get("output_path")
+        or item.get("output")
+        or item.get("artifact")
+        or item.get("file")
+    )
+    owner = str(item.get("owner") or "").strip()
+    return _normalize_output_path(candidate), owner
+
+
+def _is_data_engineer_output_path(path: str, owner: str | None = None) -> bool:
+    owner_key = str(owner or "").strip().lower()
+    if owner_key == "data_engineer":
+        return True
+    normalized = _normalize_output_path(path).lower()
+    if not normalized:
+        return False
+    canonical = {
+        _normalize_output_path(CANONICAL_CLEANED_REL).lower(),
+        _normalize_output_path(CANONICAL_MANIFEST_REL).lower(),
+        "data/cleaned_full.csv",
+    }
+    if normalized in canonical:
+        return True
+    basename = os.path.basename(normalized)
+    return basename in {"cleaned_data.csv", "cleaning_manifest.json", "cleaned_full.csv"}
+
+
+def _resolve_ml_required_outputs_for_reviewer(
+    reviewer_view: Dict[str, Any] | None,
+    evaluation_spec: Dict[str, Any] | None,
+) -> List[str]:
+    values: List[tuple[str, str]] = []
+    for block in (reviewer_view, evaluation_spec):
+        if not isinstance(block, dict):
+            continue
+        required_outputs = block.get("required_outputs")
+        if isinstance(required_outputs, list):
+            for item in required_outputs:
+                values.append(_extract_output_entry(item))
+        verification = block.get("verification")
+        if isinstance(verification, dict):
+            verification_outputs = verification.get("required_outputs")
+            if isinstance(verification_outputs, list):
+                for item in verification_outputs:
+                    values.append(_extract_output_entry(item))
+
+    filtered: List[str] = []
+    seen: set[str] = set()
+    for path, owner in values:
+        if not path:
+            continue
+        if _is_data_engineer_output_path(path, owner):
+            continue
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(path)
+    return filtered
+
+
 def _deterministic_reviewer_prechecks(
     code: str,
     evaluation_spec: Dict[str, Any] | None,
@@ -163,19 +267,7 @@ def _deterministic_reviewer_prechecks(
                 expected_data_paths.append(value.strip())
     expected_data_paths = list(dict.fromkeys(expected_data_paths))
 
-    required_outputs: List[str] = []
-    for block in (reviewer_view, evaluation_spec):
-        if not isinstance(block, dict):
-            continue
-        values = block.get("required_outputs")
-        if isinstance(values, list):
-            required_outputs.extend(str(v) for v in values if str(v).strip())
-        verification = block.get("verification")
-        if isinstance(verification, dict):
-            v = verification.get("required_outputs")
-            if isinstance(v, list):
-                required_outputs.extend(str(x) for x in v if str(x).strip())
-    required_outputs = list(dict.fromkeys(required_outputs))
+    required_outputs = _resolve_ml_required_outputs_for_reviewer(reviewer_view, evaluation_spec)
     targets = _resolve_target_columns(evaluation_spec, reviewer_view)
     strict_data_loading = bool(expected_data_paths or required_outputs or targets)
 
@@ -358,6 +450,71 @@ class ReviewerAgent:
             print(f"WARNING: {self.model_warning}")
         self.last_prompt = None
         self.last_response = None
+        self._generation_config = {
+            "temperature": float(os.getenv("REVIEWER_GEMINI_TEMPERATURE", "0.2")),
+            "top_p": 0.9,
+            "top_k": 40,
+            "max_output_tokens": int(os.getenv("REVIEWER_GEMINI_MAX_TOKENS", "8192")),
+            "response_mime_type": "application/json",
+        }
+        schema_flag = str(os.getenv("REVIEWER_USE_RESPONSE_SCHEMA", "0")).strip().lower()
+        self._use_response_schema = schema_flag not in {"0", "false", "no", "off", ""}
+
+    def _generation_config_for_review(self, active_gate_names: List[str] | None = None) -> Dict[str, Any]:
+        config = dict(self._generation_config)
+        if self._use_response_schema:
+            config["response_schema"] = copy.deepcopy(
+                build_reviewer_response_schema(active_gate_names or [])
+            )
+        return config
+
+    def _generation_config_for_evaluation(self, active_gate_names: List[str] | None = None) -> Dict[str, Any]:
+        config = dict(self._generation_config)
+        if self._use_response_schema:
+            config["response_schema"] = copy.deepcopy(
+                build_reviewer_eval_response_schema(active_gate_names or [])
+            )
+        return config
+
+    @staticmethod
+    def _is_response_schema_unsupported_error(err: Exception) -> bool:
+        message = str(err or "").lower()
+        if "response_schema" not in message:
+            return False
+        unsupported_tokens = (
+            "unknown field",
+            "unknown name",
+            "not supported",
+            "unsupported",
+            "unrecognized",
+            "no such field",
+            "schema not supported",
+        )
+        return any(token in message for token in unsupported_tokens)
+
+    def _generate_gemini_json(
+        self,
+        prompt: str,
+        *,
+        generation_config: Dict[str, Any],
+    ) -> tuple[str, Dict[str, Any]]:
+        used_config = dict(generation_config or {})
+        try:
+            response = self.client.generate_content(prompt, generation_config=used_config)
+        except TypeError:
+            response = self.client.generate_content(prompt)
+        except Exception as err:
+            if "response_schema" in used_config and self._is_response_schema_unsupported_error(err):
+                retry_config = dict(used_config)
+                retry_config.pop("response_schema", None)
+                try:
+                    response = self.client.generate_content(prompt, generation_config=retry_config)
+                except TypeError:
+                    response = self.client.generate_content(prompt)
+                used_config = retry_config
+            else:
+                raise
+        return _coerce_llm_response_text(response), used_config
 
     def review_code(
         self,
@@ -553,8 +710,10 @@ class ReviewerAgent:
         try:
             if self.provider == "gemini":
                 print(f"DEBUG: Reviewer calling Gemini ({self.model_name})...")
-                response = self.client.generate_content(system_prompt + "\n\n" + user_prompt)
-                content = response.text
+                content, _ = self._generate_gemini_json(
+                    system_prompt + "\n\n" + user_prompt,
+                    generation_config=self._generation_config_for_review(active_reviewer_gates),
+                )
             else:
                 print(f"DEBUG: Reviewer calling MIMO ({self.model_name})...")
                 response = self.client.chat.completions.create(
@@ -775,6 +934,15 @@ class ReviewerAgent:
             senior_evidence_rule=SENIOR_EVIDENCE_RULE,
         )
         self.last_prompt = system_prompt + "\n\nEvaluate results."
+        eval_reviewer_gates: List[str] = []
+        if isinstance(evaluation_spec, dict):
+            raw_gates = evaluation_spec.get("reviewer_gates") or evaluation_spec.get("gates") or []
+            if isinstance(raw_gates, list):
+                eval_reviewer_gates = [
+                    name
+                    for name in (_normalize_reviewer_gate_name(item) for item in raw_gates)
+                    if name
+                ]
 
         if not self.client or self.provider == "none":
             return self._deterministic_eval_fallback(
@@ -785,8 +953,10 @@ class ReviewerAgent:
         try:
             if self.provider == "gemini":
                 print(f"DEBUG: Reviewer evaluation calling Gemini ({self.model_name})...")
-                response = self.client.generate_content(system_prompt + "\n\nEvaluate results.")
-                content = response.text
+                content, _ = self._generate_gemini_json(
+                    system_prompt + "\n\nEvaluate results.",
+                    generation_config=self._generation_config_for_evaluation(eval_reviewer_gates),
+                )
             else:
                 response = self.client.chat.completions.create(
                     model=self.model_name,

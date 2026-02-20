@@ -3116,6 +3116,52 @@ def _resolve_ml_heavy_runner_required_outputs(
     return []
 
 
+def _apply_ml_reviewer_output_scope(
+    contract: Dict[str, Any],
+    state: Dict[str, Any] | None,
+    reviewer_view: Dict[str, Any] | None,
+    evaluation_spec: Dict[str, Any] | None,
+) -> tuple[Dict[str, Any], Dict[str, Any] | None]:
+    """
+    Force reviewer scope to ML-owned outputs only.
+
+    Prevents reviewer/QA feedback loops from asking ML to generate DE artifacts
+    (e.g., cleaned_data / cleaning_manifest).
+    """
+    scoped_outputs = _resolve_ml_heavy_runner_required_outputs(contract, state)
+    if not scoped_outputs:
+        return (
+            dict(reviewer_view) if isinstance(reviewer_view, dict) else {},
+            dict(evaluation_spec) if isinstance(evaluation_spec, dict) else evaluation_spec,
+        )
+
+    scoped_reviewer_view = dict(reviewer_view) if isinstance(reviewer_view, dict) else {}
+    scoped_reviewer_view["required_outputs"] = list(scoped_outputs)
+    verification = scoped_reviewer_view.get("verification")
+    if isinstance(verification, dict):
+        verification = dict(verification)
+    else:
+        verification = {}
+    verification["required_outputs"] = list(scoped_outputs)
+    scoped_reviewer_view["verification"] = verification
+
+    scoped_eval_spec: Dict[str, Any] | None
+    if isinstance(evaluation_spec, dict):
+        scoped_eval_spec = dict(evaluation_spec)
+        scoped_eval_spec["required_outputs"] = list(scoped_outputs)
+        eval_verification = scoped_eval_spec.get("verification")
+        if isinstance(eval_verification, dict):
+            eval_verification = dict(eval_verification)
+        else:
+            eval_verification = {}
+        eval_verification["required_outputs"] = list(scoped_outputs)
+        scoped_eval_spec["verification"] = eval_verification
+    else:
+        scoped_eval_spec = evaluation_spec
+
+    return scoped_reviewer_view, scoped_eval_spec
+
+
 def _resolve_optional_runtime_downloads(contract: Dict[str, Any]) -> List[str]:
     """
     Resolve non-blocking artifacts that should be pulled from sandbox outputs when present.
@@ -7567,6 +7613,46 @@ def _append_feedback_history(state: Dict[str, Any], message: str) -> None:
     state["feedback_history"] = history
 
 
+def _build_feedback_packet_snapshot(packet: Dict[str, Any] | None) -> Dict[str, Any]:
+    packet = packet if isinstance(packet, dict) else {}
+    return {
+        "status": str(packet.get("status") or "UNKNOWN"),
+        "feedback": _truncate_handoff_text(packet.get("feedback"), max_len=1400),
+        "failed_gates": _normalize_handoff_items(packet.get("failed_gates"), max_items=12, max_len=180),
+        "required_fixes": _normalize_handoff_items(packet.get("required_fixes"), max_items=12, max_len=220),
+        "hard_failures": _normalize_handoff_items(packet.get("hard_failures"), max_items=12, max_len=180),
+    }
+
+
+def _build_ml_feedback_json(
+    *,
+    source: str,
+    status: str,
+    feedback: str | None,
+    failed_gates: List[str] | None,
+    required_fixes: List[str] | None,
+    hard_failures: List[str] | None = None,
+    review_result: Dict[str, Any] | None = None,
+    qa_result: Dict[str, Any] | None = None,
+    evidence: List[Dict[str, str]] | None = None,
+    repair_hints: List[str] | None = None,
+) -> Dict[str, Any]:
+    payload = {
+        "version": "v1",
+        "source": str(source or "unknown"),
+        "status": str(status or "UNKNOWN"),
+        "summary": _truncate_handoff_text(feedback, max_len=1800),
+        "failed_gates": _normalize_handoff_items(failed_gates, max_items=20, max_len=180),
+        "required_fixes": _normalize_handoff_items(required_fixes, max_items=20, max_len=220),
+        "hard_failures": _normalize_handoff_items(hard_failures, max_items=15, max_len=180),
+        "reviewer_packet": _build_feedback_packet_snapshot(review_result),
+        "qa_packet": _build_feedback_packet_snapshot(qa_result),
+        "evidence": _normalize_handoff_evidence(evidence, max_items=10),
+        "repair_hints": _normalize_handoff_items(repair_hints, max_items=2, max_len=220),
+    }
+    return payload
+
+
 def _normalize_feedback_record_payload(record: Dict[str, Any] | None) -> Dict[str, Any]:
     if not isinstance(record, dict):
         return {}
@@ -8305,7 +8391,10 @@ def _build_iteration_handoff(
     next_iteration = iteration_count + 1
     normalized_status = str(status or state.get("review_verdict") or "UNKNOWN").upper()
 
-    required_outputs = [str(path) for path in (_resolve_required_outputs(contract, state) or []) if path]
+    scoped_required_outputs = _resolve_ml_heavy_runner_required_outputs(contract, state)
+    if not scoped_required_outputs:
+        scoped_required_outputs = _resolve_required_outputs(contract, state)
+    required_outputs = [str(path) for path in (scoped_required_outputs or []) if path]
     present_outputs = _normalize_handoff_items(oc_report.get("present"), max_items=15, max_len=140)
     missing_outputs = _normalize_handoff_items(oc_report.get("missing"), max_items=15, max_len=140)
     if not present_outputs and required_outputs:
@@ -16335,6 +16424,13 @@ def run_reviewer(state: AgentState) -> AgentState:
             state.get("artifact_index") or [],
         )
         reviewer_view = projected_views.get("reviewer_view") or {}
+    reviewer_contract = state.get("execution_contract", {}) if isinstance(state.get("execution_contract"), dict) else {}
+    reviewer_view, evaluation_spec = _apply_ml_reviewer_output_scope(
+        reviewer_contract,
+        state if isinstance(state, dict) else {},
+        reviewer_view if isinstance(reviewer_view, dict) else {},
+        evaluation_spec if isinstance(evaluation_spec, dict) else None,
+    )
     dataset_semantics_summary = state.get("dataset_semantics_summary")
     execution_profile = state.get("ml_execution_profile")
     if not isinstance(execution_profile, dict) or not execution_profile:
@@ -16392,6 +16488,17 @@ def run_reviewer(state: AgentState) -> AgentState:
         # Include hard_failures in gate_context if present
         if review.get('hard_failures'):
             gate_context["hard_failures"] = review.get('hard_failures', [])
+        gate_context["feedback_json"] = _build_ml_feedback_json(
+            source="reviewer",
+            status=review.get("status"),
+            feedback=review.get("feedback"),
+            failed_gates=review.get("failed_gates"),
+            required_fixes=review.get("required_fixes"),
+            hard_failures=review.get("hard_failures"),
+            review_result=review,
+            qa_result={},
+            evidence=review.get("evidence") if isinstance(review.get("evidence"), list) else [],
+        )
         fix_block = _build_fix_instructions(gate_context["required_fixes"])
         if fix_block:
             gate_context["edit_instructions"] = fix_block
@@ -16567,6 +16674,17 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             static_hard_failures = static_result.get("hard_failures", [])
             if static_hard_failures:
                 gate_context["hard_failures"] = static_hard_failures
+            gate_context["feedback_json"] = _build_ml_feedback_json(
+                source="qa_reviewer",
+                status=status,
+                feedback=feedback,
+                failed_gates=failed_gates,
+                required_fixes=required_fixes,
+                hard_failures=static_hard_failures,
+                review_result={},
+                qa_result=static_result if isinstance(static_result, dict) else {},
+                evidence=static_result.get("evidence") if isinstance(static_result.get("evidence"), list) else [],
+            )
             fix_block = _build_fix_instructions(gate_context["required_fixes"])
             if fix_block:
                 gate_context["edit_instructions"] = fix_block
@@ -16627,6 +16745,17 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         hard_failures = qa_result.get("hard_failures") or []
         if hard_failures:
             gate_context["hard_failures"] = hard_failures
+        gate_context["feedback_json"] = _build_ml_feedback_json(
+            source="qa_reviewer",
+            status=status,
+            feedback=feedback,
+            failed_gates=failed_gates,
+            required_fixes=required_fixes,
+            hard_failures=hard_failures,
+            review_result={},
+            qa_result=qa_result if isinstance(qa_result, dict) else {},
+            evidence=qa_result.get("evidence") if isinstance(qa_result.get("evidence"), list) else [],
+        )
         fix_block = _build_fix_instructions(gate_context["required_fixes"])
         if fix_block:
             gate_context["edit_instructions"] = fix_block
@@ -19172,6 +19301,12 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                         state.get("artifact_index") or [],
                     )
                     reviewer_view = projected_views.get("reviewer_view") or {}
+                reviewer_view, evaluation_spec_code_audit = _apply_ml_reviewer_output_scope(
+                    contract if isinstance(contract, dict) else {},
+                    state if isinstance(state, dict) else {},
+                    reviewer_view if isinstance(reviewer_view, dict) else {},
+                    evaluation_spec_code_audit if isinstance(evaluation_spec_code_audit, dict) else None,
+                )
                 if isinstance(reviewer_view, dict):
                     reviewer_view = dict(reviewer_view)
                     reviewer_view["execution_diagnostics"] = review_diagnostics
@@ -19440,6 +19575,21 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         gate_context["hard_failures"] = merged_hard_failures
         if isinstance(gate_context.get("feedback_record"), dict):
             gate_context["feedback_record"]["hard_failures"] = list(merged_hard_failures[:15])
+    feedback_json_payload = _build_ml_feedback_json(
+        source=gate_source,
+        status=status,
+        feedback=str(feedback or ""),
+        failed_gates=failed_gates,
+        required_fixes=required_fixes,
+        hard_failures=merged_hard_failures,
+        review_result=review_result if isinstance(review_result, dict) else {},
+        qa_result=qa_result if isinstance(qa_result, dict) else {},
+        evidence=gate_evidence[:12],
+        repair_hints=repair_hints,
+    )
+    gate_context["feedback_json"] = feedback_json_payload
+    if isinstance(gate_context.get("feedback_record"), dict):
+        gate_context["feedback_record"]["feedback_json"] = feedback_json_payload
     fix_block = _build_fix_instructions(required_fixes)
     if fix_block:
         gate_context["edit_instructions"] = fix_block

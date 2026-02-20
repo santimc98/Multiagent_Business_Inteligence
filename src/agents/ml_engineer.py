@@ -437,12 +437,19 @@ class MLEngineerAgent:
         gate_context: Dict[str, Any] | None,
         max_blocks: int = 2,
     ) -> str:
-        if isinstance(gate_context, dict) and isinstance(gate_context.get("feedback_record"), dict):
-            try:
-                payload = json.dumps(gate_context.get("feedback_record"), indent=2, ensure_ascii=True)
-                return "LATEST_ITERATION_FEEDBACK_RECORD_JSON:\n" + payload
-            except Exception:
-                pass
+        if isinstance(gate_context, dict):
+            if isinstance(gate_context.get("feedback_record"), dict):
+                try:
+                    payload = json.dumps(gate_context.get("feedback_record"), indent=2, ensure_ascii=True)
+                    return "LATEST_ITERATION_FEEDBACK_RECORD_JSON:\n" + payload
+                except Exception:
+                    pass
+            if isinstance(gate_context.get("feedback_json"), dict):
+                try:
+                    payload = json.dumps(gate_context.get("feedback_json"), indent=2, ensure_ascii=True)
+                    return "LATEST_ITERATION_FEEDBACK_JSON:\n" + payload
+                except Exception:
+                    pass
         blocks: List[str] = []
         if isinstance(gate_context, dict):
             feedback = gate_context.get("feedback")
@@ -612,17 +619,45 @@ class MLEngineerAgent:
         gate_context = gate_context if isinstance(gate_context, dict) else {}
         handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
         chunks: List[str] = []
+        seen_chunks: set[str] = set()
+
+        def _append_chunk(value: str) -> None:
+            text = str(value or "").strip()
+            if not text or text in seen_chunks:
+                return
+            seen_chunks.add(text)
+            chunks.append(text)
+
+        feedback_record = gate_context.get("feedback_record")
+        if isinstance(feedback_record, dict) and feedback_record:
+            try:
+                _append_chunk(
+                    "LATEST_ITERATION_FEEDBACK_RECORD_JSON:\n"
+                    + json.dumps(feedback_record, ensure_ascii=False, indent=2)
+                )
+            except Exception:
+                _append_chunk(str(feedback_record))
+
+        feedback_json = gate_context.get("feedback_json")
+        if isinstance(feedback_json, dict) and feedback_json:
+            try:
+                _append_chunk(
+                    "LATEST_ITERATION_FEEDBACK_JSON:\n"
+                    + json.dumps(feedback_json, ensure_ascii=False, indent=2)
+                )
+            except Exception:
+                _append_chunk(str(feedback_json))
 
         feedback = str(gate_context.get("feedback") or "").strip()
         if feedback:
-            chunks.append(feedback)
+            _append_chunk(feedback)
 
         runtime_payload = gate_context.get("runtime_error")
         if isinstance(runtime_payload, dict) and runtime_payload:
             try:
-                chunks.append(json.dumps(runtime_payload, ensure_ascii=False))
+                _append_chunk(json.dumps(runtime_payload, ensure_ascii=False))
             except Exception:
-                chunks.append(str(runtime_payload))
+                _append_chunk(str(runtime_payload))
 
         traceback_text = str(
             gate_context.get("traceback")
@@ -630,22 +665,29 @@ class MLEngineerAgent:
             or ""
         ).strip()
         if traceback_text:
-            chunks.append(traceback_text)
+            _append_chunk(traceback_text)
 
         handoff_feedback = handoff_payload.get("feedback")
         if isinstance(handoff_feedback, dict):
+            try:
+                _append_chunk(
+                    "ITERATION_HANDOFF_FEEDBACK_JSON:\n"
+                    + json.dumps(handoff_feedback, ensure_ascii=False, indent=2)
+                )
+            except Exception:
+                _append_chunk(str(handoff_feedback))
             tail = str(handoff_feedback.get("runtime_error_tail") or "").strip()
             reviewer = str(handoff_feedback.get("reviewer") or "").strip()
             qa = str(handoff_feedback.get("qa") or "").strip()
             for item in (tail, reviewer, qa):
                 if item:
-                    chunks.append(item)
+                    _append_chunk(item)
 
         if isinstance(feedback_history, list):
             for item in feedback_history[-3:]:
                 text = str(item or "").strip()
                 if text:
-                    chunks.append(text)
+                    _append_chunk(text)
 
         if not chunks:
             return ""

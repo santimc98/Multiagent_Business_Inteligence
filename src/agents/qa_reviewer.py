@@ -2,12 +2,14 @@ import ast
 import os
 import re
 import json
+import copy
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 from openai import OpenAI
 from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 from src.utils.ml_plan_validation import validate_ml_plan_constraints
+from src.utils.reviewer_response_schema import build_qa_response_schema
 
 load_dotenv()
 
@@ -43,6 +45,59 @@ def _extract_json_object(text: str) -> Optional[str]:
             if depth == 0:
                 return text[start:i + 1]
     return None
+
+
+def _clean_json_payload(text: str) -> str:
+    cleaned = re.sub(r"```json", "", str(text or ""), flags=re.IGNORECASE)
+    cleaned = re.sub(r"```", "", cleaned)
+    return cleaned.strip()
+
+
+def _coerce_llm_response_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+    candidates = getattr(response, "candidates", None)
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None)
+            if not isinstance(parts, list):
+                continue
+            chunks: List[str] = []
+            for part in parts:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    chunks.append(part_text.strip())
+            if chunks:
+                return "\n".join(chunks)
+    return str(response or "")
+
+
+def _parse_json_payload(text: str) -> Dict[str, Any]:
+    parse_error: Exception | None = None
+    cleaned = _clean_json_payload(text or "")
+    candidates = [cleaned, _extract_json_object(cleaned), _extract_json_object(text or "")]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        blob = candidate.strip()
+        if not blob or blob in seen:
+            continue
+        seen.add(blob)
+        try:
+            parsed = json.loads(blob)
+            if isinstance(parsed, dict):
+                return parsed
+            parse_error = ValueError("QA JSON payload is not an object")
+        except Exception as err:
+            parse_error = err
+    if parse_error:
+        raise parse_error
+    raise ValueError("Empty QA JSON payload")
 
 
 _CONTRACT_FALLBACK_WARNING = "CONTRACT_BROKEN_FALLBACK: qa_gates missing; please fix contract generation"
@@ -178,6 +233,76 @@ class QAReviewerAgent:
             print(f"WARNING: {self.model_warning}")
         self.last_prompt = None
         self.last_response = None
+        self._generation_config = {
+            "temperature": float(
+                os.getenv(
+                    "QA_REVIEWER_GEMINI_TEMPERATURE",
+                    os.getenv("REVIEWER_GEMINI_TEMPERATURE", "0.2"),
+                )
+            ),
+            "top_p": 0.9,
+            "top_k": 40,
+            "max_output_tokens": int(
+                os.getenv(
+                    "QA_REVIEWER_GEMINI_MAX_TOKENS",
+                    os.getenv("REVIEWER_GEMINI_MAX_TOKENS", "8192"),
+                )
+            ),
+            "response_mime_type": "application/json",
+        }
+        schema_flag = str(
+            os.getenv(
+                "QA_REVIEWER_USE_RESPONSE_SCHEMA",
+                os.getenv("REVIEWER_USE_RESPONSE_SCHEMA", "0"),
+            )
+        ).strip().lower()
+        self._use_response_schema = schema_flag not in {"0", "false", "no", "off", ""}
+
+    def _generation_config_for_review(self, qa_gate_names: List[str] | None = None) -> Dict[str, Any]:
+        config = dict(self._generation_config)
+        if self._use_response_schema:
+            config["response_schema"] = copy.deepcopy(build_qa_response_schema(qa_gate_names or []))
+        return config
+
+    @staticmethod
+    def _is_response_schema_unsupported_error(err: Exception) -> bool:
+        message = str(err or "").lower()
+        if "response_schema" not in message:
+            return False
+        unsupported_tokens = (
+            "unknown field",
+            "unknown name",
+            "not supported",
+            "unsupported",
+            "unrecognized",
+            "no such field",
+            "schema not supported",
+        )
+        return any(token in message for token in unsupported_tokens)
+
+    def _generate_gemini_json(
+        self,
+        prompt: str,
+        *,
+        generation_config: Dict[str, Any],
+    ) -> tuple[str, Dict[str, Any]]:
+        used_config = dict(generation_config or {})
+        try:
+            response = self.client.generate_content(prompt, generation_config=used_config)
+        except TypeError:
+            response = self.client.generate_content(prompt)
+        except Exception as err:
+            if "response_schema" in used_config and self._is_response_schema_unsupported_error(err):
+                retry_config = dict(used_config)
+                retry_config.pop("response_schema", None)
+                try:
+                    response = self.client.generate_content(prompt, generation_config=retry_config)
+                except TypeError:
+                    response = self.client.generate_content(prompt)
+                used_config = retry_config
+            else:
+                raise
+        return _coerce_llm_response_text(response), used_config
 
     def review_code(
         self,
@@ -365,8 +490,10 @@ class QAReviewerAgent:
         try:
             if self.provider == "gemini":
                 print(f"DEBUG: QA Reviewer calling Gemini ({self.model_name})...")
-                response = self.client.generate_content(system_prompt + "\n\n" + user_message)
-                content = response.text
+                content, _ = self._generate_gemini_json(
+                    system_prompt + "\n\n" + user_message,
+                    generation_config=self._generation_config_for_review(qa_gate_names),
+                )
             else:
                 print(f"DEBUG: QA Reviewer calling MIMO ({self.model_name})...")
                 response = self.client.chat.completions.create(
@@ -377,23 +504,16 @@ class QAReviewerAgent:
                     ],
                     response_format={"type": "json_object"}
                 )
-                content = response.choices[0].message.content
+                content = _coerce_llm_response_text(response.choices[0].message.content)
             self.last_response = content
             
             # Parse JSON (tolerant)
             parse_error = None
             result = None
             try:
-                result = json.loads(content)
-            except json.JSONDecodeError as err:
+                result = _parse_json_payload(content)
+            except Exception as err:
                 parse_error = err
-                candidate = _extract_json_object(content)
-                if candidate:
-                    try:
-                        result = json.loads(candidate)
-                        parse_error = None
-                    except json.JSONDecodeError as err2:
-                        parse_error = err2
 
             if result is None:
                 err_msg = f"QA JSON parse failed: {parse_error}"
