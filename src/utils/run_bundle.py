@@ -85,6 +85,20 @@ def _safe_load_json(path: str) -> Any:
         return None
 
 
+def _count_jsonl_rows(path: str) -> int:
+    if not path or not os.path.exists(path):
+        return 0
+    count = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+    except Exception:
+        return 0
+    return count
+
+
 def _hash_file(path: str) -> Optional[str]:
     if not path or not os.path.exists(path):
         return None
@@ -505,6 +519,28 @@ def write_run_manifest(
         run_summary = _safe_load_json(os.path.join(run_dir, "artifacts", "data", "run_summary.json")) or {}
     required_outputs = _normalize_required_outputs(contract)
     produced_outputs = sorted(set(_scan_run_outputs(run_dir)))
+    trace_summary_path = os.path.join(run_dir, "report", "governance", "ml_iteration_trace_summary.json")
+    trace_summary = _safe_load_json(trace_summary_path)
+    if not isinstance(trace_summary, dict):
+        trace_summary = {}
+    trace_journal_path = os.path.join(run_dir, "report", "governance", "ml_iteration_journal.jsonl")
+    entries_count = trace_summary.get("entries_count")
+    try:
+        entries_count = int(entries_count)
+    except Exception:
+        entries_count = _count_jsonl_rows(trace_journal_path)
+    iteration_trace = {
+        "journal_exists": os.path.exists(trace_journal_path),
+        "journal_relative_path": "report/governance/ml_iteration_journal.jsonl",
+        "entries_count": int(entries_count),
+        "summary_exists": bool(trace_summary),
+        "summary_relative_path": "report/governance/ml_iteration_trace_summary.json" if trace_summary else None,
+        "stages_count": trace_summary.get("stages_count", {}) if isinstance(trace_summary.get("stages_count"), dict) else {},
+        "last_entry": trace_summary.get("last_entry", {}) if isinstance(trace_summary.get("last_entry"), dict) else {},
+        "metric_improvement_round_count": int(state.get("ml_improvement_round_count", 0) or 0),
+        "metric_improvement_attempted": bool(state.get("ml_improvement_attempted")),
+        "metric_improvement_kept": state.get("ml_improvement_kept"),
+    }
 
     manifest_path = os.path.join(run_dir, "run_manifest.json")
     existing = _safe_load_json(manifest_path)
@@ -545,6 +581,7 @@ def write_run_manifest(
             "required_outputs_missing": output_contract.get("missing", []),
             "status_final": status_final or existing_dict.get("status_final") or gates_summary.get("status"),
             "gates_summary": gates_summary,
+            "iteration_trace": iteration_trace,
             "contracts": {
                 "execution_contract": bool(work_contract) or os.path.exists(os.path.join(contracts_dir, "execution_contract.json")),
                 "evaluation_spec": bool(work_eval) or os.path.exists(os.path.join(contracts_dir, "evaluation_spec.json")),

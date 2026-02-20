@@ -16,7 +16,7 @@ import fnmatch
 import traceback
 import importlib.util
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple
 from langgraph.graph import StateGraph, END
 from e2b_code_interpreter import Sandbox as CodeSandbox
@@ -8544,7 +8544,61 @@ def _suggest_next_actions(
     return actions[:3]
 
 def _ml_iteration_journal_path(run_id: str, base_dir: str = "runs") -> str:
-    return os.path.join(base_dir, run_id, "report", "governance", "ml_iteration_journal.jsonl")
+    run_dir = get_run_dir(run_id)
+    if run_dir:
+        return os.path.join(run_dir, "report", "governance", "ml_iteration_journal.jsonl")
+    base_root = os.path.abspath(base_dir or "runs")
+    return os.path.join(base_root, run_id, "report", "governance", "ml_iteration_journal.jsonl")
+
+
+def _ml_iteration_trace_summary_path(run_id: str, base_dir: str = "runs") -> str:
+    journal_path = _ml_iteration_journal_path(run_id, base_dir=base_dir)
+    return os.path.join(os.path.dirname(journal_path), "ml_iteration_trace_summary.json")
+
+
+def _persist_ml_iteration_trace_summary(
+    run_id: str,
+    entries: List[Dict[str, Any]],
+    base_dir: str = "runs",
+) -> None:
+    if not run_id or not isinstance(entries, list):
+        return
+
+    stage_counts: Dict[str, int] = {}
+    iterations: set[int] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        stage = str(entry.get("stage") or "unknown").strip() or "unknown"
+        stage_counts[stage] = int(stage_counts.get(stage, 0) or 0) + 1
+        try:
+            iterations.add(int(entry.get("iteration_id")))
+        except Exception:
+            pass
+
+    last_entry = entries[-1] if entries else {}
+    outputs_missing = last_entry.get("outputs_missing") if isinstance(last_entry, dict) else []
+    outputs_missing = outputs_missing if isinstance(outputs_missing, list) else []
+    summary = {
+        "run_id": run_id,
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "journal_relative_path": "report/governance/ml_iteration_journal.jsonl",
+        "entries_count": len(entries),
+        "stages_count": stage_counts,
+        "iterations_observed": sorted(iterations),
+        "last_entry": {
+            "iteration_id": last_entry.get("iteration_id") if isinstance(last_entry, dict) else None,
+            "stage": last_entry.get("stage") if isinstance(last_entry, dict) else None,
+            "reviewer_verdict": last_entry.get("reviewer_verdict") if isinstance(last_entry, dict) else None,
+            "qa_verdict": last_entry.get("qa_verdict") if isinstance(last_entry, dict) else None,
+            "outputs_missing_count": len(outputs_missing),
+        },
+    }
+
+    summary_path = _ml_iteration_trace_summary_path(run_id, base_dir=base_dir)
+    os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=True)
 
 def _append_ml_iteration_journal(
     run_id: str,
@@ -8575,6 +8629,26 @@ def _append_ml_iteration_journal(
     except Exception:
         return sorted(known)
     known.add(entry_key)
+    entries = _load_ml_iteration_journal(run_id, base_dir=base_dir)
+    try:
+        _persist_ml_iteration_trace_summary(run_id, entries, base_dir=base_dir)
+    except Exception:
+        pass
+    try:
+        log_run_event(
+            run_id,
+            "ml_iteration_trace",
+            {
+                "iteration_id": int(entry.get("iteration_id")) if entry.get("iteration_id") is not None else None,
+                "stage": stage,
+                "reviewer_verdict": entry.get("reviewer_verdict"),
+                "qa_verdict": entry.get("qa_verdict"),
+                "outputs_missing_count": len(entry.get("outputs_missing") or []),
+                "journal_entries_count": len(entries),
+            },
+        )
+    except Exception:
+        pass
     return sorted(known)
 
 def _load_ml_iteration_journal(run_id: str, base_dir: str = "runs") -> List[Dict[str, Any]]:
@@ -20661,6 +20735,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     if not _should_run_metric_improvement_round(state, contract):
         return False
 
+    run_id = str(state.get("run_id") or "")
     metric_name = _resolve_contract_primary_metric_name(state, contract) or "roc_auc"
     baseline_metrics = _load_json_safe("data/metrics.json")
     if not isinstance(baseline_metrics, dict):
@@ -20681,6 +20756,23 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     output_paths = _resolve_ml_outputs_for_metric_round(contract, state)
     snapshot_dir = Path("work") / "ml_baseline_snapshot"
     _snapshot_ml_outputs(output_paths, snapshot_dir)
+    if run_id:
+        try:
+            log_run_event(
+                run_id,
+                "metric_improvement_round_start",
+                {
+                    "iteration": int(state.get("iteration_count", 0) or 0) + 1,
+                    "round_count_current": int(state.get("ml_improvement_round_count", 0) or 0),
+                    "rounds_allowed": int(rounds),
+                    "primary_metric_name": metric_name,
+                    "baseline_metric": float(baseline_value),
+                    "min_delta": float(min_delta),
+                    "output_paths": output_paths[:12],
+                },
+            )
+        except Exception:
+            pass
 
     feature_engineering_plan = contract.get("feature_engineering_plan")
     if not isinstance(feature_engineering_plan, dict):
@@ -20724,7 +20816,6 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             + f"model={critique_meta.get('model')}"
         )
 
-    run_id = str(state.get("run_id") or "")
     tracker_entries = load_recent_experiment_entries(run_id, k=20) if run_id else []
     strategist_context = {
         "run_id": run_id,
@@ -20827,6 +20918,27 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     state["last_iteration_type"] = "metric"
     state["improvement_attempt_count"] = 0
     if run_id:
+        hypothesis = hypothesis_packet.get("hypothesis") if isinstance(hypothesis_packet.get("hypothesis"), dict) else {}
+        tracker_context = hypothesis_packet.get("tracker_context") if isinstance(hypothesis_packet.get("tracker_context"), dict) else {}
+        try:
+            log_run_event(
+                run_id,
+                "metric_improvement_round_activated",
+                {
+                    "iteration": int(state.get("iteration_count", 0) or 0) + 1,
+                    "round_count": int(state.get("ml_improvement_round_count", 0) or 0),
+                    "primary_metric_name": metric_name,
+                    "baseline_metric": float(baseline_value),
+                    "min_delta": float(min_delta),
+                    "action": hypothesis_packet.get("action"),
+                    "technique": hypothesis.get("technique"),
+                    "signature": tracker_context.get("signature"),
+                    "editor_mode_forced": True,
+                },
+            )
+        except Exception:
+            pass
+    if run_id:
         tracker_context = hypothesis_packet.get("tracker_context") if isinstance(hypothesis_packet.get("tracker_context"), dict) else {}
         append_experiment_entry(
             run_id,
@@ -20912,6 +21024,29 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 "action": hypothesis_packet.get("action"),
             },
         )
+        try:
+            delta_value: Optional[float] = None
+            if baseline_value is not None and improved_value is not None:
+                delta_value = float(improved_value - baseline_value)
+            log_run_event(
+                run_id,
+                "metric_improvement_round_complete",
+                {
+                    "iteration": int(state.get("iteration_count", 0) or 0),
+                    "primary_metric_name": metric_name,
+                    "baseline_metric": baseline_value,
+                    "candidate_metric": improved_value,
+                    "delta": delta_value,
+                    "min_delta": float(min_delta),
+                    "higher_is_better": bool(higher_is_better),
+                    "approved": bool(approved),
+                    "improved": bool(improved),
+                    "kept": state.get("ml_improvement_kept"),
+                    "review_verdict": verdict,
+                },
+            )
+        except Exception:
+            pass
 
     state["ml_improvement_attempted"] = True
     state["ml_improvement_round_active"] = False

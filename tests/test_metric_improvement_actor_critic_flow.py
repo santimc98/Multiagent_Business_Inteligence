@@ -5,6 +5,13 @@ from src.graph import graph as graph_mod
 
 def test_bootstrap_metric_improvement_round_builds_actor_critic_handoff(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    events = []
+    monkeypatch.setattr(
+        graph_mod,
+        "log_run_event",
+        lambda run_id, event_type, payload, log_dir="logs": events.append((run_id, event_type, payload)),
+    )
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         graph_mod.results_advisor,
         "generate_critique_packet",
@@ -101,4 +108,6 @@ def test_bootstrap_metric_improvement_round_builds_actor_critic_handoff(tmp_path
     feedback_history = state.get("feedback_history", [])
     assert feedback_history
     assert "ITERATION_HYPOTHESIS_PACKET" in feedback_history[-1]
-
+    event_types = [evt[1] for evt in events]
+    assert "metric_improvement_round_start" in event_types
+    assert "metric_improvement_round_activated" in event_types

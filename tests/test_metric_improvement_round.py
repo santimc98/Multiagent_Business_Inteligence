@@ -84,3 +84,44 @@ def test_check_evaluation_restores_baseline_when_improvement_is_below_delta(tmp_
     assert route == "approved"
     assert state.get("ml_improvement_kept") == "baseline"
     assert restored == baseline
+
+
+def test_check_evaluation_logs_metric_improvement_round_completion(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    events = []
+    from src.graph import graph as graph_mod
+
+    monkeypatch.setattr(
+        graph_mod,
+        "log_run_event",
+        lambda run_id, event_type, payload, log_dir="logs": events.append((run_id, event_type, payload)),
+    )
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
+
+    metrics_path = Path("data/metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps({"roc_auc": 0.8006}), encoding="utf-8")
+    snapshot_dir = Path("work/ml_baseline_snapshot")
+    output_paths = ["data/metrics.json"]
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    state = {
+        "run_id": "run_improvement_trace",
+        "review_verdict": "APPROVED",
+        "execution_contract": {},
+        "ml_improvement_round_active": True,
+        "ml_improvement_primary_metric_name": "roc_auc",
+        "ml_improvement_baseline_metric": 0.8000,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": True,
+        "ml_improvement_output_paths": output_paths,
+        "ml_improvement_snapshot_dir": str(snapshot_dir),
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "feedback_history": [],
+    }
+
+    route = check_evaluation(state)
+
+    assert route == "approved"
+    event_types = [evt[1] for evt in events]
+    assert "metric_improvement_round_complete" in event_types

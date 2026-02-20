@@ -98,3 +98,55 @@ def test_copy_run_artifacts_filters_by_mtime(tmp_path, monkeypatch):
     dest_new = Path(run_dir) / "artifacts" / "data" / "new.txt"
     assert not dest_old.exists()
     assert dest_new.exists()
+
+
+def test_run_manifest_includes_iteration_trace_metadata(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run_id = "run_trace_01"
+    state = {
+        "run_id": run_id,
+        "run_start_ts": "2026-02-20T00:00:00",
+        "ml_improvement_round_count": 1,
+        "ml_improvement_attempted": True,
+        "ml_improvement_kept": "baseline",
+    }
+    run_dir = init_run_bundle(run_id, state, base_dir=str(tmp_path / "runs"), enable_tee=False)
+
+    governance_dir = Path(run_dir) / "report" / "governance"
+    governance_dir.mkdir(parents=True, exist_ok=True)
+    journal_path = governance_dir / "ml_iteration_journal.jsonl"
+    journal_path.write_text(
+        json.dumps(
+            {
+                "iteration_id": 2,
+                "stage": "review_complete",
+                "reviewer_verdict": "NEEDS_IMPROVEMENT",
+                "qa_verdict": "APPROVE_WITH_WARNINGS",
+                "outputs_missing": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary_path = governance_dir / "ml_iteration_trace_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "entries_count": 1,
+                "stages_count": {"review_complete": 1},
+                "last_entry": {"iteration_id": 2, "stage": "review_complete"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest_path = write_run_manifest(run_id, state)
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    trace = manifest.get("iteration_trace", {})
+
+    assert trace.get("journal_exists") is True
+    assert trace.get("entries_count") == 1
+    assert trace.get("stages_count", {}).get("review_complete") == 1
+    assert trace.get("metric_improvement_round_count") == 1
+    assert trace.get("metric_improvement_attempted") is True
+    assert trace.get("metric_improvement_kept") == "baseline"
