@@ -59,6 +59,7 @@ class ResultsAdvisorAgent:
             "model": None,
         }
         self.last_critique_packet: Dict[str, Any] = {}
+        self.last_critique_error: Dict[str, Any] = {}
         # Tests frequently instantiate with api_key="" to force non-network mode.
         if explicit_api_key is not None and str(explicit_api_key).strip() == "":
             return
@@ -169,6 +170,7 @@ class ResultsAdvisorAgent:
     def generate_critique_packet(self, context: Dict[str, Any]) -> Dict[str, Any]:
         deterministic = self._generate_critique_packet_deterministic(context)
         mode = self.critique_mode
+        self.last_critique_error = {}
         self.last_critique_meta = {
             "mode": mode,
             "source": "deterministic",
@@ -191,6 +193,12 @@ class ResultsAdvisorAgent:
             self.last_critique_packet = llm_packet
             return llm_packet
 
+        if llm_packet:
+            print(
+                "RESULTS_ADVISOR_CRITIQUE_SCHEMA_INVALID: "
+                + f"provider={self.fe_provider} model={self.fe_model_name} "
+                + f"errors={validation_errors[:4]}"
+            )
         self.last_critique_meta = {
             "mode": mode,
             "source": "deterministic_fallback",
@@ -198,13 +206,45 @@ class ResultsAdvisorAgent:
             "model": self.fe_model_name,
             "validation_errors": validation_errors[:6],
         }
+        if self.last_critique_error:
+            self.last_critique_meta["llm_error"] = dict(self.last_critique_error)
         self.last_critique_packet = deterministic
         return deterministic
 
+    def _record_critique_error(
+        self,
+        *,
+        stage: str,
+        detail: str,
+        raw_preview: Optional[str] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "stage": str(stage or "unknown"),
+            "detail": str(detail or "")[:260],
+            "provider": self.fe_provider,
+            "model": self.fe_model_name,
+        }
+        if raw_preview:
+            payload["raw_preview"] = self._truncate(str(raw_preview), 260)
+        self.last_critique_error = payload
+        log_line = (
+            "RESULTS_ADVISOR_CRITIQUE_LLM_ERROR: "
+            + f"stage={payload['stage']} provider={payload.get('provider')} "
+            + f"model={payload.get('model')} detail={payload.get('detail')}"
+        )
+        if raw_preview:
+            log_line += " raw_preview=" + str(payload.get("raw_preview"))
+        print(log_line)
+
     def _generate_critique_packet_llm(self, context: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(context, dict):
+            self._record_critique_error(stage="invalid_context", detail="Context is not a dictionary.")
             return {}
         if not self.fe_client or self.fe_provider == "none":
+            self._record_critique_error(
+                stage="client_unavailable",
+                detail="Reviewer LLM client is unavailable or provider is none.",
+            )
             return {}
 
         phase = str(context.get("phase") or "baseline_review").strip() or "baseline_review"
@@ -253,10 +293,22 @@ class ResultsAdvisorAgent:
                     temperature=0.0,
                 )
                 raw_text = response.choices[0].message.content
-        except Exception:
+        except Exception as exc:
+            self._record_critique_error(
+                stage="api_call_exception",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
             return {}
 
-        return self._parse_json_object(raw_text)
+        packet = self._parse_json_object(raw_text)
+        if not packet:
+            self._record_critique_error(
+                stage="json_parse_failed",
+                detail="LLM returned non-JSON or malformed JSON for critique packet.",
+                raw_preview=str(raw_text or "")[:800],
+            )
+            return {}
+        return packet
 
     def _parse_json_object(self, raw_text: Any) -> Dict[str, Any]:
         text = str(raw_text or "").strip()

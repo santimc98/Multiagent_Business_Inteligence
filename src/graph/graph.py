@@ -9183,6 +9183,9 @@ class AgentState(TypedDict):
     ml_review_stack: Dict[str, Any]
     review_board_facts: Dict[str, Any]
     review_board_verdict: Dict[str, Any]
+    metric_improvement_nodes_managed: bool
+    metric_improvement_bootstrapped: bool
+    metric_improvement_finalized: bool
 
 from src.agents.domain_expert import DomainExpertAgent
 
@@ -9644,6 +9647,9 @@ def run_steward(state: AgentState) -> AgentState:
         "iteration_handoff": None,
         "review_reject_streak": 0,
         "qa_reject_streak": 0,
+        "metric_improvement_nodes_managed": False,
+        "metric_improvement_bootstrapped": False,
+        "metric_improvement_finalized": False,
         "leakage_audit_summary": "",
         "restrategize_count": state.get("restrategize_count", 0) if state else 0,
         "strategist_context_override": state.get("strategist_context_override", "") if state else "",
@@ -21104,13 +21110,24 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         else {}
     )
     if critique_meta:
-        print(
+        critique_line = (
             "RESULTS_ADVISOR_CRITIQUE: "
             + f"mode={critique_meta.get('mode')} "
             + f"source={critique_meta.get('source')} "
             + f"provider={critique_meta.get('provider')} "
             + f"model={critique_meta.get('model')}"
         )
+        llm_error = critique_meta.get("llm_error") if isinstance(critique_meta.get("llm_error"), dict) else {}
+        if llm_error:
+            critique_line += (
+                " "
+                + f"error_stage={llm_error.get('stage')} "
+                + f"error_detail={llm_error.get('detail')}"
+            )
+        validation_errors = critique_meta.get("validation_errors")
+        if isinstance(validation_errors, list) and validation_errors:
+            critique_line += " validation_errors=" + str(validation_errors[:3])
+        print(critique_line)
 
     tracker_entries = load_recent_experiment_entries(run_id, k=20) if run_id else []
     strategist_context = {
@@ -21314,6 +21331,25 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     meta_obj = getattr(results_advisor, "last_critique_meta", None)
     if isinstance(meta_obj, dict):
         critique_meta = dict(meta_obj)
+    if critique_meta:
+        critique_line = (
+            "RESULTS_ADVISOR_CANDIDATE_CRITIQUE: "
+            + f"mode={critique_meta.get('mode')} "
+            + f"source={critique_meta.get('source')} "
+            + f"provider={critique_meta.get('provider')} "
+            + f"model={critique_meta.get('model')}"
+        )
+        llm_error = critique_meta.get("llm_error") if isinstance(critique_meta.get("llm_error"), dict) else {}
+        if llm_error:
+            critique_line += (
+                " "
+                + f"error_stage={llm_error.get('stage')} "
+                + f"error_detail={llm_error.get('detail')}"
+            )
+        validation_errors = critique_meta.get("validation_errors")
+        if isinstance(validation_errors, list) and validation_errors:
+            critique_line += " validation_errors=" + str(validation_errors[:3])
+        print(critique_line)
 
     metric_comparison = critique_packet.get("metric_comparison") if isinstance(critique_packet, dict) else {}
     if isinstance(metric_comparison, dict):
@@ -21432,6 +21468,75 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     return "approved"
 
 
+def _collect_state_updates(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+    updates: Dict[str, Any] = {}
+    before = before if isinstance(before, dict) else {}
+    after = after if isinstance(after, dict) else {}
+    for key, value in after.items():
+        try:
+            changed = key not in before or before.get(key) != value
+        except Exception:
+            changed = True
+        if changed:
+            updates[key] = value
+    return updates
+
+
+def run_metric_improvement_bootstrap(state: AgentState) -> AgentState:
+    working_state = dict(state if isinstance(state, dict) else {})
+    before = dict(working_state)
+    contract = (
+        working_state.get("execution_contract")
+        if isinstance(working_state.get("execution_contract"), dict)
+        else {}
+    )
+    activated = _bootstrap_metric_improvement_round(working_state, contract)
+    updates = _collect_state_updates(before, working_state)
+    updates["metric_improvement_nodes_managed"] = True
+    updates["metric_improvement_bootstrapped"] = bool(activated)
+    updates["metric_improvement_finalized"] = False
+    return updates
+
+
+def run_metric_improvement_finalize(state: AgentState) -> AgentState:
+    working_state = dict(state if isinstance(state, dict) else {})
+    before = dict(working_state)
+    contract = (
+        working_state.get("execution_contract")
+        if isinstance(working_state.get("execution_contract"), dict)
+        else {}
+    )
+    finalized = False
+    if bool(working_state.get("ml_improvement_round_active")):
+        _finalize_metric_improvement_round(working_state, contract)
+        finalized = True
+    updates = _collect_state_updates(before, working_state)
+    updates["metric_improvement_nodes_managed"] = True
+    updates["metric_improvement_bootstrapped"] = False
+    updates["metric_improvement_finalized"] = bool(finalized)
+    return updates
+
+
+def check_review_board_metric_improvement_route(state: AgentState) -> str:
+    if bool(state.get("ml_improvement_round_active")):
+        return "finalize_improvement_round"
+    return "bootstrap_improvement_round"
+
+
+def check_metric_improvement_bootstrap_route(state: AgentState) -> str:
+    if bool(state.get("metric_improvement_bootstrapped")):
+        snapshot = state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {}
+        metric_name = snapshot.get("primary_metric_name", "unknown")
+        metric_value = snapshot.get("primary_metric_value", "N/A")
+        best_value = snapshot.get("baseline_value", "N/A")
+        print(
+            f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT_ROUND "
+            f"metric={metric_name}:{metric_value} best={best_value} budget_left=1"
+        )
+        return "retry"
+    return check_evaluation(state)
+
+
 def check_evaluation(state: AgentState):
     # Helper to get metric info for logging
     def _get_metric_info():
@@ -21451,7 +21556,8 @@ def check_evaluation(state: AgentState):
         return "approved"
 
     contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
-    if state.get("ml_improvement_round_active"):
+    metric_nodes_managed = bool(state.get("metric_improvement_nodes_managed"))
+    if not metric_nodes_managed and state.get("ml_improvement_round_active"):
         return _finalize_metric_improvement_round(state, contract)
 
     policy = _get_iteration_policy(state)
@@ -21547,7 +21653,7 @@ def check_evaluation(state: AgentState):
         state["stop_reason"] = "ADVISORY_ONLY"
         return "approved"
 
-    if _bootstrap_metric_improvement_round(state, contract):
+    if not metric_nodes_managed and _bootstrap_metric_improvement_round(state, contract):
         print(
             f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT_ROUND "
             f"metric={metric_name}:{metric_value} best={best_value} budget_left=1"
@@ -22074,6 +22180,8 @@ workflow.add_node("final_runtime_fix", finalize_runtime_failure)
 workflow.add_node("execute_code", execute_code)
 workflow.add_node("evaluate_results", run_result_evaluator) # New Node
 workflow.add_node("review_board", run_review_board)
+workflow.add_node("bootstrap_improvement_round", run_metric_improvement_bootstrap)
+workflow.add_node("finalize_improvement_round", run_metric_improvement_finalize)
 workflow.add_node("retry_handler", retry_handler)
 workflow.add_node("retry_sandbox", retry_sandbox_execution)
 workflow.add_node("prepare_runtime_fix", prepare_runtime_fix) # New Node
@@ -22153,6 +22261,24 @@ workflow.add_edge("evaluate_results", "review_board")
 # Conditional Edge for Review Board Decision
 workflow.add_conditional_edges(
     "review_board",
+    check_review_board_metric_improvement_route,
+    {
+        "bootstrap_improvement_round": "bootstrap_improvement_round",
+        "finalize_improvement_round": "finalize_improvement_round",
+    }
+)
+
+workflow.add_conditional_edges(
+    "bootstrap_improvement_round",
+    check_metric_improvement_bootstrap_route,
+    {
+        "retry": "retry_handler",
+        "approved": "translator"
+    }
+)
+
+workflow.add_conditional_edges(
+    "finalize_improvement_round",
     check_evaluation,
     {
         "retry": "retry_handler",
