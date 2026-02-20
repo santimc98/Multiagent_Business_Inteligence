@@ -261,6 +261,8 @@ def test_check_evaluation_results_advisor_improve_retry_routes_to_retry(monkeypa
 
     state = {
         "review_verdict": "APPROVE_WITH_WARNINGS",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
         "execution_output": "OK",
         "last_iteration_type": None,
         "execution_error": False,
@@ -287,6 +289,8 @@ def test_check_evaluation_results_advisor_stop_does_not_block_improvement_round(
 
     state = {
         "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
         "execution_output": "OK",
         "last_iteration_type": None,
         "execution_error": False,

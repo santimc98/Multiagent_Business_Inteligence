@@ -91,11 +91,23 @@ def test_bootstrap_metric_improvement_round_builds_actor_critic_handoff(tmp_path
     state = {
         "run_id": "run_test",
         "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
         "execution_error": False,
         "sandbox_failed": False,
         "ml_improvement_attempted": False,
         "iteration_count": 1,
         "generated_code": "def train():\n    pass\n",
+        "data_summary": "Steward summary: core columns validated.",
+        "steward_context_ready": True,
+        "steward_context_quality": {"ready": True, "reasons": [], "warnings": []},
+        "ml_review_stack": {
+            "results_advisor": {
+                "summary_lines": ["Baseline metrics verified; proceed with incremental FE."],
+                "recommendations": ["Apply one FE hypothesis and keep CV fixed."],
+                "risks": [],
+            }
+        },
         "feedback_history": [],
     }
     activated = graph_mod._bootstrap_metric_improvement_round(state, contract)
@@ -107,6 +119,8 @@ def test_bootstrap_metric_improvement_round_builds_actor_critic_handoff(tmp_path
     assert isinstance(handoff.get("hypothesis_packet"), dict)
     feedback_history = state.get("feedback_history", [])
     assert feedback_history
+    assert "STEWARD_FEEDBACK" in feedback_history[-1]
+    assert "RESULTS_ADVISOR_FEEDBACK" in feedback_history[-1]
     assert "ITERATION_HYPOTHESIS_PACKET" in feedback_history[-1]
     event_types = [evt[1] for evt in events]
     assert "metric_improvement_round_start" in event_types

@@ -20754,6 +20754,83 @@ def _resolve_metric_round_review_mode(contract: Dict[str, Any] | None) -> str:
     return _normalize_metric_round_review_mode(os.getenv("METRIC_ROUND_REVIEW_MODE", "hybrid_guarded"))
 
 
+def _is_approved_review_status(value: Any) -> bool:
+    normalized = _normalize_review_status(str(value or ""))
+    return normalized in {"APPROVED", "APPROVE_WITH_WARNINGS"}
+
+
+def _has_real_baseline_reviewer_approval(state: Dict[str, Any]) -> bool:
+    if not isinstance(state, dict):
+        return False
+    reviewer_packet = state.get("reviewer_last_result")
+    qa_packet = state.get("qa_last_result")
+    if not isinstance(reviewer_packet, dict) or not isinstance(qa_packet, dict):
+        return False
+    reviewer_status = reviewer_packet.get("status")
+    qa_status = qa_packet.get("status")
+    return _is_approved_review_status(reviewer_status) and _is_approved_review_status(qa_status)
+
+
+def _build_steward_feedback_for_improvement(state: Dict[str, Any]) -> str:
+    if not isinstance(state, dict):
+        return ""
+    quality = state.get("steward_context_quality") if isinstance(state.get("steward_context_quality"), dict) else {}
+    ready = bool(state.get("steward_context_ready"))
+    reasons = quality.get("reasons") if isinstance(quality.get("reasons"), list) else []
+    warnings = quality.get("warnings") if isinstance(quality.get("warnings"), list) else []
+    semantic_summary = _truncate_handoff_text(
+        str(state.get("dataset_semantics_summary") or ""),
+        max_len=260,
+    )
+    summary = _truncate_handoff_text(str(state.get("data_summary") or ""), max_len=260)
+    parts: List[str] = []
+    if ready:
+        parts.append("steward_context_ready=true")
+    else:
+        parts.append("steward_context_ready=false")
+    if reasons:
+        parts.append("reasons=" + ", ".join([str(item) for item in reasons[:3]]))
+    if warnings:
+        parts.append("warnings=" + ", ".join([str(item) for item in warnings[:2]]))
+    if semantic_summary:
+        parts.append("dataset_semantics=" + semantic_summary)
+    elif summary:
+        parts.append("summary=" + summary)
+    return " | ".join([str(item) for item in parts if str(item).strip()])
+
+
+def _build_results_advisor_feedback_for_improvement(
+    state: Dict[str, Any],
+    critique_packet: Dict[str, Any] | None = None,
+) -> str:
+    if not isinstance(state, dict):
+        return ""
+    review_stack = state.get("ml_review_stack") if isinstance(state.get("ml_review_stack"), dict) else {}
+    advisor_packet = review_stack.get("results_advisor") if isinstance(review_stack.get("results_advisor"), dict) else {}
+    summary_lines = advisor_packet.get("summary_lines") if isinstance(advisor_packet.get("summary_lines"), list) else []
+    recommendations = advisor_packet.get("recommendations") if isinstance(advisor_packet.get("recommendations"), list) else []
+    risks = advisor_packet.get("risks") if isinstance(advisor_packet.get("risks"), list) else []
+    review_feedback = _truncate_handoff_text(str(state.get("review_feedback") or ""), max_len=220)
+    critique_summary = ""
+    if isinstance(critique_packet, dict):
+        critique_summary = _truncate_handoff_text(str(critique_packet.get("analysis_summary") or ""), max_len=220)
+
+    lines: List[str] = []
+    for item in summary_lines[:2]:
+        token = str(item or "").strip()
+        if token:
+            lines.append(token)
+    if critique_summary:
+        lines.append("critique=" + critique_summary)
+    if recommendations:
+        lines.append("recommendation=" + str(recommendations[0]))
+    if risks:
+        lines.append("risk=" + str(risks[0]))
+    if not lines and review_feedback:
+        lines.append(review_feedback)
+    return " | ".join(lines[:3])
+
+
 def _coerce_review_packet_to_nonblocking(packet: Dict[str, Any], actor: str) -> Dict[str, Any]:
     patched = dict(packet) if isinstance(packet, dict) else {}
     original_status = str(patched.get("status") or "").strip().upper()
@@ -20846,8 +20923,9 @@ def _is_data_limited_mode_active(state: Dict[str, Any], contract: Dict[str, Any]
 def _should_run_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
     if not isinstance(state, dict) or not isinstance(contract, dict):
         return False
-    verdict = normalize_review_status(state.get("review_verdict"))
-    if verdict not in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+    if not _is_approved_review_status(state.get("review_verdict")):
+        return False
+    if not _has_real_baseline_reviewer_approval(state):
         return False
     if bool(state.get("execution_error")) or bool(state.get("sandbox_failed")):
         return False
@@ -21003,13 +21081,19 @@ def _build_metric_improvement_feedback_block(
     feature_engineering_plan: Dict[str, Any],
     critique_packet: Dict[str, Any],
     hypothesis_packet: Dict[str, Any],
+    steward_feedback: str = "",
+    advisor_feedback: str = "",
 ) -> str:
     plan_compact = compress_long_lists(feature_engineering_plan or {})[0]
     plan_text = json.dumps(plan_compact, ensure_ascii=True)
     critique_text = json.dumps(compress_long_lists(critique_packet or {})[0], ensure_ascii=True)
     hypothesis_text = json.dumps(compress_long_lists(hypothesis_packet or {})[0], ensure_ascii=True)
+    steward_text = _truncate_handoff_text(str(steward_feedback or ""), max_len=420)
+    advisor_text = _truncate_handoff_text(str(advisor_feedback or ""), max_len=420)
     return (
         "\n\n# IMPROVEMENT_ROUND\n"
+        + ("STEWARD_FEEDBACK: " + steward_text + "\n" if steward_text else "")
+        + ("RESULTS_ADVISOR_FEEDBACK: " + advisor_text + "\n" if advisor_text else "")
         + "FEATURE_ENGINEERING_PLAN: "
         + plan_text
         + "\nADVISOR_CRITIQUE_PACKET: "
@@ -21154,10 +21238,14 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         )
 
     patch_objectives = _build_metric_improvement_patch_objectives(hypothesis_packet)
+    steward_feedback = _build_steward_feedback_for_improvement(state)
+    advisor_feedback = _build_results_advisor_feedback_for_improvement(state, critique_packet)
     feedback_block = _build_metric_improvement_feedback_block(
         feature_engineering_plan=feature_engineering_plan,
         critique_packet=critique_packet,
         hypothesis_packet=hypothesis_packet,
+        steward_feedback=steward_feedback,
+        advisor_feedback=advisor_feedback,
     )
 
     history = list(state.get("feedback_history", []) or [])
@@ -21202,6 +21290,8 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             "qa": "",
             "runtime_error_tail": "",
             "evidence": [],
+            "steward": steward_feedback,
+            "results_advisor": advisor_feedback,
         },
         "must_preserve": [
             "data_split_logic",

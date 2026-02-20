@@ -13,12 +13,26 @@ from src.graph.graph import (
 def test_should_run_metric_improvement_round_defaults_to_true_after_baseline_approved() -> None:
     state = {
         "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
         "execution_error": False,
         "sandbox_failed": False,
         "ml_improvement_attempted": False,
     }
     contract = {}
     assert _should_run_metric_improvement_round(state, contract) is True
+
+
+def test_should_run_metric_improvement_round_requires_real_reviewer_pair_approval() -> None:
+    state = {
+        "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "REJECTED"},
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_attempted": False,
+    }
+    assert _should_run_metric_improvement_round(state, {}) is False
 
 
 def test_is_improvement_respects_min_delta_threshold() -> None:
