@@ -1,4 +1,7 @@
-from src.agents.execution_planner import _apply_deterministic_repairs
+from src.agents.execution_planner import (
+    _apply_deterministic_repairs,
+    _sanitize_target_mapping_conflicts,
+)
 
 
 def test_deterministic_repair_column_dtype_targets_aliases() -> None:
@@ -97,3 +100,69 @@ def test_deterministic_repair_scope_promotes_full_pipeline_when_both_segments_pr
     repaired = _apply_deterministic_repairs(contract)
 
     assert repaired.get("scope") == "full_pipeline"
+
+
+def test_sanitize_target_mapping_conflicts_removes_conflicting_gate_and_runbook_line() -> None:
+    contract = {
+        "column_roles": {"outcome": ["target"]},
+        "cleaning_gates": [
+            {
+                "name": "target_mapping_check",
+                "severity": "HARD",
+                "params": {"mapping": {"Presence": 1, "Absence": 0}},
+            },
+            {"name": "required_columns_present", "severity": "HARD", "params": {}},
+        ],
+        "data_engineer_runbook": (
+            "1. Load CSV. "
+            "2. Map target values: Presence -> 1, Absence -> 0. "
+            "3. Export cleaned artifacts."
+        ),
+    }
+    data_profile = {
+        "outcome_analysis": {"target": {"n_unique": 2}},
+        "numeric_summary": {"target": {"min": 0.0, "max": 1.0}},
+        "cardinality": {
+            "target": {
+                "top_values": [
+                    {"value": "0.0", "count": 100},
+                    {"value": "1.0", "count": 80},
+                    {"value": "nan", "count": 20},
+                ]
+            }
+        },
+    }
+
+    sanitized = _sanitize_target_mapping_conflicts(contract, data_profile)
+
+    gate_names = [str(g.get("name")) for g in sanitized.get("cleaning_gates", []) if isinstance(g, dict)]
+    assert "target_mapping_check" not in gate_names
+    assert "required_columns_present" in gate_names
+    assert "Presence -> 1" not in str(sanitized.get("data_engineer_runbook", ""))
+
+
+def test_sanitize_target_mapping_conflicts_keeps_mapping_for_text_targets() -> None:
+    contract = {
+        "column_roles": {"outcome": ["target"]},
+        "cleaning_gates": [
+            {
+                "name": "target_mapping_check",
+                "severity": "HARD",
+                "params": {"mapping": {"Presence": 1, "Absence": 0}},
+            },
+        ],
+    }
+    data_profile = {
+        "cardinality": {
+            "target": {
+                "top_values": [
+                    {"value": "Presence", "count": 60},
+                    {"value": "Absence", "count": 40},
+                ]
+            }
+        }
+    }
+
+    sanitized = _sanitize_target_mapping_conflicts(contract, data_profile)
+    gate_names = [str(g.get("name")) for g in sanitized.get("cleaning_gates", []) if isinstance(g, dict)]
+    assert "target_mapping_check" in gate_names

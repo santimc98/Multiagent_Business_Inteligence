@@ -418,3 +418,48 @@ def test_validate_contract_minimal_readonly_rejects_model_features_with_only_str
     assert result.get("accepted") is False
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.model_features_empty" in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_conflicting_target_mapping_against_observed_numeric_values():
+    contract = _base_full_pipeline_contract()
+    contract["cleaning_gates"] = [
+        {
+            "name": "target_mapping_check",
+            "severity": "HARD",
+            "params": {"mapping": {"Presence": 1, "Absence": 0}},
+        }
+    ]
+
+    result = validate_contract_minimal_readonly(
+        contract,
+        steward_semantics={
+            "primary_target": "target",
+            "target_observed_values": {"target": ["0.0", "1.0", "nan"]},
+        },
+    )
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.target_mapping_consistency" in rules
+
+
+def test_validate_contract_minimal_readonly_allows_target_mapping_when_observed_labels_are_textual():
+    contract = _base_full_pipeline_contract()
+    contract["cleaning_gates"] = [
+        {
+            "name": "target_mapping_check",
+            "severity": "HARD",
+            "params": {"mapping": {"Presence": 1, "Absence": 0}},
+        }
+    ]
+
+    result = validate_contract_minimal_readonly(
+        contract,
+        steward_semantics={
+            "primary_target": "target",
+            "target_observed_values": {"target": ["Presence", "Absence"]},
+        },
+    )
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.target_mapping_consistency" not in rules

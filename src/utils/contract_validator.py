@@ -3040,6 +3040,107 @@ def validate_contract_minimal_readonly(
             _extend(column_roles.get("label"))
         return outcomes
 
+    def _normalize_target_value_token(value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip().strip("\"'")
+        if not text:
+            return ""
+        lowered = text.lower()
+        if lowered in {"nan", "none", "null", "na", "n/a", "<na>"}:
+            return ""
+        try:
+            number = float(text)
+        except Exception:
+            return lowered
+        if not (number == number):  # NaN guard
+            return ""
+        rounded = round(number)
+        if abs(number - rounded) < 1e-9:
+            return str(int(rounded))
+        return str(number)
+
+    def _collect_steward_observed_target_values(target_candidates: List[str]) -> Dict[str, List[str]]:
+        observed: Dict[str, List[str]] = {}
+        if not isinstance(steward_semantics, dict):
+            return observed
+
+        raw_map_candidates = (
+            steward_semantics.get("target_observed_values"),
+            steward_semantics.get("observed_target_values"),
+            steward_semantics.get("target_values_by_column"),
+        )
+        for raw_map in raw_map_candidates:
+            if not isinstance(raw_map, dict):
+                continue
+            for key, values in raw_map.items():
+                key_name = str(key or "").strip()
+                if not key_name:
+                    continue
+                normalized_values, _ = _normalize_nonempty_str_list(values)
+                if not normalized_values:
+                    continue
+                target_list = observed.setdefault(key_name, [])
+                for raw_value in normalized_values:
+                    token = _normalize_target_value_token(raw_value)
+                    if token and token not in target_list:
+                        target_list.append(token)
+
+        if not observed and len(target_candidates) == 1:
+            fallback_values = steward_semantics.get("target_values")
+            normalized_values, _ = _normalize_nonempty_str_list(fallback_values)
+            if normalized_values:
+                only_target = target_candidates[0]
+                observed_values: List[str] = []
+                for raw_value in normalized_values:
+                    token = _normalize_target_value_token(raw_value)
+                    if token and token not in observed_values:
+                        observed_values.append(token)
+                if observed_values:
+                    observed[only_target] = observed_values
+        return observed
+
+    def _collect_target_mapping_gates() -> List[Dict[str, Any]]:
+        raw_gates = contract.get("cleaning_gates")
+        if not isinstance(raw_gates, list):
+            return []
+        mapping_gates: List[Dict[str, Any]] = []
+        for gate in raw_gates:
+            if not isinstance(gate, dict):
+                continue
+            gate_name = (
+                gate.get("name")
+                or gate.get("id")
+                or gate.get("gate")
+                or gate.get("rule")
+                or gate.get("check")
+            )
+            gate_norm = re.sub(r"[^a-z0-9]+", "_", str(gate_name or "").strip().lower()).strip("_")
+            if not gate_norm:
+                continue
+            if gate_norm in {"target_mapping_check", "target_mapping", "target_label_mapping", "target_map_check"}:
+                mapping_gates.append(gate)
+                continue
+            if "target" in gate_norm and "mapping" in gate_norm:
+                mapping_gates.append(gate)
+        return mapping_gates
+
+    def _extract_mapping_keys(gate: Dict[str, Any]) -> List[str]:
+        if not isinstance(gate, dict):
+            return []
+        params = gate.get("params")
+        mapping = params.get("mapping") if isinstance(params, dict) else None
+        if mapping is None:
+            mapping = gate.get("mapping")
+        if not isinstance(mapping, dict):
+            return []
+        keys: List[str] = []
+        for raw_key in mapping.keys():
+            token = _normalize_target_value_token(raw_key)
+            if token and token not in keys:
+                keys.append(token)
+        return keys
+
     def _collect_structural_columns() -> List[str]:
         structural: List[str] = []
 
@@ -3602,6 +3703,48 @@ def validate_contract_minimal_readonly(
                         "error",
                         "clean_dataset.column_transformations.drop_columns removes ML-required columns.",
                         drop_vs_ml[:25],
+                    )
+                )
+
+    if requires_cleaning:
+        target_candidates = _collect_target_candidates()
+        mapping_gates = _collect_target_mapping_gates()
+        observed_targets = _collect_steward_observed_target_values(target_candidates)
+        if mapping_gates and observed_targets:
+            conflicting_gates: List[Dict[str, Any]] = []
+            for target_col, observed_values in observed_targets.items():
+                if not observed_values:
+                    continue
+                if not all(value in {"0", "1"} for value in observed_values):
+                    continue
+                for gate in mapping_gates:
+                    mapping_keys = _extract_mapping_keys(gate)
+                    if not mapping_keys:
+                        continue
+                    if any(value not in {"0", "1"} for value in mapping_keys):
+                        gate_name = (
+                            gate.get("name")
+                            or gate.get("id")
+                            or gate.get("gate")
+                            or gate.get("rule")
+                            or gate.get("check")
+                            or "target_mapping_check"
+                        )
+                        conflicting_gates.append(
+                            {
+                                "gate": str(gate_name),
+                                "target_column": target_col,
+                                "mapping_labels": mapping_keys,
+                                "observed_values": observed_values,
+                            }
+                        )
+            if conflicting_gates:
+                issues.append(
+                    _strict_issue(
+                        "contract.target_mapping_consistency",
+                        "error",
+                        "target_mapping_check conflicts with observed numeric-binary target values; remove label remapping or align with observed domain.",
+                        conflicting_gates[:10],
                     )
                 )
 

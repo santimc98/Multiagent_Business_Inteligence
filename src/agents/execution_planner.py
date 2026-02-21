@@ -2,6 +2,7 @@ import json
 import os
 import ast
 import copy
+import math
 from typing import Dict, Any, List, Optional, Tuple, Callable
 from string import Template
 import re
@@ -180,6 +181,8 @@ Hard rules:
 - Treat strategy techniques as advisory hypotheses, not immutable requirements.
 - If strategy wording conflicts with direct data evidence (profile ranges/dtypes/semantics), prioritize data evidence
   and encode the safer choice in contract fields.
+- If observed target values are already numeric-binary (e.g., 0/1), do NOT add a label-to-number
+  target_mapping_check gate or runbook instructions that remap textual labels.
 - Avoid declaring dtype constraints that conflict with observed ranges (e.g., signed int8 when observed values exceed
   [-128, 127]).
 - Every requirement must be consumable by at least one downstream agent view.
@@ -1047,6 +1050,356 @@ def _normalize_gate_name(name: Any) -> str:
     text = str(name).strip().lower()
     text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
     return text
+
+
+_TARGET_BINARY_NUMERIC_TOKENS = {"0", "1"}
+_TARGET_NULL_TOKENS = {"", "nan", "none", "null", "na", "n/a", "<na>"}
+_TARGET_MAPPING_GATE_NAMES = {
+    "target_mapping_check",
+    "target_mapping",
+    "target_label_mapping",
+    "target_map_check",
+}
+_TARGET_MAPPING_LABEL_HINTS = (
+    "presence",
+    "absence",
+    "positive",
+    "negative",
+    "yes",
+    "no",
+    "true",
+    "false",
+)
+
+
+def _normalize_target_value_token(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().strip("\"'")
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in _TARGET_NULL_TOKENS:
+        return ""
+    try:
+        number = float(text)
+    except Exception:
+        return lowered
+    if not math.isfinite(number):
+        return ""
+    rounded = round(number)
+    if abs(number - rounded) < 1e-9:
+        return str(int(rounded))
+    return str(number)
+
+
+def _collect_contract_target_candidates(contract: Dict[str, Any], data_profile: Dict[str, Any] | None = None) -> List[str]:
+    candidates: List[str] = []
+
+    def _append(values: Any) -> None:
+        if isinstance(values, list):
+            for item in values:
+                _append(item)
+            return
+        if isinstance(values, (str, int, float)):
+            col = str(values).strip()
+            if col and col not in candidates:
+                candidates.append(col)
+
+    _append(contract.get("target_column"))
+    _append(contract.get("target_columns"))
+    _append(contract.get("outcome_columns"))
+    roles = contract.get("column_roles")
+    if isinstance(roles, dict):
+        _append(roles.get("outcome"))
+    objective_analysis = contract.get("objective_analysis")
+    if isinstance(objective_analysis, dict):
+        _append(objective_analysis.get("primary_target"))
+        _append(objective_analysis.get("primary_targets"))
+        _append(objective_analysis.get("target_column"))
+        _append(objective_analysis.get("target_columns"))
+        _append(objective_analysis.get("label_column"))
+        _append(objective_analysis.get("label_columns"))
+    evaluation_spec = contract.get("evaluation_spec")
+    if isinstance(evaluation_spec, dict):
+        _append(evaluation_spec.get("primary_target"))
+        _append(evaluation_spec.get("primary_targets"))
+        _append(evaluation_spec.get("target_column"))
+        _append(evaluation_spec.get("target_columns"))
+        _append(evaluation_spec.get("label_column"))
+        _append(evaluation_spec.get("label_columns"))
+        params = evaluation_spec.get("params")
+        if isinstance(params, dict):
+            _append(params.get("primary_target"))
+            _append(params.get("target_column"))
+            _append(params.get("target_columns"))
+    if isinstance(data_profile, dict):
+        outcome_analysis = data_profile.get("outcome_analysis")
+        if isinstance(outcome_analysis, dict):
+            for key in outcome_analysis.keys():
+                if isinstance(key, str):
+                    _append(key)
+    return candidates
+
+
+def _collect_profile_discrete_target_values(data_profile: Dict[str, Any], target_col: str) -> List[str]:
+    if not isinstance(data_profile, dict) or not target_col:
+        return []
+    tokens: List[str] = []
+
+    def _add(value: Any) -> None:
+        token = _normalize_target_value_token(value)
+        if token and token not in tokens:
+            tokens.append(token)
+
+    cardinality = data_profile.get("cardinality")
+    if isinstance(cardinality, dict):
+        target_card = cardinality.get(target_col)
+        if isinstance(target_card, dict):
+            top_values = target_card.get("top_values")
+            if isinstance(top_values, list):
+                for item in top_values:
+                    if isinstance(item, dict):
+                        _add(item.get("value"))
+                    else:
+                        _add(item)
+            unique_values = target_card.get("unique_values_sample")
+            if isinstance(unique_values, list):
+                for item in unique_values:
+                    if isinstance(item, dict):
+                        _add(item.get("value"))
+                    else:
+                        _add(item)
+
+    distributions = data_profile.get("distributions")
+    if isinstance(distributions, dict):
+        target_dist = distributions.get(target_col)
+        if isinstance(target_dist, dict):
+            top_values = target_dist.get("value_counts_top")
+            if isinstance(top_values, list):
+                for item in top_values:
+                    if isinstance(item, dict):
+                        _add(item.get("value"))
+                    else:
+                        _add(item)
+            unique_values = target_dist.get("unique_values_sample")
+            if isinstance(unique_values, list):
+                for item in unique_values:
+                    if isinstance(item, dict):
+                        _add(item.get("value"))
+                    else:
+                        _add(item)
+
+    outcome_analysis = data_profile.get("outcome_analysis")
+    if isinstance(outcome_analysis, dict):
+        target_outcome = outcome_analysis.get(target_col)
+        if isinstance(target_outcome, dict):
+            unique_values = target_outcome.get("unique_values_sample")
+            if isinstance(unique_values, list):
+                for item in unique_values:
+                    if isinstance(item, dict):
+                        _add(item.get("value"))
+                    else:
+                        _add(item)
+    return tokens
+
+
+def _build_target_observed_values_map(
+    contract: Dict[str, Any] | None,
+    data_profile: Dict[str, Any] | None,
+) -> Dict[str, List[str]]:
+    if not isinstance(contract, dict) or not isinstance(data_profile, dict):
+        return {}
+    observed: Dict[str, List[str]] = {}
+    targets = _collect_contract_target_candidates(contract, data_profile)
+    for target_col in targets:
+        values = _collect_profile_discrete_target_values(data_profile, target_col)
+        if values:
+            observed[target_col] = values
+    return observed
+
+
+def _profile_numeric_binary_hint(data_profile: Dict[str, Any], target_col: str) -> bool:
+    if not isinstance(data_profile, dict) or not target_col:
+        return False
+    n_unique: Optional[int] = None
+    outcome_analysis = data_profile.get("outcome_analysis")
+    if isinstance(outcome_analysis, dict):
+        target_outcome = outcome_analysis.get(target_col)
+        if isinstance(target_outcome, dict):
+            raw_unique = target_outcome.get("n_unique")
+            try:
+                n_unique = int(raw_unique) if raw_unique is not None else None
+            except Exception:
+                n_unique = None
+    if n_unique is None:
+        cardinality = data_profile.get("cardinality")
+        if isinstance(cardinality, dict):
+            target_card = cardinality.get(target_col)
+            if isinstance(target_card, dict):
+                raw_unique = target_card.get("unique")
+                try:
+                    n_unique = int(raw_unique) if raw_unique is not None else None
+                except Exception:
+                    n_unique = None
+    if n_unique is None or n_unique > 2:
+        return False
+
+    numeric_summary = data_profile.get("numeric_summary")
+    if not isinstance(numeric_summary, dict):
+        return False
+    target_numeric = numeric_summary.get(target_col)
+    if not isinstance(target_numeric, dict):
+        return False
+    try:
+        min_val = float(target_numeric.get("min"))
+        max_val = float(target_numeric.get("max"))
+    except Exception:
+        return False
+    if not (math.isfinite(min_val) and math.isfinite(max_val)):
+        return False
+    return min_val >= 0.0 and max_val <= 1.0
+
+
+def _is_target_mapping_gate(gate: Dict[str, Any]) -> bool:
+    if not isinstance(gate, dict):
+        return False
+    name = (
+        gate.get("name")
+        or gate.get("id")
+        or gate.get("gate")
+        or gate.get("rule")
+        or gate.get("check")
+    )
+    normalized = _normalize_gate_name(name)
+    if not normalized:
+        return False
+    if normalized in _TARGET_MAPPING_GATE_NAMES:
+        return True
+    return "target" in normalized and "mapping" in normalized
+
+
+def _gate_uses_non_numeric_target_labels(gate: Dict[str, Any]) -> bool:
+    if not isinstance(gate, dict):
+        return False
+    params = gate.get("params")
+    mapping = None
+    if isinstance(params, dict):
+        mapping = params.get("mapping")
+    if mapping is None:
+        mapping = gate.get("mapping")
+    if not isinstance(mapping, dict) or not mapping:
+        return True
+    labels = [_normalize_target_value_token(key) for key in mapping.keys()]
+    labels = [label for label in labels if label]
+    if not labels:
+        return True
+    return any(label not in _TARGET_BINARY_NUMERIC_TOKENS for label in labels)
+
+
+def _sanitize_target_mapping_runbook_text(text: str) -> Tuple[str, bool]:
+    if not isinstance(text, str) or not text.strip():
+        return text, False
+    chunks = re.split(r"(?<=[\.\n])\s+", text)
+    kept_chunks: List[str] = []
+    removed = False
+    for chunk in chunks:
+        lower = chunk.lower()
+        has_target = "target" in lower
+        has_mapping = "map" in lower or "mapping" in lower
+        has_arrow = "->" in chunk or " to " in lower
+        has_label_hint = any(token in lower for token in _TARGET_MAPPING_LABEL_HINTS)
+        if has_target and has_mapping and (has_arrow or has_label_hint):
+            removed = True
+            continue
+        kept_chunks.append(chunk)
+    sanitized = " ".join(part for part in kept_chunks if part is not None).strip()
+    if removed and not sanitized:
+        sanitized = (
+            "Validate target domain from observed values; do not remap when target is already numeric binary."
+        )
+    return sanitized, removed
+
+
+def _sanitize_target_mapping_runbook_payload(payload: Any) -> Tuple[Any, bool]:
+    if isinstance(payload, str):
+        return _sanitize_target_mapping_runbook_text(payload)
+    if isinstance(payload, list):
+        changed = False
+        out: List[Any] = []
+        for item in payload:
+            sanitized_item, item_changed = _sanitize_target_mapping_runbook_payload(item)
+            out.append(sanitized_item)
+            changed = changed or item_changed
+        return out, changed
+    if isinstance(payload, dict):
+        changed = False
+        out: Dict[str, Any] = {}
+        for key, value in payload.items():
+            sanitized_value, value_changed = _sanitize_target_mapping_runbook_payload(value)
+            out[key] = sanitized_value
+            changed = changed or value_changed
+        return out, changed
+    return payload, False
+
+
+def _sanitize_target_mapping_conflicts(
+    contract: Dict[str, Any] | None,
+    data_profile: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+    repaired = copy.deepcopy(contract)
+    if not isinstance(data_profile, dict) or not data_profile:
+        return repaired
+
+    observed_values = _build_target_observed_values_map(repaired, data_profile)
+    numeric_binary_targets: List[str] = []
+    for target_col in _collect_contract_target_candidates(repaired, data_profile):
+        values = observed_values.get(target_col, [])
+        has_binary_values = bool(values) and all(
+            value in _TARGET_BINARY_NUMERIC_TOKENS for value in values
+        )
+        if has_binary_values or _profile_numeric_binary_hint(data_profile, target_col):
+            if target_col not in numeric_binary_targets:
+                numeric_binary_targets.append(target_col)
+    if not numeric_binary_targets:
+        return repaired
+
+    removed_gates = 0
+    cleaning_gates = repaired.get("cleaning_gates")
+    if isinstance(cleaning_gates, list):
+        sanitized_gates: List[Any] = []
+        for gate in cleaning_gates:
+            if isinstance(gate, dict) and _is_target_mapping_gate(gate):
+                if _gate_uses_non_numeric_target_labels(gate):
+                    removed_gates += 1
+                    continue
+            sanitized_gates.append(gate)
+        repaired["cleaning_gates"] = sanitized_gates
+
+    runbook_changed = False
+    if "data_engineer_runbook" in repaired:
+        sanitized_runbook, runbook_changed = _sanitize_target_mapping_runbook_payload(
+            repaired.get("data_engineer_runbook")
+        )
+        if runbook_changed:
+            repaired["data_engineer_runbook"] = sanitized_runbook
+
+    if removed_gates or runbook_changed:
+        notes = repaired.get("notes_for_engineers")
+        if not isinstance(notes, list):
+            notes = []
+        target_preview = ", ".join(numeric_binary_targets[:3])
+        note = (
+            "Target mapping directives were sanitized because observed target values are already "
+            "numeric-binary"
+            + (f" ({target_preview})." if target_preview else ".")
+        )
+        if note not in notes:
+            notes.append(note)
+        repaired["notes_for_engineers"] = notes
+    return repaired
 
 
 def _ensure_missing_category_values(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -7698,12 +8051,23 @@ class ExecutionPlannerAgent:
 
         def _validate_contract_quality(contract_payload: Dict[str, Any] | None) -> Dict[str, Any]:
             payload_for_validation = _apply_deterministic_repairs(contract_payload if isinstance(contract_payload, dict) else {})
+            payload_for_validation = _sanitize_target_mapping_conflicts(
+                payload_for_validation,
+                data_profile if isinstance(data_profile, dict) else None,
+            )
             base_result: Dict[str, Any]
             steward_semantics_payload: Dict[str, Any] = {}
             if isinstance(data_profile, dict):
                 semantics_candidate = data_profile.get("dataset_semantics")
                 if isinstance(semantics_candidate, dict) and semantics_candidate:
                     steward_semantics_payload = semantics_candidate
+                observed_target_values = _build_target_observed_values_map(
+                    payload_for_validation,
+                    data_profile,
+                )
+                if observed_target_values:
+                    steward_semantics_payload = dict(steward_semantics_payload)
+                    steward_semantics_payload["target_observed_values"] = observed_target_values
             try:
                 base_result = validate_contract_minimal_readonly(
                     copy.deepcopy(payload_for_validation or {}),
@@ -9732,6 +10096,10 @@ class ExecutionPlannerAgent:
             if isinstance(contract, dict) and contract:
                 contract = _merge_contract_missing_fields(contract, deterministic_scaffold_contract)
                 contract = _apply_deterministic_repairs(contract)
+                contract = _sanitize_target_mapping_conflicts(
+                    contract,
+                    data_profile if isinstance(data_profile, dict) else None,
+                )
                 contract = _ensure_contract_visual_policy(
                     contract=contract,
                     strategy=strategy if isinstance(strategy, dict) else {},

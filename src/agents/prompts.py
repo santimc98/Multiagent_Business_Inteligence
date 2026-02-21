@@ -75,6 +75,8 @@ Before generating the contract:
 
 * Read the Dataset Semantics Summary from data_summary (Steward-decided).
 * Do NOT invent target or split logic. Use the Steward's primary_target and training/scoring rules.
+* If observed target values are already numeric-binary (for example 0/1), do NOT add label-to-number
+  remapping gates/instructions (no target_mapping_check with textual labels).
 * Explicitly declare:
   - Which column(s) are treated as outcome/target (must match Steward primary_target).
   - Whether partial labels are present (labeled vs unlabeled rows).
