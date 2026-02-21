@@ -36,6 +36,20 @@ def test_should_run_metric_improvement_round_requires_real_reviewer_pair_approva
     assert _should_run_metric_improvement_round(state, {}) is False
 
 
+def test_should_run_metric_improvement_round_accepts_ml_review_stack_fallback() -> None:
+    state = {
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "ml_review_stack": {
+            "reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "APPROVE_WITH_WARNINGS"},
+        },
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_attempted": False,
+    }
+    assert _should_run_metric_improvement_round(state, {}) is True
+
+
 def test_is_improvement_respects_min_delta_threshold() -> None:
     assert _is_improvement(0.8000, 0.8003, True, 0.0005) is False
     assert _is_improvement(0.8000, 0.8010, True, 0.0005) is True

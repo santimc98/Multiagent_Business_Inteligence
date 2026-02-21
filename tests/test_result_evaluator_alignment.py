@@ -62,6 +62,16 @@ def test_result_evaluator_persists_qa_and_reviewer_packets_with_warnings(tmp_pat
     assert graph_mod._has_real_baseline_reviewer_approval(merged_state) is True
 
 
+def test_has_real_baseline_reviewer_approval_falls_back_to_review_stack() -> None:
+    state = {
+        "ml_review_stack": {
+            "reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "APPROVE_WITH_WARNINGS"},
+        }
+    }
+    assert graph_mod._has_real_baseline_reviewer_approval(state) is True
+
+
 def test_build_ml_iteration_journal_entry_includes_handoff_and_parse_repair_flags():
     state = {
         "iteration_count": 1,

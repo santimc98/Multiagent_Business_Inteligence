@@ -21030,6 +21030,45 @@ def _is_approved_review_status(value: Any) -> bool:
     return normalized in {"APPROVED", "APPROVE_WITH_WARNINGS"}
 
 
+def _extract_review_status_from_packet(packet: Any) -> str | None:
+    if not isinstance(packet, dict):
+        return None
+    raw = packet.get("status")
+    if raw is None:
+        return None
+    normalized = _normalize_review_status(str(raw or ""))
+    if normalized == "UNKNOWN":
+        return None
+    return normalized
+
+
+def _resolve_baseline_reviewer_status_pair(state: Dict[str, Any]) -> Tuple[str | None, str | None, str]:
+    if not isinstance(state, dict):
+        return None, None, "unavailable"
+    sources: List[Tuple[str, Any, Any]] = [
+        (
+            "state.last_results",
+            state.get("reviewer_last_result"),
+            state.get("qa_last_result"),
+        ),
+    ]
+    review_stack = state.get("ml_review_stack")
+    if isinstance(review_stack, dict):
+        sources.append(
+            (
+                "state.ml_review_stack",
+                review_stack.get("reviewer"),
+                review_stack.get("qa_reviewer"),
+            )
+        )
+    for source, reviewer_packet, qa_packet in sources:
+        reviewer_status = _extract_review_status_from_packet(reviewer_packet)
+        qa_status = _extract_review_status_from_packet(qa_packet)
+        if reviewer_status and qa_status:
+            return reviewer_status, qa_status, source
+    return None, None, "unavailable"
+
+
 def _is_augmentation_technique_name(value: Any) -> bool:
     token = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
     if not token:
@@ -21106,13 +21145,38 @@ def _resolve_metric_round_augmentation_requested(
 def _has_real_baseline_reviewer_approval(state: Dict[str, Any]) -> bool:
     if not isinstance(state, dict):
         return False
-    reviewer_packet = state.get("reviewer_last_result")
-    qa_packet = state.get("qa_last_result")
-    if not isinstance(reviewer_packet, dict) or not isinstance(qa_packet, dict):
+    reviewer_status, qa_status, _source = _resolve_baseline_reviewer_status_pair(state)
+    if not reviewer_status or not qa_status:
         return False
-    reviewer_status = reviewer_packet.get("status")
-    qa_status = qa_packet.get("status")
     return _is_approved_review_status(reviewer_status) and _is_approved_review_status(qa_status)
+
+
+def _metric_improvement_skip_reason(state: Dict[str, Any], contract: Dict[str, Any]) -> str | None:
+    if not isinstance(state, dict) or not isinstance(contract, dict):
+        return "invalid_state_or_contract"
+    if not _is_approved_review_status(state.get("review_verdict")):
+        return "review_verdict_not_approved"
+    if not _has_real_baseline_reviewer_approval(state):
+        return "baseline_reviewer_pair_not_approved"
+    if bool(state.get("execution_error")):
+        return "execution_error_present"
+    if bool(state.get("sandbox_failed")):
+        return "sandbox_failed_present"
+    if bool(state.get("ml_improvement_loop_complete")):
+        return "loop_already_complete"
+    if bool(state.get("ml_improvement_attempted")):
+        return "improvement_already_attempted"
+    if bool(state.get("ml_improvement_round_active")):
+        return "improvement_round_already_active"
+    if _is_data_limited_mode_active(state, contract):
+        return "data_limited_mode_active"
+    rounds, _, _ = _metric_improvement_policy(contract)
+    if rounds <= 0:
+        return "metric_rounds_disabled"
+    done = int(state.get("ml_improvement_round_count", 0) or 0)
+    if done >= rounds:
+        return "metric_round_budget_exhausted"
+    return None
 
 
 def _build_steward_feedback_for_improvement(state: Dict[str, Any]) -> str:
@@ -21265,25 +21329,7 @@ def _is_data_limited_mode_active(state: Dict[str, Any], contract: Dict[str, Any]
 
 
 def _should_run_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
-    if not isinstance(state, dict) or not isinstance(contract, dict):
-        return False
-    if not _is_approved_review_status(state.get("review_verdict")):
-        return False
-    if not _has_real_baseline_reviewer_approval(state):
-        return False
-    if bool(state.get("execution_error")) or bool(state.get("sandbox_failed")):
-        return False
-    if bool(state.get("ml_improvement_loop_complete")):
-        return False
-    if bool(state.get("ml_improvement_attempted")) or bool(state.get("ml_improvement_round_active")):
-        return False
-    if _is_data_limited_mode_active(state, contract):
-        return False
-    rounds, _, _ = _metric_improvement_policy(contract)
-    if rounds <= 0:
-        return False
-    done = int(state.get("ml_improvement_round_count", 0) or 0)
-    return done < rounds
+    return _metric_improvement_skip_reason(state, contract) is None
 
 
 def _flatten_numeric_metrics_for_improvement(payload: Any, prefix: str = "") -> List[Tuple[str, float]]:
@@ -21585,7 +21631,31 @@ def _build_metric_improvement_patch_objectives(hypothesis_packet: Dict[str, Any]
 
 
 def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
-    if not _should_run_metric_improvement_round(state, contract):
+    skip_reason = _metric_improvement_skip_reason(state, contract)
+    if skip_reason:
+        run_id = str(state.get("run_id") or "")
+        reviewer_status, qa_status, status_source = _resolve_baseline_reviewer_status_pair(state)
+        if run_id:
+            try:
+                log_run_event(
+                    run_id,
+                    "metric_improvement_round_skipped",
+                    {
+                        "reason": skip_reason,
+                        "review_verdict": str(state.get("review_verdict") or ""),
+                        "reviewer_status": reviewer_status,
+                        "qa_status": qa_status,
+                        "status_source": status_source,
+                        "execution_error": bool(state.get("execution_error")),
+                        "sandbox_failed": bool(state.get("sandbox_failed")),
+                        "loop_complete": bool(state.get("ml_improvement_loop_complete")),
+                        "attempted": bool(state.get("ml_improvement_attempted")),
+                        "round_active": bool(state.get("ml_improvement_round_active")),
+                        "round_count": int(state.get("ml_improvement_round_count", 0) or 0),
+                    },
+                )
+            except Exception:
+                pass
         return False
 
     run_id = str(state.get("run_id") or "")
@@ -21613,10 +21683,35 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
                     "source": "primary_metric_snapshot",
                 }
     if baseline_value is None:
+        if run_id:
+            try:
+                log_run_event(
+                    run_id,
+                    "metric_improvement_round_skipped",
+                    {
+                        "reason": "baseline_metric_unavailable",
+                        "primary_metric_name": metric_name,
+                        "metric_target_source": metric_target.get("source"),
+                    },
+                )
+            except Exception:
+                pass
         return False
 
     rounds, min_delta, patience = _metric_improvement_policy(contract)
     if rounds <= 0:
+        if run_id:
+            try:
+                log_run_event(
+                    run_id,
+                    "metric_improvement_round_skipped",
+                    {
+                        "reason": "metric_rounds_disabled",
+                        "rounds": int(rounds),
+                    },
+                )
+            except Exception:
+                pass
         return False
     round_index_before = int(state.get("ml_improvement_round_count", 0) or 0)
     round_id = round_index_before + 1
