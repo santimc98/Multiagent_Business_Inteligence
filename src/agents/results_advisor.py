@@ -2,6 +2,7 @@ import os
 import json
 import csv
 import re
+import copy
 from statistics import median
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -13,8 +14,35 @@ from src.utils.retries import call_with_retries
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.actor_critic_schemas import validate_advisor_critique_packet
+from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
+from src.utils.results_advisor_response_schema import (
+    build_results_advisor_critique_response_schema,
+)
 
 load_dotenv()
+
+
+def _coerce_llm_response_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+    candidates = getattr(response, "candidates", None)
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None)
+            if not isinstance(parts, list):
+                continue
+            chunks: List[str] = []
+            for part in parts:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    chunks.append(part_text.strip())
+            if chunks:
+                return "\n".join(chunks)
+    return str(response or "")
 
 
 class ResultsAdvisorAgent:
@@ -46,6 +74,30 @@ class ResultsAdvisorAgent:
         self.critique_mode = self._normalize_critique_mode(
             os.getenv("RESULTS_ADVISOR_CRITIQUE_MODE", "hybrid")
         )
+        self._generation_config = {
+            "temperature": float(
+                os.getenv(
+                    "RESULTS_ADVISOR_GEMINI_TEMPERATURE",
+                    os.getenv("REVIEWER_GEMINI_TEMPERATURE", "0.2"),
+                )
+            ),
+            "top_p": 0.9,
+            "top_k": 40,
+            "max_output_tokens": int(
+                os.getenv(
+                    "RESULTS_ADVISOR_GEMINI_MAX_TOKENS",
+                    os.getenv("REVIEWER_GEMINI_MAX_TOKENS", "8192"),
+                )
+            ),
+            "response_mime_type": "application/json",
+        }
+        schema_flag = str(
+            os.getenv(
+                "RESULTS_ADVISOR_USE_RESPONSE_SCHEMA",
+                os.getenv("REVIEWER_USE_RESPONSE_SCHEMA", "0"),
+            )
+        ).strip().lower()
+        self._use_response_schema = schema_flag not in {"0", "false", "no", "off", ""}
         self.last_fe_advice_meta: Dict[str, Any] = {
             "mode": self.fe_advice_mode,
             "source": "deterministic",
@@ -63,13 +115,64 @@ class ResultsAdvisorAgent:
         # Tests frequently instantiate with api_key="" to force non-network mode.
         if explicit_api_key is not None and str(explicit_api_key).strip() == "":
             return
-        if self.fe_advice_mode in {"llm", "hybrid"}:
+        if (
+            self.fe_advice_mode in {"llm", "hybrid"}
+            or self.critique_mode in {"llm", "hybrid"}
+        ):
             (
                 self.fe_provider,
                 self.fe_client,
                 self.fe_model_name,
                 self.fe_model_warning,
             ) = init_reviewer_llm(None)
+
+    def _generation_config_for_critique(self) -> Dict[str, Any]:
+        config = dict(self._generation_config)
+        if self._use_response_schema:
+            config["response_schema"] = copy.deepcopy(
+                build_results_advisor_critique_response_schema()
+            )
+        return config
+
+    @staticmethod
+    def _is_response_schema_unsupported_error(err: Exception) -> bool:
+        message = str(err or "").lower()
+        if "response_schema" not in message:
+            return False
+        unsupported_tokens = (
+            "unknown field",
+            "unknown name",
+            "not supported",
+            "unsupported",
+            "unrecognized",
+            "no such field",
+            "schema not supported",
+        )
+        return any(token in message for token in unsupported_tokens)
+
+    def _generate_gemini_json(
+        self,
+        prompt: str,
+        *,
+        generation_config: Dict[str, Any],
+    ) -> tuple[str, Dict[str, Any]]:
+        used_config = dict(generation_config or {})
+        try:
+            response = self.fe_client.generate_content(prompt, generation_config=used_config)
+        except TypeError:
+            response = self.fe_client.generate_content(prompt)
+        except Exception as err:
+            if "response_schema" in used_config and self._is_response_schema_unsupported_error(err):
+                retry_config = dict(used_config)
+                retry_config.pop("response_schema", None)
+                try:
+                    response = self.fe_client.generate_content(prompt, generation_config=retry_config)
+                except TypeError:
+                    response = self.fe_client.generate_content(prompt)
+                used_config = retry_config
+            else:
+                raise
+        return _coerce_llm_response_text(response), used_config
 
     def generate_ml_advice(self, context: Dict[str, Any]) -> str:
         if not context:
@@ -281,8 +384,16 @@ class ResultsAdvisorAgent:
 
         try:
             if self.fe_provider == "gemini":
-                response = self.fe_client.generate_content(system_prompt + "\n\n" + user_prompt)
-                raw_text = response.text
+                generation_config = self._generation_config_for_critique()
+                raw_text, used_config = self._generate_gemini_json(
+                    system_prompt + "\n\n" + user_prompt,
+                    generation_config=generation_config,
+                )
+                if "response_schema" in generation_config and "response_schema" not in used_config:
+                    print(
+                        "RESULTS_ADVISOR_CRITIQUE_SCHEMA_FALLBACK: "
+                        + f"provider={self.fe_provider} model={self.fe_model_name} reason=response_schema_unsupported"
+                    )
             else:
                 response = self.fe_client.chat.completions.create(
                     model=self.fe_model_name,
@@ -314,6 +425,12 @@ class ResultsAdvisorAgent:
         text = str(raw_text or "").strip()
         if not text:
             return {}
+        try:
+            parsed, _trace = parse_json_object_with_repair(text, actor="results_advisor")
+            if isinstance(parsed, dict):
+                return parsed
+        except JsonObjectParseError:
+            pass
         cleaned = text.replace("```json", "").replace("```", "").strip()
         try:
             parsed = json.loads(cleaned)

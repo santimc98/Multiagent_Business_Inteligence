@@ -9315,6 +9315,38 @@ class AgentState(TypedDict):
     metric_improvement_nodes_managed: bool
     metric_improvement_bootstrapped: bool
     metric_improvement_finalized: bool
+    ml_improvement_round_active: bool
+    ml_improvement_continue: bool
+    ml_improvement_loop_complete: bool
+    ml_improvement_attempted: bool
+    ml_improvement_round_count: int
+    ml_improvement_rounds_allowed: int
+    ml_improvement_current_round_id: int
+    ml_improvement_no_improve_streak: int
+    ml_improvement_patience: int
+    ml_improvement_min_delta: float
+    ml_improvement_higher_is_better: bool
+    ml_improvement_kept: str
+    ml_improvement_review_mode: str
+    ml_improvement_snapshot_dir: str
+    ml_improvement_output_paths: List[str]
+    ml_improvement_primary_metric_name: str
+    ml_improvement_primary_metric_source: str
+    ml_improvement_critique_packet: Dict[str, Any]
+    ml_improvement_candidate_critique_packet: Dict[str, Any]
+    ml_improvement_hypothesis_packet: Dict[str, Any]
+    ml_improvement_round_baseline_metric: float
+    ml_improvement_round_baseline_metrics: Dict[str, Any]
+    ml_improvement_round_baseline_reviewer_packet: Dict[str, Any]
+    ml_improvement_round_baseline_qa_packet: Dict[str, Any]
+    ml_improvement_incumbent_metric: float
+    ml_improvement_baseline_metric: float
+    ml_improvement_baseline_metrics: Dict[str, Any]
+    ml_improvement_baseline_review_verdict: str
+    ml_improvement_best_metric: float
+    ml_improvement_best_round: int
+    ml_improvement_round_history: List[Dict[str, Any]]
+    ml_improvement_pareto_frontier: List[Dict[str, Any]]
 
 from src.agents.domain_expert import DomainExpertAgent
 
@@ -9779,6 +9811,38 @@ def run_steward(state: AgentState) -> AgentState:
         "metric_improvement_nodes_managed": False,
         "metric_improvement_bootstrapped": False,
         "metric_improvement_finalized": False,
+        "ml_improvement_round_active": False,
+        "ml_improvement_continue": False,
+        "ml_improvement_loop_complete": False,
+        "ml_improvement_attempted": False,
+        "ml_improvement_round_count": 0,
+        "ml_improvement_rounds_allowed": 1,
+        "ml_improvement_current_round_id": 0,
+        "ml_improvement_no_improve_streak": 0,
+        "ml_improvement_patience": 2,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": True,
+        "ml_improvement_kept": "baseline",
+        "ml_improvement_review_mode": "full",
+        "ml_improvement_snapshot_dir": "",
+        "ml_improvement_output_paths": [],
+        "ml_improvement_primary_metric_name": "",
+        "ml_improvement_primary_metric_source": "",
+        "ml_improvement_critique_packet": {},
+        "ml_improvement_candidate_critique_packet": {},
+        "ml_improvement_hypothesis_packet": {},
+        "ml_improvement_round_baseline_metric": 0.0,
+        "ml_improvement_round_baseline_metrics": {},
+        "ml_improvement_round_baseline_reviewer_packet": {},
+        "ml_improvement_round_baseline_qa_packet": {},
+        "ml_improvement_incumbent_metric": 0.0,
+        "ml_improvement_baseline_metric": 0.0,
+        "ml_improvement_baseline_metrics": {},
+        "ml_improvement_baseline_review_verdict": "",
+        "ml_improvement_best_metric": 0.0,
+        "ml_improvement_best_round": 0,
+        "ml_improvement_round_history": [],
+        "ml_improvement_pareto_frontier": [],
         "leakage_audit_summary": "",
         "restrategize_count": state.get("restrategize_count", 0) if state else 0,
         "strategist_context_override": state.get("strategist_context_override", "") if state else "",
