@@ -787,24 +787,88 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _resolve_contract_primary_metric_name(state: Dict[str, Any], contract: Dict[str, Any]) -> str | None:
-    candidates: List[Any] = []
-    if isinstance(contract, dict):
-        candidates.append(contract.get("evaluation_spec"))
-        candidates.append(contract.get("validation_requirements"))
-    if isinstance(state, dict):
-        candidates.append(state.get("evaluation_spec"))
-    for entry in candidates:
-        if not isinstance(entry, dict):
+def _coerce_optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return None
+    token = str(value or "").strip().lower()
+    if token in {"1", "true", "yes", "y", "higher", "maximize", "max"}:
+        return True
+    if token in {"0", "false", "no", "n", "lower", "minimize", "min"}:
+        return False
+    return None
+
+
+def _resolve_metric_from_entry(entry: Any, source: str) -> Dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    keys_in_priority = [
+        "competition_metric",
+        "leaderboard_metric",
+        "kaggle_metric",
+        "primary_metric",
+    ]
+    for key in keys_in_priority:
+        raw = entry.get(key)
+        metric_name = ""
+        higher_is_better: bool | None = None
+        if isinstance(raw, dict):
+            metric_name = str(
+                raw.get("name")
+                or raw.get("metric")
+                or raw.get("id")
+                or raw.get("value")
+                or ""
+            ).strip()
+            higher_is_better = _coerce_optional_bool(
+                raw.get("higher_is_better")
+                if raw.get("higher_is_better") is not None
+                else raw.get("maximize")
+            )
+        elif isinstance(raw, str):
+            metric_name = raw.strip()
+        if not metric_name:
             continue
-        validation = entry.get("validation_requirements")
-        if isinstance(validation, dict):
-            metric = validation.get("primary_metric")
-            if isinstance(metric, str) and metric.strip():
-                return metric.strip()
-        metric = entry.get("primary_metric")
-        if isinstance(metric, str) and metric.strip():
-            return metric.strip()
+        if higher_is_better is None:
+            higher_is_better = _coerce_optional_bool(entry.get(key + "_higher_is_better"))
+        if higher_is_better is None and key == "primary_metric":
+            higher_is_better = _coerce_optional_bool(entry.get("higher_is_better"))
+        return {
+            "name": metric_name,
+            "higher_is_better": higher_is_better,
+            "source": source + "." + key,
+        }
+    return None
+
+
+def _resolve_contract_metric_target(state: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str, Any]:
+    candidates: List[Tuple[str, Any]] = []
+    if isinstance(contract, dict):
+        candidates.append(("contract.validation_requirements", contract.get("validation_requirements")))
+        candidates.append(("contract.evaluation_spec", contract.get("evaluation_spec")))
+        candidates.append(("contract.root", contract))
+    if isinstance(state, dict):
+        candidates.append(("state.evaluation_spec", state.get("evaluation_spec")))
+        eval_spec = state.get("evaluation_spec")
+        if isinstance(eval_spec, dict):
+            candidates.append(("state.evaluation_spec.validation_requirements", eval_spec.get("validation_requirements")))
+    for source, entry in candidates:
+        resolved = _resolve_metric_from_entry(entry, source)
+        if isinstance(resolved, dict) and resolved.get("name"):
+            return resolved
+    return {"name": None, "higher_is_better": None, "source": "unavailable"}
+
+
+def _resolve_contract_primary_metric_name(state: Dict[str, Any], contract: Dict[str, Any]) -> str | None:
+    resolved = _resolve_contract_metric_target(state, contract)
+    metric_name = resolved.get("name")
+    if isinstance(metric_name, str) and metric_name.strip():
+        return metric_name.strip()
     return None
 
 
@@ -21094,13 +21158,53 @@ def _is_improvement(
     improved_val: Optional[float],
     higher_is_better: bool,
     min_delta: float,
+    stability_ok: bool = True,
 ) -> bool:
     if baseline_val is None or improved_val is None:
         return False
     delta = float(improved_val) - float(baseline_val)
     if not higher_is_better:
         delta = -delta
-    return bool(delta >= float(min_delta))
+    return bool(delta >= float(min_delta)) and bool(stability_ok)
+
+
+def _metric_round_stability_ok(
+    critique_packet: Dict[str, Any] | None,
+    *,
+    max_cv_std: Optional[float] = None,
+    max_generalization_gap: Optional[float] = 0.02,
+    disallow_high_variance: bool = True,
+) -> bool:
+    if not isinstance(critique_packet, dict):
+        return True
+    error_modes = critique_packet.get("error_modes") if isinstance(critique_packet.get("error_modes"), list) else []
+    error_mode_ids = {
+        str(item.get("id") or "").strip().lower()
+        for item in error_modes
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    if "fold_instability" in error_mode_ids or "generalization_gap_high" in error_mode_ids:
+        return False
+
+    validation = (
+        critique_packet.get("validation_signals")
+        if isinstance(critique_packet.get("validation_signals"), dict)
+        else {}
+    )
+    cv_block = validation.get("cv") if isinstance(validation.get("cv"), dict) else {}
+    variance_level = str(cv_block.get("variance_level") or "").strip().lower()
+    if disallow_high_variance and variance_level == "high":
+        return False
+
+    cv_std = _coerce_float(cv_block.get("cv_std"))
+    if max_cv_std is not None and cv_std is not None and cv_std > float(max_cv_std):
+        return False
+
+    gap = _coerce_float(validation.get("generalization_gap"))
+    if max_generalization_gap is not None and gap is not None:
+        if abs(float(gap)) > float(max_generalization_gap):
+            return False
+    return True
 
 
 def _resolve_ml_outputs_for_metric_round(contract: Dict[str, Any], state: Dict[str, Any]) -> List[str]:
@@ -21231,7 +21335,11 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         return False
 
     run_id = str(state.get("run_id") or "")
-    metric_name = _resolve_contract_primary_metric_name(state, contract) or "roc_auc"
+    metric_target = _resolve_contract_metric_target(state, contract)
+    metric_name = str(metric_target.get("name") or "roc_auc").strip() or "roc_auc"
+    metric_higher_is_better = metric_target.get("higher_is_better")
+    if not isinstance(metric_higher_is_better, bool):
+        metric_higher_is_better = bool(_metric_higher_is_better(metric_name))
     baseline_metrics = _load_json_safe("data/metrics.json")
     if not isinstance(baseline_metrics, dict):
         baseline_metrics = {}
@@ -21244,6 +21352,12 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             snap_name = snapshot.get("primary_metric_name")
             if isinstance(snap_name, str) and snap_name.strip():
                 metric_name = snap_name.strip()
+                metric_higher_is_better = bool(_metric_higher_is_better(metric_name))
+                metric_target = {
+                    "name": metric_name,
+                    "higher_is_better": metric_higher_is_better,
+                    "source": "primary_metric_snapshot",
+                }
     if baseline_value is None:
         return False
 
@@ -21284,7 +21398,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     }
     advisor_context["run_id"] = str(state.get("run_id") or "")
     advisor_context["iteration"] = int(state.get("iteration_count", 0) or 0)
-    advisor_context["higher_is_better"] = bool(_metric_higher_is_better(metric_name))
+    advisor_context["higher_is_better"] = bool(metric_higher_is_better)
     advisor_context["min_delta"] = float(min_delta)
     advisor_context["phase"] = "baseline_review"
     advisor_context["candidate_metrics"] = baseline_metrics
@@ -21325,6 +21439,8 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "feature_engineering_plan": feature_engineering_plan,
         "critique_packet": critique_packet,
         "experiment_tracker": tracker_entries,
+        "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
+        "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
     }
     hypothesis_packet = strategist.generate_iteration_hypothesis(strategist_context)
     hypothesis_meta = (
@@ -21416,10 +21532,11 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     state["ml_improvement_snapshot_dir"] = str(snapshot_dir)
     state["ml_improvement_output_paths"] = output_paths
     state["ml_improvement_primary_metric_name"] = metric_name
+    state["ml_improvement_primary_metric_source"] = metric_target.get("source")
     state["ml_improvement_baseline_metric"] = float(baseline_value)
     state["ml_improvement_baseline_metrics"] = baseline_metrics
     state["ml_improvement_baseline_review_verdict"] = normalize_review_status(state.get("review_verdict"))
-    state["ml_improvement_higher_is_better"] = bool(_metric_higher_is_better(metric_name))
+    state["ml_improvement_higher_is_better"] = bool(metric_higher_is_better)
     state["ml_improvement_min_delta"] = float(min_delta)
     state["ml_improvement_rounds_allowed"] = int(rounds)
     state["last_iteration_type"] = "metric"
@@ -21469,14 +21586,25 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
 
 
 def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> str:
+    metric_target = _resolve_contract_metric_target(state, contract if isinstance(contract, dict) else {})
     metric_name = str(
         state.get("ml_improvement_primary_metric_name")
+        or metric_target.get("name")
         or _resolve_contract_primary_metric_name(state, contract)
         or "roc_auc"
     ).strip()
     baseline_value = _coerce_float(state.get("ml_improvement_baseline_metric"))
     min_delta = float(state.get("ml_improvement_min_delta", 0.0005) or 0.0005)
-    higher_is_better = bool(state.get("ml_improvement_higher_is_better"))
+    higher_is_better_state = state.get("ml_improvement_higher_is_better")
+    if isinstance(higher_is_better_state, bool):
+        higher_is_better = higher_is_better_state
+    else:
+        resolved_hib = metric_target.get("higher_is_better")
+        higher_is_better = (
+            bool(resolved_hib)
+            if isinstance(resolved_hib, bool)
+            else bool(_metric_higher_is_better(metric_name))
+        )
     output_paths = state.get("ml_improvement_output_paths") if isinstance(state.get("ml_improvement_output_paths"), list) else []
     snapshot_dir = Path(str(state.get("ml_improvement_snapshot_dir") or Path("work") / "ml_baseline_snapshot"))
     baseline_verdict = normalize_review_status(state.get("ml_improvement_baseline_review_verdict") or "APPROVED")
@@ -21558,6 +21686,21 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         else None
     )
 
+    policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
+    if not isinstance(policy, dict):
+        policy = {}
+    max_cv_std = _coerce_float(policy.get("metric_max_cv_std"))
+    if max_cv_std is not None and max_cv_std < 0:
+        max_cv_std = None
+    max_generalization_gap = _coerce_float(policy.get("metric_max_generalization_gap"))
+    if max_generalization_gap is None:
+        max_generalization_gap = 0.02
+    if max_generalization_gap < 0:
+        max_generalization_gap = abs(max_generalization_gap)
+    disallow_high_variance = _coerce_optional_bool(policy.get("metric_disallow_high_variance"))
+    if disallow_high_variance is None:
+        disallow_high_variance = True
+
     verdict = normalize_review_status(state.get("review_verdict"))
     deterministic_blockers = _metric_round_has_deterministic_blockers(state)
     approved = not deterministic_blockers
@@ -21566,7 +21709,13 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         if isinstance(meets_min_delta_packet, bool)
         else _is_improvement(baseline_value, improved_value, higher_is_better, min_delta)
     )
-    improved = approved and improved_by_metric
+    stability_ok = _metric_round_stability_ok(
+        critique_packet,
+        max_cv_std=max_cv_std,
+        max_generalization_gap=max_generalization_gap,
+        disallow_high_variance=bool(disallow_high_variance),
+    )
+    improved = approved and improved_by_metric and stability_ok
 
     if not improved:
         _restore_ml_outputs(snapshot_dir, output_paths)
@@ -21580,7 +21729,8 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     decision_note = (
         f"METRIC_IMPROVEMENT_ROUND: metric={metric_name} baseline={baseline_value} "
         f"improved={improved_value} min_delta={min_delta} "
-        f"meets_min_delta={improved_by_metric} deterministic_blockers={deterministic_blockers} "
+        f"meets_min_delta={improved_by_metric} stability_ok={stability_ok} "
+        f"deterministic_blockers={deterministic_blockers} "
         f"kept={state.get('ml_improvement_kept')}"
     )
     _append_feedback_history(state, decision_note)
@@ -21613,6 +21763,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 "action": hypothesis_packet.get("action"),
                 "deterministic_blockers": bool(deterministic_blockers),
                 "advisor_meets_min_delta": bool(improved_by_metric),
+                "stability_ok": bool(stability_ok),
             },
         )
         try:
@@ -21647,9 +21798,11 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                     "approved": bool(approved),
                     "improved": bool(improved),
                     "improved_by_metric": bool(improved_by_metric),
+                    "stability_ok": bool(stability_ok),
                     "deterministic_blockers": bool(deterministic_blockers),
                     "kept": state.get("ml_improvement_kept"),
                     "review_verdict": verdict,
+                    "metric_source": metric_target.get("source"),
                 },
             )
         except Exception:

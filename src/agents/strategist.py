@@ -220,6 +220,65 @@ class StrategistAgent:
                     signatures.add(nested)
         return signatures
 
+    def _dedupe_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deduped: List[Dict[str, Any]] = []
+        seen_signatures: set[str] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            signature = build_hypothesis_signature(
+                technique=candidate.get("technique"),
+                target_columns=candidate.get("target_columns"),
+                feature_scope=candidate.get("feature_scope"),
+                params=candidate.get("params"),
+            )
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            deduped.append(candidate)
+        return deduped
+
+    def _dataset_has_missingness_signal(self, dataset_profile: Dict[str, Any]) -> bool:
+        if not isinstance(dataset_profile, dict):
+            return False
+        for key in ("missingness", "missingness_top30"):
+            block = dataset_profile.get(key)
+            if not isinstance(block, dict):
+                continue
+            for value in block.values():
+                try:
+                    if float(value) > 0.0:
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _dataset_has_high_cardinality_signal(self, dataset_profile: Dict[str, Any]) -> bool:
+        if not isinstance(dataset_profile, dict):
+            return False
+        high_card_cols = dataset_profile.get("high_cardinality_columns")
+        if isinstance(high_card_cols, list) and any(str(item or "").strip() for item in high_card_cols):
+            return True
+        cardinality = dataset_profile.get("cardinality")
+        if not isinstance(cardinality, dict):
+            return False
+        row_count = 0
+        try:
+            row_count = int(dataset_profile.get("basic_stats", {}).get("n_rows") or dataset_profile.get("n_rows") or 0)
+        except Exception:
+            row_count = 0
+        dynamic_threshold = max(50, int(row_count * 0.01)) if row_count > 0 else 50
+        for payload in cardinality.values():
+            if not isinstance(payload, dict):
+                continue
+            try:
+                unique_count = int(payload.get("unique") or 0)
+            except Exception:
+                unique_count = 0
+            if unique_count >= dynamic_threshold and unique_count > 20:
+                return True
+        return False
+
     def _candidate_techniques_from_plan(self, feature_engineering_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
         techniques_raw = feature_engineering_plan.get("techniques")
         if not isinstance(techniques_raw, list):
@@ -236,7 +295,7 @@ class StrategistAgent:
                         "target_columns": normalize_target_columns(item.get("columns")),
                         "feature_scope": str(item.get("feature_scope") or "model_features"),
                         "params": item.get("params") if isinstance(item.get("params"), dict) else {},
-                        "objective": str(item.get("rationale") or "").strip(),
+                        "objective": str(item.get("rationale") or item.get("notes") or "").strip(),
                     }
                 )
                 continue
@@ -252,13 +311,34 @@ class StrategistAgent:
                     "objective": "",
                 }
             )
-        return candidates
+        return self._dedupe_candidates(candidates)
 
-    def _fallback_candidates_from_critique(self, critique_packet: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _fallback_candidates_from_critique(
+        self,
+        critique_packet: Dict[str, Any],
+        *,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         error_modes = critique_packet.get("error_modes") if isinstance(critique_packet.get("error_modes"), list) else []
-        ids = [str(item.get("id") or "") for item in error_modes if isinstance(item, dict)]
+        ids = {str(item.get("id") or "").strip().lower() for item in error_modes if isinstance(item, dict)}
+        dataset_profile = {}
+        if isinstance(context, dict) and isinstance(context.get("dataset_profile"), dict):
+            dataset_profile = context.get("dataset_profile") or {}
+        has_missing_signal = self._dataset_has_missingness_signal(dataset_profile)
+        has_high_card_signal = self._dataset_has_high_cardinality_signal(dataset_profile)
+
         out: List[Dict[str, Any]] = []
-        if "minority_class_recall_low" in ids:
+        if "fold_instability" in ids or has_missing_signal:
+            out.append(
+                {
+                    "technique": "missing_indicators",
+                    "target_columns": ["ALL_NUMERIC"],
+                    "feature_scope": "model_features",
+                    "params": {"indicator_suffix": "_is_missing"},
+                    "objective": "Inject missingness indicators to stabilize fold behavior with low-risk edits.",
+                }
+            )
+        if "minority_class_recall_low" in ids or has_high_card_signal:
             out.append(
                 {
                     "technique": "rare_category_grouping",
@@ -268,14 +348,24 @@ class StrategistAgent:
                     "objective": "Reduce noise in long-tail categories affecting minority-class recall.",
                 }
             )
-        if "fold_instability" in ids:
+        if has_high_card_signal:
             out.append(
                 {
-                    "technique": "missing_indicators",
+                    "technique": "frequency_encoding",
+                    "target_columns": ["ALL_CATEGORICAL"],
+                    "feature_scope": "model_features",
+                    "params": {"normalize": True},
+                    "objective": "Add frequency signals for high-cardinality categories with compact features.",
+                }
+            )
+        if "generalization_gap_high" in ids:
+            out.append(
+                {
+                    "technique": "quantile_binning",
                     "target_columns": ["ALL_NUMERIC"],
                     "feature_scope": "model_features",
-                    "params": {"indicator_suffix": "_is_missing"},
-                    "objective": "Stabilize fold behavior with robust missingness signals.",
+                    "params": {"q": 20, "drop_duplicates": True},
+                    "objective": "Apply bounded quantile bins to reduce over-sensitive continuous splits.",
                 }
             )
         if not out:
@@ -288,7 +378,7 @@ class StrategistAgent:
                     "objective": "Low-cost baseline feature engineering refinement.",
                 }
             )
-        return out
+        return self._dedupe_candidates(out)
 
     def _generate_iteration_hypothesis_llm(self, context: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(context, dict):
@@ -319,6 +409,14 @@ class StrategistAgent:
                     "critique_packet": critique_packet,
                     "feature_engineering_plan": feature_engineering_plan,
                     "experiment_tracker": tracker_entries[-10:],
+                    "dataset_profile_signals": {
+                        "has_missing_signal": self._dataset_has_missingness_signal(
+                            context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
+                        ),
+                        "has_high_cardinality_signal": self._dataset_has_high_cardinality_signal(
+                            context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
+                        ),
+                    },
                 },
                 ensure_ascii=False,
             )
@@ -363,7 +461,7 @@ class StrategistAgent:
 
         candidates = self._candidate_techniques_from_plan(feature_engineering_plan)
         if not candidates:
-            candidates = self._fallback_candidates_from_critique(critique_packet)
+            candidates = self._fallback_candidates_from_critique(critique_packet, context=context)
 
         selected_candidate = None
         selected_signature = ""
