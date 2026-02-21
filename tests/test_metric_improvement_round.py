@@ -4,6 +4,7 @@ from pathlib import Path
 from src.graph.graph import (
     check_evaluation,
     _is_improvement,
+    run_metric_improvement_finalize,
     _should_run_metric_improvement_round,
     _snapshot_ml_outputs,
     _restore_ml_outputs,
@@ -139,3 +140,148 @@ def test_check_evaluation_logs_metric_improvement_round_completion(tmp_path, mon
     assert route == "approved"
     event_types = [evt[1] for evt in events]
     assert "metric_improvement_round_complete" in event_types
+
+
+def test_finalize_round_requests_continue_when_budget_and_patience_allow(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("data/metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps({"roc_auc": 0.8001}), encoding="utf-8")
+    snapshot_dir = Path("work/ml_incumbent_snapshot_r1")
+    output_paths = ["data/metrics.json"]
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    state = {
+        "review_verdict": "APPROVED",
+        "execution_contract": {"iteration_policy": {"metric_improvement_rounds": 3, "metric_improvement_patience": 2}},
+        "ml_improvement_round_active": True,
+        "ml_improvement_round_count": 1,
+        "ml_improvement_current_round_id": 1,
+        "ml_improvement_primary_metric_name": "roc_auc",
+        "ml_improvement_round_baseline_metric": 0.8000,
+        "ml_improvement_baseline_metric": 0.8000,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": True,
+        "ml_improvement_output_paths": output_paths,
+        "ml_improvement_snapshot_dir": str(snapshot_dir),
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "ml_improvement_rounds_allowed": 3,
+        "ml_improvement_patience": 2,
+        "ml_improvement_no_improve_streak": 0,
+        "feedback_history": [],
+    }
+    updates = run_metric_improvement_finalize(state)
+    assert updates.get("metric_improvement_nodes_managed") is False
+    assert updates.get("ml_improvement_continue") is True
+    assert updates.get("ml_improvement_attempted") is False
+
+
+def test_check_evaluation_bootstraps_next_round_after_continue(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data" / "metrics.json").write_text(json.dumps({"roc_auc": 0.8002}), encoding="utf-8")
+    events = []
+    from src.graph import graph as graph_mod
+
+    monkeypatch.setattr(
+        graph_mod,
+        "log_run_event",
+        lambda run_id, event_type, payload, log_dir="logs": events.append((run_id, event_type, payload)),
+    )
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_critique_packet",
+        lambda _ctx: {
+            "packet_type": "advisor_critique_packet",
+            "packet_version": "1.0",
+            "run_id": "run_test",
+            "iteration": 2,
+            "timestamp_utc": "2026-02-19T10:00:00+00:00",
+            "primary_metric_name": "roc_auc",
+            "higher_is_better": True,
+            "metric_comparison": {
+                "baseline_value": 0.8002,
+                "candidate_value": 0.8002,
+                "delta_abs": 0.0,
+                "delta_rel": 0.0,
+                "min_delta_required": 0.0005,
+                "meets_min_delta": False,
+            },
+            "validation_signals": {"validation_mode": "cv"},
+            "error_modes": [],
+            "risk_flags": [],
+            "active_gates_context": [],
+            "analysis_summary": "No gain over incumbent.",
+            "strictly_no_code_advice": True,
+        },
+    )
+    monkeypatch.setattr(
+        graph_mod.strategist,
+        "generate_iteration_hypothesis",
+        lambda _ctx: {
+            "packet_type": "iteration_hypothesis_packet",
+            "packet_version": "1.0",
+            "run_id": "run_test",
+            "iteration": 3,
+            "hypothesis_id": "h_abcdef12",
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "missing_indicators",
+                "objective": "Improve round.",
+                "target_columns": ["ALL_NUMERIC"],
+                "feature_scope": "model_features",
+                "params": {},
+                "expected_effect": {"target_error_modes": ["metric_stagnation"], "direction": "positive"},
+            },
+            "application_constraints": {
+                "edit_mode": "incremental",
+                "max_code_regions_to_change": 3,
+                "forbid_replanning": True,
+                "forbid_model_family_switch": True,
+                "must_keep": ["data_split_logic", "cv_protocol", "output_paths_contract"],
+            },
+            "success_criteria": {
+                "primary_metric_name": "roc_auc",
+                "min_delta": 0.0005,
+                "must_pass_active_gates": True,
+            },
+            "tracker_context": {"signature": "hyp_next_round", "is_duplicate": False, "duplicate_of": None},
+            "explanation": "Single hypothesis selected.",
+            "fallback_if_not_applicable": "NO_OP",
+        },
+    )
+    monkeypatch.setattr(graph_mod.strategist, "last_iteration_meta", {"mode": "deterministic", "source": "deterministic", "model": None})
+    monkeypatch.setattr(graph_mod.results_advisor, "last_critique_meta", {"mode": "deterministic", "source": "deterministic", "provider": "none", "model": None})
+
+    state = {
+        "run_id": "run_test",
+        "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_continue": True,
+        "ml_improvement_attempted": False,
+        "ml_improvement_round_active": False,
+        "metric_improvement_nodes_managed": False,
+        "ml_improvement_round_count": 1,
+        "ml_improvement_rounds_allowed": 3,
+        "ml_improvement_no_improve_streak": 1,
+        "ml_improvement_patience": 2,
+        "ml_improvement_primary_metric_name": "roc_auc",
+        "ml_improvement_min_delta": 0.0005,
+        "generated_code": "def train():\n    pass\n",
+        "execution_contract": {
+            "iteration_policy": {"metric_improvement_rounds": 3, "metric_improvement_patience": 2},
+            "feature_engineering_plan": {"techniques": [{"technique": "missing_indicators"}], "derived_columns": [], "notes": ""},
+            "artifact_requirements": {"required_files": [{"path": "data/metrics.json"}]},
+            "required_outputs": ["data/metrics.json"],
+            "column_roles": {},
+        },
+        "feedback_history": [],
+    }
+    route = check_evaluation(state)
+    assert route == "retry"
+    assert state.get("ml_improvement_round_active") is True
+    assert int(state.get("ml_improvement_round_count", 0)) == 2

@@ -20976,27 +20976,36 @@ def finalize_runtime_failure(state: AgentState) -> AgentState:
     return result
 
 
-def _metric_improvement_policy(contract: Dict[str, Any] | None) -> Tuple[int, float]:
+def _metric_improvement_policy(contract: Dict[str, Any] | None) -> Tuple[int, float, int]:
     policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
     if not isinstance(policy, dict):
         policy = {}
-    rounds_raw = policy.get("metric_improvement_rounds", 1)
+    rounds_raw = policy.get("metric_improvement_rounds", os.getenv("METRIC_IMPROVEMENT_MAX_ROUNDS", 4))
     min_delta_raw = policy.get("metric_min_delta", 0.0005)
+    patience_raw = policy.get("metric_improvement_patience", os.getenv("METRIC_IMPROVEMENT_PATIENCE", 2))
     try:
         rounds = int(rounds_raw)
     except Exception:
-        rounds = 1
+        rounds = 4
     try:
         min_delta = float(min_delta_raw)
     except Exception:
         min_delta = 0.0005
+    try:
+        patience = int(patience_raw)
+    except Exception:
+        patience = 2
     if rounds < 0:
         rounds = 0
+    if rounds > 12:
+        rounds = 12
     if min_delta < 0:
         min_delta = 0.0
-    # Universal policy for this flow: at most one extra round.
-    rounds = min(rounds, 1)
-    return rounds, min_delta
+    if patience < 1:
+        patience = 1
+    if rounds > 0:
+        patience = min(max(1, patience), rounds)
+    return rounds, min_delta, patience
 
 
 def _normalize_metric_round_review_mode(raw: Any) -> str:
@@ -21264,11 +21273,13 @@ def _should_run_metric_improvement_round(state: Dict[str, Any], contract: Dict[s
         return False
     if bool(state.get("execution_error")) or bool(state.get("sandbox_failed")):
         return False
+    if bool(state.get("ml_improvement_loop_complete")):
+        return False
     if bool(state.get("ml_improvement_attempted")) or bool(state.get("ml_improvement_round_active")):
         return False
     if _is_data_limited_mode_active(state, contract):
         return False
-    rounds, _ = _metric_improvement_policy(contract)
+    rounds, _, _ = _metric_improvement_policy(contract)
     if rounds <= 0:
         return False
     done = int(state.get("ml_improvement_round_count", 0) or 0)
@@ -21334,6 +21345,81 @@ def _is_improvement(
     if not higher_is_better:
         delta = -delta
     return bool(delta >= float(min_delta)) and bool(stability_ok)
+
+
+def _extract_metric_round_tradeoff(
+    metric_value: Optional[float],
+    critique_packet: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    critique_packet = critique_packet if isinstance(critique_packet, dict) else {}
+    validation = critique_packet.get("validation_signals")
+    validation = validation if isinstance(validation, dict) else {}
+    cv_block = validation.get("cv") if isinstance(validation.get("cv"), dict) else {}
+    cv_std = _coerce_float(cv_block.get("cv_std"))
+    if cv_std is None:
+        cv_std = _coerce_float(validation.get("cv_std"))
+    gen_gap = _coerce_float(validation.get("generalization_gap"))
+    return {
+        "metric_value": metric_value,
+        "cv_std": cv_std,
+        "generalization_gap_abs": abs(float(gen_gap)) if gen_gap is not None else None,
+    }
+
+
+def _pareto_dominates_metric_round(
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+    *,
+    higher_is_better: bool,
+) -> bool:
+    left_metric = _coerce_float(left.get("metric_value"))
+    right_metric = _coerce_float(right.get("metric_value"))
+    left_cv_std = _coerce_float(left.get("cv_std"))
+    right_cv_std = _coerce_float(right.get("cv_std"))
+    left_gap = _coerce_float(left.get("generalization_gap_abs"))
+    right_gap = _coerce_float(right.get("generalization_gap_abs"))
+
+    comparisons: List[tuple[Optional[float], Optional[float], bool]] = [
+        (left_metric, right_metric, bool(higher_is_better)),
+        (left_cv_std, right_cv_std, False),
+        (left_gap, right_gap, False),
+    ]
+    any_strict_better = False
+    for left_value, right_value, maximize in comparisons:
+        if left_value is None or right_value is None:
+            continue
+        if maximize:
+            if left_value < right_value:
+                return False
+            if left_value > right_value:
+                any_strict_better = True
+        else:
+            if left_value > right_value:
+                return False
+            if left_value < right_value:
+                any_strict_better = True
+    return any_strict_better
+
+
+def _update_metric_round_pareto_frontier(
+    frontier: List[Dict[str, Any]] | None,
+    candidate: Dict[str, Any],
+    *,
+    higher_is_better: bool,
+) -> tuple[List[Dict[str, Any]], bool]:
+    frontier = [item for item in (frontier or []) if isinstance(item, dict)]
+    candidate = candidate if isinstance(candidate, dict) else {}
+    for incumbent in frontier:
+        if _pareto_dominates_metric_round(incumbent, candidate, higher_is_better=bool(higher_is_better)):
+            return frontier, False
+
+    filtered: List[Dict[str, Any]] = []
+    for incumbent in frontier:
+        if _pareto_dominates_metric_round(candidate, incumbent, higher_is_better=bool(higher_is_better)):
+            continue
+        filtered.append(incumbent)
+    filtered.append(candidate)
+    return filtered[-24:], True
 
 
 def _metric_round_stability_ok(
@@ -21529,9 +21615,21 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     if baseline_value is None:
         return False
 
-    rounds, min_delta = _metric_improvement_policy(contract)
+    rounds, min_delta, patience = _metric_improvement_policy(contract)
+    if rounds <= 0:
+        return False
+    round_index_before = int(state.get("ml_improvement_round_count", 0) or 0)
+    round_id = round_index_before + 1
+    no_improve_streak = int(state.get("ml_improvement_no_improve_streak", 0) or 0)
+    round_history = state.get("ml_improvement_round_history")
+    if not isinstance(round_history, list):
+        round_history = []
+    best_metric_so_far = _coerce_float(state.get("ml_improvement_best_metric"))
+    if best_metric_so_far is None:
+        best_metric_so_far = _coerce_float(baseline_value)
+
     output_paths = _resolve_ml_outputs_for_metric_round(contract, state)
-    snapshot_dir = Path("work") / "ml_baseline_snapshot"
+    snapshot_dir = Path("work") / f"ml_incumbent_snapshot_r{round_id}"
     _snapshot_ml_outputs(output_paths, snapshot_dir)
     if run_id:
         try:
@@ -21540,10 +21638,14 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
                 "metric_improvement_round_start",
                 {
                     "iteration": int(state.get("iteration_count", 0) or 0) + 1,
-                    "round_count_current": int(state.get("ml_improvement_round_count", 0) or 0),
+                    "round_id": int(round_id),
+                    "round_count_current": int(round_index_before),
                     "rounds_allowed": int(rounds),
+                    "patience": int(patience),
+                    "no_improve_streak": int(no_improve_streak),
                     "primary_metric_name": metric_name,
                     "baseline_metric": float(baseline_value),
+                    "best_metric_so_far": best_metric_so_far,
                     "min_delta": float(min_delta),
                     "output_paths": output_paths[:12],
                 },
@@ -21602,11 +21704,16 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     strategist_context = {
         "run_id": run_id,
         "iteration": int(state.get("iteration_count", 0) or 0) + 1,
+        "round_id": int(round_id),
+        "rounds_allowed": int(rounds),
+        "patience": int(patience),
+        "no_improve_streak": int(no_improve_streak),
         "primary_metric_name": metric_name,
         "min_delta": float(min_delta),
         "feature_engineering_plan": feature_engineering_plan,
         "critique_packet": critique_packet,
         "experiment_tracker": tracker_entries,
+        "round_history": round_history[-8:],
         "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
         "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
     }
@@ -21693,20 +21800,46 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     state["ml_improvement_critique_packet"] = critique_packet
     state["ml_improvement_hypothesis_packet"] = hypothesis_packet
     state["ml_improvement_round_active"] = True
-    state["ml_improvement_round_count"] = int(state.get("ml_improvement_round_count", 0) or 0) + 1
+    state["ml_improvement_round_count"] = int(round_id)
     state["ml_improvement_attempted"] = False
+    state["ml_improvement_continue"] = False
+    state["ml_improvement_loop_complete"] = False
     state["ml_improvement_kept"] = "pending"
     state["ml_improvement_review_mode"] = _resolve_metric_round_review_mode(contract)
     state["ml_improvement_snapshot_dir"] = str(snapshot_dir)
     state["ml_improvement_output_paths"] = output_paths
+    state["ml_improvement_current_round_id"] = int(round_id)
+    state["ml_improvement_round_baseline_metric"] = float(baseline_value)
+    state["ml_improvement_round_baseline_metrics"] = baseline_metrics
+    state["ml_improvement_round_baseline_reviewer_packet"] = (
+        dict(state.get("reviewer_last_result"))
+        if isinstance(state.get("reviewer_last_result"), dict)
+        else {}
+    )
+    state["ml_improvement_round_baseline_qa_packet"] = (
+        dict(state.get("qa_last_result"))
+        if isinstance(state.get("qa_last_result"), dict)
+        else {}
+    )
+    state["ml_improvement_incumbent_metric"] = float(baseline_value)
     state["ml_improvement_primary_metric_name"] = metric_name
     state["ml_improvement_primary_metric_source"] = metric_target.get("source")
-    state["ml_improvement_baseline_metric"] = float(baseline_value)
+    state["ml_improvement_baseline_metric"] = float(best_metric_so_far if best_metric_so_far is not None else baseline_value)
     state["ml_improvement_baseline_metrics"] = baseline_metrics
     state["ml_improvement_baseline_review_verdict"] = normalize_review_status(state.get("review_verdict"))
     state["ml_improvement_higher_is_better"] = bool(metric_higher_is_better)
     state["ml_improvement_min_delta"] = float(min_delta)
     state["ml_improvement_rounds_allowed"] = int(rounds)
+    state["ml_improvement_patience"] = int(patience)
+    state["ml_improvement_no_improve_streak"] = int(no_improve_streak)
+    state["ml_improvement_best_metric"] = (
+        float(best_metric_so_far)
+        if best_metric_so_far is not None
+        else float(baseline_value)
+    )
+    state["ml_improvement_best_round"] = int(state.get("ml_improvement_best_round", 0) or 0)
+    if not isinstance(state.get("ml_improvement_round_history"), list):
+        state["ml_improvement_round_history"] = round_history
     state["last_iteration_type"] = "metric"
     state["improvement_attempt_count"] = 0
     if run_id:
@@ -21718,7 +21851,11 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
                 "metric_improvement_round_activated",
                 {
                     "iteration": int(state.get("iteration_count", 0) or 0) + 1,
+                    "round_id": int(round_id),
                     "round_count": int(state.get("ml_improvement_round_count", 0) or 0),
+                    "rounds_allowed": int(rounds),
+                    "patience": int(patience),
+                    "no_improve_streak": int(no_improve_streak),
                     "primary_metric_name": metric_name,
                     "baseline_metric": float(baseline_value),
                     "min_delta": float(min_delta),
@@ -21761,8 +21898,27 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         or _resolve_contract_primary_metric_name(state, contract)
         or "roc_auc"
     ).strip()
-    baseline_value = _coerce_float(state.get("ml_improvement_baseline_metric"))
+    round_baseline_value = _coerce_float(
+        state.get("ml_improvement_round_baseline_metric")
+    )
+    if round_baseline_value is None:
+        round_baseline_value = _coerce_float(state.get("ml_improvement_incumbent_metric"))
+    best_metric_value = _coerce_float(state.get("ml_improvement_best_metric"))
+    if best_metric_value is None:
+        best_metric_value = _coerce_float(state.get("ml_improvement_baseline_metric"))
+    baseline_value = (
+        round_baseline_value
+        if round_baseline_value is not None
+        else best_metric_value
+    )
     min_delta = float(state.get("ml_improvement_min_delta", 0.0005) or 0.0005)
+    rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
+    patience = int(state.get("ml_improvement_patience", 2) or 2)
+    round_id = int(state.get("ml_improvement_current_round_id", state.get("ml_improvement_round_count", 0) or 0) or 0)
+    no_improve_streak = int(state.get("ml_improvement_no_improve_streak", 0) or 0)
+    round_history = state.get("ml_improvement_round_history")
+    if not isinstance(round_history, list):
+        round_history = []
     higher_is_better_state = state.get("ml_improvement_higher_is_better")
     if isinstance(higher_is_better_state, bool):
         higher_is_better = higher_is_better_state
@@ -21787,10 +21943,16 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
 
     active_gates_context = _collect_active_gate_names(contract if isinstance(contract, dict) else {})
     baseline_metrics_payload = (
-        state.get("ml_improvement_baseline_metrics")
-        if isinstance(state.get("ml_improvement_baseline_metrics"), dict)
+        state.get("ml_improvement_round_baseline_metrics")
+        if isinstance(state.get("ml_improvement_round_baseline_metrics"), dict)
         else {}
     )
+    if not baseline_metrics_payload:
+        baseline_metrics_payload = (
+            state.get("ml_improvement_baseline_metrics")
+            if isinstance(state.get("ml_improvement_baseline_metrics"), dict)
+            else {}
+        )
     if not baseline_metrics_payload and baseline_value is not None:
         baseline_metrics_payload = {
             metric_name: float(baseline_value),
@@ -21871,7 +22033,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
 
     verdict = normalize_review_status(state.get("review_verdict"))
     deterministic_blockers = _metric_round_has_deterministic_blockers(state)
-    approved = not deterministic_blockers
+    approved = _is_approved_review_status(verdict) and (not deterministic_blockers)
     improved_by_metric = (
         bool(meets_min_delta_packet)
         if isinstance(meets_min_delta_packet, bool)
@@ -21884,22 +22046,102 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         disallow_high_variance=bool(disallow_high_variance),
     )
     improved = approved and improved_by_metric and stability_ok
-
     if not improved:
         _restore_ml_outputs(snapshot_dir, output_paths)
         state["ml_improvement_kept"] = "baseline"
         state["review_verdict"] = baseline_verdict
-        state["stop_reason"] = "IMPROVEMENT_ROUND_RESTORE_BASELINE"
+        state["stop_reason"] = "IMPROVEMENT_ROUND_RESTORE_INCUMBENT"
+        baseline_reviewer_packet = (
+            state.get("ml_improvement_round_baseline_reviewer_packet")
+            if isinstance(state.get("ml_improvement_round_baseline_reviewer_packet"), dict)
+            else {}
+        )
+        baseline_qa_packet = (
+            state.get("ml_improvement_round_baseline_qa_packet")
+            if isinstance(state.get("ml_improvement_round_baseline_qa_packet"), dict)
+            else {}
+        )
+        if baseline_reviewer_packet:
+            state["reviewer_last_result"] = dict(baseline_reviewer_packet)
+        if baseline_qa_packet:
+            state["qa_last_result"] = dict(baseline_qa_packet)
+        if baseline_value is not None:
+            state["ml_improvement_incumbent_metric"] = float(baseline_value)
+        no_improve_streak = int(no_improve_streak) + 1
     else:
         state["ml_improvement_kept"] = "improved"
         state["stop_reason"] = "IMPROVEMENT_ROUND_KEPT_IMPROVED"
+        no_improve_streak = 0
+        state["ml_improvement_incumbent_metric"] = float(improved_value) if improved_value is not None else baseline_value
+
+    def _metric_better(candidate: Optional[float], incumbent: Optional[float], hib: bool) -> bool:
+        if candidate is None:
+            return False
+        if incumbent is None:
+            return True
+        if hib:
+            return float(candidate) > float(incumbent)
+        return float(candidate) < float(incumbent)
+
+    if _metric_better(improved_value if improved else baseline_value, best_metric_value, bool(higher_is_better)):
+        best_metric_value = improved_value if improved else baseline_value
+        if best_metric_value is not None:
+            state["ml_improvement_best_metric"] = float(best_metric_value)
+            state["ml_improvement_best_round"] = int(round_id or 0)
+
+    round_record = {
+        "round_id": int(round_id or 0),
+        "metric_name": metric_name,
+        "baseline_metric": baseline_value,
+        "candidate_metric": improved_value,
+        "delta": None
+        if baseline_value is None or improved_value is None
+        else float(improved_value - baseline_value),
+        "approved": bool(approved),
+        "improved_by_metric": bool(improved_by_metric),
+        "stability_ok": bool(stability_ok),
+        "deterministic_blockers": bool(deterministic_blockers),
+        "kept": state.get("ml_improvement_kept"),
+        "no_improve_streak": int(no_improve_streak),
+        "rounds_allowed": int(rounds_allowed),
+        "patience": int(patience),
+    }
+    round_record.update(_extract_metric_round_tradeoff(improved_value, critique_packet))
+    frontier = state.get("ml_improvement_pareto_frontier")
+    if not isinstance(frontier, list):
+        frontier = []
+    updated_frontier, frontier_improved = _update_metric_round_pareto_frontier(
+        frontier,
+        {
+            "round_id": int(round_id or 0),
+            "metric_value": round_record.get("metric_value"),
+            "cv_std": round_record.get("cv_std"),
+            "generalization_gap_abs": round_record.get("generalization_gap_abs"),
+            "kept": round_record.get("kept"),
+        },
+        higher_is_better=bool(higher_is_better),
+    )
+    round_record["pareto_frontier_improved"] = bool(frontier_improved)
+    state["ml_improvement_pareto_frontier"] = updated_frontier
+    round_history.append(round_record)
+    state["ml_improvement_round_history"] = round_history[-24:]
+    state["ml_improvement_no_improve_streak"] = int(no_improve_streak)
+
+    rounds_done = int(state.get("ml_improvement_round_count", 0) or 0)
+    has_budget = rounds_done < int(max(0, rounds_allowed))
+    under_patience = int(no_improve_streak) < int(max(1, patience))
+    continue_round = bool(has_budget and under_patience)
+    state["ml_improvement_continue"] = bool(continue_round)
 
     decision_note = (
-        f"METRIC_IMPROVEMENT_ROUND: metric={metric_name} baseline={baseline_value} "
+        f"METRIC_IMPROVEMENT_ROUND: round={round_id}/{rounds_allowed} metric={metric_name} baseline={baseline_value} "
         f"improved={improved_value} min_delta={min_delta} "
         f"meets_min_delta={improved_by_metric} stability_ok={stability_ok} "
         f"deterministic_blockers={deterministic_blockers} "
-        f"kept={state.get('ml_improvement_kept')}"
+        f"kept={state.get('ml_improvement_kept')} "
+        f"pareto_frontier_improved={round_record.get('pareto_frontier_improved')} "
+        f"no_improve_streak={no_improve_streak} "
+        f"patience={patience} continue_round={continue_round}"
     )
     _append_feedback_history(state, decision_note)
     if isinstance(critique_packet, dict) and critique_packet:
@@ -21919,6 +22161,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 "iter": int(state.get("iteration_count", 0) or 0),
                 "event": "candidate_evaluated",
                 "phase": "metric_improvement_round",
+                "round_id": int(round_id or 0),
                 "kept": state.get("ml_improvement_kept"),
                 "approved": approved,
                 "primary_metric_name": metric_name,
@@ -21932,6 +22175,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 "deterministic_blockers": bool(deterministic_blockers),
                 "advisor_meets_min_delta": bool(improved_by_metric),
                 "stability_ok": bool(stability_ok),
+                "pareto_frontier_improved": bool(round_record.get("pareto_frontier_improved")),
+                "no_improve_streak": int(no_improve_streak),
+                "continue_round": bool(continue_round),
             },
         )
         try:
@@ -21956,27 +22202,51 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 run_id,
                 "metric_improvement_round_complete",
                 {
-                    "iteration": int(state.get("iteration_count", 0) or 0),
-                    "primary_metric_name": metric_name,
-                    "baseline_metric": baseline_value,
-                    "candidate_metric": improved_value,
-                    "delta": delta_value,
-                    "min_delta": float(min_delta),
+                        "iteration": int(state.get("iteration_count", 0) or 0),
+                        "round_id": int(round_id or 0),
+                        "rounds_allowed": int(rounds_allowed),
+                        "primary_metric_name": metric_name,
+                        "baseline_metric": baseline_value,
+                        "candidate_metric": improved_value,
+                        "delta": delta_value,
+                        "min_delta": float(min_delta),
                     "higher_is_better": bool(higher_is_better),
                     "approved": bool(approved),
                     "improved": bool(improved),
-                    "improved_by_metric": bool(improved_by_metric),
-                    "stability_ok": bool(stability_ok),
-                    "deterministic_blockers": bool(deterministic_blockers),
-                    "kept": state.get("ml_improvement_kept"),
-                    "review_verdict": verdict,
+                        "improved_by_metric": bool(improved_by_metric),
+                        "stability_ok": bool(stability_ok),
+                        "pareto_frontier_improved": bool(round_record.get("pareto_frontier_improved")),
+                        "deterministic_blockers": bool(deterministic_blockers),
+                        "kept": state.get("ml_improvement_kept"),
+                        "no_improve_streak": int(no_improve_streak),
+                        "patience": int(patience),
+                        "continue_round": bool(continue_round),
+                        "review_verdict": verdict,
                     "metric_source": metric_target.get("source"),
                 },
             )
+            if continue_round:
+                log_run_event(
+                    run_id,
+                    "metric_improvement_round_continue",
+                    {
+                        "round_id": int(round_id or 0),
+                        "rounds_allowed": int(rounds_allowed),
+                        "no_improve_streak": int(no_improve_streak),
+                        "patience": int(patience),
+                        "pareto_frontier_size": len(state.get("ml_improvement_pareto_frontier") or []),
+                    },
+                )
         except Exception:
             pass
 
-    state["ml_improvement_attempted"] = True
+    if continue_round:
+        state["stop_reason"] = "IMPROVEMENT_ROUND_CONTINUE"
+        state["ml_improvement_attempted"] = False
+        state["ml_improvement_loop_complete"] = False
+    else:
+        state["ml_improvement_attempted"] = True
+        state["ml_improvement_loop_complete"] = True
     state["ml_improvement_round_active"] = False
     state["last_iteration_type"] = None
     return "approved"
@@ -22024,8 +22294,9 @@ def run_metric_improvement_finalize(state: AgentState) -> AgentState:
     if bool(working_state.get("ml_improvement_round_active")):
         _finalize_metric_improvement_round(working_state, contract)
         finalized = True
+    continue_round = bool(working_state.get("ml_improvement_continue"))
     updates = _collect_state_updates(before, working_state)
-    updates["metric_improvement_nodes_managed"] = True
+    updates["metric_improvement_nodes_managed"] = False if continue_round else True
     updates["metric_improvement_bootstrapped"] = False
     updates["metric_improvement_finalized"] = bool(finalized)
     return updates
@@ -22043,9 +22314,12 @@ def check_metric_improvement_bootstrap_route(state: AgentState) -> str:
         metric_name = snapshot.get("primary_metric_name", "unknown")
         metric_value = snapshot.get("primary_metric_value", "N/A")
         best_value = snapshot.get("baseline_value", "N/A")
+        rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
+        round_count = int(state.get("ml_improvement_round_count", 0) or 0)
+        budget_left = max(0, rounds_allowed - round_count)
         print(
             f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT_ROUND "
-            f"metric={metric_name}:{metric_value} best={best_value} budget_left=1"
+            f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
         )
         return "retry"
     return check_evaluation(state)
@@ -22168,9 +22442,12 @@ def check_evaluation(state: AgentState):
         return "approved"
 
     if not metric_nodes_managed and _bootstrap_metric_improvement_round(state, contract):
+        rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
+        round_count = int(state.get("ml_improvement_round_count", 0) or 0)
+        budget_left = max(0, rounds_allowed - round_count)
         print(
             f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT_ROUND "
-            f"metric={metric_name}:{metric_value} best={best_value} budget_left=1"
+            f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
         )
         return "retry"
 
