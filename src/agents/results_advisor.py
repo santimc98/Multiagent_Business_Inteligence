@@ -296,6 +296,26 @@ class ResultsAdvisorAgent:
             self.last_critique_packet = llm_packet
             return llm_packet
 
+        repaired_packet, repair_meta = self._repair_critique_packet(
+            llm_packet=llm_packet,
+            deterministic_packet=deterministic,
+            context=context,
+            validation_errors=validation_errors,
+        )
+        if isinstance(repaired_packet, dict):
+            repaired_ok, repaired_errors = validate_advisor_critique_packet(repaired_packet)
+            if repaired_ok:
+                self.last_critique_meta = {
+                    "mode": mode,
+                    "source": str(repair_meta.get("source") or "llm_repaired"),
+                    "provider": self.fe_provider,
+                    "model": self.fe_model_name,
+                    "repair_meta": repair_meta,
+                }
+                self.last_critique_packet = repaired_packet
+                return repaired_packet
+            validation_errors = repaired_errors
+
         if llm_packet:
             print(
                 "RESULTS_ADVISOR_CRITIQUE_SCHEMA_INVALID: "
@@ -309,10 +329,365 @@ class ResultsAdvisorAgent:
             "model": self.fe_model_name,
             "validation_errors": validation_errors[:6],
         }
+        if repair_meta:
+            self.last_critique_meta["repair_meta"] = repair_meta
         if self.last_critique_error:
             self.last_critique_meta["llm_error"] = dict(self.last_critique_error)
         self.last_critique_packet = deterministic
         return deterministic
+
+    def _repair_critique_packet(
+        self,
+        *,
+        llm_packet: Dict[str, Any],
+        deterministic_packet: Dict[str, Any],
+        context: Dict[str, Any],
+        validation_errors: List[str],
+    ) -> tuple[Dict[str, Any] | None, Dict[str, Any]]:
+        trace: Dict[str, Any] = {
+            "attempted": False,
+            "source": None,
+            "provider": self.fe_provider,
+            "model": self.fe_model_name,
+            "input_errors": list(validation_errors or [])[:8],
+        }
+        if not isinstance(llm_packet, dict) or not llm_packet:
+            trace["skipped"] = "empty_llm_packet"
+            return None, trace
+        normalized = self._normalize_critique_packet_candidate(llm_packet, deterministic_packet, context)
+        normalized_ok, normalized_errors = validate_advisor_critique_packet(normalized)
+        if normalized_ok:
+            trace["attempted"] = True
+            trace["source"] = "llm_repair_normalized"
+            trace["normalized_only"] = True
+            print(
+                "RESULTS_ADVISOR_CRITIQUE_REPAIR: "
+                + f"source=normalize success=True provider={self.fe_provider} model={self.fe_model_name}"
+            )
+            return normalized, trace
+
+        trace["attempted"] = True
+        trace["normalized_only"] = False
+        trace["normalize_errors"] = normalized_errors[:6]
+        if not self.fe_client or self.fe_provider == "none":
+            print(
+                "RESULTS_ADVISOR_CRITIQUE_REPAIR: "
+                + "source=normalize success=False reason=llm_unavailable"
+            )
+            return None, trace
+
+        schema = build_results_advisor_critique_response_schema()
+        schema_json = self._truncate(json.dumps(schema, ensure_ascii=True), 10000)
+        llm_packet_json = self._truncate(json.dumps(llm_packet or {}, ensure_ascii=True), 10000)
+        raw_preview = self._truncate(str(self.last_response or ""), 8000)
+        deterministic_json = self._truncate(json.dumps(deterministic_packet, ensure_ascii=True), 8000)
+        errors_json = self._truncate(json.dumps(validation_errors[:8], ensure_ascii=True), 2000)
+        repair_prompt = (
+            "You are a strict JSON repair tool. Return ONLY one JSON object, no markdown.\n"
+            "Repair the candidate packet so it strictly matches TARGET_SCHEMA.\n"
+            "Keep semantic intent. When fields are missing/invalid, use deterministic fallback packet.\n"
+            "TARGET_SCHEMA:\n"
+            + schema_json
+            + "\nVALIDATION_ERRORS:\n"
+            + errors_json
+            + "\nCANDIDATE_PACKET_JSON:\n"
+            + llm_packet_json
+            + "\nRAW_RESPONSE_PREVIEW:\n"
+            + raw_preview
+            + "\nDETERMINISTIC_FALLBACK_PACKET:\n"
+            + deterministic_json
+        )
+
+        try:
+            if self.fe_provider == "gemini":
+                generation_config = self._generation_config_for_critique()
+                generation_config["response_schema"] = copy.deepcopy(schema)
+                repaired_text, used_config = self._generate_gemini_json(
+                    repair_prompt,
+                    generation_config=generation_config,
+                )
+                trace["used_response_schema"] = "response_schema" in used_config
+            else:
+                response = self.fe_client.chat.completions.create(
+                    model=self.fe_model_name,
+                    messages=[
+                        {"role": "system", "content": "Return only valid JSON."},
+                        {"role": "user", "content": repair_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+                repaired_text = response.choices[0].message.content
+                trace["used_response_schema"] = False
+            repaired_packet = self._parse_json_object(repaired_text)
+            normalized_repaired = self._normalize_critique_packet_candidate(
+                repaired_packet,
+                deterministic_packet,
+                context,
+            )
+            repaired_ok, repaired_errors = validate_advisor_critique_packet(normalized_repaired)
+            trace["repair_errors"] = repaired_errors[:6]
+            trace["repair_llm_ok"] = repaired_ok
+            if repaired_ok:
+                trace["source"] = "llm_repair_pass"
+                print(
+                    "RESULTS_ADVISOR_CRITIQUE_REPAIR: "
+                    + f"source=llm_repair_pass success=True provider={self.fe_provider} model={self.fe_model_name}"
+                )
+                return normalized_repaired, trace
+        except Exception as exc:
+            trace["repair_exception"] = f"{type(exc).__name__}: {exc}"[:240]
+
+        print(
+            "RESULTS_ADVISOR_CRITIQUE_REPAIR: "
+            + f"source=llm_repair_pass success=False provider={self.fe_provider} model={self.fe_model_name}"
+        )
+        return None, trace
+
+    def _normalize_critique_packet_candidate(
+        self,
+        packet: Dict[str, Any] | None,
+        deterministic_packet: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        base = copy.deepcopy(deterministic_packet if isinstance(deterministic_packet, dict) else {})
+        incoming = packet if isinstance(packet, dict) else {}
+
+        def _as_number(value: Any, default: float) -> float:
+            try:
+                if isinstance(value, bool):
+                    raise ValueError("bool is not a numeric payload")
+                return float(value)
+            except Exception:
+                return float(default)
+
+        def _as_int(value: Any, default: int) -> int:
+            try:
+                if isinstance(value, bool):
+                    raise ValueError("bool is not integer payload")
+                return int(value)
+            except Exception:
+                return int(default)
+
+        def _as_bool(value: Any, default: bool) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                token = value.strip().lower()
+                if token in {"1", "true", "yes", "on"}:
+                    return True
+                if token in {"0", "false", "no", "off"}:
+                    return False
+            return bool(default)
+
+        def _dedup_strings(values: Any, max_items: int) -> List[str]:
+            out: List[str] = []
+            seen: set[str] = set()
+            if not isinstance(values, list):
+                return out
+            for item in values:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                key = text.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(text)
+                if len(out) >= max_items:
+                    break
+            return out
+
+        severity_map = {
+            "critical": "high",
+            "severe": "high",
+            "blocker": "high",
+            "warn": "medium",
+            "warning": "medium",
+            "med": "medium",
+            "minor": "low",
+        }
+        impact_map = {
+            "down": "negative",
+            "decrease": "negative",
+            "negative_bias": "negative",
+            "positive_bias": "positive",
+            "up": "positive",
+            "increase": "positive",
+            "none": "neutral",
+            "flat": "neutral",
+        }
+
+        normalized: Dict[str, Any] = {
+            "packet_type": "advisor_critique_packet",
+            "packet_version": "1.0",
+            "run_id": str(incoming.get("run_id") or base.get("run_id") or context.get("run_id") or "unknown_run"),
+            "iteration": _as_int(incoming.get("iteration"), _as_int(base.get("iteration"), 0)),
+            "timestamp_utc": str(
+                incoming.get("timestamp_utc")
+                or base.get("timestamp_utc")
+                or datetime.now(timezone.utc).isoformat()
+            ),
+            "primary_metric_name": str(
+                incoming.get("primary_metric_name")
+                or base.get("primary_metric_name")
+                or context.get("primary_metric_name")
+                or "primary_metric"
+            ),
+            "higher_is_better": _as_bool(
+                incoming.get("higher_is_better"),
+                _as_bool(base.get("higher_is_better"), bool(context.get("higher_is_better", True))),
+            ),
+            "metric_comparison": {},
+            "validation_signals": {},
+            "error_modes": [],
+            "risk_flags": _dedup_strings(
+                incoming.get("risk_flags") if "risk_flags" in incoming else base.get("risk_flags"),
+                max_items=10,
+            ),
+            "active_gates_context": _dedup_strings(
+                incoming.get("active_gates_context")
+                if "active_gates_context" in incoming
+                else base.get("active_gates_context"),
+                max_items=30,
+            ),
+            "analysis_summary": self._truncate(
+                str(incoming.get("analysis_summary") or base.get("analysis_summary") or "Model critique packet."),
+                280,
+            ),
+            "strictly_no_code_advice": True,
+        }
+
+        base_metric = base.get("metric_comparison") if isinstance(base.get("metric_comparison"), dict) else {}
+        incoming_metric = incoming.get("metric_comparison") if isinstance(incoming.get("metric_comparison"), dict) else {}
+        metric_comparison = {
+            "baseline_value": _as_number(
+                incoming_metric.get("baseline_value"),
+                _as_number(base_metric.get("baseline_value"), 0.0),
+            ),
+            "candidate_value": _as_number(
+                incoming_metric.get("candidate_value"),
+                _as_number(base_metric.get("candidate_value"), 0.0),
+            ),
+            "delta_abs": _as_number(
+                incoming_metric.get("delta_abs"),
+                _as_number(base_metric.get("delta_abs"), 0.0),
+            ),
+            "delta_rel": _as_number(
+                incoming_metric.get("delta_rel"),
+                _as_number(base_metric.get("delta_rel"), 0.0),
+            ),
+            "min_delta_required": _as_number(
+                incoming_metric.get("min_delta_required"),
+                _as_number(base_metric.get("min_delta_required"), float(context.get("min_delta", 0.0005) or 0.0005)),
+            ),
+            "meets_min_delta": _as_bool(
+                incoming_metric.get("meets_min_delta"),
+                _as_bool(base_metric.get("meets_min_delta"), False),
+            ),
+        }
+        normalized["metric_comparison"] = metric_comparison
+
+        base_validation = base.get("validation_signals") if isinstance(base.get("validation_signals"), dict) else {}
+        incoming_validation = (
+            incoming.get("validation_signals")
+            if isinstance(incoming.get("validation_signals"), dict)
+            else {}
+        )
+        validation_mode = str(
+            incoming_validation.get("validation_mode")
+            or base_validation.get("validation_mode")
+            or "unknown"
+        ).strip().lower()
+        if validation_mode not in {"cv", "holdout", "cv_and_holdout", "unknown"}:
+            validation_mode = "unknown"
+        validation_signals: Dict[str, Any] = {"validation_mode": validation_mode}
+
+        def _normalize_cv_payload(raw_cv: Any, fallback_cv: Any) -> Dict[str, Any] | None:
+            source_cv = raw_cv if isinstance(raw_cv, dict) else fallback_cv if isinstance(fallback_cv, dict) else None
+            if not isinstance(source_cv, dict):
+                return None
+            variance_level = str(source_cv.get("variance_level") or "unknown").strip().lower()
+            if variance_level not in {"low", "medium", "high", "unknown"}:
+                variance_level = "unknown"
+            return {
+                "cv_mean": _as_number(source_cv.get("cv_mean"), 0.0),
+                "cv_std": max(0.0, _as_number(source_cv.get("cv_std"), 0.0)),
+                "fold_count": max(2, _as_int(source_cv.get("fold_count"), 5)),
+                "variance_level": variance_level,
+            }
+
+        def _normalize_holdout_payload(raw_holdout: Any, fallback_holdout: Any) -> Dict[str, Any] | None:
+            source_holdout = (
+                raw_holdout
+                if isinstance(raw_holdout, dict)
+                else fallback_holdout
+                if isinstance(fallback_holdout, dict)
+                else None
+            )
+            if not isinstance(source_holdout, dict):
+                return None
+            shift = str(source_holdout.get("class_distribution_shift") or "unknown").strip().lower()
+            if shift not in {"low", "medium", "high", "unknown"}:
+                shift = "unknown"
+            payload = {
+                "metric_value": _as_number(source_holdout.get("metric_value"), 0.0),
+                "split_name": str(source_holdout.get("split_name") or "holdout"),
+                "sample_count": max(1, _as_int(source_holdout.get("sample_count"), 1)),
+                "class_distribution_shift": shift,
+            }
+            if isinstance(source_holdout.get("positive_class_rate"), (int, float)):
+                rate = float(source_holdout.get("positive_class_rate"))
+                payload["positive_class_rate"] = min(1.0, max(0.0, rate))
+            return payload
+
+        base_cv = base_validation.get("cv")
+        base_holdout = base_validation.get("holdout")
+        cv_payload = _normalize_cv_payload(incoming_validation.get("cv"), base_cv)
+        holdout_payload = _normalize_holdout_payload(incoming_validation.get("holdout"), base_holdout)
+        if validation_mode in {"cv", "cv_and_holdout"} and isinstance(cv_payload, dict):
+            validation_signals["cv"] = cv_payload
+        if validation_mode in {"holdout", "cv_and_holdout"} and isinstance(holdout_payload, dict):
+            validation_signals["holdout"] = holdout_payload
+        if "generalization_gap" in incoming_validation or "generalization_gap" in base_validation:
+            validation_signals["generalization_gap"] = _as_number(
+                incoming_validation.get("generalization_gap"),
+                _as_number(base_validation.get("generalization_gap"), 0.0),
+            )
+        normalized["validation_signals"] = validation_signals
+
+        raw_error_modes = incoming.get("error_modes") if isinstance(incoming.get("error_modes"), list) else []
+        if not raw_error_modes and isinstance(base.get("error_modes"), list):
+            raw_error_modes = base.get("error_modes")
+        normalized_error_modes: List[Dict[str, Any]] = []
+        for idx, item in enumerate(raw_error_modes):
+            if not isinstance(item, dict):
+                continue
+            severity_token = str(item.get("severity") or "medium").strip().lower()
+            severity_token = severity_map.get(severity_token, severity_token)
+            if severity_token not in {"low", "medium", "high"}:
+                severity_token = "medium"
+            impact_token = str(item.get("metric_impact_direction") or "neutral").strip().lower()
+            impact_token = impact_map.get(impact_token, impact_token)
+            if impact_token not in {"negative", "neutral", "positive"}:
+                impact_token = "neutral"
+            confidence = _as_number(item.get("confidence"), 0.5)
+            normalized_error_modes.append(
+                {
+                    "id": str(item.get("id") or f"mode_{idx+1}"),
+                    "severity": severity_token,
+                    "confidence": min(1.0, max(0.0, confidence)),
+                    "evidence": self._truncate(str(item.get("evidence") or "No evidence provided."), 500),
+                    "affected_scope": str(item.get("affected_scope") or "model"),
+                    "metric_impact_direction": impact_token,
+                }
+            )
+            if len(normalized_error_modes) >= 5:
+                break
+        normalized["error_modes"] = normalized_error_modes
+        return normalized
 
     def _record_critique_error(
         self,
@@ -411,6 +786,7 @@ class ResultsAdvisorAgent:
             )
             return {}
 
+        self.last_response = str(raw_text or "")
         packet = self._parse_json_object(raw_text)
         if not packet:
             self._record_critique_error(

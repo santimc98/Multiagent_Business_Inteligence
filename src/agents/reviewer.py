@@ -13,7 +13,7 @@ from src.utils.reviewer_response_schema import (
     build_reviewer_eval_response_schema,
     build_reviewer_response_schema,
 )
-from src.utils.llm_json_repair import parse_json_object_with_repair
+from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
 
 load_dotenv()
 
@@ -518,6 +518,116 @@ class ReviewerAgent:
                 raise
         return _coerce_llm_response_text(response), used_config
 
+    def _attempt_llm_json_repair(
+        self,
+        raw_text: str,
+        *,
+        schema: Dict[str, Any] | None,
+        repair_label: str,
+    ) -> tuple[Dict[str, Any] | None, Dict[str, Any]]:
+        trace: Dict[str, Any] = {
+            "repair_label": str(repair_label or "reviewer_json"),
+            "repair_attempted": False,
+            "repair_succeeded": False,
+            "provider": self.provider,
+            "model": self.model_name,
+        }
+        if not isinstance(schema, dict) or not schema:
+            return None, trace
+        if not self.client or self.provider == "none":
+            return None, trace
+        raw = str(raw_text or "").strip()
+        if not raw:
+            return None, trace
+
+        trace["repair_attempted"] = True
+        schema_json = json.dumps(schema, ensure_ascii=True)
+        raw_preview = raw[:12000]
+        repair_prompt = (
+            "You are a strict JSON repair tool. Return ONLY one JSON object, no markdown.\n"
+            "TASK: Repair/normalize RAW_JSON so it conforms to TARGET_SCHEMA.\n"
+            "RULES:\n"
+            "- Keep original semantic intent when possible.\n"
+            "- If malformed/truncated, complete minimally with safe defaults.\n"
+            "- Do not invent gate names not present in data.\n"
+            "TARGET_SCHEMA:\n"
+            + schema_json
+            + "\nRAW_JSON:\n"
+            + raw_preview
+        )
+
+        try:
+            if self.provider == "gemini":
+                generation_config = dict(self._generation_config)
+                generation_config["response_schema"] = copy.deepcopy(schema)
+                repaired_text, used_config = self._generate_gemini_json(
+                    repair_prompt,
+                    generation_config=generation_config,
+                )
+                trace["used_response_schema"] = "response_schema" in used_config
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": "Return only valid JSON."},
+                        {"role": "user", "content": repair_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+                repaired_text = response.choices[0].message.content
+                trace["used_response_schema"] = False
+            parsed, parsed_trace = parse_json_object_with_repair(
+                str(repaired_text or ""),
+                actor="reviewer_json_repair",
+            )
+            trace["repair_succeeded"] = isinstance(parsed, dict)
+            trace["repair_parse_trace"] = parsed_trace
+            return parsed if isinstance(parsed, dict) else None, trace
+        except Exception as exc:
+            trace["repair_error"] = f"{type(exc).__name__}: {exc}"[:240]
+            return None, trace
+
+    def _parse_json_payload_with_llm_repair(
+        self,
+        text: str,
+        *,
+        schema: Dict[str, Any] | None,
+        repair_label: str,
+    ) -> Dict[str, Any]:
+        try:
+            parsed = self._parse_json_payload(text)
+            trace = dict(self.last_json_parse_trace or {})
+            trace["repair_via_llm"] = False
+            self.last_json_parse_trace = trace
+            return parsed
+        except Exception:
+            base_trace = dict(self.last_json_parse_trace or {})
+            repaired, repair_trace = self._attempt_llm_json_repair(
+                text,
+                schema=schema,
+                repair_label=repair_label,
+            )
+            if isinstance(repaired, dict):
+                merged_trace = dict(base_trace)
+                merged_trace["repair_via_llm"] = True
+                merged_trace["llm_repair"] = repair_trace
+                self.last_json_parse_trace = merged_trace
+                print(
+                    "REVIEWER_JSON_REPAIR_PASS: "
+                    + f"label={repair_label} success=True provider={self.provider} model={self.model_name}"
+                )
+                return repaired
+            merged_trace = dict(base_trace)
+            merged_trace["repair_via_llm"] = False
+            merged_trace["llm_repair"] = repair_trace
+            self.last_json_parse_trace = merged_trace
+            print(
+                "REVIEWER_JSON_REPAIR_PASS: "
+                + f"label={repair_label} success=False provider={self.provider} model={self.model_name}"
+            )
+            raise
+
     def review_code(
         self,
         code: str,
@@ -726,7 +836,11 @@ class ReviewerAgent:
                 )
                 content = response.choices[0].message.content
             self.last_response = content
-            result = self._parse_json_payload(content)
+            result = self._parse_json_payload_with_llm_repair(
+                content,
+                schema=build_reviewer_response_schema(active_reviewer_gates),
+                repair_label="review_code",
+            )
             parse_trace = self.last_json_parse_trace if isinstance(self.last_json_parse_trace, dict) else {}
             
             # Normalize lists
@@ -777,7 +891,11 @@ class ReviewerAgent:
         return text.strip()
 
     def _parse_json_payload(self, text: str) -> Dict[str, Any]:
-        parsed, trace = parse_json_object_with_repair(text or "", actor="reviewer")
+        try:
+            parsed, trace = parse_json_object_with_repair(text or "", actor="reviewer")
+        except JsonObjectParseError as err:
+            self.last_json_parse_trace = err.trace if isinstance(err.trace, dict) else {}
+            raise
         self.last_json_parse_trace = trace
         return parsed
 
@@ -956,7 +1074,11 @@ class ReviewerAgent:
                 )
                 content = response.choices[0].message.content
             self.last_response = content
-            result = self._parse_json_payload(content)
+            result = self._parse_json_payload_with_llm_repair(
+                content,
+                schema=build_reviewer_eval_response_schema(eval_reviewer_gates),
+                repair_label="evaluate_results",
+            )
             parse_trace = self.last_json_parse_trace if isinstance(self.last_json_parse_trace, dict) else {}
             
             # Defaults for backward compatibility
