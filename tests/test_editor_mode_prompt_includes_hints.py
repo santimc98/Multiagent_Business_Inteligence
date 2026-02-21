@@ -40,7 +40,14 @@ def test_editor_mode_prompt_includes_repair_hints(monkeypatch):
             "failed_gates": ["runtime_failure"],
             "required_fixes": ["Fix runtime failure."],
         },
-        iteration_handoff={"mode": "patch"},
+        iteration_handoff={
+            "mode": "patch",
+            "editor_constraints": {
+                "must_apply_hypothesis": True,
+                "forbid_noop": True,
+                "patch_intensity": "aggressive",
+            },
+        },
         execution_contract={"required_outputs": ["data/metrics.json"], "canonical_columns": []},
         ml_view={"required_outputs": ["data/metrics.json"]},
         editor_mode=True,
@@ -48,3 +55,4 @@ def test_editor_mode_prompt_includes_repair_hints(monkeypatch):
 
     assert "REPAIR_HINTS (deterministic, no-autopatch):" in str(agent.last_prompt or "")
     assert "Tipo invalido en columnas categoricas" in str(agent.last_prompt or "")
+    assert "Metric-improvement round enforcement is ACTIVE." in str(agent.last_prompt or "")

@@ -106,3 +106,73 @@ def test_editor_mode_forced_after_first_iteration_with_reviewer_feedback(monkeyp
     assert calls.get("editor_mode") is True
     assert calls.get("previous_code") == "print('baseline')"
     assert result.get("generated_code") == "print('patched-reviewer')"
+
+
+def test_metric_round_apply_guard_reprompts_once_when_hypothesis_not_applied(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    calls = {"count": 0}
+    previous_code = (
+        "def build_features(df):\n"
+        "    return df\n"
+        "\n"
+        "def train(df):\n"
+        "    return build_features(df)\n"
+    )
+    changed_code = (
+        "def build_features(df):\n"
+        "    df = df.copy()\n"
+        "    for col in df.select_dtypes(include=['number']).columns:\n"
+        "        df[f\"{col}_is_missing\"] = df[col].isna().astype('Int64')\n"
+        "    return df\n"
+        "\n"
+        "def train(df):\n"
+        "    return build_features(df)\n"
+    )
+
+    def _fake_generate_code(*, editor_mode=False, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return previous_code
+        return changed_code
+
+    monkeypatch.setattr("src.graph.graph.ml_engineer.generate_code", _fake_generate_code, raising=True)
+    monkeypatch.setattr(
+        "src.graph.graph.load_recent_memory",
+        lambda run_id, k=5: [],
+        raising=True,
+    )
+
+    state = {
+        "run_id": "unit_metric_round_guard",
+        "selected_strategy": {"title": "Strategy", "analysis_type": "predictive", "required_columns": []},
+        "feedback_history": [],
+        "data_summary": "",
+        "business_objective": "",
+        "csv_encoding": "utf-8",
+        "csv_sep": ",",
+        "csv_decimal": ".",
+        "generated_code": previous_code,
+        "last_generated_code": previous_code,
+        "last_gate_context": {
+            "source": "review_board",
+            "status": "NEEDS_IMPROVEMENT",
+            "feedback": "Apply one hypothesis with material edits.",
+            "failed_gates": ["metric_improvement_round"],
+            "required_fixes": ["Apply active hypothesis."],
+        },
+        "iteration_count": 1,
+        "execution_contract": {"required_outputs": ["data/metrics.json"], "canonical_columns": []},
+        "ml_improvement_round_active": True,
+        "ml_improvement_hypothesis_packet": {
+            "action": "APPLY",
+            "hypothesis": {"technique": "missing_indicators", "target_columns": ["ALL_NUMERIC"]},
+        },
+    }
+
+    result = run_engineer(state)
+
+    assert calls["count"] == 2
+    assert result.get("generated_code") == changed_code
+    apply_guard = result.get("ml_improvement_apply_guard_report") or {}
+    assert apply_guard.get("repair_attempted") is True
+    assert apply_guard.get("applied") is True

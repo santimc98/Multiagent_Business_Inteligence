@@ -534,6 +534,26 @@ class MLEngineerAgent:
                 if isinstance(raw.get("iteration_hypothesis_packet"), dict)
                 else {}
             )
+        editor_constraints = (
+            dict(raw.get("editor_constraints"))
+            if isinstance(raw.get("editor_constraints"), dict)
+            else {}
+        )
+        gate_enforcement = (
+            gate_context.get("metric_round_enforcement")
+            if isinstance(gate_context.get("metric_round_enforcement"), dict)
+            else {}
+        )
+        if isinstance(gate_enforcement, dict):
+            for key in ("must_apply_hypothesis", "forbid_noop", "patch_intensity"):
+                if key not in editor_constraints and key in gate_enforcement:
+                    editor_constraints[key] = gate_enforcement.get(key)
+        if "must_apply_hypothesis" not in editor_constraints:
+            editor_constraints["must_apply_hypothesis"] = bool(raw.get("must_apply_hypothesis"))
+        if "forbid_noop" not in editor_constraints:
+            editor_constraints["forbid_noop"] = bool(raw.get("forbid_noop"))
+        if not str(editor_constraints.get("patch_intensity") or "").strip():
+            editor_constraints["patch_intensity"] = str(raw.get("patch_intensity") or "incremental")
 
         required_outputs = self._normalize_handoff_items(
             contract_focus.get("required_outputs") or required_deliverables,
@@ -567,6 +587,10 @@ class MLEngineerAgent:
         if not must_preserve and present_outputs:
             must_preserve = [f"Preserve generation for {path}" for path in present_outputs[:6]]
         patch_objectives = self._normalize_handoff_items(raw.get("patch_objectives"), max_items=8, max_len=260)
+        if bool(editor_constraints.get("must_apply_hypothesis")):
+            enforce_msg = "Apply the active metric-improvement hypothesis with material code edits (NO_OP forbidden)."
+            if enforce_msg not in patch_objectives:
+                patch_objectives.insert(0, enforce_msg)
         if missing_outputs and not any("missing contract outputs" in item.lower() for item in patch_objectives):
             patch_objectives.insert(
                 0,
@@ -608,6 +632,11 @@ class MLEngineerAgent:
             "patch_objectives": patch_objectives[:8],
             "critic_packet": critic_packet if isinstance(critic_packet, dict) else {},
             "hypothesis_packet": hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
+            "editor_constraints": {
+                "must_apply_hypothesis": bool(editor_constraints.get("must_apply_hypothesis")),
+                "forbid_noop": bool(editor_constraints.get("forbid_noop")),
+                "patch_intensity": str(editor_constraints.get("patch_intensity") or "incremental"),
+            },
         }
 
     def _collect_editor_feedback_text(
@@ -816,6 +845,31 @@ class MLEngineerAgent:
             max_str_len=350,
             max_list_items=8,
         )
+
+    def _build_editor_enforcement_block(
+        self,
+        handoff_payload: Dict[str, Any] | None,
+    ) -> str:
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        constraints = (
+            handoff_payload.get("editor_constraints")
+            if isinstance(handoff_payload.get("editor_constraints"), dict)
+            else {}
+        )
+        must_apply = bool(constraints.get("must_apply_hypothesis"))
+        forbid_noop = bool(constraints.get("forbid_noop"))
+        patch_intensity = str(constraints.get("patch_intensity") or "incremental").strip() or "incremental"
+        if not (must_apply or forbid_noop):
+            return "- Standard editor mode. Apply patch objectives and keep minimal safe edits."
+
+        lines: List[str] = [
+            "- Metric-improvement round enforcement is ACTIVE.",
+            "- You must apply the active hypothesis with material code edits.",
+            "- Returning baseline-equivalent code or NO_OP is invalid in this round.",
+            "- Keep strategy lock, model family, CV protocol, and output contract paths unchanged.",
+            f"- Patch intensity: {patch_intensity}.",
+        ]
+        return "\n".join(lines)
 
     def _extract_decisioning_context(
         self,
@@ -3003,12 +3057,15 @@ $strategy_json
         MUST PRESERVE:
         $must_preserve
 
+        EDITOR ENFORCEMENT:
+        $editor_enforcement
+
         PREVIOUS SCRIPT:
         $previous_code
 
         EDITOR RULES:
         1) Return ONLY the full updated Python script. No markdown, no explanation.
-        2) Keep script structure and change the minimum possible lines.
+        2) Keep script structure and apply targeted edits required by patch objectives and enforcement.
         3) Keep strategy/objective/contract paths unchanged.
         4) If phase is "persistence", do not modify training/model selection logic.
            Only fix persistence/serialization/artifact-writing blocks.
@@ -3121,6 +3178,7 @@ $strategy_json
                 max_str_len=260,
                 max_list_items=30,
             )
+            editor_enforcement_block = self._build_editor_enforcement_block(handoff_payload)
             user_message = render_prompt(
                 USER_EDITOR_TEMPLATE,
                 phase_classification=phase_classification,
@@ -3132,6 +3190,7 @@ $strategy_json
                 hypothesis_packet_json=hypothesis_packet_block,
                 patch_objectives=patch_objectives_block,
                 must_preserve=must_preserve_block,
+                editor_enforcement=editor_enforcement_block,
                 previous_code=previous_code_block,
             )
         elif improve_mode_active:

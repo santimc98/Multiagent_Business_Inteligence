@@ -8,7 +8,9 @@ from src.graph.graph import (
     _should_run_metric_improvement_round,
     _snapshot_ml_outputs,
     _restore_ml_outputs,
+    _evaluate_metric_round_hypothesis_application,
 )
+from src.graph import graph as graph_mod
 
 
 def test_should_run_metric_improvement_round_defaults_to_true_after_baseline_approved() -> None:
@@ -299,3 +301,105 @@ def test_check_evaluation_bootstraps_next_round_after_continue(tmp_path, monkeyp
     assert route == "retry"
     assert state.get("ml_improvement_round_active") is True
     assert int(state.get("ml_improvement_round_count", 0)) == 2
+
+
+def test_metric_round_apply_guard_requires_material_edit() -> None:
+    state = {
+        "ml_improvement_round_active": True,
+        "ml_improvement_hypothesis_packet": {
+            "action": "APPLY",
+            "hypothesis": {"technique": "missing_indicators", "target_columns": ["ALL_NUMERIC"]},
+        },
+    }
+    previous_code = (
+        "def build_features(df):\n"
+        "    return df\n"
+        "\n"
+        "def train(df):\n"
+        "    X = build_features(df)\n"
+        "    return X\n"
+    )
+
+    no_change = _evaluate_metric_round_hypothesis_application(
+        state,
+        previous_code=previous_code,
+        candidate_code=previous_code,
+    )
+    assert no_change.get("enforced") is True
+    assert no_change.get("applied") is False
+
+    changed_code = (
+        "def build_features(df):\n"
+        "    df = df.copy()\n"
+        "    for col in df.select_dtypes(include=['number']).columns:\n"
+        "        df[f\"{col}_is_missing\"] = df[col].isna().astype('Int64')\n"
+        "    return df\n"
+        "\n"
+        "def train(df):\n"
+        "    X = build_features(df)\n"
+        "    return X\n"
+    )
+    applied = _evaluate_metric_round_hypothesis_application(
+        state,
+        previous_code=previous_code,
+        candidate_code=changed_code,
+    )
+    assert applied.get("enforced") is True
+    assert applied.get("applied") is True
+
+
+def test_metric_round_guarded_mode_ignores_advisory_verdict(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("data/metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps({"roc_auc": 0.8}), encoding="utf-8")
+    snapshot_dir = Path("work/ml_incumbent_snapshot_r1")
+    output_paths = ["data/metrics.json"]
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+    metrics_path.write_text(json.dumps({"roc_auc": 0.801}), encoding="utf-8")
+
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_critique_packet",
+        lambda _ctx: {
+            "metric_comparison": {
+                "baseline_value": 0.8,
+                "candidate_value": 0.801,
+                "meets_min_delta": True,
+            },
+            "validation_signals": {"validation_mode": "cv"},
+            "error_modes": [],
+        },
+    )
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "last_critique_meta",
+        {"mode": "deterministic", "source": "deterministic", "provider": "none", "model": None},
+    )
+
+    state = {
+        "review_verdict": "NEEDS_IMPROVEMENT",
+        "execution_contract": {
+            "iteration_policy": {"metric_round_review_mode": "hybrid_guarded"},
+        },
+        "ml_improvement_round_active": True,
+        "ml_improvement_review_mode": "hybrid_guarded",
+        "ml_improvement_primary_metric_name": "roc_auc",
+        "ml_improvement_round_baseline_metric": 0.8,
+        "ml_improvement_baseline_metric": 0.8,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": True,
+        "ml_improvement_output_paths": output_paths,
+        "ml_improvement_snapshot_dir": str(snapshot_dir),
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "last_gate_context": {
+            "failed_gates": ["qa_non_active_gate"],
+            "hard_failures": ["qa_non_active_gate"],
+        },
+        "feedback_history": [],
+    }
+
+    route = check_evaluation(state)
+
+    assert route == "approved"
+    assert state.get("ml_improvement_kept") == "improved"

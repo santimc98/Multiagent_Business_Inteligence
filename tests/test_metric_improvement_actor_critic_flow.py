@@ -117,6 +117,10 @@ def test_bootstrap_metric_improvement_round_builds_actor_critic_handoff(tmp_path
     assert handoff.get("source") == "actor_critic_metric_improvement"
     assert isinstance(handoff.get("critic_packet"), dict)
     assert isinstance(handoff.get("hypothesis_packet"), dict)
+    constraints = handoff.get("editor_constraints") if isinstance(handoff.get("editor_constraints"), dict) else {}
+    assert constraints.get("must_apply_hypothesis") is True
+    assert constraints.get("forbid_noop") is True
+    assert constraints.get("patch_intensity") == "aggressive"
     feedback_history = state.get("feedback_history", [])
     assert feedback_history
     assert "STEWARD_FEEDBACK" in feedback_history[-1]

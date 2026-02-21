@@ -8640,6 +8640,24 @@ def _build_iteration_handoff(
     if not patch_objectives:
         patch_objectives.append("Apply reviewer and QA feedback with minimal, targeted code edits.")
 
+    hypothesis_packet = _resolve_metric_round_hypothesis_packet(state)
+    hypothesis_action = str(hypothesis_packet.get("action") or "NO_OP").strip().upper()
+    hypothesis_technique = str(_extract_hypothesis_technique(hypothesis_packet) or "").strip()
+    enforce_apply_hypothesis = bool(
+        bool(state.get("ml_improvement_round_active"))
+        and hypothesis_action == "APPLY"
+        and hypothesis_technique
+        and hypothesis_technique.upper() != "NO_OP"
+    )
+    if enforce_apply_hypothesis:
+        enforce_msg = (
+            "Metric-improvement round: apply active hypothesis '"
+            + hypothesis_technique
+            + "' with material edits (NO_OP forbidden)."
+        )
+        if enforce_msg not in patch_objectives:
+            patch_objectives.insert(0, enforce_msg)
+
     # ── Retry context: structured error classification for targeted retries ──
     retry_context = _build_retry_context(
         runtime_tail=runtime_tail,
@@ -8686,6 +8704,11 @@ def _build_iteration_handoff(
         },
         "must_preserve": must_preserve[:8],
         "patch_objectives": patch_objectives[:8],
+        "editor_constraints": {
+            "must_apply_hypothesis": bool(enforce_apply_hypothesis),
+            "forbid_noop": bool(enforce_apply_hypothesis),
+            "patch_intensity": "aggressive" if enforce_apply_hypothesis else "incremental",
+        },
         "retry_context": retry_context,
     }
     if preflight_failures:
@@ -9347,6 +9370,7 @@ class AgentState(TypedDict):
     ml_improvement_best_round: int
     ml_improvement_round_history: List[Dict[str, Any]]
     ml_improvement_pareto_frontier: List[Dict[str, Any]]
+    ml_improvement_apply_guard_report: Dict[str, Any]
 
 from src.agents.domain_expert import DomainExpertAgent
 
@@ -9843,6 +9867,7 @@ def run_steward(state: AgentState) -> AgentState:
         "ml_improvement_best_round": 0,
         "ml_improvement_round_history": [],
         "ml_improvement_pareto_frontier": [],
+        "ml_improvement_apply_guard_report": {},
         "leakage_audit_summary": "",
         "restrategize_count": state.get("restrategize_count", 0) if state else 0,
         "strategist_context_override": state.get("strategist_context_override", "") if state else "",
@@ -16439,6 +16464,135 @@ def run_engineer(state: AgentState) -> AgentState:
                     pass
 
         code = ml_engineer.generate_code(**kwargs)
+        apply_guard_report: Dict[str, Any] = {}
+        if bool(state.get("ml_improvement_round_active")):
+            apply_guard_report = _evaluate_metric_round_hypothesis_application(
+                state if isinstance(state, dict) else {},
+                previous_code=previous_code,
+                candidate_code=code,
+                iteration_handoff=iteration_handoff if isinstance(iteration_handoff, dict) else {},
+            )
+            if bool(apply_guard_report.get("enforced")) and not bool(apply_guard_report.get("applied")):
+                hypothesis_packet = _resolve_metric_round_hypothesis_packet(
+                    state if isinstance(state, dict) else {},
+                    iteration_handoff=iteration_handoff if isinstance(iteration_handoff, dict) else {},
+                )
+                technique = str(_extract_hypothesis_technique(hypothesis_packet) or "active_hypothesis")
+                enforcement_fix = (
+                    "Metric improvement round is active: apply hypothesis '"
+                    + technique
+                    + "' with material edits. NO_OP is not allowed."
+                )
+                enforcement_note = (
+                    "METRIC_IMPROVEMENT_ENFORCEMENT: first editor output did not materially apply hypothesis '"
+                    + technique
+                    + "'. Regenerate as a targeted edit over previous code with real feature-engineering changes."
+                )
+                print(enforcement_note)
+                if run_id:
+                    try:
+                        log_run_event(
+                            run_id,
+                            "metric_improvement_hypothesis_repair_prompt",
+                            {
+                                "iteration": int(state.get("iteration_count", 0) or 0) + 1,
+                                "reason": apply_guard_report.get("reason"),
+                                "technique": technique,
+                                "changed_lines": apply_guard_report.get("changed_lines"),
+                                "similarity": apply_guard_report.get("similarity"),
+                            },
+                        )
+                    except Exception:
+                        pass
+                forced_feedback_history = list(feedback_history if isinstance(feedback_history, list) else [])
+                forced_feedback_history.append(enforcement_note)
+
+                forced_gate_context = dict(gate_context) if isinstance(gate_context, dict) else {}
+                existing_feedback = str(forced_gate_context.get("feedback") or "").strip()
+                forced_gate_context["feedback"] = (
+                    f"{existing_feedback}\n\n{enforcement_note}".strip()
+                    if existing_feedback
+                    else enforcement_note
+                )
+                forced_required_fixes = [
+                    str(item)
+                    for item in (forced_gate_context.get("required_fixes") or [])
+                    if str(item or "").strip()
+                ]
+                if enforcement_fix not in forced_required_fixes:
+                    forced_required_fixes.insert(0, enforcement_fix)
+                forced_gate_context["required_fixes"] = forced_required_fixes[:12]
+                forced_gate_context["source"] = str(forced_gate_context.get("source") or "metric_improvement_round")
+
+                forced_handoff = dict(iteration_handoff) if isinstance(iteration_handoff, dict) else {}
+                forced_quality = (
+                    dict(forced_handoff.get("quality_focus"))
+                    if isinstance(forced_handoff.get("quality_focus"), dict)
+                    else {}
+                )
+                forced_quality_fixes = [
+                    str(item)
+                    for item in (forced_quality.get("required_fixes") or [])
+                    if str(item or "").strip()
+                ]
+                if enforcement_fix not in forced_quality_fixes:
+                    forced_quality_fixes.insert(0, enforcement_fix)
+                forced_quality["required_fixes"] = forced_quality_fixes[:12]
+                forced_quality["status"] = "NEEDS_IMPROVEMENT"
+                forced_handoff["quality_focus"] = forced_quality
+                forced_patch_objectives = [
+                    str(item)
+                    for item in (forced_handoff.get("patch_objectives") or [])
+                    if str(item or "").strip()
+                ]
+                if enforcement_fix not in forced_patch_objectives:
+                    forced_patch_objectives.insert(0, enforcement_fix)
+                forced_handoff["patch_objectives"] = forced_patch_objectives[:8]
+                editor_constraints = (
+                    dict(forced_handoff.get("editor_constraints"))
+                    if isinstance(forced_handoff.get("editor_constraints"), dict)
+                    else {}
+                )
+                editor_constraints["must_apply_hypothesis"] = True
+                editor_constraints["forbid_noop"] = True
+                editor_constraints["patch_intensity"] = "aggressive"
+                forced_handoff["editor_constraints"] = editor_constraints
+                forced_handoff["must_apply_hypothesis"] = True
+                forced_handoff["forbid_noop"] = True
+                forced_handoff["patch_intensity"] = "aggressive"
+
+                forced_kwargs = dict(kwargs)
+                forced_kwargs["feedback_history"] = forced_feedback_history
+                forced_kwargs["gate_context"] = forced_gate_context
+                forced_kwargs["iteration_handoff"] = forced_handoff
+                forced_kwargs["previous_code"] = previous_code
+                forced_kwargs["editor_mode"] = True
+                code = ml_engineer.generate_code(**forced_kwargs)
+                retry_report = _evaluate_metric_round_hypothesis_application(
+                    state if isinstance(state, dict) else {},
+                    previous_code=previous_code,
+                    candidate_code=code,
+                    iteration_handoff=forced_handoff,
+                )
+                retry_report["repair_attempted"] = True
+                retry_report["first_pass_reason"] = apply_guard_report.get("reason")
+                apply_guard_report = retry_report
+                if run_id:
+                    try:
+                        log_run_event(
+                            run_id,
+                            "metric_improvement_hypothesis_repair_result",
+                            {
+                                "iteration": int(state.get("iteration_count", 0) or 0) + 1,
+                                "applied": bool(apply_guard_report.get("applied")),
+                                "reason": apply_guard_report.get("reason"),
+                                "technique": apply_guard_report.get("technique"),
+                                "changed_lines": apply_guard_report.get("changed_lines"),
+                                "similarity": apply_guard_report.get("similarity"),
+                            },
+                        )
+                    except Exception:
+                        pass
         try:
             os.makedirs("artifacts", exist_ok=True)
             with open(os.path.join("artifacts", "ml_engineer_last.py"), "w", encoding="utf-8") as f_art:
@@ -16533,6 +16687,7 @@ def run_engineer(state: AgentState) -> AgentState:
             "ml_plan_path": state.get("ml_plan_path"),
             "ml_engineer_attempt": ml_attempt,
             "ml_execution_profile": execution_profile,
+            "ml_improvement_apply_guard_report": apply_guard_report,
         }
         merged_state = dict(state or {})
         merged_state.update(result)
@@ -21167,27 +21322,38 @@ def _extract_hypothesis_technique(packet: Any) -> str:
     return ""
 
 
+def _resolve_metric_round_hypothesis_packet(
+    state: Dict[str, Any],
+    iteration_handoff: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    handoff = iteration_handoff if isinstance(iteration_handoff, dict) else (
+        state.get("iteration_handoff") if isinstance(state.get("iteration_handoff"), dict) else {}
+    )
+    packet_candidates: List[Any] = [
+        state.get("ml_improvement_hypothesis_packet"),
+        handoff.get("hypothesis_packet") if isinstance(handoff, dict) else None,
+        handoff.get("iteration_hypothesis_packet") if isinstance(handoff, dict) else None,
+        state.get("last_gate_context", {}).get("iteration_hypothesis_packet")
+        if isinstance(state.get("last_gate_context"), dict)
+        else None,
+    ]
+    for packet in packet_candidates:
+        if isinstance(packet, dict) and packet:
+            return packet
+    return {}
+
+
 def _resolve_metric_round_augmentation_requested(
     state: Dict[str, Any],
     contract: Dict[str, Any] | None = None,
 ) -> bool:
     if not isinstance(state, dict):
         return False
-    packet_candidates: List[Any] = [
-        state.get("ml_improvement_hypothesis_packet"),
-        state.get("iteration_handoff", {}).get("hypothesis_packet")
-        if isinstance(state.get("iteration_handoff"), dict)
-        else None,
-        state.get("iteration_handoff", {}).get("iteration_hypothesis_packet")
-        if isinstance(state.get("iteration_handoff"), dict)
-        else None,
-        state.get("last_gate_context", {}).get("iteration_hypothesis_packet")
-        if isinstance(state.get("last_gate_context"), dict)
-        else None,
-    ]
-    for packet in packet_candidates:
-        if _is_augmentation_technique_name(_extract_hypothesis_technique(packet)):
-            return True
+    hypothesis_packet = _resolve_metric_round_hypothesis_packet(state)
+    if _is_augmentation_technique_name(_extract_hypothesis_technique(hypothesis_packet)):
+        return True
 
     source_contract = contract if isinstance(contract, dict) else (
         state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
@@ -21334,9 +21500,21 @@ def _collect_active_gate_names(contract: Dict[str, Any]) -> List[str]:
     return list(dict.fromkeys(active))
 
 
+def _is_metric_round_advisory_review_mode(state: Dict[str, Any], contract: Dict[str, Any] | None = None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    mode = str(
+        state.get("ml_improvement_review_mode")
+        or _resolve_metric_round_review_mode(contract if isinstance(contract, dict) else {})
+    ).strip().lower()
+    return mode in {"hybrid_guarded", "advisor_only"}
+
+
 def _metric_round_has_deterministic_blockers(
     state: Dict[str, Any],
     gate_context: Dict[str, Any] | None = None,
+    *,
+    include_review_signals: bool = True,
 ) -> bool:
     if not isinstance(state, dict):
         return True
@@ -21362,15 +21540,16 @@ def _metric_round_has_deterministic_blockers(
         if blockers:
             return True
 
-    current_gate = gate_context if isinstance(gate_context, dict) else (
-        state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
-    )
-    hard_failures = [str(x) for x in (current_gate.get("hard_failures") or []) if x]
-    if hard_failures:
-        return True
-    for gate in [str(x) for x in (current_gate.get("failed_gates") or []) if x]:
-        if _looks_blocking_retry_signal(gate):
+    if include_review_signals:
+        current_gate = gate_context if isinstance(gate_context, dict) else (
+            state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+        )
+        hard_failures = [str(x) for x in (current_gate.get("hard_failures") or []) if x]
+        if hard_failures:
             return True
+        for gate in [str(x) for x in (current_gate.get("failed_gates") or []) if x]:
+            if _looks_blocking_retry_signal(gate):
+                return True
     return False
 
 
@@ -21685,13 +21864,125 @@ def _build_metric_improvement_patch_objectives(hypothesis_packet: Dict[str, Any]
     objectives: List[str] = []
     if action == "APPLY" and technique and technique != "NO_OP":
         objectives.append(
-            "Apply hypothesis technique '" + technique + "' incrementally on target columns: " + targets_text + "."
+            "Apply hypothesis technique '" + technique + "' on target columns: " + targets_text + "."
         )
-        objectives.append("Keep training logic stable; edit only the minimum blocks needed for hypothesis injection.")
+        objectives.append(
+            "NO_OP is forbidden in this round. Implement the hypothesis with material feature engineering edits."
+        )
+        objectives.append(
+            "Keep baseline model family and CV/data-split protocol stable while injecting the hypothesis end-to-end."
+        )
     else:
         objectives.append("No-op hypothesis selected; preserve baseline logic and keep outputs contract-compliant.")
     objectives.append("Preserve CV/data-split protocol and all contract output paths.")
     return objectives[:8]
+
+
+def _normalize_code_for_apply_guard(code: Any) -> str:
+    if not isinstance(code, str) or not code.strip():
+        return ""
+    lines: List[str] = []
+    for raw in code.splitlines():
+        line = str(raw).strip()
+        if not line or line.startswith("#"):
+            continue
+        lines.append(re.sub(r"\s+", " ", line))
+    return "\n".join(lines)
+
+
+def _count_code_line_changes(previous_code: str, candidate_code: str) -> int:
+    if not previous_code and not candidate_code:
+        return 0
+    prev_lines = previous_code.splitlines()
+    cand_lines = candidate_code.splitlines()
+    changes = 0
+    for opcode, i1, i2, j1, j2 in difflib.SequenceMatcher(None, prev_lines, cand_lines).get_opcodes():
+        if opcode == "equal":
+            continue
+        changes += max(i2 - i1, j2 - j1)
+    return int(changes)
+
+
+def _evaluate_metric_round_hypothesis_application(
+    state: Dict[str, Any],
+    previous_code: Any,
+    candidate_code: Any,
+    iteration_handoff: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    report: Dict[str, Any] = {
+        "enforced": False,
+        "applied": True,
+        "reason": "not_metric_round",
+        "action": "NO_OP",
+        "technique": "",
+        "similarity": None,
+        "changed_lines": 0,
+        "char_delta": 0,
+    }
+    if not isinstance(state, dict) or not bool(state.get("ml_improvement_round_active")):
+        return report
+
+    packet = _resolve_metric_round_hypothesis_packet(state, iteration_handoff=iteration_handoff)
+    action = str(packet.get("action") or "NO_OP").strip().upper()
+    technique = str(_extract_hypothesis_technique(packet) or "").strip()
+    report["action"] = action
+    report["technique"] = technique
+
+    enforce_apply = bool(action == "APPLY" and technique and technique.upper() != "NO_OP")
+    report["enforced"] = enforce_apply
+    if not enforce_apply:
+        report["reason"] = "no_apply_hypothesis"
+        return report
+
+    if not isinstance(previous_code, str) or not previous_code.strip():
+        report["reason"] = "missing_previous_code"
+        return report
+    if not isinstance(candidate_code, str) or not candidate_code.strip():
+        report["applied"] = False
+        report["reason"] = "empty_candidate_code"
+        return report
+
+    prev_norm = _normalize_code_for_apply_guard(previous_code)
+    cand_norm = _normalize_code_for_apply_guard(candidate_code)
+    if not prev_norm or not cand_norm:
+        report["reason"] = "insufficient_code_for_comparison"
+        return report
+
+    if prev_norm == cand_norm:
+        report["applied"] = False
+        report["reason"] = "no_code_change"
+        report["similarity"] = 1.0
+        return report
+
+    similarity = float(difflib.SequenceMatcher(None, prev_norm, cand_norm).ratio())
+    changed_lines = _count_code_line_changes(prev_norm, cand_norm)
+    char_delta = abs(len(cand_norm) - len(prev_norm))
+    report["similarity"] = round(similarity, 6)
+    report["changed_lines"] = int(changed_lines)
+    report["char_delta"] = int(char_delta)
+
+    technique_tokens = [
+        token
+        for token in re.split(r"[^a-z0-9]+", technique.lower())
+        if token and len(token) >= 4 and token not in {"feature", "engineering", "technique"}
+    ]
+    prev_lower = prev_norm.lower()
+    cand_lower = cand_norm.lower()
+    token_added = any(token in cand_lower and token not in prev_lower for token in technique_tokens[:4])
+
+    if token_added:
+        report["reason"] = "technique_token_added"
+        return report
+    if changed_lines >= 8 or char_delta >= 180:
+        report["reason"] = "material_diff_detected"
+        return report
+    if similarity <= 0.985 and changed_lines >= 4:
+        report["reason"] = "moderate_diff_detected"
+        return report
+
+    report["applied"] = False
+    report["reason"] = "no_material_hypothesis_edit"
+    return report
 
 
 def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
@@ -21900,6 +22191,13 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         steward_feedback=steward_feedback,
         advisor_feedback=advisor_feedback,
     )
+    hypothesis_action = str(hypothesis_packet.get("action") or "NO_OP").strip().upper()
+    hypothesis_technique = str(_extract_hypothesis_technique(hypothesis_packet) or "").strip()
+    enforce_apply_hypothesis = bool(
+        hypothesis_action == "APPLY"
+        and hypothesis_technique
+        and hypothesis_technique.upper() != "NO_OP"
+    )
 
     history = list(state.get("feedback_history", []) or [])
     history.append(feedback_block)
@@ -21918,6 +22216,11 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "feature_engineering_plan": feature_engineering_plan,
         "advisor_critique_packet": critique_packet,
         "iteration_hypothesis_packet": hypothesis_packet,
+        "metric_round_enforcement": {
+            "must_apply_hypothesis": bool(enforce_apply_hypothesis),
+            "forbid_noop": bool(enforce_apply_hypothesis),
+            "patch_intensity": "aggressive" if enforce_apply_hypothesis else "incremental",
+        },
     }
 
     state["iteration_handoff"] = {
@@ -21951,6 +22254,15 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             "cv_protocol",
             "output_paths_contract",
         ],
+        "editor_constraints": {
+            "must_apply_hypothesis": bool(enforce_apply_hypothesis),
+            "forbid_noop": bool(enforce_apply_hypothesis),
+            "patch_intensity": "aggressive" if enforce_apply_hypothesis else "incremental",
+            "strategy_lock": True,
+        },
+        "must_apply_hypothesis": bool(enforce_apply_hypothesis),
+        "forbid_noop": bool(enforce_apply_hypothesis),
+        "patch_intensity": "aggressive" if enforce_apply_hypothesis else "incremental",
         "patch_objectives": patch_objectives,
         "critic_packet": critique_packet,
         "hypothesis_packet": hypothesis_packet,
@@ -21958,6 +22270,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
 
     state["ml_improvement_critique_packet"] = critique_packet
     state["ml_improvement_hypothesis_packet"] = hypothesis_packet
+    state["ml_improvement_apply_guard_report"] = {}
     state["ml_improvement_round_active"] = True
     state["ml_improvement_round_count"] = int(round_id)
     state["ml_improvement_attempted"] = False
@@ -22191,8 +22504,24 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         disallow_high_variance = True
 
     verdict = normalize_review_status(state.get("review_verdict"))
-    deterministic_blockers = _metric_round_has_deterministic_blockers(state)
-    approved = _is_approved_review_status(verdict) and (not deterministic_blockers)
+    advisory_review_mode = _is_metric_round_advisory_review_mode(
+        state if isinstance(state, dict) else {},
+        contract if isinstance(contract, dict) else {},
+    )
+    deterministic_blockers = _metric_round_has_deterministic_blockers(
+        state,
+        include_review_signals=not advisory_review_mode,
+    )
+    approved = (
+        (not deterministic_blockers)
+        if advisory_review_mode
+        else (_is_approved_review_status(verdict) and (not deterministic_blockers))
+    )
+    if advisory_review_mode and not _is_approved_review_status(verdict):
+        _append_feedback_history(
+            state,
+            "METRIC_IMPROVEMENT_REVIEW_OVERRIDE: reviewer status treated as advisory in guarded mode.",
+        )
     improved_by_metric = (
         bool(meets_min_delta_packet)
         if isinstance(meets_min_delta_packet, bool)
@@ -22260,11 +22589,25 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         "improved_by_metric": bool(improved_by_metric),
         "stability_ok": bool(stability_ok),
         "deterministic_blockers": bool(deterministic_blockers),
+        "advisory_review_mode": bool(advisory_review_mode),
         "kept": state.get("ml_improvement_kept"),
         "no_improve_streak": int(no_improve_streak),
         "rounds_allowed": int(rounds_allowed),
         "patience": int(patience),
     }
+    apply_guard_report = (
+        state.get("ml_improvement_apply_guard_report")
+        if isinstance(state.get("ml_improvement_apply_guard_report"), dict)
+        else {}
+    )
+    if apply_guard_report:
+        round_record["apply_guard"] = {
+            "enforced": bool(apply_guard_report.get("enforced")),
+            "applied": bool(apply_guard_report.get("applied")),
+            "reason": str(apply_guard_report.get("reason") or ""),
+            "changed_lines": int(apply_guard_report.get("changed_lines", 0) or 0),
+            "repair_attempted": bool(apply_guard_report.get("repair_attempted")),
+        }
     round_record.update(_extract_metric_round_tradeoff(improved_value, critique_packet))
     frontier = state.get("ml_improvement_pareto_frontier")
     if not isinstance(frontier, list):
@@ -22297,6 +22640,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         f"improved={improved_value} min_delta={min_delta} "
         f"meets_min_delta={improved_by_metric} stability_ok={stability_ok} "
         f"deterministic_blockers={deterministic_blockers} "
+        f"advisory_review_mode={advisory_review_mode} "
         f"kept={state.get('ml_improvement_kept')} "
         f"pareto_frontier_improved={round_record.get('pareto_frontier_improved')} "
         f"no_improve_streak={no_improve_streak} "
@@ -22337,6 +22681,11 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 "pareto_frontier_improved": bool(round_record.get("pareto_frontier_improved")),
                 "no_improve_streak": int(no_improve_streak),
                 "continue_round": bool(continue_round),
+                "apply_guard_reason": (
+                    round_record.get("apply_guard", {}).get("reason")
+                    if isinstance(round_record.get("apply_guard"), dict)
+                    else None
+                ),
             },
         )
         try:
@@ -22376,12 +22725,14 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                         "stability_ok": bool(stability_ok),
                         "pareto_frontier_improved": bool(round_record.get("pareto_frontier_improved")),
                         "deterministic_blockers": bool(deterministic_blockers),
+                        "advisory_review_mode": bool(advisory_review_mode),
                         "kept": state.get("ml_improvement_kept"),
                         "no_improve_streak": int(no_improve_streak),
                         "patience": int(patience),
                         "continue_round": bool(continue_round),
                         "review_verdict": verdict,
                     "metric_source": metric_target.get("source"),
+                    "apply_guard": round_record.get("apply_guard"),
                 },
             )
             if continue_round:
