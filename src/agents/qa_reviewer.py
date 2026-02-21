@@ -10,48 +10,9 @@ from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 from src.utils.ml_plan_validation import validate_ml_plan_constraints
 from src.utils.reviewer_response_schema import build_qa_response_schema
+from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
 
 load_dotenv()
-
-def _extract_json_object(text: str) -> Optional[str]:
-    if not text:
-        return None
-    start = None
-    depth = 0
-    in_str = False
-    escape = False
-    for i, ch in enumerate(text):
-        if start is None:
-            if ch == "{":
-                start = i
-                depth = 1
-                in_str = False
-                escape = False
-            continue
-        if in_str:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == "\"":
-                in_str = False
-            continue
-        if ch == "\"":
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
-    return None
-
-
-def _clean_json_payload(text: str) -> str:
-    cleaned = re.sub(r"```json", "", str(text or ""), flags=re.IGNORECASE)
-    cleaned = re.sub(r"```", "", cleaned)
-    return cleaned.strip()
-
 
 def _coerce_llm_response_text(response: Any) -> str:
     if isinstance(response, str):
@@ -77,27 +38,12 @@ def _coerce_llm_response_text(response: Any) -> str:
 
 
 def _parse_json_payload(text: str) -> Dict[str, Any]:
-    parse_error: Exception | None = None
-    cleaned = _clean_json_payload(text or "")
-    candidates = [cleaned, _extract_json_object(cleaned), _extract_json_object(text or "")]
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not isinstance(candidate, str):
-            continue
-        blob = candidate.strip()
-        if not blob or blob in seen:
-            continue
-        seen.add(blob)
-        try:
-            parsed = json.loads(blob)
-            if isinstance(parsed, dict):
-                return parsed
-            parse_error = ValueError("QA JSON payload is not an object")
-        except Exception as err:
-            parse_error = err
-    if parse_error:
-        raise parse_error
-    raise ValueError("Empty QA JSON payload")
+    parsed, _ = parse_json_object_with_repair(text or "", actor="qa_reviewer")
+    return parsed
+
+
+def _parse_json_payload_with_trace(text: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    return parse_json_object_with_repair(text or "", actor="qa_reviewer")
 
 
 _CONTRACT_FALLBACK_WARNING = "CONTRACT_BROKEN_FALLBACK: qa_gates missing; please fix contract generation"
@@ -346,6 +292,7 @@ class QAReviewerAgent:
             print(f"WARNING: {self.model_warning}")
         self.last_prompt = None
         self.last_response = None
+        self.last_json_parse_trace = None
         self._generation_config = {
             "temperature": float(
                 os.getenv(
@@ -632,9 +579,15 @@ class QAReviewerAgent:
             
             # Parse JSON (tolerant)
             parse_error = None
+            parse_trace: Dict[str, Any] = {}
             result = None
             try:
-                result = _parse_json_payload(content)
+                result, parse_trace = _parse_json_payload_with_trace(content)
+                self.last_json_parse_trace = parse_trace
+            except JsonObjectParseError as err:
+                parse_error = err
+                parse_trace = err.trace if isinstance(getattr(err, "trace", None), dict) else {}
+                self.last_json_parse_trace = parse_trace
             except Exception as err:
                 parse_error = err
 
@@ -662,6 +615,8 @@ class QAReviewerAgent:
                 fallback["soft_failures"] = []
                 fallback["contract_source_used"] = contract_source_used
                 fallback["warnings"] = warnings
+                if parse_trace:
+                    fallback["json_parse_trace"] = parse_trace
                 return fallback
 
             # Fallback normalization
@@ -724,6 +679,8 @@ class QAReviewerAgent:
             result["soft_failures"] = soft_failures
             result["contract_source_used"] = contract_source_used
             result["warnings"] = warnings
+            if parse_trace:
+                result["json_parse_trace"] = parse_trace
             return result
                 
         except Exception as e:

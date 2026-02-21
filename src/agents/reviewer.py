@@ -13,6 +13,7 @@ from src.utils.reviewer_response_schema import (
     build_reviewer_eval_response_schema,
     build_reviewer_response_schema,
 )
+from src.utils.llm_json_repair import parse_json_object_with_repair
 
 load_dotenv()
 
@@ -450,6 +451,7 @@ class ReviewerAgent:
             print(f"WARNING: {self.model_warning}")
         self.last_prompt = None
         self.last_response = None
+        self.last_json_parse_trace = None
         self._generation_config = {
             "temperature": float(os.getenv("REVIEWER_GEMINI_TEMPERATURE", "0.2")),
             "top_p": 0.9,
@@ -725,6 +727,7 @@ class ReviewerAgent:
                 content = response.choices[0].message.content
             self.last_response = content
             result = self._parse_json_payload(content)
+            parse_trace = self.last_json_parse_trace if isinstance(self.last_json_parse_trace, dict) else {}
             
             # Normalize lists
             for field in ['failed_gates', 'required_fixes']:
@@ -736,6 +739,8 @@ class ReviewerAgent:
                 else:
                     result[field] = val
             result["evidence"] = _normalize_evidence_items(result.get("evidence"), max_items=8)
+            if parse_trace:
+                result["json_parse_trace"] = parse_trace
 
             result = apply_reviewer_gate_filter(result, reviewer_gates)
             if precheck_warnings:
@@ -772,27 +777,9 @@ class ReviewerAgent:
         return text.strip()
 
     def _parse_json_payload(self, text: str) -> Dict[str, Any]:
-        parse_error: Exception | None = None
-        cleaned = self._clean_json(text or "")
-        candidates = [cleaned, _extract_json_object(cleaned), _extract_json_object(text or "")]
-        seen: set[str] = set()
-        for candidate in candidates:
-            if not isinstance(candidate, str):
-                continue
-            blob = candidate.strip()
-            if not blob or blob in seen:
-                continue
-            seen.add(blob)
-            try:
-                parsed = json.loads(blob)
-                if isinstance(parsed, dict):
-                    return parsed
-                parse_error = ValueError("Reviewer JSON payload is not an object")
-            except Exception as err:
-                parse_error = err
-        if parse_error:
-            raise parse_error
-        raise ValueError("Empty reviewer JSON payload")
+        parsed, trace = parse_json_object_with_repair(text or "", actor="reviewer")
+        self.last_json_parse_trace = trace
+        return parsed
 
     def evaluate_results(
         self,
@@ -970,12 +957,15 @@ class ReviewerAgent:
                 content = response.choices[0].message.content
             self.last_response = content
             result = self._parse_json_payload(content)
+            parse_trace = self.last_json_parse_trace if isinstance(self.last_json_parse_trace, dict) else {}
             
             # Defaults for backward compatibility
             if "failed_gates" not in result: result["failed_gates"] = []
             if "required_fixes" not in result: result["required_fixes"] = []
             if "retry_worth_it" not in result: result["retry_worth_it"] = True
             result["evidence"] = _normalize_evidence_items(result.get("evidence"), max_items=8)
+            if parse_trace:
+                result["json_parse_trace"] = parse_trace
             
             return result
             

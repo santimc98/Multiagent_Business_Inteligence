@@ -7688,6 +7688,39 @@ def _build_feedback_packet_snapshot(packet: Dict[str, Any] | None) -> Dict[str, 
     }
 
 
+def _normalize_review_packet_for_state(
+    packet: Dict[str, Any] | None,
+    *,
+    default_status: str = "UNKNOWN",
+) -> Dict[str, Any]:
+    packet = packet if isinstance(packet, dict) else {}
+    if not packet and default_status == "UNKNOWN":
+        return {}
+    normalized = _build_feedback_packet_snapshot(packet)
+    status = normalized.get("status") or default_status
+    if str(status or "").upper() != "UNKNOWN":
+        normalized["status"] = _normalize_review_status(str(status))
+    else:
+        normalized["status"] = str(default_status or "UNKNOWN")
+    normalized["warnings"] = _normalize_handoff_items(packet.get("warnings"), max_items=10, max_len=220)
+    normalized["soft_failures"] = _normalize_handoff_items(packet.get("soft_failures"), max_items=12, max_len=180)
+    if isinstance(packet.get("qa_gates_evaluated"), list):
+        normalized["qa_gates_evaluated"] = _normalize_handoff_items(
+            packet.get("qa_gates_evaluated"),
+            max_items=20,
+            max_len=160,
+        )
+    if isinstance(packet.get("contract_source_used"), str):
+        normalized["contract_source_used"] = str(packet.get("contract_source_used") or "")
+    if isinstance(packet.get("improvement_suggestions"), dict):
+        normalized["improvement_suggestions"] = packet.get("improvement_suggestions")
+    if "retry_worth_it" in packet:
+        normalized["retry_worth_it"] = bool(packet.get("retry_worth_it"))
+    if isinstance(packet.get("json_parse_trace"), dict):
+        normalized["json_parse_trace"] = packet.get("json_parse_trace")
+    return normalized
+
+
 def _build_ml_feedback_json(
     *,
     source: str,
@@ -8913,6 +8946,9 @@ def _build_ml_iteration_journal_entry(
     qa_reasons: List[str],
     next_actions: List[str],
     stage: str,
+    reviewer_packet: Dict[str, Any] | None = None,
+    qa_packet: Dict[str, Any] | None = None,
+    iteration_handoff: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     code = state.get("generated_code") or ""
     code_hash = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:12] if code else ""
@@ -8921,7 +8957,31 @@ def _build_ml_iteration_journal_entry(
     if runtime_error and isinstance(runtime_error, dict) and runtime_error.get("message"):
         diagnostics.setdefault("root_cause", runtime_error.get("message"))
     stage_value = stage if stage in {"preflight", "runtime_fix", "review_complete"} else "unknown"
+    reviewer_packet = reviewer_packet if isinstance(reviewer_packet, dict) else (
+        state.get("reviewer_last_result") if isinstance(state.get("reviewer_last_result"), dict) else {}
+    )
+    qa_packet = qa_packet if isinstance(qa_packet, dict) else (
+        state.get("qa_last_result") if isinstance(state.get("qa_last_result"), dict) else {}
+    )
+    handoff_obj = iteration_handoff if isinstance(iteration_handoff, dict) else (
+        state.get("iteration_handoff") if isinstance(state.get("iteration_handoff"), dict) else {}
+    )
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return 0
+
+    handoff_meta = {
+        "source": str(handoff_obj.get("source") or ""),
+        "mode": str(handoff_obj.get("mode") or ""),
+        "from_iteration": _safe_int(handoff_obj.get("from_iteration")),
+        "next_iteration": _safe_int(handoff_obj.get("next_iteration")),
+    }
+    reviewer_trace = reviewer_packet.get("json_parse_trace") if isinstance(reviewer_packet, dict) else {}
+    qa_trace = qa_packet.get("json_parse_trace") if isinstance(qa_packet, dict) else {}
     return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "iteration_id": iter_id,
         "stage": stage_value,
         "code_hash": code_hash,
@@ -8935,6 +8995,11 @@ def _build_ml_iteration_journal_entry(
         "qa_reasons": qa_reasons or [],
         "next_actions": next_actions or [],
         "iteration_diagnostics": diagnostics,
+        "handoff_meta": handoff_meta,
+        "reviewer_packet_status": str(reviewer_packet.get("status") or ""),
+        "qa_packet_status": str(qa_packet.get("status") or ""),
+        "reviewer_json_repair_used": bool(reviewer_trace.get("used_repair")) if isinstance(reviewer_trace, dict) else False,
+        "qa_json_repair_used": bool(qa_trace.get("used_repair")) if isinstance(qa_trace, dict) else False,
     }
 
 def _build_iteration_memory(
@@ -19517,7 +19582,36 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 review_counters = counters
                 budget_counter_state["budget_counters"] = review_counters
                 if ok:
-                    qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context_prompt)
+                    qa_context_for_call = qa_context_prompt
+                    if isinstance(qa_context_prompt, dict):
+                        qa_context_for_call = dict(qa_context_prompt)
+                        provisional_gate_context = {
+                            "source": "result_evaluator_pre_qa",
+                            "status": str((review_result or {}).get("status") or (eval_result or {}).get("status") or ""),
+                            "feedback": str((review_result or {}).get("feedback") or (eval_result or {}).get("feedback") or ""),
+                            "failed_gates": _normalize_handoff_items(
+                                (review_result or {}).get("failed_gates") if isinstance(review_result, dict) else [],
+                                max_items=12,
+                                max_len=180,
+                            ),
+                            "required_fixes": _normalize_handoff_items(
+                                (review_result or {}).get("required_fixes") if isinstance(review_result, dict) else [],
+                                max_items=12,
+                                max_len=220,
+                            ),
+                        }
+                        qa_context_for_call["iteration_handoff"] = _build_iteration_handoff(
+                            state=state if isinstance(state, dict) else {},
+                            status=str(provisional_gate_context.get("status") or ""),
+                            gate_context=provisional_gate_context,
+                            oc_report=oc_report if isinstance(oc_report, dict) else {},
+                            review_result=review_result if isinstance(review_result, dict) else {},
+                            qa_result={},
+                            eval_result=eval_result if isinstance(eval_result, dict) else {},
+                            evaluation_spec=evaluation_spec_for_review if isinstance(evaluation_spec_for_review, dict) else {},
+                        )
+                        qa_context_for_call = compress_long_lists(qa_context_for_call)[0]
+                    qa_result = qa_reviewer.review_code(code, strategy, business_objective, qa_context_for_call)
                     qa_result = _apply_review_consistency_guard(
                         qa_result,
                         review_diagnostics,
@@ -19536,7 +19630,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                             "qa_reviewer",
                             prompt=getattr(qa_reviewer, "last_prompt", None),
                             response=getattr(qa_reviewer, "last_response", None) or qa_result,
-                            context=qa_context_prompt if isinstance(qa_context_prompt, dict) else {"qa_context": qa_context_prompt},
+                            context=qa_context_for_call if isinstance(qa_context_for_call, dict) else {"qa_context": qa_context_for_call},
                             verdicts=qa_result,
                             attempt=iter_id,
                         )
@@ -19803,14 +19897,81 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         # Note: metric branch removed since iteration_type="metric" is now downgraded above
 
     review_feedback = feedback or state.get("review_feedback", "")
-    qa_summary = None
-    if qa_failed_gates or qa_required_fixes or qa_hard_failures or qa_rejected:
-        qa_summary = {
-            "status": "REJECTED" if (qa_rejected or qa_hard_failures) else "APPROVE_WITH_WARNINGS",
-            "failed_gates": qa_failed_gates,
-            "required_fixes": qa_required_fixes,
-            "hard_failures": qa_hard_failures,
-        }
+    qa_packet_for_state = _normalize_review_packet_for_state(
+        qa_result if isinstance(qa_result, dict) else {},
+        default_status="UNKNOWN",
+    )
+    reviewer_packet_for_state = _normalize_review_packet_for_state(
+        review_result if isinstance(review_result, dict) else {},
+        default_status="UNKNOWN",
+    )
+    qa_has_packet = isinstance(qa_result, dict) and bool(qa_result)
+    reviewer_has_packet = isinstance(review_result, dict) and bool(review_result)
+    reviewer_failed_from_result = _normalize_handoff_items(
+        (review_result or {}).get("failed_gates") if isinstance(review_result, dict) else [],
+        max_items=20,
+        max_len=180,
+    )
+    reviewer_required_from_result = _normalize_handoff_items(
+        (review_result or {}).get("required_fixes") if isinstance(review_result, dict) else [],
+        max_items=20,
+        max_len=220,
+    )
+    reviewer_hard_from_result = _normalize_handoff_items(
+        (review_result or {}).get("hard_failures") if isinstance(review_result, dict) else [],
+        max_items=15,
+        max_len=180,
+    )
+    reviewer_rejected = str((review_result or {}).get("status") or "").strip().upper() == "REJECTED"
+    qa_packet_for_state["failed_gates"] = list(
+        dict.fromkeys(
+            _normalize_handoff_items(qa_packet_for_state.get("failed_gates"), max_items=20, max_len=180)
+            + _normalize_handoff_items(qa_failed_gates, max_items=20, max_len=180)
+        )
+    )[:20]
+    qa_packet_for_state["required_fixes"] = list(
+        dict.fromkeys(
+            _normalize_handoff_items(qa_packet_for_state.get("required_fixes"), max_items=20, max_len=220)
+            + _normalize_handoff_items(qa_required_fixes, max_items=20, max_len=220)
+        )
+    )[:20]
+    qa_packet_for_state["hard_failures"] = list(
+        dict.fromkeys(
+            _normalize_handoff_items(qa_packet_for_state.get("hard_failures"), max_items=15, max_len=180)
+            + _normalize_handoff_items(qa_hard_failures, max_items=15, max_len=180)
+        )
+    )[:15]
+    if qa_rejected or qa_packet_for_state.get("hard_failures"):
+        qa_packet_for_state["status"] = "REJECTED"
+    elif qa_has_packet and str(qa_packet_for_state.get("status") or "").upper() == "UNKNOWN":
+        qa_packet_for_state["status"] = "APPROVE_WITH_WARNINGS"
+    elif not qa_packet_for_state.get("status"):
+        qa_packet_for_state["status"] = "UNKNOWN"
+
+    reviewer_packet_for_state["failed_gates"] = list(
+        dict.fromkeys(
+            _normalize_handoff_items(reviewer_packet_for_state.get("failed_gates"), max_items=20, max_len=180)
+            + reviewer_failed_from_result
+        )
+    )[:20]
+    reviewer_packet_for_state["required_fixes"] = list(
+        dict.fromkeys(
+            _normalize_handoff_items(reviewer_packet_for_state.get("required_fixes"), max_items=20, max_len=220)
+            + reviewer_required_from_result
+        )
+    )[:20]
+    reviewer_packet_for_state["hard_failures"] = list(
+        dict.fromkeys(
+            _normalize_handoff_items(reviewer_packet_for_state.get("hard_failures"), max_items=15, max_len=180)
+            + reviewer_hard_from_result
+        )
+    )[:15]
+    if reviewer_rejected or reviewer_packet_for_state.get("hard_failures"):
+        reviewer_packet_for_state["status"] = "REJECTED"
+    elif reviewer_has_packet and str(reviewer_packet_for_state.get("status") or "").upper() == "UNKNOWN":
+        reviewer_packet_for_state["status"] = "APPROVE_WITH_WARNINGS"
+    elif not reviewer_packet_for_state.get("status"):
+        reviewer_packet_for_state["status"] = "UNKNOWN"
     result_state = {
         "review_verdict": status,
         "review_feedback": review_feedback,
@@ -19842,17 +20003,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         result_state["ml_feedback_record"] = gate_context.get("feedback_record")
     if merged_hard_failures:
         result_state["hard_failures"] = merged_hard_failures
-    if qa_summary:
-        result_state["qa_last_result"] = qa_summary
-    if review_result:
-        result_state["reviewer_last_result"] = {
-            "status": review_result.get("status"),
-            "feedback": review_result.get("feedback"),
-            "failed_gates": review_result.get("failed_gates", []),
-            "required_fixes": review_result.get("required_fixes", []),
-            "hard_failures": review_result.get("hard_failures", []),
-            "improvement_suggestions": review_result.get("improvement_suggestions"),
-        }
+    if code or qa_packet_for_state:
+        result_state["qa_last_result"] = qa_packet_for_state
+    if code or reviewer_packet_for_state:
+        result_state["reviewer_last_result"] = reviewer_packet_for_state
     if retry_worth_it is not None:
         result_state["review_retry_worth_it"] = bool(retry_worth_it)
     if state.get("qa_budget_exceeded"):
@@ -19963,22 +20117,22 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "retry_worth_it": bool(retry_worth_it) if retry_worth_it is not None else None,
         "evidence": _normalize_handoff_evidence(eval_result.get("evidence"), max_items=8),
     }
-    reviewer_packet = {
-        "status": str(review_result.get("status") or "SKIPPED"),
-        "feedback": str(review_result.get("feedback") or ""),
-        "failed_gates": [str(g) for g in (review_result.get("failed_gates") or []) if g],
-        "required_fixes": [str(fx) for fx in (review_result.get("required_fixes") or []) if fx],
-        "hard_failures": [str(h) for h in (review_result.get("hard_failures") or []) if h],
-        "evidence": _normalize_handoff_evidence(review_result.get("evidence"), max_items=8),
-    }
-    qa_packet = qa_summary or {
-        "status": str(qa_result.get("status") or "SKIPPED"),
-        "feedback": str(qa_result.get("feedback") or ""),
-        "failed_gates": [str(g) for g in (qa_result.get("failed_gates") or []) if g],
-        "required_fixes": [str(fx) for fx in (qa_result.get("required_fixes") or []) if fx],
-        "hard_failures": [str(h) for h in (qa_result.get("hard_failures") or []) if h],
-        "evidence": _normalize_handoff_evidence(qa_result.get("evidence"), max_items=8),
-    }
+    reviewer_packet = _normalize_review_packet_for_state(
+        review_result if isinstance(review_result, dict) else {},
+        default_status="SKIPPED",
+    )
+    reviewer_packet["evidence"] = _normalize_handoff_evidence(
+        (review_result or {}).get("evidence") if isinstance(review_result, dict) else [],
+        max_items=8,
+    )
+    qa_packet = _normalize_review_packet_for_state(
+        qa_result if isinstance(qa_result, dict) else {},
+        default_status="SKIPPED",
+    )
+    qa_packet["evidence"] = _normalize_handoff_evidence(
+        (qa_result or {}).get("evidence") if isinstance(qa_result, dict) else [],
+        max_items=8,
+    )
     if isinstance(qa_packet, dict) and not isinstance(qa_packet.get("evidence"), list):
         qa_packet = dict(qa_packet)
         qa_packet["evidence"] = _normalize_handoff_evidence(qa_result.get("evidence"), max_items=8)
@@ -20091,7 +20245,18 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if run_id:
         outputs_state = _collect_outputs_state(_resolve_required_outputs(contract, state))
         reviewer_reasons = _normalize_reason_tags(review_feedback, failed_gates)
-        next_actions = _suggest_next_actions([], outputs_state["missing"], reviewer_reasons, [])
+        qa_feedback_for_journal = str(qa_packet_for_state.get("feedback") or "")
+        qa_failed_for_journal = [
+            str(item)
+            for item in (
+                qa_packet_for_state.get("failed_gates")
+                if isinstance(qa_packet_for_state.get("failed_gates"), list)
+                else []
+            )
+            if str(item).strip()
+        ]
+        qa_reasons = _normalize_reason_tags(qa_feedback_for_journal, qa_failed_for_journal)
+        next_actions = _suggest_next_actions([], outputs_state["missing"], reviewer_reasons, qa_reasons)
         entry = _build_ml_iteration_journal_entry(
             state,
             preflight_issues=[],
@@ -20100,10 +20265,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             outputs_missing=outputs_state["missing"],
             reviewer_verdict=status,
             reviewer_reasons=reviewer_reasons,
-            qa_verdict=None,
-            qa_reasons=[],
+            qa_verdict=str(qa_packet_for_state.get("status") or "UNKNOWN"),
+            qa_reasons=qa_reasons,
             next_actions=next_actions,
             stage="review_complete",
+            reviewer_packet=reviewer_packet_for_state,
+            qa_packet=qa_packet_for_state,
+            iteration_handoff=iteration_handoff,
         )
         written_ids = _append_ml_iteration_journal(
             run_id,
