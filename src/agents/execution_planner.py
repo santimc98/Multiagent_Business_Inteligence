@@ -284,7 +284,22 @@ FULL EXAMPLE (full_pipeline with model_training=true):
       "allow_feature_engineering": true, "allow_calibration": false
     },
     "artifact_requirements": {
-      "model_path": "artifacts/ml/model.pkl"
+      "model_path": "artifacts/ml/model.pkl",
+      "file_schemas": {
+        "artifacts/ml/predictions.csv": {
+          "required_columns": ["id", "prediction"],
+          "recommended_patterns": ["prob"]
+        },
+        "artifacts/ml/cv_metrics.json": {
+          "required_keys_any_depth": ["primary_metric", "metrics"]
+        }
+      },
+      "python_interfaces": {
+        "artifacts/ml/scoring_function.py": {
+          "expected_functions": ["predict"],
+          "expected_return_columns": ["prediction"]
+        }
+      }
     }
   },
   "cleaning_reviewer": {
@@ -711,6 +726,7 @@ SEVEN CORE PRINCIPLES
 6. Preserve semantic exclusions: if SEMANTIC_CORE_AUTHORITY_JSON or strategy reasoning marks a column as audit-only, reporting-only, stratification-only, or excluded from the initial model, keep it out of model_features. Represent it under audit_only_features or another non-model dependency surface when still operationally required.
 7. Phase coherence: every gate you emit must be verifiable by the agent you assign to it against the artifact you bind it to. If a gate talks about a feature matrix but no feature_matrix artifact exists, either create the artifact, relocate the gate to the phase where the feature matrix exists, or rephrase it as a manifest-declaration invariant.
 8. Semantic parameter coherence: gate params must describe the post-cleaning artifact, not raw profiler artifacts. For datetime parsing gates, never copy raw string cardinality into expected_unique_range after normalization; mixed date formats can collapse many raw strings into fewer canonical dates. If TEMPORAL_NORMALIZATION_FACTS are present, treat raw_unique_count as pre-normalization evidence and use canonical_unique_counts only when the gate is explicitly bound to that representation. Prefer parse success, null preservation, cadence/span, and period alignment unless canonical parsed cardinality is explicitly evidenced.
+9. Semantic cast coherence: column_dtype_targets and cleaning runbook casts must preserve observed value semantics. If COLUMN_SEMANTIC_CAST_RISK_PACK is present, use it before declaring numeric/date/category targets; boolean-like, labelled categorical, or mixed-format values require explicit mappings or preservation rationale, not blind coercion.
 
 WHAT GOES IN "shared" (preserved verbatim from SEMANTIC_CORE where available)
 scope, active_workstreams, future_ml_handoff, task_semantics, column_roles, allowed_feature_sets, model_features, strategy_title, business_objective, output_dialect, canonical_columns, column_dtype_targets, iteration_policy.
@@ -730,6 +746,12 @@ When scope includes cleaning (cleaning_only or full_pipeline):
 - data_engineer.artifact_requirements.cleaned_dataset MUST include output_manifest_path (e.g., "artifacts/clean/cleaning_manifest.json"). The manifest is read by downstream reviewers and QA to verify cleaning provenance.
 - data_engineer.required_outputs MUST include a cleaning_manifest artifact with intent "cleaning_manifest" pointing to the same path.
 Omitting the manifest path causes downstream validation failures because the system cannot resolve the cleaning provenance chain.
+When scope includes ML/model_training:
+- ml_engineer.artifact_requirements MUST describe machine-checkable artifact contracts when the business objective or deliverable text specifies schemas or entrypoints.
+- For CSV outputs, use artifact_requirements.file_schemas[path].required_columns for required columns and recommended_patterns for advisory families such as probability columns.
+- For JSON outputs, use artifact_requirements.file_schemas[path].required_keys_any_depth for required metric/monitoring keys that can appear per-feature or nested.
+- For Python scoring modules, use artifact_requirements.python_interfaces[path].expected_functions and expected_return_columns.
+- Do not rely only on prose descriptions for production-facing artifacts; downstream QA needs structured facts to verify whether a file exists AND whether it exposes the promised interface.
 
 DE OUTPUT DESIGN — REASON, DO NOT TEMPLATE
 The number and naming of DE output datasets is YOUR decision, not a template:
@@ -3857,6 +3879,71 @@ def _validate_gate_parameter_semantics(
     return {"status": "ok" if not violations else "violations", "violations": violations}
 
 
+def _contract_column_dtype_targets(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+    targets: Dict[str, Any] = {}
+    for container in (contract, contract.get("shared"), contract.get("data_engineer")):
+        if not isinstance(container, dict):
+            continue
+        raw_targets = container.get("column_dtype_targets")
+        if isinstance(raw_targets, dict):
+            targets.update(raw_targets)
+    return targets
+
+
+def _validate_column_semantic_cast_coherence(
+    contract: Dict[str, Any],
+    data_profile: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Expose advisory warnings when dtype targets risk erasing observed value semantics."""
+    violations: List[Dict[str, Any]] = []
+    if not isinstance(contract, dict) or not isinstance(data_profile, dict):
+        return {"status": "ok", "violations": []}
+    pack = data_profile.get("column_semantic_cast_risk_pack")
+    if not isinstance(pack, dict):
+        return {"status": "ok", "violations": []}
+    risks = pack.get("risks") if isinstance(pack.get("risks"), list) else []
+    dtype_targets = _contract_column_dtype_targets(contract)
+    for risk in risks:
+        if not isinstance(risk, dict):
+            continue
+        column = str(risk.get("column") or "").strip()
+        if not column:
+            continue
+        target_spec = dtype_targets.get(column)
+        if target_spec is None:
+            target_spec = dtype_targets.get(column.lower())
+        target_text = str(target_spec or risk.get("target_dtype") or "").lower()
+        if not target_text:
+            continue
+        is_numeric_target = any(token in target_text for token in ("float", "int", "numeric", "number"))
+        risk_kinds = {str(item) for item in (risk.get("risk_kinds") or [])}
+        if is_numeric_target and risk_kinds & {
+            "boolean_like_values",
+            "labelled_numeric_values",
+            "categorical_to_numeric_target",
+            "mixed_numeric_text_parseability",
+        }:
+            violations.append(
+                {
+                    "kind": "risky_dtype_target_for_observed_semantics",
+                    "severity": "soft",
+                    "column": column,
+                    "detail": (
+                        f"Column {column} has semantic-cast risk {sorted(risk_kinds)} and contract target "
+                        f"dtype {target_spec!r}. This may be correct, but the contract/runbook should require "
+                        "explicit mapping, coercion-failure accounting, or a preservation rationale rather than blind casting."
+                    ),
+                    "suggested_action": (
+                        "Keep the dtype target only if the cleaning contract explains the semantic mapping and audit evidence; "
+                        "otherwise preserve as categorical or split parsed values from raw labels."
+                    ),
+                }
+            )
+    return {"status": "ok" if not violations else "violations", "violations": violations}
+
+
 def _gate_parameter_semantics_validation_result(semantics: Dict[str, Any] | None) -> Dict[str, Any]:
     if not isinstance(semantics, dict) or semantics.get("status") != "violations":
         return {"status": "ok", "accepted": True, "issues": [], "summary": {"error_count": 0, "warning_count": 0}}
@@ -3892,6 +3979,35 @@ def _gate_parameter_semantics_validation_result(semantics: Dict[str, Any] | None
         "accepted": error_count == 0,
         "issues": issues,
         "summary": {"error_count": error_count, "warning_count": warning_count, "phase": "gate_parameter_semantics"},
+    }
+
+
+def _column_semantic_cast_validation_result(semantics: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(semantics, dict) or semantics.get("status") != "violations":
+        return {"status": "ok", "accepted": True, "issues": [], "summary": {"error_count": 0, "warning_count": 0}}
+    issues: List[Dict[str, Any]] = []
+    raw_violations = semantics.get("violations")
+    if not isinstance(raw_violations, list):
+        raw_violations = []
+    for violation in raw_violations:
+        if not isinstance(violation, dict):
+            continue
+        kind = str(violation.get("kind") or "unknown").strip() or "unknown"
+        issues.append(
+            {
+                "severity": "warning",
+                "rule": f"contract.column_semantic_cast.{kind}",
+                "message": str(violation.get("detail") or ""),
+                "phase": "column_semantic_cast",
+                "column": violation.get("column"),
+                "suggested_action": violation.get("suggested_action"),
+            }
+        )
+    return {
+        "status": "warning" if issues else "ok",
+        "accepted": True,
+        "issues": issues,
+        "summary": {"error_count": 0, "warning_count": len(issues), "phase": "column_semantic_cast"},
     }
 
 
@@ -11439,6 +11555,7 @@ class ExecutionPlannerAgent:
                 )
                 phase_coherence = _validate_gate_phase_coherence(contract)
                 gate_parameter_semantics = _validate_gate_parameter_semantics(contract, data_profile)
+                column_semantic_cast = _validate_column_semantic_cast_coherence(contract, data_profile)
                 validation_result = _merge_validation_results(
                     validation_result,
                     _phase_coherence_validation_result(phase_coherence),
@@ -11446,6 +11563,10 @@ class ExecutionPlannerAgent:
                 validation_result = _merge_validation_results(
                     validation_result,
                     _gate_parameter_semantics_validation_result(gate_parameter_semantics),
+                )
+                validation_result = _merge_validation_results(
+                    validation_result,
+                    _column_semantic_cast_validation_result(column_semantic_cast),
                 )
             except Exception as err:
                 phase_coherence = {
@@ -11463,6 +11584,7 @@ class ExecutionPlannerAgent:
                     ],
                 }
                 gate_parameter_semantics = {"status": "ok", "violations": []}
+                column_semantic_cast = {"status": "ok", "violations": []}
                 validation_result = {
                     "status": "error",
                     "accepted": False,
@@ -11478,6 +11600,7 @@ class ExecutionPlannerAgent:
 
             diagnostics["phase_coherence"] = phase_coherence
             diagnostics["gate_parameter_semantics"] = gate_parameter_semantics
+            diagnostics["column_semantic_cast"] = column_semantic_cast
             status = str(validation_result.get("status") or "unknown").lower()
             issues = validation_result.get("issues") if isinstance(validation_result, dict) else []
             accepted = _contract_is_accepted(validation_result if isinstance(validation_result, dict) else None)
@@ -11571,6 +11694,8 @@ class ExecutionPlannerAgent:
                         "or rephrase cleaning-phase gates as cleaning_manifest invariants.\n"
                         "For gate_parameter_semantics issues, repair the gate params: do not use raw profiler cardinality "
                         "as parsed artifact cardinality; remove impossible thresholds or replace them with canonical artifact evidence.\n"
+                        "For column_semantic_cast warnings, keep the agent decision but add explicit mapping/preservation rationale "
+                        "where dtype targets could erase observed business semantics.\n"
                         + "Attempt "
                         + str(attempt)
                         + "/2.\n\n"
@@ -11629,6 +11754,12 @@ class ExecutionPlannerAgent:
                         result,
                         _gate_parameter_semantics_validation_result(
                             _validate_gate_parameter_semantics(payload, data_profile)
+                        ),
+                    )
+                    result = _merge_validation_results(
+                        result,
+                        _column_semantic_cast_validation_result(
+                            _validate_column_semantic_cast_coherence(payload, data_profile)
                         ),
                     )
                     return result
@@ -12367,6 +12498,12 @@ domain_expert_critique:
                                 validation_result,
                                 _gate_parameter_semantics_validation_result(
                                     _validate_gate_parameter_semantics(candidate_for_validation, data_profile)
+                                ),
+                            )
+                            validation_result = _merge_validation_results(
+                                validation_result,
+                                _column_semantic_cast_validation_result(
+                                    _validate_column_semantic_cast_coherence(candidate_for_validation, data_profile)
                                 ),
                             )
                         except Exception as val_err:

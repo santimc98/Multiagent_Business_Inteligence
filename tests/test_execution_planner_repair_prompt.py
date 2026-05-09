@@ -131,6 +131,19 @@ class TestContractCompilerPromptProperties:
         prompt = MINIMAL_CONTRACT_COMPILER_PROMPT.lower()
         assert "schema" in prompt or "examples" in prompt
 
+    def test_requires_machine_checkable_artifact_interfaces(self):
+        prompt = MINIMAL_CONTRACT_COMPILER_PROMPT
+        assert "file_schemas" in prompt
+        assert "required_columns" in prompt
+        assert "required_keys_any_depth" in prompt
+        assert "python_interfaces" in prompt
+        assert "expected_functions" in prompt
+
+    def test_uses_semantic_cast_risk_context(self):
+        prompt = MINIMAL_CONTRACT_COMPILER_PROMPT
+        assert "COLUMN_SEMANTIC_CAST_RISK_PACK" in prompt
+        assert "Semantic cast coherence" in prompt
+
 
 # ── Integration tests (mock LLM) ─────────────────────────────────────────────
 
@@ -181,7 +194,7 @@ def test_contract_compile_prompt_uses_clean_support_context(monkeypatch):
 
     planner = ExecutionPlannerAgent(api_key="mock_key")
     planner.client = object()
-    planner._build_model_client = lambda _model_name: object()
+    planner._build_model_client = lambda _model_name, **_kwargs: object()
 
     semantic_payload = {
         "scope": "cleaning_only",

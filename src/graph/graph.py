@@ -225,6 +225,10 @@ from src.utils.data_quality_shape import (
     build_data_quality_shape_pack,
     summarize_data_quality_shape_pack,
 )
+from src.utils.semantic_cast_risk import (
+    build_column_semantic_cast_risk_pack,
+    summarize_column_semantic_cast_risk_pack,
+)
 from src.utils.feature_governance import (
     build_feature_governance_pack,
     summarize_feature_governance_pack,
@@ -3489,6 +3493,44 @@ def _build_senior_context_pack_usage_protocol(agent_role: str = "agent") -> str:
         "- Do not auto-drop columns, reject work, or invent contract gates solely because a pack raises a warning.\n"
         "- Deterministic pack facts prevent hallucination; the LLM remains responsible for the senior judgment."
     )
+
+
+def _attach_senior_context_packs_to_eval_spec(
+    evaluation_spec: Dict[str, Any] | None,
+    state: Dict[str, Any] | None,
+    *,
+    agent_role: str,
+) -> Dict[str, Any]:
+    enriched = dict(evaluation_spec) if isinstance(evaluation_spec, dict) else {}
+    state = state if isinstance(state, dict) else {}
+    enriched["senior_context_pack_usage_protocol"] = _build_senior_context_pack_usage_protocol(agent_role)
+    for key, path in (
+        ("data_quality_shape_pack", "data/data_quality_shape_pack.json"),
+        ("feature_governance_pack", "data/feature_governance_pack.json"),
+        ("model_dependency_context_pack", "data/model_dependency_context_pack.json"),
+        ("integration_card", "data/integration_card.json"),
+    ):
+        payload = state.get(key) if isinstance(state.get(key), dict) else None
+        if not isinstance(payload, dict) or not payload:
+            payload = _load_json_safe(path)
+        if isinstance(payload, dict) and payload:
+            enriched[key] = compress_long_lists(payload)[0]
+    for key, path in (
+        ("data_quality_shape_summary", "data/data_quality_shape_summary.txt"),
+        ("feature_governance_summary", "data/feature_governance_summary.txt"),
+        ("model_dependency_context_summary", "data/model_dependency_context_summary.txt"),
+        ("integration_card_summary", "data/integration_card_summary.txt"),
+    ):
+        value = state.get(key)
+        if not value and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    value = handle.read()
+            except Exception:
+                value = ""
+        if value:
+            enriched[key] = str(value)[:8000]
+    return enriched
 
 
 def _build_steward_facts_block(state: Dict[str, Any]) -> str:
@@ -7682,6 +7724,18 @@ def _extract_contract_artifact_issues(oc_report: Dict[str, Any] | None) -> Dict[
                 schema_issues.append(
                     "scored_rows.csv missing required any-of groups: " + "; ".join(fail_groups)
                 )
+
+        schema_interface_report = artifact_report.get("schema_interface_report")
+        if isinstance(schema_interface_report, dict):
+            for issue in schema_interface_report.get("issues") or []:
+                text = str(issue or "").strip()
+                if text and text not in schema_issues:
+                    schema_issues.append(text)
+
+    for issue in oc_report.get("schema_issues") or []:
+        text = str(issue or "").strip()
+        if text and text not in schema_issues:
+            schema_issues.append(text)
 
     return {"missing_paths": missing_paths, "schema_issues": schema_issues}
 
@@ -16521,6 +16575,76 @@ def _prune_stale_execution_hard_failures(
     return cleaned
 
 
+def _sanitize_stale_runtime_packet_for_current_success(
+    packet: Dict[str, Any] | None,
+    *,
+    runtime_ok: bool,
+    output_contract_report: Dict[str, Any] | None,
+    performance_gaps: List[Any] | None = None,
+) -> Dict[str, Any]:
+    normalized = dict(packet) if isinstance(packet, dict) else {}
+    if not normalized or not runtime_ok:
+        return normalized
+    oc_report = output_contract_report if isinstance(output_contract_report, dict) else {}
+    output_missing = bool(
+        oc_report.get("missing")
+        or oc_report.get("missing_required_artifacts")
+        or oc_report.get("blocking_qa_gate_failures")
+    )
+    if output_missing:
+        return normalized
+
+    runtime_tokens = ("runtime", "traceback", "exception", "crash", "sandbox", "dtype", "object columns")
+
+    def _is_stale_runtime_signal(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        return bool(text and any(token in text for token in runtime_tokens))
+
+    failed_gates = [
+        str(item)
+        for item in (normalized.get("failed_gates") or [])
+        if str(item).strip() and not _is_stale_runtime_signal(item)
+    ]
+    hard_failures = [
+        str(item)
+        for item in (normalized.get("hard_failures") or [])
+        if str(item).strip() and not _is_stale_runtime_signal(item)
+    ]
+    required_fixes = [
+        str(item)
+        for item in (normalized.get("required_fixes") or [])
+        if str(item).strip() and not _is_stale_runtime_signal(item)
+    ]
+    feedback = str(normalized.get("feedback") or "")
+    feedback_runtime_stale = _is_stale_runtime_signal(feedback)
+
+    performance_gaps = performance_gaps if isinstance(performance_gaps, list) else []
+    only_performance_remaining = bool(
+        failed_gates
+        and all(
+            is_performance_threshold_gap_reference(item, performance_gaps)
+            or _looks_performance_threshold_signal(item)
+            for item in failed_gates
+        )
+    )
+    if feedback_runtime_stale or len(failed_gates) != len(normalized.get("failed_gates") or []) or len(hard_failures) != len(normalized.get("hard_failures") or []):
+        normalized["stale_runtime_feedback_pruned"] = True
+        normalized["failed_gates"] = [] if only_performance_remaining else failed_gates
+        normalized["hard_failures"] = hard_failures
+        normalized["required_fixes"] = required_fixes
+        note = (
+            "STALE_RUNTIME_FEEDBACK_PRUNED: current deterministic runtime is OK and required artifacts are present; "
+            "older runtime/dtype failure text is comparison history only, not a current blocker."
+        )
+        normalized["feedback"] = note if feedback_runtime_stale else f"{feedback}\n{note}".strip()
+        if str(normalized.get("status") or "").strip().upper() == "NEEDS_IMPROVEMENT" and not hard_failures and (
+            not failed_gates or only_performance_remaining
+        ):
+            normalized["status"] = "APPROVE_WITH_WARNINGS"
+            normalized["retry_worth_it"] = False
+    return normalized
+
+
 def _prune_patch_objectives_for_repair_focus(
     patch_objectives: List[str] | None,
     *,
@@ -22104,6 +22228,29 @@ def run_execution_planner(state: AgentState) -> AgentState:
                     _shape_summary = ""
             if isinstance(_shape_pack, dict) and _shape_pack:
                 planner_data_profile["data_quality_shape_pack"] = compress_long_lists(_shape_pack)[0]
+            _cast_risk_pack = state.get("column_semantic_cast_risk_pack") if isinstance(state, dict) else None
+            if not isinstance(_cast_risk_pack, dict) or not _cast_risk_pack:
+                _cast_risk_pack = _load_json_safe(_abs_in_work(work_dir_abs, "data/column_semantic_cast_risk_pack.json"))
+            if not isinstance(_cast_risk_pack, dict) or not _cast_risk_pack:
+                _cast_risk_pack = build_column_semantic_cast_risk_pack(_shape_pack if isinstance(_shape_pack, dict) else {})
+            _cast_risk_summary = state.get("column_semantic_cast_risk_summary") if isinstance(state, dict) else ""
+            if not _cast_risk_summary:
+                try:
+                    with open(_abs_in_work(work_dir_abs, "data/column_semantic_cast_risk_summary.txt"), "r", encoding="utf-8") as _f_cast:
+                        _cast_risk_summary = _f_cast.read()
+                except Exception:
+                    _cast_risk_summary = summarize_column_semantic_cast_risk_pack(_cast_risk_pack)
+            if isinstance(_cast_risk_pack, dict) and _cast_risk_pack:
+                planner_data_profile["column_semantic_cast_risk_pack"] = compress_long_lists(_cast_risk_pack)[0]
+                state["column_semantic_cast_risk_pack"] = _cast_risk_pack
+                state["column_semantic_cast_risk_summary"] = _cast_risk_summary
+                try:
+                    os.makedirs(_abs_in_work(work_dir_abs, "data"), exist_ok=True)
+                    dump_json("data/column_semantic_cast_risk_pack.json", _cast_risk_pack)
+                    with open(_abs_in_work(work_dir_abs, "data/column_semantic_cast_risk_summary.txt"), "w", encoding="utf-8") as _f_cast_out:
+                        _f_cast_out.write(_cast_risk_summary or "")
+                except Exception:
+                    pass
             _feature_gov_pack = state.get("feature_governance_pack") if isinstance(state, dict) else None
             if not isinstance(_feature_gov_pack, dict) or not _feature_gov_pack:
                 _feature_gov_pack = _load_json_safe(_abs_in_work(work_dir_abs, "data/feature_governance_pack.json"))
@@ -22140,6 +22287,11 @@ def run_execution_planner(state: AgentState) -> AgentState:
                         "Use DATA_QUALITY_SHAPE_PACK as senior factual evidence for cleaning obligations and "
                         "review evidence requirements. It is advisory context only, not an automatic hard gate."
                     ),
+                    "semantic_cast_risk_policy": (
+                        "Use COLUMN_SEMANTIC_CAST_RISK_PACK to avoid declaring dtype targets or cleaning runbook "
+                        "steps that would erase boolean-like, labelled categorical, date-like, or mixed-format semantics. "
+                        "It is advisory context only; resolve conflicts by reasoning from observed values and contract intent."
+                    ),
                     "feature_governance_policy": (
                         "Use FEATURE_GOVERNANCE_PACK to design feature-selection obligations, reviewer evidence, "
                         "and reporting requirements around duplicate concepts, correlated variables, and dominance risk. "
@@ -22152,6 +22304,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
                     f"{data_summary}\n\n{_build_senior_context_pack_usage_protocol('execution_planner')}"
                     f"\n\nDATA_PROFILE_COMPACT_JSON:\n{compact_payload}"
                     f"\n\nDATA_QUALITY_SHAPE_PACK_SUMMARY:\n{_shape_summary or 'Not available.'}"
+                    f"\n\nCOLUMN_SEMANTIC_CAST_RISK_PACK_SUMMARY:\n{_cast_risk_summary or 'Not available.'}"
                     f"\n\nFEATURE_GOVERNANCE_PACK_SUMMARY:\n{_feature_gov_summary or 'Not available.'}"
                     f"\n\nPLANNER_SEMANTIC_CONTEXT_JSON:\n{semantic_payload}"
                 )
@@ -22884,6 +23037,23 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 )
         except Exception as shape_err:
             print(f"Warning: failed to load data_quality_shape_summary for Data Engineer: {shape_err}")
+        try:
+            cast_risk_summary = state.get("column_semantic_cast_risk_summary") if isinstance(state, dict) else ""
+            if not cast_risk_summary:
+                cast_risk_path = "data/column_semantic_cast_risk_summary.txt"
+                if os.path.exists(cast_risk_path):
+                    with open(cast_risk_path, "r", encoding="utf-8") as f_cast_risk:
+                        cast_risk_summary = f_cast_risk.read()
+            if cast_risk_summary:
+                data_engineer_audit_override = _merge_de_audit_override(
+                    data_engineer_audit_override,
+                    (
+                        "COLUMN_SEMANTIC_CAST_RISK_CONTEXT (ADVISORY FACTS; PRESERVE VALUE SEMANTICS, DO NOT AUTO-REJECT):\n"
+                        + str(cast_risk_summary)
+                    ),
+                )
+        except Exception as cast_risk_err:
+            print(f"Warning: failed to load column_semantic_cast_risk_summary for Data Engineer: {cast_risk_err}")
         try:
             feature_governance_summary = state.get("feature_governance_summary") if isinstance(state, dict) else ""
             if not feature_governance_summary:
@@ -27246,6 +27416,11 @@ def run_reviewer(state: AgentState) -> AgentState:
         reviewer_view if isinstance(reviewer_view, dict) else {},
         evaluation_spec if isinstance(evaluation_spec, dict) else None,
     )
+    evaluation_spec = _attach_senior_context_packs_to_eval_spec(
+        evaluation_spec,
+        state if isinstance(state, dict) else {},
+        agent_role="technical_reviewer",
+    )
     dataset_semantics_summary = state.get("dataset_semantics_summary")
     execution_profile = state.get("ml_execution_profile")
     if not isinstance(execution_profile, dict) or not execution_profile:
@@ -29575,6 +29750,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if governance_context:
         evaluation_spec_for_review = dict(evaluation_spec_for_review)
         evaluation_spec_for_review["governance_context"] = governance_context
+    evaluation_spec_for_review = _attach_senior_context_packs_to_eval_spec(
+        evaluation_spec_for_review,
+        state if isinstance(state, dict) else {},
+        agent_role="result_evaluator",
+    )
     evaluation_spec_for_review["metric_improvement_round_active"] = bool(metric_improvement_round_active)
     iteration_handoff_ctx = state.get("iteration_handoff")
     if isinstance(iteration_handoff_ctx, dict) and iteration_handoff_ctx:
@@ -31657,6 +31837,17 @@ def run_review_board(state: AgentState) -> AgentState:
             ),
             "gaps": performance_threshold_gaps,
         }
+    runtime_ok_for_board = str((board_context.get("runtime") or {}).get("status") or "").strip().upper() == "OK"
+    if runtime_ok_for_board:
+        for packet_key in ("result_evaluator", "reviewer", "qa_reviewer"):
+            packet = board_context.get(packet_key)
+            if isinstance(packet, dict):
+                board_context[packet_key] = _sanitize_stale_runtime_packet_for_current_success(
+                    packet,
+                    runtime_ok=True,
+                    output_contract_report=output_contract_facts,
+                    performance_gaps=performance_threshold_gaps,
+                )
     board_context["progress_tracker"] = _build_review_progress_tracker(state if isinstance(state, dict) else {})
     board_context["review_verdict_before_board"] = state.get("review_verdict")
     board_context["review_feedback_before_board"] = state.get("review_feedback")

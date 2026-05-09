@@ -163,6 +163,222 @@ def _normalize_rel_path(value: Any) -> str:
     return text
 
 
+def _iter_required_output_entries(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(contract, dict):
+        return []
+    entries: List[Dict[str, Any]] = []
+    active_workstreams = contract.get("active_workstreams") if isinstance(contract.get("active_workstreams"), dict) else {}
+    model_training_active = active_workstreams.get("model_training")
+
+    def _is_inactive_owner(owner: Any) -> bool:
+        owner_text = str(owner or "").strip().lower()
+        return owner_text == "ml_engineer" and model_training_active is False
+
+    raw = contract.get("required_outputs")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                if _is_inactive_owner(item.get("owner")):
+                    continue
+                path = item.get("path") or item.get("output") or item.get("artifact")
+                if path:
+                    entry = dict(item)
+                    entry["path"] = str(path)
+                    entries.append(entry)
+            elif item:
+                entries.append({"path": str(item), "required": True})
+    for section_name in ("data_engineer", "ml_engineer", "qa_reviewer", "reviewer", "business_translator"):
+        section = contract.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        raw_outputs = section.get("required_outputs")
+        if not isinstance(raw_outputs, list):
+            continue
+        if _is_inactive_owner(section_name):
+            continue
+        for item in raw_outputs:
+            if isinstance(item, dict):
+                path = item.get("path") or item.get("output") or item.get("artifact")
+                if path:
+                    entry = dict(item)
+                    entry["path"] = str(path)
+                    entry.setdefault("owner", section_name)
+                    entries.append(entry)
+            elif item:
+                entries.append({"path": str(item), "required": True, "owner": section_name})
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        path = _normalize_rel_path(entry.get("path"))
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        entry["path"] = path
+        deduped.append(entry)
+    return deduped
+
+
+def _code_tokens_from_text(text: Any) -> List[str]:
+    raw = str(text or "")
+    tokens: List[str] = []
+    for token in re.findall(r"`([^`]+)`", raw):
+        clean = token.strip()
+        if clean and clean not in tokens:
+            tokens.append(clean)
+    token_source = raw
+    match = re.search(
+        r"(?:columns?|fields?|outputs?|returns?)\s*(?:include|including|with|:)\s*([^.;\n]+)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        token_source = match.group(1)
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", token_source):
+        token_lower = token.lower()
+        if token_lower in {
+            "with",
+            "and",
+            "or",
+            "the",
+            "columns",
+            "column",
+            "path",
+            "file",
+            "model",
+            "function",
+            "include",
+            "including",
+            "returns",
+            "return",
+            "row",
+            "rows",
+            "holdout",
+            "scoring",
+            "partitions",
+            "probability",
+            "probabilities",
+            "level",
+            "levels",
+        }:
+            continue
+        if token.islower() and "_" not in token and not any(ch.isdigit() for ch in token):
+            continue
+        if token and token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _infer_artifact_schema_from_output(entry: Dict[str, Any]) -> Dict[str, Any]:
+    path = _normalize_rel_path(entry.get("path"))
+    if not path:
+        return {}
+    intent = str(entry.get("intent") or "").strip().lower()
+    kind = str(entry.get("kind") or "").strip().lower()
+    description = str(entry.get("description") or "")
+    text = " ".join([intent, kind, path.lower(), description])
+    lower = text.lower()
+    schema: Dict[str, Any] = {}
+
+    if path.lower().endswith(".csv"):
+        required_columns: List[str] = []
+        tokens = _code_tokens_from_text(description)
+        for token in tokens:
+            token_lower = token.lower()
+            if token_lower in {
+                "csv",
+                "json",
+                "row",
+                "rows",
+                "holdout",
+                "scoring",
+                "partitions",
+                "probability",
+                "probabilities",
+                "columns",
+            }:
+                continue
+            if "." in token or "/" in token or "\\" in token:
+                continue
+            if token not in required_columns:
+                required_columns.append(token)
+        if required_columns:
+            schema["required_columns"] = required_columns[:80]
+        if "probability columns" in lower or "probabilities" in lower or "proba" in lower:
+            schema["recommended_patterns"] = ["prob", "proba", "probability"]
+
+    elif path.lower().endswith(".json"):
+        required_keys: List[str] = []
+        if "p25" in lower:
+            required_keys.append("p25")
+        if "p75" in lower:
+            required_keys.append("p75")
+        if "mean" in lower:
+            required_keys.append("mean")
+        if "median" in lower:
+            required_keys.append("median")
+        if required_keys:
+            schema["required_keys_any_depth"] = list(dict.fromkeys(required_keys))
+
+    elif path.lower().endswith(".py"):
+        if "predict(" in lower or "predict(df_features" in lower:
+            schema["expected_functions"] = ["predict"]
+        return_columns: List[str] = []
+        for token in _code_tokens_from_text(description):
+            if token.startswith("riim") or token.endswith("_pred") or "pred" in token.lower() or "proba" in token.lower():
+                if token not in return_columns:
+                    return_columns.append(token)
+        if return_columns:
+            schema["expected_return_columns"] = return_columns[:40]
+    return schema
+
+
+def _hydrate_inferred_artifact_requirements(
+    contract: Dict[str, Any],
+    artifact_requirements: Dict[str, Any],
+) -> Dict[str, Any]:
+    hydrated = dict(artifact_requirements) if isinstance(artifact_requirements, dict) else {}
+    required_files = list(hydrated.get("required_files") or [])
+    file_schemas = dict(hydrated.get("file_schemas") or {})
+    python_interfaces = dict(hydrated.get("python_interfaces") or {})
+
+    existing_paths = {
+        _normalize_rel_path(item.get("path") if isinstance(item, dict) else item)
+        for item in required_files
+    }
+    for entry in _iter_required_output_entries(contract):
+        path = _normalize_rel_path(entry.get("path"))
+        if not path:
+            continue
+        if entry.get("required", True) is not False and path not in existing_paths:
+            required_files.append({"path": path, "required": True})
+            existing_paths.add(path)
+        inferred = _infer_artifact_schema_from_output(entry)
+        if not inferred:
+            continue
+        if path.lower().endswith(".py"):
+            existing = python_interfaces.get(path)
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            for key, value in inferred.items():
+                if key not in merged:
+                    merged[key] = value
+            python_interfaces[path] = merged
+        else:
+            existing = file_schemas.get(path)
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            for key, value in inferred.items():
+                if key not in merged:
+                    merged[key] = value
+            file_schemas[path] = merged
+
+    if required_files:
+        hydrated["required_files"] = required_files
+    if file_schemas:
+        hydrated["file_schemas"] = file_schemas
+    if python_interfaces:
+        hydrated["python_interfaces"] = python_interfaces
+    return hydrated
+
+
 def _extract_json_artifact_from_evidence(value: Any) -> Tuple[str, str]:
     text = _normalize_rel_path(value)
     lower = text.lower()
@@ -1103,6 +1319,154 @@ def check_csv_row_counts(
     }
 
 
+def _flatten_json_keys(payload: Any) -> set[str]:
+    keys: set[str] = set()
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            keys.add(str(key))
+            keys |= _flatten_json_keys(value)
+    elif isinstance(payload, list):
+        for item in payload[:200]:
+            keys |= _flatten_json_keys(item)
+    return keys
+
+
+def check_artifact_schema_interfaces(
+    file_schemas: Dict[str, Any],
+    python_interfaces: Dict[str, Any],
+    work_dir: str = ".",
+    dialect: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Produce advisory schema/interface facts for generated artifacts."""
+
+    checked: List[Dict[str, Any]] = []
+    issues: List[str] = []
+    warnings: List[str] = []
+    details: List[Dict[str, Any]] = []
+    sep = dialect.get("sep", ",") if isinstance(dialect, dict) else ","
+    encoding = dialect.get("encoding", "utf-8") if isinstance(dialect, dict) else "utf-8"
+
+    if isinstance(file_schemas, dict):
+        for raw_path, schema in file_schemas.items():
+            path = _normalize_rel_path(raw_path)
+            if not path or not isinstance(schema, dict):
+                continue
+            abs_path = os.path.join(work_dir, path)
+            if not os.path.exists(abs_path):
+                continue
+            if path.lower().endswith(".csv"):
+                required_columns = [str(c) for c in (schema.get("required_columns") or []) if str(c).strip()]
+                recommended_patterns = [str(c).lower() for c in (schema.get("recommended_patterns") or []) if str(c).strip()]
+                if not required_columns and not recommended_patterns:
+                    continue
+                try:
+                    import pandas as pd
+
+                    df_header = pd.read_csv(abs_path, nrows=0, sep=sep, encoding=encoding)
+                    actual = list(df_header.columns)
+                    actual_norm = {str(col).strip().lower(): str(col) for col in actual}
+                    missing = [col for col in required_columns if col.strip().lower() not in actual_norm]
+                    missing_patterns: List[str] = []
+                    actual_lower = [str(col).lower() for col in actual]
+                    for pattern in recommended_patterns:
+                        if not any(pattern in col for col in actual_lower):
+                            missing_patterns.append(pattern)
+                    item = {
+                        "path": path,
+                        "type": "csv_columns",
+                        "required_columns": required_columns,
+                        "missing_columns": missing,
+                        "missing_recommended_patterns": missing_patterns,
+                    }
+                    checked.append(item)
+                    if missing:
+                        issue = f"{path} missing required columns: {', '.join(missing)}"
+                        issues.append(issue)
+                        details.append({**item, "issue": issue})
+                    for pattern in missing_patterns:
+                        warning = f"{path} missing recommended column pattern containing '{pattern}'"
+                        warnings.append(warning)
+                        details.append({**item, "issue": warning, "severity": "advisory"})
+                except Exception as err:
+                    issue = f"{path} schema read error: {err}"
+                    issues.append(issue)
+                    details.append({"path": path, "type": "csv_columns", "issue": issue})
+            elif path.lower().endswith(".json"):
+                required_keys = [str(c) for c in (schema.get("required_keys_any_depth") or []) if str(c).strip()]
+                if not required_keys:
+                    continue
+                try:
+                    with open(abs_path, "r", encoding="utf-8") as handle:
+                        payload = json.load(handle)
+                    keys = _flatten_json_keys(payload)
+                    missing = [key for key in required_keys if key not in keys]
+                    item = {
+                        "path": path,
+                        "type": "json_keys_any_depth",
+                        "required_keys": required_keys,
+                        "missing_keys": missing,
+                    }
+                    checked.append(item)
+                    if missing:
+                        issue = f"{path} missing required JSON keys anywhere in artifact: {', '.join(missing)}"
+                        issues.append(issue)
+                        details.append({**item, "issue": issue})
+                except Exception as err:
+                    issue = f"{path} JSON schema read error: {err}"
+                    issues.append(issue)
+                    details.append({"path": path, "type": "json_keys_any_depth", "issue": issue})
+
+    if isinstance(python_interfaces, dict):
+        for raw_path, spec in python_interfaces.items():
+            path = _normalize_rel_path(raw_path)
+            if not path or not isinstance(spec, dict):
+                continue
+            abs_path = os.path.join(work_dir, path)
+            if not os.path.exists(abs_path):
+                continue
+            expected_functions = [str(c) for c in (spec.get("expected_functions") or []) if str(c).strip()]
+            expected_return_columns = [str(c) for c in (spec.get("expected_return_columns") or []) if str(c).strip()]
+            if not expected_functions and not expected_return_columns:
+                continue
+            try:
+                source = open(abs_path, "r", encoding="utf-8").read()
+                missing_functions = [
+                    fn for fn in expected_functions
+                    if not re.search(rf"(?m)^\s*def\s+{re.escape(fn)}\s*\(", source)
+                ]
+                missing_mentions = [col for col in expected_return_columns if col not in source]
+                item = {
+                    "path": path,
+                    "type": "python_interface",
+                    "expected_functions": expected_functions,
+                    "missing_functions": missing_functions,
+                    "expected_return_columns": expected_return_columns,
+                    "missing_return_column_mentions": missing_mentions,
+                }
+                checked.append(item)
+                if missing_functions:
+                    issue = f"{path} missing expected function(s): {', '.join(missing_functions)}"
+                    issues.append(issue)
+                    details.append({**item, "issue": issue})
+                if missing_mentions:
+                    issue = f"{path} missing expected return column mention(s): {', '.join(missing_mentions)}"
+                    issues.append(issue)
+                    details.append({**item, "issue": issue})
+            except Exception as err:
+                issue = f"{path} python interface read error: {err}"
+                issues.append(issue)
+                details.append({"path": path, "type": "python_interface", "issue": issue})
+
+    return {
+        "checked": checked,
+        "issues": issues,
+        "warnings": warnings,
+        "details": details,
+        "status": "warning" if issues or warnings else "ok",
+        "summary": f"Artifact schema/interface checks: {len(checked)}; issues={len(issues)}; warnings={len(warnings)}",
+    }
+
+
 def check_artifact_requirements(
     artifact_requirements: Dict[str, Any],
     work_dir: str = ".",
@@ -1146,6 +1510,7 @@ def check_artifact_requirements(
 
     files_report = check_required_outputs(file_paths)
     file_schemas = artifact_requirements.get("file_schemas", {})
+    python_interfaces = artifact_requirements.get("python_interfaces", {})
     dialect = get_csv_dialect(work_dir)
     selector_report = {
         "checked": [],
@@ -1161,6 +1526,12 @@ def check_artifact_requirements(
             dialect=dialect,
         )
     row_count_report = check_csv_row_counts(file_schemas, work_dir=work_dir, dialect=dialect)
+    schema_interface_report = check_artifact_schema_interfaces(
+        file_schemas if isinstance(file_schemas, dict) else {},
+        python_interfaces if isinstance(python_interfaces, dict) else {},
+        work_dir=work_dir,
+        dialect=dialect,
+    )
 
     # Check scored_rows schema
     scored_schema = artifact_requirements.get("scored_rows_schema", {})
@@ -1217,7 +1588,7 @@ def check_artifact_requirements(
         has_fail_severity = any(m["severity"] == "fail" for m in missing_with_severity)
         if has_fail_severity:
             status = "error"
-        elif missing_with_severity:
+        elif missing_with_severity or schema_interface_report.get("issues"):
             status = "warning"
         else:
             status = "ok"
@@ -1225,6 +1596,7 @@ def check_artifact_requirements(
     summary = (
         f"Files: {files_report.get('summary', 'N/A')}; "
         f"Rows: {row_count_report.get('summary', 'N/A')}; "
+        f"Artifact schemas: {schema_interface_report.get('summary', 'N/A')}; "
         f"Scored rows: {scored_rows_report.get('summary', 'N/A')}; "
         f"Subset selectors: {selector_report.get('summary', 'N/A')}"
     )
@@ -1233,6 +1605,7 @@ def check_artifact_requirements(
         "status": status,
         "files_report": files_report,
         "row_count_report": row_count_report,
+        "schema_interface_report": schema_interface_report,
         "selector_report": selector_report,
         "scored_rows_report": scored_rows_report,
         "summary": summary,
@@ -1279,6 +1652,10 @@ def build_output_contract_report(
 
     # 2) Check artifact requirements with schema validation
     artifact_req = get_artifact_requirements(contract) if isinstance(contract, dict) else {}
+    artifact_req = _hydrate_inferred_artifact_requirements(
+        contract if isinstance(contract, dict) else {},
+        artifact_req if isinstance(artifact_req, dict) else {},
+    )
     artifact_report = check_artifact_requirements(artifact_req, work_dir=work_dir, contract=contract)
 
     # 3) Evaluate artifact-backed numeric QA gates. These gates are contract
@@ -1318,6 +1695,12 @@ def build_output_contract_report(
         ]
     if qa_gate_report.get("warnings"):
         report["qa_gate_warnings"] = qa_gate_report.get("warnings") or []
+    schema_report = artifact_report.get("schema_interface_report") if isinstance(artifact_report, dict) else {}
+    if isinstance(schema_report, dict) and schema_report.get("issues"):
+        report["schema_issues"] = schema_report.get("issues") or []
+        report["schema_issue_details"] = schema_report.get("details") or []
+    if isinstance(schema_report, dict) and schema_report.get("warnings"):
+        report["schema_warnings"] = schema_report.get("warnings") or []
     if qa_gate_report.get("checked"):
         report["summary"] = (
             f"{report.get('summary') or ''} {qa_gate_report.get('summary') or ''}"
