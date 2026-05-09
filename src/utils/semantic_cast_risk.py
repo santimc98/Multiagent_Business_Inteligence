@@ -69,6 +69,11 @@ def _has_labelled_numeric_values(values: List[str]) -> bool:
         text = str(value or "").strip()
         if not text:
             continue
+        try:
+            float(text)
+            continue
+        except Exception:
+            pass
         has_digit = any(ch.isdigit() for ch in text)
         has_alpha = any(ch.isalpha() for ch in text)
         if has_digit and has_alpha:

@@ -57,3 +57,20 @@ def test_planner_semantic_cast_validator_warns_without_blocking():
     assert result["status"] == "warning"
     assert result["accepted"] is True
     assert result["issues"][0]["rule"].startswith("contract.column_semantic_cast.")
+
+
+def test_semantic_cast_risk_does_not_treat_scientific_notation_as_label():
+    pack = build_column_semantic_cast_risk_pack(
+        {
+            "column_facts": [
+                {
+                    "name": "ratio_feature",
+                    "type_hint": "numeric",
+                    "top_values": [{"value": "0"}, {"value": "1e-06"}, {"value": "2e-06"}],
+                }
+            ]
+        },
+        column_dtype_targets={"ratio_feature": {"target_dtype": "float64"}},
+    )
+
+    assert pack["risk_count"] == 0

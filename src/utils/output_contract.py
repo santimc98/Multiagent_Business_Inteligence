@@ -225,14 +225,17 @@ def _code_tokens_from_text(text: Any) -> List[str]:
         clean = token.strip()
         if clean and clean not in tokens:
             tokens.append(clean)
-    token_source = raw
-    match = re.search(
-        r"(?:columns?|fields?|outputs?|returns?)\s*(?:include|including|with|:)\s*([^.;\n]+)",
-        raw,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        token_source = match.group(1)
+    explicit_sources: List[str] = []
+    for pattern in (
+        r"(?:columns?|fields?|outputs?)\s*(?:include|including|:)\s*([^.;\n]+)",
+        r"\bwith\s+([^.;\n]+?)\s+columns?\b",
+        r"\breturns?\s+([^.;\n]+)",
+    ):
+        for match in re.finditer(pattern, raw, flags=re.IGNORECASE):
+            explicit_sources.append(match.group(1))
+    if not explicit_sources:
+        return tokens
+    token_source = ", ".join(explicit_sources)
     for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", token_source):
         token_lower = token.lower()
         if token_lower in {
@@ -281,7 +284,14 @@ def _infer_artifact_schema_from_output(entry: Dict[str, Any]) -> Dict[str, Any]:
 
     if path.lower().endswith(".csv"):
         required_columns: List[str] = []
-        tokens = _code_tokens_from_text(description)
+        has_explicit_column_contract = bool(
+            re.search(
+                r"(?:columns?|fields?|outputs?)\s*(?:include|including|:)|\bwith\s+[^.;\n]+?\s+columns?\b",
+                description,
+                flags=re.IGNORECASE,
+            )
+        )
+        tokens = _code_tokens_from_text(description) if has_explicit_column_contract else []
         for token in tokens:
             token_lower = token.lower()
             if token_lower in {
@@ -1399,7 +1409,13 @@ def check_artifact_schema_interfaces(
                     with open(abs_path, "r", encoding="utf-8") as handle:
                         payload = json.load(handle)
                     keys = _flatten_json_keys(payload)
-                    missing = [key for key in required_keys if key not in keys]
+                    key_lowers = {str(key).lower() for key in keys}
+                    missing = [
+                        key
+                        for key in required_keys
+                        if str(key).lower() not in key_lowers
+                        and not any(str(key).lower() in actual_key for actual_key in key_lowers)
+                    ]
                     item = {
                         "path": path,
                         "type": "json_keys_any_depth",
