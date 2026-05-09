@@ -221,6 +221,19 @@ from src.utils.data_atlas import (
     validate_steward_semantics,
     resolve_steward_target_reconsideration_candidate,
 )
+from src.utils.data_quality_shape import (
+    build_data_quality_shape_pack,
+    summarize_data_quality_shape_pack,
+)
+from src.utils.feature_governance import (
+    build_feature_governance_pack,
+    summarize_feature_governance_pack,
+)
+from src.utils.model_dependency_context import (
+    build_model_dependency_context_pack,
+    summarize_model_dependency_context_pack,
+)
+from src.utils.integration_card import build_integration_card, summarize_integration_card
 from src.utils.sandbox_paths import (
     CANONICAL_RAW_REL,
     CANONICAL_CLEANED_REL,
@@ -3459,7 +3472,23 @@ def _strip_run_facts_blocks(text: str) -> str:
 
 def _build_senior_summary_context(state: Dict[str, Any]) -> str:
     base = _strip_run_facts_blocks(str((state or {}).get("data_summary", "") or ""))
-    return _prepend_dataset_semantics_summary(base, state if isinstance(state, dict) else {})
+    enriched = _prepend_dataset_semantics_summary(base, state if isinstance(state, dict) else {})
+    protocol = _build_senior_context_pack_usage_protocol("strategist")
+    return f"{protocol}\n\n{enriched}" if enriched else protocol
+
+
+def _build_senior_context_pack_usage_protocol(agent_role: str = "agent") -> str:
+    role = str(agent_role or "agent").strip() or "agent"
+    return (
+        "SENIOR_CONTEXT_PACK_USAGE_PROTOCOL:\n"
+        f"- role: {role}\n"
+        "- Treat DATA_QUALITY_SHAPE_PACK and FEATURE_GOVERNANCE_PACK as senior factual evidence, not as automatic gates.\n"
+        "- Use them to reason about zero-vs-null semantics, dispersion, concentration, duplicate concepts, correlations, and dominance risk.\n"
+        "- If a signal is material to your task, reflect it in the plan, code, review, or narrative decision you own.\n"
+        "- If you intentionally do not act on a relevant signal, state the rationale in your output or feedback.\n"
+        "- Do not auto-drop columns, reject work, or invent contract gates solely because a pack raises a warning.\n"
+        "- Deterministic pack facts prevent hallucination; the LLM remains responsible for the senior judgment."
+    )
 
 
 def _build_steward_facts_block(state: Dict[str, Any]) -> str:
@@ -3648,6 +3677,10 @@ def _prepend_dataset_semantics_summary(text: str, state: Dict[str, Any]) -> str:
     column_sets_summary = state.get("column_sets_summary")
     column_manifest_summary = state.get("column_manifest_summary")
     data_atlas_summary = state.get("data_atlas_summary")
+    data_quality_shape_summary = state.get("data_quality_shape_summary")
+    feature_governance_summary = state.get("feature_governance_summary")
+    model_dependency_context_summary = state.get("model_dependency_context_summary")
+    integration_card_summary = state.get("integration_card_summary")
     combined = facts_block or ""
     if summary:
         combined = f"{combined}\n{summary}" if combined else summary
@@ -3657,6 +3690,14 @@ def _prepend_dataset_semantics_summary(text: str, state: Dict[str, Any]) -> str:
         combined = f"{combined}\n{column_manifest_summary}" if combined else column_manifest_summary
     if data_atlas_summary:
         combined = f"{combined}\n{data_atlas_summary}" if combined else data_atlas_summary
+    if data_quality_shape_summary:
+        combined = f"{combined}\n{data_quality_shape_summary}" if combined else data_quality_shape_summary
+    if feature_governance_summary:
+        combined = f"{combined}\n{feature_governance_summary}" if combined else feature_governance_summary
+    if model_dependency_context_summary:
+        combined = f"{combined}\n{model_dependency_context_summary}" if combined else model_dependency_context_summary
+    if integration_card_summary:
+        combined = f"{combined}\n{integration_card_summary}" if combined else integration_card_summary
     if not combined:
         return text
     if text:
@@ -10012,6 +10053,106 @@ def _load_json_safe(path: str) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _load_first_json_safe(*paths: str) -> Dict[str, Any]:
+    for path in paths:
+        payload = _load_json_safe(path)
+        if isinstance(payload, dict) and payload:
+            return payload
+    return {}
+
+
+def _build_model_dependency_context_from_state(state: Dict[str, Any] | None) -> Tuple[Dict[str, Any], str]:
+    state = state if isinstance(state, dict) else {}
+    work_dir = str(state.get("work_dir") or ".")
+    model_card = _load_first_json_safe(
+        "data/model_card.json",
+        "artifacts/model_card.json",
+        os.path.join("artifacts", "ml", "model_card.json"),
+        os.path.join("reports", "model_card.json"),
+        os.path.join(work_dir, "data", "model_card.json"),
+        os.path.join(work_dir, "artifacts", "model_card.json"),
+        os.path.join(work_dir, "artifacts", "ml", "model_card.json"),
+        os.path.join(work_dir, "reports", "model_card.json"),
+    )
+    metrics_payload = _load_first_json_safe(
+        "data/metrics.json",
+        "artifacts/metrics.json",
+        "artifacts/cv_metrics.json",
+        os.path.join("reports", "metrics.json"),
+        os.path.join(work_dir, "data", "metrics.json"),
+        os.path.join(work_dir, "artifacts", "metrics.json"),
+        os.path.join(work_dir, "artifacts", "cv_metrics.json"),
+        os.path.join(work_dir, "reports", "metrics.json"),
+    )
+    feature_governance_pack = (
+        state.get("feature_governance_pack")
+        if isinstance(state.get("feature_governance_pack"), dict)
+        else _load_json_safe("data/feature_governance_pack.json")
+    )
+    pack = build_model_dependency_context_pack(
+        model_card=model_card,
+        metrics_payload=metrics_payload,
+        feature_governance_pack=feature_governance_pack if isinstance(feature_governance_pack, dict) else {},
+    )
+    summary = summarize_model_dependency_context_pack(pack, max_lines=80)
+    return pack, summary
+
+
+def _build_integration_card_from_state(state: Dict[str, Any] | None) -> Tuple[Dict[str, Any], str]:
+    state = state if isinstance(state, dict) else {}
+    work_dir = str(state.get("work_dir") or ".")
+    contract = (
+        state.get("execution_contract")
+        if isinstance(state.get("execution_contract"), dict)
+        else _load_json_safe("data/execution_contract.json")
+    )
+    model_card = _load_first_json_safe(
+        "data/model_card.json",
+        "artifacts/model_card.json",
+        os.path.join("artifacts", "ml", "model_card.json"),
+        os.path.join("reports", "model_card.json"),
+        os.path.join(work_dir, "data", "model_card.json"),
+        os.path.join(work_dir, "artifacts", "model_card.json"),
+        os.path.join(work_dir, "artifacts", "ml", "model_card.json"),
+        os.path.join(work_dir, "reports", "model_card.json"),
+    )
+    metrics_payload = _load_first_json_safe(
+        "data/metrics.json",
+        "artifacts/metrics.json",
+        "artifacts/cv_metrics.json",
+        os.path.join("reports", "metrics.json"),
+        os.path.join(work_dir, "data", "metrics.json"),
+        os.path.join(work_dir, "artifacts", "metrics.json"),
+        os.path.join(work_dir, "artifacts", "cv_metrics.json"),
+        os.path.join(work_dir, "reports", "metrics.json"),
+    )
+    inference_benchmark = _load_first_json_safe(
+        "data/inference_benchmark.json",
+        "artifacts/inference_benchmark.json",
+        os.path.join("artifacts", "ml", "inference_benchmark.json"),
+        os.path.join(work_dir, "data", "inference_benchmark.json"),
+        os.path.join(work_dir, "artifacts", "inference_benchmark.json"),
+        os.path.join(work_dir, "artifacts", "ml", "inference_benchmark.json"),
+    )
+    model_dep = (
+        state.get("model_dependency_context_pack")
+        if isinstance(state.get("model_dependency_context_pack"), dict)
+        else _load_json_safe("data/model_dependency_context_pack.json")
+    )
+    artifact_index = state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else []
+    card = build_integration_card(
+        contract=contract if isinstance(contract, dict) else {},
+        model_card=model_card,
+        metrics_payload=metrics_payload,
+        inference_benchmark=inference_benchmark,
+        artifact_index=artifact_index,
+        model_dependency_context_pack=model_dep if isinstance(model_dep, dict) else {},
+        work_dir=work_dir,
+    )
+    summary = summarize_integration_card(card, max_lines=80)
+    return card, summary
 
 def _load_json_any(path: str) -> Any:
     if not path or not os.path.exists(path):
@@ -18237,6 +18378,14 @@ class AgentState(TypedDict):
     cleaned_data_summary_min_path: str
     data_atlas: Dict[str, Any]
     data_atlas_summary: str
+    data_quality_shape_pack: Dict[str, Any]
+    data_quality_shape_summary: str
+    feature_governance_pack: Dict[str, Any]
+    feature_governance_summary: str
+    model_dependency_context_pack: Dict[str, Any]
+    model_dependency_context_summary: str
+    integration_card: Dict[str, Any]
+    integration_card_summary: str
     steward_evidence_bundle: Dict[str, Any]
     steward_focus_context: Dict[str, Any]
     steward_focus_context_summary: str
@@ -18779,6 +18928,14 @@ def run_steward(state: AgentState) -> AgentState:
     column_manifest_summary = ""
     data_atlas = {}
     data_atlas_summary = ""
+    data_quality_shape_pack = {}
+    data_quality_shape_summary = ""
+    feature_governance_pack = {}
+    feature_governance_summary = ""
+    model_dependency_context_pack = {}
+    model_dependency_context_summary = ""
+    integration_card = {}
+    integration_card_summary = ""
     steward_evidence_bundle = {}
     steward_focus_context = {}
     steward_focus_context_summary = ""
@@ -18825,11 +18982,37 @@ def run_steward(state: AgentState) -> AgentState:
             column_sets=column_sets if isinstance(column_sets, dict) else {},
         )
         data_atlas_summary = summarize_data_atlas(data_atlas, max_columns=48, max_lines=90)
+        data_quality_shape_pack = build_data_quality_shape_pack(
+            profile_payload,
+            data_profile=state.get("data_profile") if isinstance(state, dict) else {},
+            data_atlas=data_atlas,
+        )
+        data_quality_shape_summary = summarize_data_quality_shape_pack(
+            data_quality_shape_pack,
+            max_columns=48,
+            max_lines=90,
+        )
+        feature_governance_pack = build_feature_governance_pack(
+            profile_payload,
+            data_profile=state.get("data_profile") if isinstance(state, dict) else {},
+            dataset_semantics=state.get("dataset_semantics") if isinstance(state, dict) else {},
+            column_sets=column_sets if isinstance(column_sets, dict) else {},
+        )
+        feature_governance_summary = summarize_feature_governance_pack(
+            feature_governance_pack,
+            max_lines=90,
+        )
         try:
             os.makedirs("data", exist_ok=True)
             dump_json("data/data_atlas.json", data_atlas)
             with open("data/data_atlas_summary.txt", "w", encoding="utf-8") as f_atlas:
                 f_atlas.write(data_atlas_summary or "")
+            dump_json("data/data_quality_shape_pack.json", data_quality_shape_pack)
+            with open("data/data_quality_shape_summary.txt", "w", encoding="utf-8") as f_shape:
+                f_shape.write(data_quality_shape_summary or "")
+            dump_json("data/feature_governance_pack.json", feature_governance_pack)
+            with open("data/feature_governance_summary.txt", "w", encoding="utf-8") as f_feature_gov:
+                f_feature_gov.write(feature_governance_summary or "")
         except Exception as atlas_err:
             print(f"Warning: failed to persist data_atlas artifacts: {atlas_err}")
 
@@ -18858,6 +19041,8 @@ def run_steward(state: AgentState) -> AgentState:
             "column_inventory_path": "data/column_inventory.json",
             "column_inventory_preview": header_preview,
             "data_atlas_summary": data_atlas_summary,
+            "data_quality_shape_summary": data_quality_shape_summary,
+            "feature_governance_summary": feature_governance_summary,
             "sample_rows": sample_payload,
         }
         pass1_result = steward.decide_semantics_pass1(steward_pass1_input)
@@ -18923,6 +19108,8 @@ def run_steward(state: AgentState) -> AgentState:
             "column_inventory_path": "data/column_inventory.json",
             "column_inventory_preview": header_preview,
             "data_atlas_summary": data_atlas_summary,
+            "data_quality_shape_summary": data_quality_shape_summary,
+            "feature_governance_summary": feature_governance_summary,
             "steward_focus_context": steward_focus_context_summary,
         }
         pass2_result = steward.decide_semantics_pass2(steward_pass2_input)
@@ -19021,6 +19208,8 @@ def run_steward(state: AgentState) -> AgentState:
                 "column_inventory_path": "data/column_inventory.json",
                 "column_inventory_preview": header_preview,
                 "data_atlas_summary": data_atlas_summary,
+                "data_quality_shape_summary": data_quality_shape_summary,
+                "feature_governance_summary": feature_governance_summary,
                 "steward_focus_context": reconsideration_focus_context_summary,
                 "reconsideration_note": reconsideration_note,
             }
@@ -19109,6 +19298,22 @@ def run_steward(state: AgentState) -> AgentState:
             print(f"Warning: failed to build column_manifest: {manifest_err}")
             column_manifest = {}
             column_manifest_summary = ""
+        try:
+            profile_payload_for_governance = result.get("profile") if isinstance(result, dict) else {}
+            if not isinstance(profile_payload_for_governance, dict):
+                profile_payload_for_governance = {}
+            feature_governance_pack = build_feature_governance_pack(
+                profile_payload_for_governance,
+                data_profile=state.get("data_profile") if isinstance(state, dict) else {},
+                dataset_semantics=dataset_semantics,
+                column_sets=column_sets,
+            )
+            feature_governance_summary = summarize_feature_governance_pack(
+                feature_governance_pack,
+                max_lines=90,
+            )
+        except Exception as feature_gov_err:
+            print(f"Warning: failed to refresh feature_governance_pack: {feature_gov_err}")
         steward_context_quality = validate_steward_semantics(
             dataset_semantics=dataset_semantics,
             dataset_training_mask=dataset_training_mask,
@@ -19130,6 +19335,10 @@ def run_steward(state: AgentState) -> AgentState:
             dump_json("data/steward_focus_context.json", steward_focus_context)
             dump_json("data/steward_semantics_quality.json", steward_context_quality)
             dump_json("data/steward_target_reconsideration.json", steward_target_reconsideration)
+            dump_json("data/feature_governance_pack.json", feature_governance_pack)
+            if feature_governance_summary:
+                with open("data/feature_governance_summary.txt", "w", encoding="utf-8") as f_feature_gov_summary:
+                    f_feature_gov_summary.write(feature_governance_summary)
             if steward_focus_context_summary:
                 with open("data/steward_focus_context_summary.txt", "w", encoding="utf-8") as f_focus_summary:
                     f_focus_summary.write(steward_focus_context_summary)
@@ -19174,6 +19383,10 @@ def run_steward(state: AgentState) -> AgentState:
         if isinstance(state, dict):
             state["data_atlas"] = data_atlas
             state["data_atlas_summary"] = data_atlas_summary
+            state["data_quality_shape_pack"] = data_quality_shape_pack
+            state["data_quality_shape_summary"] = data_quality_shape_summary
+            state["feature_governance_pack"] = feature_governance_pack
+            state["feature_governance_summary"] = feature_governance_summary
             state["steward_evidence_bundle"] = steward_evidence_bundle
             state["steward_focus_context"] = steward_focus_context
             state["steward_focus_context_summary"] = steward_focus_context_summary
@@ -19203,6 +19416,23 @@ def run_steward(state: AgentState) -> AgentState:
             "recommended_primary_target": (steward_context_quality or {}).get("recommended_primary_target", ""),
             "target_reconsideration_attempted": bool((steward_target_reconsideration or {}).get("attempted")),
             "target_reconsideration_accepted": bool((steward_target_reconsideration or {}).get("accepted")),
+            "data_quality_shape_signal_counts": (
+                ((data_quality_shape_pack or {}).get("shape_signals") or {}).get("counts", {})
+                if isinstance(data_quality_shape_pack, dict)
+                else {}
+            ),
+            "feature_governance_counts": {
+                "semantic_duplicate_groups": (
+                    len(((feature_governance_pack or {}).get("feature_governance_signals") or {}).get("semantic_duplicate_groups") or [])
+                    if isinstance(feature_governance_pack, dict)
+                    else 0
+                ),
+                "high_correlation_pairs": (
+                    len(((feature_governance_pack or {}).get("feature_governance_signals") or {}).get("high_correlation_pairs") or [])
+                    if isinstance(feature_governance_pack, dict)
+                    else 0
+                ),
+            },
         },
     )
     log_agent_snapshot(
@@ -19225,6 +19455,14 @@ def run_steward(state: AgentState) -> AgentState:
         "dataset_semantics_summary": dataset_semantics_summary,
         "data_atlas": data_atlas,
         "data_atlas_summary": data_atlas_summary,
+        "data_quality_shape_pack": data_quality_shape_pack,
+        "data_quality_shape_summary": data_quality_shape_summary,
+        "feature_governance_pack": feature_governance_pack,
+        "feature_governance_summary": feature_governance_summary,
+        "model_dependency_context_pack": model_dependency_context_pack,
+        "model_dependency_context_summary": model_dependency_context_summary,
+        "integration_card": integration_card,
+        "integration_card_summary": integration_card_summary,
         "steward_evidence_bundle": steward_evidence_bundle,
         "steward_target_reconsideration": steward_target_reconsideration,
         "steward_context_quality": steward_context_quality,
@@ -21854,6 +22092,30 @@ def run_execution_planner(state: AgentState) -> AgentState:
             if isinstance(_semantics_data, dict) and _semantics_data:
                 if not planner_data_profile.get("dataset_semantics"):
                     planner_data_profile["dataset_semantics"] = _semantics_data
+            _shape_pack = state.get("data_quality_shape_pack") if isinstance(state, dict) else None
+            if not isinstance(_shape_pack, dict) or not _shape_pack:
+                _shape_pack = _load_json_safe(_abs_in_work(work_dir_abs, "data/data_quality_shape_pack.json"))
+            _shape_summary = state.get("data_quality_shape_summary") if isinstance(state, dict) else ""
+            if not _shape_summary:
+                try:
+                    with open(_abs_in_work(work_dir_abs, "data/data_quality_shape_summary.txt"), "r", encoding="utf-8") as _f_shape:
+                        _shape_summary = _f_shape.read()
+                except Exception:
+                    _shape_summary = ""
+            if isinstance(_shape_pack, dict) and _shape_pack:
+                planner_data_profile["data_quality_shape_pack"] = compress_long_lists(_shape_pack)[0]
+            _feature_gov_pack = state.get("feature_governance_pack") if isinstance(state, dict) else None
+            if not isinstance(_feature_gov_pack, dict) or not _feature_gov_pack:
+                _feature_gov_pack = _load_json_safe(_abs_in_work(work_dir_abs, "data/feature_governance_pack.json"))
+            _feature_gov_summary = state.get("feature_governance_summary") if isinstance(state, dict) else ""
+            if not _feature_gov_summary:
+                try:
+                    with open(_abs_in_work(work_dir_abs, "data/feature_governance_summary.txt"), "r", encoding="utf-8") as _f_feature_gov:
+                        _feature_gov_summary = _f_feature_gov.read()
+                except Exception:
+                    _feature_gov_summary = ""
+            if isinstance(_feature_gov_pack, dict) and _feature_gov_pack:
+                planner_data_profile["feature_governance_pack"] = compress_long_lists(_feature_gov_pack)[0]
             compact_profile = compact_data_profile_for_llm(planner_data_profile)
             if compact_profile:
                 planner_semantic_context = {
@@ -21861,6 +22123,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
                     "conflict_resolution_priority": [
                         "DATA_PROFILE_COMPACT_JSON.temporal_normalization_facts",
                         "DATA_PROFILE_COMPACT_JSON.numeric_ranges_digest",
+                        "DATA_QUALITY_SHAPE_PACK.zero_null_concentration_dispersion_facts",
+                        "FEATURE_GOVERNANCE_PACK.semantic_duplicate_and_correlation_facts",
                         "dataset_semantics",
                         "strategy_text",
                     ],
@@ -21872,11 +22136,23 @@ def run_execution_planner(state: AgentState) -> AgentState:
                         "For datetime/date gates, distinguish raw CSV representation from canonical parsed "
                         "artifact properties; raw_unique_count is not a cleaned-artifact expected_unique_range."
                     ),
+                    "data_quality_shape_policy": (
+                        "Use DATA_QUALITY_SHAPE_PACK as senior factual evidence for cleaning obligations and "
+                        "review evidence requirements. It is advisory context only, not an automatic hard gate."
+                    ),
+                    "feature_governance_policy": (
+                        "Use FEATURE_GOVERNANCE_PACK to design feature-selection obligations, reviewer evidence, "
+                        "and reporting requirements around duplicate concepts, correlated variables, and dominance risk. "
+                        "It is advisory context only; the LLM must reason whether action is needed."
+                    ),
                 }
                 compact_payload = json.dumps(compact_profile, indent=2, ensure_ascii=False)
                 semantic_payload = json.dumps(planner_semantic_context, indent=2, ensure_ascii=False)
                 data_summary_for_planner = (
-                    f"{data_summary}\n\nDATA_PROFILE_COMPACT_JSON:\n{compact_payload}"
+                    f"{data_summary}\n\n{_build_senior_context_pack_usage_protocol('execution_planner')}"
+                    f"\n\nDATA_PROFILE_COMPACT_JSON:\n{compact_payload}"
+                    f"\n\nDATA_QUALITY_SHAPE_PACK_SUMMARY:\n{_shape_summary or 'Not available.'}"
+                    f"\n\nFEATURE_GOVERNANCE_PACK_SUMMARY:\n{_feature_gov_summary or 'Not available.'}"
                     f"\n\nPLANNER_SEMANTIC_CONTEXT_JSON:\n{semantic_payload}"
                 )
     except Exception:
@@ -22587,6 +22863,44 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     )
         except Exception as nr_err:
             print(f"Warning: failed to build numeric_ranges_summary: {nr_err}")
+        data_engineer_audit_override = _merge_de_audit_override(
+            data_engineer_audit_override,
+            _build_senior_context_pack_usage_protocol("data_engineer"),
+        )
+        try:
+            shape_summary = state.get("data_quality_shape_summary") if isinstance(state, dict) else ""
+            if not shape_summary:
+                shape_summary_path = "data/data_quality_shape_summary.txt"
+                if os.path.exists(shape_summary_path):
+                    with open(shape_summary_path, "r", encoding="utf-8") as f_shape:
+                        shape_summary = f_shape.read()
+            if shape_summary:
+                data_engineer_audit_override = _merge_de_audit_override(
+                    data_engineer_audit_override,
+                    (
+                        "DATA_QUALITY_SHAPE_CONTEXT (ADVISORY FACTS; DO NOT TREAT AS AUTOMATIC REJECTION GATES):\n"
+                        + str(shape_summary)
+                    ),
+                )
+        except Exception as shape_err:
+            print(f"Warning: failed to load data_quality_shape_summary for Data Engineer: {shape_err}")
+        try:
+            feature_governance_summary = state.get("feature_governance_summary") if isinstance(state, dict) else ""
+            if not feature_governance_summary:
+                feature_gov_path = "data/feature_governance_summary.txt"
+                if os.path.exists(feature_gov_path):
+                    with open(feature_gov_path, "r", encoding="utf-8") as f_feature_gov:
+                        feature_governance_summary = f_feature_gov.read()
+            if feature_governance_summary:
+                data_engineer_audit_override = _merge_de_audit_override(
+                    data_engineer_audit_override,
+                    (
+                        "FEATURE_GOVERNANCE_CONTEXT (ADVISORY FACTS; PRESERVE CONCEPT LINEAGE, DO NOT AUTO-DROP):\n"
+                        + str(feature_governance_summary)
+                    ),
+                )
+        except Exception as feature_gov_err:
+            print(f"Warning: failed to load feature_governance_summary for Data Engineer: {feature_gov_err}")
 
     required_cols = []
     required_raw_map = {}
@@ -26355,6 +26669,67 @@ def run_engineer(state: AgentState) -> AgentState:
                     log_run_event(run_id, "ml_context_ops_preview", {"preview": ops_preview})
             except Exception as ops_err:
                 print(f"Warning: failed to persist ml_engineer_context_ops.txt: {ops_err}")
+        if not minimal_context_mode:
+            data_audit_context = _merge_de_audit_override(
+                data_audit_context,
+                _build_senior_context_pack_usage_protocol("ml_engineer"),
+            )
+            try:
+                shape_summary = state.get("data_quality_shape_summary") if isinstance(state, dict) else ""
+                if not shape_summary:
+                    shape_summary_path = "data/data_quality_shape_summary.txt"
+                    if os.path.exists(shape_summary_path):
+                        with open(shape_summary_path, "r", encoding="utf-8") as f_shape:
+                            shape_summary = f_shape.read()
+                if shape_summary:
+                    data_audit_context = _merge_de_audit_override(
+                        data_audit_context,
+                        (
+                            "DATA_QUALITY_SHAPE_CONTEXT (ADVISORY FEATURE ROBUSTNESS FACTS; "
+                            "DO NOT TREAT AS AUTOMATIC QA FAILURE):\n"
+                            + str(shape_summary)
+                        ),
+                    )
+            except Exception as shape_err:
+                print(f"Warning: failed to load data_quality_shape_summary for ML Engineer: {shape_err}")
+            try:
+                feature_governance_summary = state.get("feature_governance_summary") if isinstance(state, dict) else ""
+                if not feature_governance_summary:
+                    feature_gov_path = "data/feature_governance_summary.txt"
+                    if os.path.exists(feature_gov_path):
+                        with open(feature_gov_path, "r", encoding="utf-8") as f_feature_gov:
+                            feature_governance_summary = f_feature_gov.read()
+                if feature_governance_summary:
+                    data_audit_context = _merge_de_audit_override(
+                        data_audit_context,
+                        (
+                            "FEATURE_GOVERNANCE_CONTEXT (ADVISORY FEATURE-SELECTION FACTS; "
+                            "DO NOT AUTO-DROP WITHOUT SENIOR RATIONALE):\n"
+                            + str(feature_governance_summary)
+                        ),
+                    )
+            except Exception as feature_gov_err:
+                print(f"Warning: failed to load feature_governance_summary for ML Engineer: {feature_gov_err}")
+            try:
+                model_dependency_context_pack, model_dependency_context_summary = _build_model_dependency_context_from_state(
+                    state if isinstance(state, dict) else {}
+                )
+                state["model_dependency_context_pack"] = model_dependency_context_pack
+                state["model_dependency_context_summary"] = model_dependency_context_summary
+                os.makedirs("data", exist_ok=True)
+                dump_json("data/model_dependency_context_pack.json", model_dependency_context_pack)
+                with open("data/model_dependency_context_summary.txt", "w", encoding="utf-8") as f_model_dep:
+                    f_model_dep.write(model_dependency_context_summary or "")
+                if model_dependency_context_summary:
+                    data_audit_context = _merge_de_audit_override(
+                        data_audit_context,
+                        (
+                            "MODEL_DEPENDENCY_OBSERVABILITY_CONTEXT (ADVISORY; EMIT FEATURES_USED AND IMPORTANCES WHEN FEASIBLE):\n"
+                            + str(model_dependency_context_summary)
+                        ),
+                    )
+            except Exception as model_dep_err:
+                print(f"Warning: failed to build model_dependency_context for ML Engineer: {model_dep_err}")
         data_audit_context = _truncate_text(data_audit_context)
         iteration_memory_block = _truncate_text(iteration_memory_block, max_len=6000, head_len=3500, tail_len=2000)
         kwargs["data_audit_context"] = data_audit_context
@@ -26375,6 +26750,40 @@ def run_engineer(state: AgentState) -> AgentState:
                     contract=execution_contract,
                     analysis_type=analysis_type,
                 )
+                shape_pack = state.get("data_quality_shape_pack") if isinstance(state, dict) else None
+                if not isinstance(shape_pack, dict) or not shape_pack:
+                    shape_pack = _load_json_safe("data/data_quality_shape_pack.json")
+                if isinstance(compact_profile, dict) and isinstance(shape_pack, dict) and shape_pack:
+                    compact_profile["data_quality_shape_pack"] = compress_long_lists(shape_pack)[0]
+                feature_governance_pack = state.get("feature_governance_pack") if isinstance(state, dict) else None
+                try:
+                    dataset_profile_for_feature_gov = (
+                        state.get("dataset_profile")
+                        if isinstance(state.get("dataset_profile"), dict)
+                        else _load_json_safe("data/dataset_profile.json")
+                    )
+                    if isinstance(data_profile, dict) and data_profile:
+                        feature_governance_pack = build_feature_governance_pack(
+                            dataset_profile_for_feature_gov if isinstance(dataset_profile_for_feature_gov, dict) else {},
+                            data_profile=data_profile,
+                            dataset_semantics=state.get("dataset_semantics") if isinstance(state.get("dataset_semantics"), dict) else {},
+                            column_sets=state.get("column_sets") if isinstance(state.get("column_sets"), dict) else {},
+                        )
+                        state["feature_governance_pack"] = feature_governance_pack
+                        state["feature_governance_summary"] = summarize_feature_governance_pack(feature_governance_pack, max_lines=90)
+                        os.makedirs("data", exist_ok=True)
+                        dump_json("data/feature_governance_pack.json", feature_governance_pack)
+                        with open("data/feature_governance_summary.txt", "w", encoding="utf-8") as f_feature_gov:
+                            f_feature_gov.write(state.get("feature_governance_summary") or "")
+                except Exception as feature_gov_refresh_err:
+                    print(f"Warning: failed to refresh feature_governance_pack for ML plan: {feature_gov_refresh_err}")
+                if not isinstance(feature_governance_pack, dict) or not feature_governance_pack:
+                    feature_governance_pack = _load_json_safe("data/feature_governance_pack.json")
+                if isinstance(compact_profile, dict) and isinstance(feature_governance_pack, dict) and feature_governance_pack:
+                    compact_profile["feature_governance_pack"] = compress_long_lists(feature_governance_pack)[0]
+                model_dependency_pack = state.get("model_dependency_context_pack") if isinstance(state, dict) else None
+                if isinstance(compact_profile, dict) and isinstance(model_dependency_pack, dict) and model_dependency_pack:
+                    compact_profile["model_dependency_context_pack"] = compress_long_lists(model_dependency_pack)[0]
 
                 ml_plan = ml_engineer.generate_ml_plan(
                     data_profile=compact_profile,
@@ -27223,7 +27632,52 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                      ml_plan_for_qa = _load_json_safe("data/ml_plan.json")
                  qa_context["evaluation_spec"]["ml_plan"] = ml_plan_for_qa or {}
                  qa_context["evaluation_spec"]["data_profile"] = state.get("data_profile") or {}
+                 qa_context["evaluation_spec"]["senior_context_pack_usage_protocol"] = (
+                     _build_senior_context_pack_usage_protocol("qa_reviewer")
+                 )
+                 qa_context["evaluation_spec"]["data_quality_shape_pack"] = (
+                     state.get("data_quality_shape_pack")
+                     or _load_json_safe("data/data_quality_shape_pack.json")
+                     or {}
+                 )
+                 qa_context["evaluation_spec"]["feature_governance_pack"] = (
+                     state.get("feature_governance_pack")
+                     or _load_json_safe("data/feature_governance_pack.json")
+                     or {}
+                 )
+                 model_dependency_context_pack, model_dependency_context_summary = _build_model_dependency_context_from_state(
+                     state if isinstance(state, dict) else {}
+                 )
+                 state["model_dependency_context_pack"] = model_dependency_context_pack
+                 state["model_dependency_context_summary"] = model_dependency_context_summary
+                 os.makedirs("data", exist_ok=True)
+                 dump_json("data/model_dependency_context_pack.json", model_dependency_context_pack)
+                 with open("data/model_dependency_context_summary.txt", "w", encoding="utf-8") as f_model_dep:
+                     f_model_dep.write(model_dependency_context_summary or "")
+                 qa_context["evaluation_spec"]["model_dependency_context_pack"] = model_dependency_context_pack or {}
+                 integration_card, integration_card_summary = _build_integration_card_from_state(
+                     state if isinstance(state, dict) else {}
+                 )
+                 state["integration_card"] = integration_card
+                 state["integration_card_summary"] = integration_card_summary
+                 dump_json("data/integration_card.json", integration_card)
+                 with open("data/integration_card_summary.txt", "w", encoding="utf-8") as f_integration_card:
+                     f_integration_card.write(integration_card_summary or "")
+                 qa_context["evaluation_spec"]["integration_card"] = integration_card or {}
                  qa_context["evaluation_spec"]["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings") or {}
+        data_quality_shape_summary = state.get("data_quality_shape_summary")
+        qa_context["senior_context_pack_usage_protocol"] = _build_senior_context_pack_usage_protocol("reviewer_stack")
+        if data_quality_shape_summary:
+            qa_context["data_quality_shape_summary"] = data_quality_shape_summary
+        feature_governance_summary = state.get("feature_governance_summary")
+        if feature_governance_summary:
+            qa_context["feature_governance_summary"] = feature_governance_summary
+        model_dependency_context_summary = state.get("model_dependency_context_summary")
+        if model_dependency_context_summary:
+            qa_context["model_dependency_context_summary"] = model_dependency_context_summary
+        integration_card_summary = state.get("integration_card_summary")
+        if integration_card_summary:
+            qa_context["integration_card_summary"] = integration_card_summary
         dataset_semantics_summary = state.get("dataset_semantics_summary")
         if dataset_semantics_summary:
             qa_context["dataset_semantics_summary"] = dataset_semantics_summary
@@ -29727,7 +30181,52 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     else:
         qa_context = {"_contract_source": "fallback"}
     if isinstance(qa_context, dict):
+        qa_context["senior_context_pack_usage_protocol"] = _build_senior_context_pack_usage_protocol("qa_reviewer")
         qa_context["qa_gates"] = get_qa_gates(review_contract) if isinstance(review_contract, dict) else []
+        qa_context["data_quality_shape_pack"] = (
+            state.get("data_quality_shape_pack")
+            or _load_json_safe("data/data_quality_shape_pack.json")
+            or {}
+        )
+        qa_context["feature_governance_pack"] = (
+            state.get("feature_governance_pack")
+            or _load_json_safe("data/feature_governance_pack.json")
+            or {}
+        )
+        try:
+            model_dependency_context_pack, model_dependency_context_summary = _build_model_dependency_context_from_state(
+                state if isinstance(state, dict) else {}
+            )
+            state["model_dependency_context_pack"] = model_dependency_context_pack
+            state["model_dependency_context_summary"] = model_dependency_context_summary
+            os.makedirs("data", exist_ok=True)
+            dump_json("data/model_dependency_context_pack.json", model_dependency_context_pack)
+            with open("data/model_dependency_context_summary.txt", "w", encoding="utf-8") as f_model_dep:
+                f_model_dep.write(model_dependency_context_summary or "")
+            qa_context["model_dependency_context_pack"] = model_dependency_context_pack or {}
+        except Exception:
+            pass
+        try:
+            integration_card, integration_card_summary = _build_integration_card_from_state(
+                state if isinstance(state, dict) else {}
+            )
+            state["integration_card"] = integration_card
+            state["integration_card_summary"] = integration_card_summary
+            os.makedirs("data", exist_ok=True)
+            dump_json("data/integration_card.json", integration_card)
+            with open("data/integration_card_summary.txt", "w", encoding="utf-8") as f_integration_card:
+                f_integration_card.write(integration_card_summary or "")
+            qa_context["integration_card"] = integration_card or {}
+        except Exception:
+            pass
+        if state.get("data_quality_shape_summary"):
+            qa_context["data_quality_shape_summary"] = state.get("data_quality_shape_summary")
+        if state.get("feature_governance_summary"):
+            qa_context["feature_governance_summary"] = state.get("feature_governance_summary")
+        if state.get("model_dependency_context_summary"):
+            qa_context["model_dependency_context_summary"] = state.get("model_dependency_context_summary")
+        if state.get("integration_card_summary"):
+            qa_context["integration_card_summary"] = state.get("integration_card_summary")
     ml_data_path = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
     if ml_data_path:
         qa_context["ml_data_path"] = ml_data_path
@@ -34828,6 +35327,9 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "experiment_tracker": tracker_entries,
         "round_history": round_history[-8:],
         "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
+        "data_quality_shape_pack": state.get("data_quality_shape_pack") if isinstance(state.get("data_quality_shape_pack"), dict) else {},
+        "feature_governance_pack": state.get("feature_governance_pack") if isinstance(state.get("feature_governance_pack"), dict) else {},
+        "model_dependency_context_pack": state.get("model_dependency_context_pack") if isinstance(state.get("model_dependency_context_pack"), dict) else {},
         "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
         "optimization_blueprint": optimization_blueprint if isinstance(optimization_blueprint, dict) else {},
         "optimization_policy": resolve_optimization_policy(contract),
@@ -36610,7 +37112,7 @@ def _sync_review_board_verdict_after_metric_round(
         final_entry_review
         and _is_approved_review_status(final_entry_review)
         and (
-            (loop_selection_label in {"best_attempt", "incumbent"} and not _is_approved_review_status(final_verdict))
+            (loop_selection_label in {"baseline", "best_attempt", "incumbent"} and not _is_approved_review_status(final_verdict))
             or (board_kept and loop_selection_label and board_kept != loop_selection_label)
             or (
                 board_final_metric is not None
@@ -36653,7 +37155,20 @@ def _sync_review_board_verdict_after_metric_round(
     payload["status"] = final_verdict
     payload["final_review_verdict"] = final_verdict
     payload["candidate_assessment_status"] = candidate_assessment_status
-    payload["runtime_fix_terminal"] = bool(state.get("runtime_fix_terminal"))
+    output_contract = _load_json_safe("data/output_contract_report.json")
+    restored_baseline_contract_ok = bool(
+        kept == "baseline"
+        and isinstance(output_contract, dict)
+        and str(output_contract.get("overall_status") or "").strip().lower() in {"ok", "pass", "passed"}
+        and not output_contract.get("missing")
+        and not output_contract.get("blocking_qa_gate_failures")
+        and not output_contract.get("qa_gate_failures")
+    )
+    payload["runtime_fix_terminal"] = (
+        False if restored_baseline_contract_ok else bool(state.get("runtime_fix_terminal"))
+    )
+    if restored_baseline_contract_ok and _is_approved_review_status(final_verdict):
+        deterministic_blockers = False
     if kept == "baseline":
         payload["deterministic_blockers"] = [
             str(item)

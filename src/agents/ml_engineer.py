@@ -4137,6 +4137,16 @@ class MLEngineerAgent:
         *** BUSINESS OBJECTIVE ***
         "$business_objective"
 
+        *** SENIOR CONTEXT PACK USAGE ***
+        If data_profile contains data_quality_shape_pack, feature_governance_pack, or model_dependency_context_pack:
+        - Treat them as senior advisory evidence, not deterministic gates.
+        - Use data quality shape facts to choose preprocessing, validation robustness, and estimator compatibility.
+        - Use feature governance facts to reason about duplicate concepts, correlated variables, source dependency,
+          dominance risk, and what should be modeled vs audited/explained.
+        - If a signal materially affects the ML plan, reflect it in metric_policy, cv_policy, leakage_policy,
+          evidence_used, assumptions, or notes.
+        - If you intentionally ignore a material signal, record why.
+
         *** REASONING TASK ***
         Infer the safest and most executable plan for:
         - which rows are trainable,
@@ -4898,6 +4908,18 @@ class MLEngineerAgent:
         - Exclude forbidden_for_modeling and audit_only_features from model inputs.
         - Never hardcode dataset-specific column names.
         - For wide datasets, prefer column selectors/column_sets when available.
+
+        SENIOR CONTEXT PACK USAGE
+        - If Data Audit Context contains DATA_QUALITY_SHAPE_CONTEXT, FEATURE_GOVERNANCE_CONTEXT, or
+          MODEL_DEPENDENCY_OBSERVABILITY_CONTEXT, use those sections as senior advisory evidence.
+        - Use data quality shape facts to choose preprocessing that respects missingness, zero-vs-null
+          semantics, dispersion, concentration, and estimator compatibility.
+        - Use feature governance facts to reason about duplicate concepts, correlated variables, source
+          dependency, and whether a feature should be modeled, audited, grouped, regularized, or explained.
+        - Use model dependency facts to emit traceability artifacts and avoid silent dominance by one feature,
+          family, or data source when the business objective makes that risky.
+        - These packs are not hard gates and do not authorize blind column dropping. If you act on a signal,
+          connect it to the contract, ML plan, or observed data. If you ignore a material signal, document why.
 
         VISUALS AND DECISIONING
         - If the ml_engineer_runbook requests diagnostic plots, generate them as matplotlib/seaborn PNGs.

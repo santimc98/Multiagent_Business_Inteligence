@@ -1493,6 +1493,18 @@ class QAReviewerAgent:
         - HARD_BLOCKER_PACKET (JSON): $hard_blocker_packet_json
         - Metric Improvement Round Active: $metric_round_active
         - Augmentation Requested (from hypothesis/plan): $augmentation_requested
+
+        SENIOR CONTEXT PACK USAGE:
+        - If QA Context contains data_quality_shape_pack, feature_governance_pack, model_dependency_context_pack,
+          integration_card, summaries, or senior_context_pack_usage_protocol, use them as advisory evidence.
+        - These packs help you reason like a senior QA reviewer about missingness, zero-vs-null semantics,
+          dispersion, concentration, duplicate concepts, correlated variables, dominance risk, integration
+          readiness, and traceability.
+        - They are not extra gates. Do not fail a candidate solely because a context pack raises a warning
+          unless the issue violates an active QA Gate or proves a concrete correctness/safety failure.
+        - If a pack signal is material but not gate-failing, include it as warning/actionable feedback.
+        - If you approve despite a material pack signal, explain briefly why it is handled, out of scope,
+          or unsupported by the current evidence.
         
         INSTRUCTIONS:
         - Analyze the code regions that matter for the active gates and supplied evidence.

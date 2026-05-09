@@ -1296,9 +1296,11 @@ def build_dataset_profile(
                     "mean": float(numeric.mean()),
                     "std": float(numeric.std()),
                     "min": float(numeric.min()),
+                    "p01": float(numeric.quantile(0.01)),
                     "q25": float(numeric.quantile(0.25)),
                     "median": float(numeric.median()),
                     "q75": float(numeric.quantile(0.75)),
+                    "p99": float(numeric.quantile(0.99)),
                     "max": float(numeric.max()),
                 }
             )

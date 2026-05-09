@@ -759,6 +759,20 @@ class ReviewerAgent:
         - Execution Diagnostics (JSON): $execution_diagnostics_json
         - Deterministic Prechecks (JSON): $deterministic_prechecks_json
         - HARD_BLOCKER_PACKET (JSON): $hard_blocker_packet_json
+
+        ### SENIOR CONTEXT PACK USAGE
+        - If evaluation_spec or reviewer_view contains data_quality_shape_pack, feature_governance_pack,
+          model_dependency_context_pack, integration_card, or senior_context_pack_usage_protocol, use them
+          as evidence to reason about material risks.
+        - These packs are advisory facts, not extra reviewer gates. Do not reject solely because a pack
+          contains a warning unless the issue also violates an ACTIVE_REVIEWER_GATE or proves a critical
+          correctness/safety failure with concrete evidence.
+        - Use data quality facts to assess whether the implementation handled missingness, zero-vs-null,
+          dispersion, and concentration risks relevant to the chosen method.
+        - Use feature governance and model dependency facts to assess duplicate concepts, correlations,
+          source dependency, feature dominance, and whether the code/report provides enough traceability.
+        - If you approve despite a material pack signal, explain why the signal is handled, out of scope,
+          or not supported by the current evidence.
         
         ### CRITERIA FOR APPROVAL (QUALITY FIRST PRINCIPLES)
 

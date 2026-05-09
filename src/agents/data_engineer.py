@@ -1506,6 +1506,16 @@ class DataEngineerAgent:
         4) EXECUTION_CONTRACT_CONTEXT resolves ties when DE_VIEW is silent.
         5) DATA AUDIT and STRATEGY are supporting context, not permission to ignore gates.
 
+        SENIOR CONTEXT PACK USAGE:
+        - If DATA AUDIT includes DATA_QUALITY_SHAPE_CONTEXT or FEATURE_GOVERNANCE_CONTEXT, treat it as
+          senior factual evidence for this cleaning plan.
+        - Use data quality shape facts to reason about zero-vs-null semantics, dispersion, concentration,
+          placeholder values, and whether transformations preserve business signal.
+        - Use feature governance facts to preserve concept lineage and avoid accidental loss of duplicated
+          or correlated business concepts needed downstream.
+        - These packs are advisory context, not automatic rejection/drop rules. If you act on a signal,
+          tie the action to deliverables/gates/evidence. If you do not act, record why.
+
         REASONING WORKFLOW:
         1. Enumerate every owned deliverable and the concrete evidence needed to write it.
         2. Inspect raw column profiles for nulls, date formats, numeric formats, cardinality, and placeholders.
@@ -2296,6 +2306,9 @@ class DataEngineerAgent:
             "example_values_sample, numeric_format_requires_normalization), and what the actual cardinality "
             "and value distribution is (check unique_count, top_values). If DATA_SAMPLE_CONTEXT is unavailable, "
             "reason from COLUMN_RESOLUTION_CONTEXT and DATA AUDIT instead of guessing hidden raw patterns. "
+            "If DATA AUDIT contains DATA_QUALITY_SHAPE_CONTEXT or FEATURE_GOVERNANCE_CONTEXT, use it as "
+            "advisory senior evidence: preserve zero-vs-null semantics, avoid erasing concentrated values "
+            "without rationale, and preserve concept lineage unless the contract/evidence justifies exclusion. "
             "Treat dtype targets as downstream goals that must be justified by evidence, not as blind coercion instructions. "
             "For each parsing step, mentally verify that your approach will not inflate nulls "
             "beyond the raw null_pct shown in the profile or erase mixed semantics that the context still treats as signal. "

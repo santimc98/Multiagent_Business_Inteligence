@@ -1080,7 +1080,15 @@ class StrategistAgent:
                     context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
                 ),
             },
+            "senior_context_pack_usage_protocol": (
+                "Use data_quality_shape_pack, feature_governance_pack, and model_dependency_context_pack as "
+                "advisory evidence for hypothesis selection. They are not a mandatory queue or automatic gates; "
+                "if a material signal drives or is ignored by the hypothesis, explain why."
+            ),
         }
+        for key in ("data_quality_shape_pack", "feature_governance_pack", "model_dependency_context_pack"):
+            if isinstance(context.get(key), dict) and context.get(key):
+                llm_context[key] = context.get(key)
         if blueprint_actions:
             llm_context["optimization_blueprint_actions"] = blueprint_actions[:6]
 
@@ -1104,8 +1112,9 @@ class StrategistAgent:
             "search-space issue, calibration problem, or no credible next move.\n"
             "2. Use critique_packet, round_history, experiment_tracker, and dataset_profile_signals to decide whether to exploit the incumbent's strongest signal, pivot away from repeated regressions, or stop.\n"
             "3. Choose the single highest-ROI next hypothesis for THIS context, balancing expected lift, compute cost, and recent regressions.\n"
-            "4. Prefer the cheapest valid experiment that meaningfully tests the idea.\n"
-            "5. Do not repeat a duplicate hypothesis signature. If every credible option is duplicate or low-value, emit NO_OP.\n\n"
+            "4. Use senior context packs to reason about data quality, duplicate/correlated concepts, and feature/source dominance when material.\n"
+            "5. Prefer the cheapest valid experiment that meaningfully tests the idea.\n"
+            "6. Do not repeat a duplicate hypothesis signature. If every credible option is duplicate or low-value, emit NO_OP.\n\n"
             "Rules:\n"
             "- Exactly one hypothesis; action APPLY or NO_OP.\n"
             "- If duplicate signature then action must be NO_OP.\n"
@@ -2096,6 +2105,19 @@ $payload_json
         5) Generic data science patterns are advisory only and must never override the current run context
         6) If free-text narrative conflicts with STEWARD_FACTS, DATASET_SEMANTICS_SUMMARY, or COLUMN METADATA,
            the structured facts win. Do not blend contradictory rules into a compromise.
+
+        *** SENIOR CONTEXT PACK USAGE ***
+        If DATA_QUALITY_SHAPE_PACK, FEATURE_GOVERNANCE_PACK, or SENIOR_CONTEXT_PACK_USAGE_PROTOCOL appear
+        inside DATASET SUMMARY, use them as senior factual evidence for strategy design.
+        - Use data quality shape signals to reason about zero-vs-null semantics, dispersion, concentration,
+          missingness, and robustness risks.
+        - Use feature governance signals to reason about duplicate concepts, correlated features,
+          source dependency, and dominance risk.
+        - These packs are advisory context, not deterministic rules. Do not auto-drop columns or impose hard
+          gates solely because a pack raises a warning.
+        - If a signal materially affects the recommended strategy, reflect it in required_columns,
+          audit_only_columns, validation_rationale, feasibility_analysis, or fallback_chain.
+        - If you choose not to act on a material signal, state why in reasoning.
 
         *** DATASET SUMMARY ***
         $data_summary

@@ -24,6 +24,18 @@ from src.utils.csv_dialect import (
 )
 from src.utils.dataset_semantics import build_target_lineage_summary
 from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
+from src.utils.business_impact_context import (
+    build_business_impact_context_pack,
+    summarize_business_impact_context_pack,
+)
+from src.utils.report_narrative_contract import (
+    build_report_narrative_contract,
+    summarize_report_narrative_contract,
+)
+from src.utils.senior_context_orchestrator import (
+    build_senior_context_manifest,
+    summarize_senior_context_manifest,
+)
 
 
 def _detect_primary_language(text: str, preferred_language: Optional[str] = None) -> str:
@@ -4696,6 +4708,7 @@ def _build_outline_prompt(
     executive_decision_label: str,
     facts_block: Dict[str, Any],
     reporting_policy_context: Dict[str, Any],
+    report_narrative_contract: Dict[str, Any] | None = None,
     evidence_paths: List[str],
     execution_results: str,
     abort_info: Optional[Dict[str, Any]] = None,
@@ -4741,6 +4754,9 @@ Reasoning workflow:
 FACTS_BLOCK:
 $facts_block_json
 
+REPORT_NARRATIVE_CONTRACT:
+$report_narrative_contract_json
+
 reporting_policy:
 $reporting_policy_json
 
@@ -4770,6 +4786,7 @@ Return JSON with this schema:
         target_language_code=target_language_code,
         executive_decision_label=executive_decision_label,
         facts_block_json=json.dumps(facts_block, ensure_ascii=False),
+        report_narrative_contract_json=json.dumps(report_narrative_contract or {}, ensure_ascii=False),
         reporting_policy_json=json.dumps(reporting_policy_context or {}, ensure_ascii=False),
         evidence_paths=evidence_paths_text,
         execution_results=str(execution_results or "")[:12000],
@@ -5046,6 +5063,104 @@ class BusinessTranslatorAgent:
             or _safe_load_json(os.path.join("work", "artifacts", "data_profile.json"))
             or {}
         )
+        data_quality_shape_pack = (
+            state.get("data_quality_shape_pack") if isinstance(state.get("data_quality_shape_pack"), dict) else None
+        ) or (
+            _safe_load_json("data/data_quality_shape_pack.json")
+            or _safe_load_json(os.path.join(work_dir, "data", "data_quality_shape_pack.json"))
+            or _safe_load_json(os.path.join("work", "data", "data_quality_shape_pack.json"))
+            or {}
+        )
+        data_quality_shape_summary = str(state.get("data_quality_shape_summary") or "")
+        if not data_quality_shape_summary:
+            for _shape_summary_path in (
+                "data/data_quality_shape_summary.txt",
+                os.path.join(work_dir, "data", "data_quality_shape_summary.txt"),
+                os.path.join("work", "data", "data_quality_shape_summary.txt"),
+            ):
+                try:
+                    with open(_shape_summary_path, "r", encoding="utf-8") as _f_shape_summary:
+                        data_quality_shape_summary = _f_shape_summary.read()
+                    if data_quality_shape_summary:
+                        break
+                except Exception:
+                    continue
+        data_quality_shape_prompt = data_quality_shape_pack
+        if isinstance(data_quality_shape_pack, dict) and isinstance(data_quality_shape_pack.get("column_facts"), list):
+            data_quality_shape_prompt = dict(data_quality_shape_pack)
+            data_quality_shape_prompt["column_facts"] = [
+                item
+                for item in data_quality_shape_pack.get("column_facts", [])
+                if isinstance(item, dict) and item.get("advisory_warnings")
+            ][:40]
+        feature_governance_pack = (
+            state.get("feature_governance_pack") if isinstance(state.get("feature_governance_pack"), dict) else None
+        ) or (
+            _safe_load_json("data/feature_governance_pack.json")
+            or _safe_load_json(os.path.join(work_dir, "data", "feature_governance_pack.json"))
+            or _safe_load_json(os.path.join("work", "data", "feature_governance_pack.json"))
+            or {}
+        )
+        feature_governance_summary = str(state.get("feature_governance_summary") or "")
+        if not feature_governance_summary:
+            for _feature_gov_summary_path in (
+                "data/feature_governance_summary.txt",
+                os.path.join(work_dir, "data", "feature_governance_summary.txt"),
+                os.path.join("work", "data", "feature_governance_summary.txt"),
+            ):
+                try:
+                    with open(_feature_gov_summary_path, "r", encoding="utf-8") as _f_feature_gov_summary:
+                        feature_governance_summary = _f_feature_gov_summary.read()
+                    if feature_governance_summary:
+                        break
+                except Exception:
+                    continue
+        model_dependency_context_pack = (
+            state.get("model_dependency_context_pack")
+            if isinstance(state.get("model_dependency_context_pack"), dict)
+            else None
+        ) or (
+            _safe_load_json("data/model_dependency_context_pack.json")
+            or _safe_load_json(os.path.join(work_dir, "data", "model_dependency_context_pack.json"))
+            or _safe_load_json(os.path.join("work", "data", "model_dependency_context_pack.json"))
+            or {}
+        )
+        model_dependency_context_summary = str(state.get("model_dependency_context_summary") or "")
+        if not model_dependency_context_summary:
+            for _model_dep_summary_path in (
+                "data/model_dependency_context_summary.txt",
+                os.path.join(work_dir, "data", "model_dependency_context_summary.txt"),
+                os.path.join("work", "data", "model_dependency_context_summary.txt"),
+            ):
+                try:
+                    with open(_model_dep_summary_path, "r", encoding="utf-8") as _f_model_dep_summary:
+                        model_dependency_context_summary = _f_model_dep_summary.read()
+                    if model_dependency_context_summary:
+                        break
+                except Exception:
+                    continue
+        integration_card = (
+            state.get("integration_card") if isinstance(state.get("integration_card"), dict) else None
+        ) or (
+            _safe_load_json("data/integration_card.json")
+            or _safe_load_json(os.path.join(work_dir, "data", "integration_card.json"))
+            or _safe_load_json(os.path.join("work", "data", "integration_card.json"))
+            or {}
+        )
+        integration_card_summary = str(state.get("integration_card_summary") or "")
+        if not integration_card_summary:
+            for _integration_summary_path in (
+                "data/integration_card_summary.txt",
+                os.path.join(work_dir, "data", "integration_card_summary.txt"),
+                os.path.join("work", "data", "integration_card_summary.txt"),
+            ):
+                try:
+                    with open(_integration_summary_path, "r", encoding="utf-8") as _f_integration_summary:
+                        integration_card_summary = _f_integration_summary.read()
+                    if integration_card_summary:
+                        break
+                except Exception:
+                    continue
         dataset_semantics = (
             _safe_load_json("data/dataset_semantics.json")
             or _safe_load_json(os.path.join(work_dir, "data", "dataset_semantics.json"))
@@ -5647,12 +5762,31 @@ class BusinessTranslatorAgent:
             governance_contradiction_packet=governance_contradiction_packet,
             decision_discrepancy=decision_discrepancy,
         )
+        business_impact_context_pack = build_business_impact_context_pack(
+            business_objective=business_objective,
+            executive_decision_label=executive_decision_label,
+            run_summary=run_summary if isinstance(run_summary, dict) else {},
+            metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
+            data_adequacy_report=data_adequacy_report if isinstance(data_adequacy_report, dict) else {},
+            case_alignment_report=case_alignment_report if isinstance(case_alignment_report, dict) else {},
+            integration_card=integration_card if isinstance(integration_card, dict) else {},
+            model_dependency_context_pack=model_dependency_context_pack if isinstance(model_dependency_context_pack, dict) else {},
+            feature_governance_pack=feature_governance_pack if isinstance(feature_governance_pack, dict) else {},
+        )
+        business_impact_context_summary = summarize_business_impact_context_pack(
+            business_impact_context_pack,
+            max_lines=80,
+        )
         try:
             os.makedirs("data", exist_ok=True)
             with open("data/governance_contradiction_packet.json", "w", encoding="utf-8") as f_contradictions:
                 json.dump(governance_contradiction_packet or {}, f_contradictions, indent=2, ensure_ascii=False)
             with open("data/stale_or_rejected_history.json", "w", encoding="utf-8") as f_history:
                 json.dump(stale_or_rejected_history or {}, f_history, indent=2, ensure_ascii=False)
+            with open("data/business_impact_context_pack.json", "w", encoding="utf-8") as f_biz_impact:
+                json.dump(business_impact_context_pack or {}, f_biz_impact, indent=2, ensure_ascii=False)
+            with open("data/business_impact_context_summary.txt", "w", encoding="utf-8") as f_biz_impact_summary:
+                f_biz_impact_summary.write(business_impact_context_summary or "")
         except Exception:
             pass
 
@@ -5711,6 +5845,61 @@ class BusinessTranslatorAgent:
                 if isinstance(item, dict)
             ][:6]
 
+        report_narrative_contract = build_report_narrative_contract(
+            data_quality_shape_pack=data_quality_shape_pack if isinstance(data_quality_shape_pack, dict) else {},
+            feature_governance_pack=feature_governance_pack if isinstance(feature_governance_pack, dict) else {},
+            model_dependency_context_pack=model_dependency_context_pack if isinstance(model_dependency_context_pack, dict) else {},
+            integration_card=integration_card if isinstance(integration_card, dict) else {},
+            business_impact_context_pack=business_impact_context_pack if isinstance(business_impact_context_pack, dict) else {},
+            qa_review_signals=qa_review_signals,
+        )
+        report_narrative_contract_summary = summarize_report_narrative_contract(report_narrative_contract)
+        senior_context_manifest = build_senior_context_manifest(
+            packs={
+                "data_quality_shape_pack": data_quality_shape_pack if isinstance(data_quality_shape_pack, dict) else {},
+                "feature_governance_pack": feature_governance_pack if isinstance(feature_governance_pack, dict) else {},
+                "model_dependency_context_pack": model_dependency_context_pack if isinstance(model_dependency_context_pack, dict) else {},
+                "integration_card": integration_card if isinstance(integration_card, dict) else {},
+                "business_impact_context_pack": business_impact_context_pack if isinstance(business_impact_context_pack, dict) else {},
+                "report_narrative_contract": report_narrative_contract if isinstance(report_narrative_contract, dict) else {},
+            },
+            summaries={
+                "data_quality_shape_summary": data_quality_shape_summary,
+                "feature_governance_summary": feature_governance_summary,
+                "model_dependency_context_summary": model_dependency_context_summary,
+                "integration_card_summary": integration_card_summary,
+                "business_impact_context_summary": business_impact_context_summary,
+                "report_narrative_contract_summary": report_narrative_contract_summary,
+            },
+        )
+        senior_context_manifest_summary = summarize_senior_context_manifest(senior_context_manifest)
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/report_narrative_contract.json", "w", encoding="utf-8") as f_narrative_contract:
+                json.dump(report_narrative_contract or {}, f_narrative_contract, indent=2, ensure_ascii=False)
+            with open("data/report_narrative_contract_summary.txt", "w", encoding="utf-8") as f_narrative_summary:
+                f_narrative_summary.write(report_narrative_contract_summary or "")
+            with open("data/senior_context_manifest.json", "w", encoding="utf-8") as f_context_manifest:
+                json.dump(senior_context_manifest or {}, f_context_manifest, indent=2, ensure_ascii=False)
+            with open("data/senior_context_manifest_summary.txt", "w", encoding="utf-8") as f_context_manifest_summary:
+                f_context_manifest_summary.write(senior_context_manifest_summary or "")
+        except Exception:
+            pass
+
+        feature_governance_signal_payload = (
+            (feature_governance_pack or {}).get("feature_governance_signals") or {}
+            if isinstance(feature_governance_pack, dict)
+            else {}
+        )
+        feature_governance_counts = {
+            "semantic_duplicate_groups": len(
+                feature_governance_signal_payload.get("semantic_duplicate_groups") or []
+            ),
+            "high_correlation_pairs": len(
+                feature_governance_signal_payload.get("high_correlation_pairs") or []
+            ),
+        }
+
         facts_block = {
             "executive_decision_label": executive_decision_label,
             "authoritative_run_outcome": run_outcome_token,
@@ -5724,6 +5913,57 @@ class BusinessTranslatorAgent:
             "strategy_title": strategy_title,
             "review_verdict": review_verdict or compliance,
             "steward_signal_pack": steward_signal_pack,
+            "data_quality_shape_signals": {
+                "role": (data_quality_shape_pack or {}).get("role") if isinstance(data_quality_shape_pack, dict) else None,
+                "signal_counts": (
+                    ((data_quality_shape_pack or {}).get("shape_signals") or {}).get("counts", {})
+                    if isinstance(data_quality_shape_pack, dict)
+                    else {}
+                ),
+                "summary": data_quality_shape_summary[:4000] if data_quality_shape_summary else "",
+            },
+            "feature_governance_signals": {
+                "role": (feature_governance_pack or {}).get("role") if isinstance(feature_governance_pack, dict) else None,
+                "summary": feature_governance_summary[:5000] if feature_governance_summary else "",
+                "counts": feature_governance_counts,
+            },
+            "model_dependency_signals": {
+                "role": (model_dependency_context_pack or {}).get("role") if isinstance(model_dependency_context_pack, dict) else None,
+                "summary": model_dependency_context_summary[:5000] if model_dependency_context_summary else "",
+                "signals": (
+                    (model_dependency_context_pack or {}).get("model_dependency_signals") or {}
+                    if isinstance(model_dependency_context_pack, dict)
+                    else {}
+                ),
+            },
+            "integration_card": {
+                "role": (integration_card or {}).get("role") if isinstance(integration_card, dict) else None,
+                "summary": integration_card_summary[:5000] if integration_card_summary else "",
+                "input_contract": (integration_card or {}).get("input_contract", {}) if isinstance(integration_card, dict) else {},
+                "execution_contract": (integration_card or {}).get("execution_contract", {}) if isinstance(integration_card, dict) else {},
+                "output_contract": (integration_card or {}).get("output_contract", {}) if isinstance(integration_card, dict) else {},
+            },
+            "business_impact_context": {
+                "role": (business_impact_context_pack or {}).get("role") if isinstance(business_impact_context_pack, dict) else None,
+                "summary": business_impact_context_summary[:5000] if business_impact_context_summary else "",
+                "decision_context": (
+                    (business_impact_context_pack or {}).get("decision_context", {})
+                    if isinstance(business_impact_context_pack, dict)
+                    else {}
+                ),
+                "business_caveats": (
+                    (business_impact_context_pack or {}).get("business_caveats", [])[:10]
+                    if isinstance(business_impact_context_pack, dict)
+                    else []
+                ),
+                "operational_examples": (
+                    (business_impact_context_pack or {}).get("operational_examples", [])[:6]
+                    if isinstance(business_impact_context_pack, dict)
+                    else []
+                ),
+            },
+            "report_narrative_contract": report_narrative_contract,
+            "senior_context_manifest": senior_context_manifest,
             "target_lineage": target_lineage_summary,
             "data_adequacy": {
                 "status": (data_adequacy_report or {}).get("status"),
@@ -5763,6 +6003,20 @@ class BusinessTranslatorAgent:
             "slot_payloads": slot_payloads,
             "slot_coverage": slot_coverage_context,
             "steward_signal_pack": steward_signal_pack,
+            "data_quality_shape_pack": data_quality_shape_prompt if isinstance(data_quality_shape_prompt, dict) else {},
+            "data_quality_shape_summary": data_quality_shape_summary[:8000] if data_quality_shape_summary else "",
+            "feature_governance_pack": feature_governance_pack if isinstance(feature_governance_pack, dict) else {},
+            "feature_governance_summary": feature_governance_summary[:8000] if feature_governance_summary else "",
+            "model_dependency_context_pack": model_dependency_context_pack if isinstance(model_dependency_context_pack, dict) else {},
+            "model_dependency_context_summary": model_dependency_context_summary[:8000] if model_dependency_context_summary else "",
+            "integration_card": integration_card if isinstance(integration_card, dict) else {},
+            "integration_card_summary": integration_card_summary[:8000] if integration_card_summary else "",
+            "business_impact_context_pack": business_impact_context_pack if isinstance(business_impact_context_pack, dict) else {},
+            "business_impact_context_summary": business_impact_context_summary[:8000] if business_impact_context_summary else "",
+            "report_narrative_contract": report_narrative_contract,
+            "report_narrative_contract_summary": report_narrative_contract_summary[:8000] if report_narrative_contract_summary else "",
+            "senior_context_manifest": senior_context_manifest,
+            "senior_context_manifest_summary": senior_context_manifest_summary[:8000] if senior_context_manifest_summary else "",
             "target_lineage": target_lineage_summary,
             "steward_context": steward_context,
             "cleaning_context": cleaning_context,
@@ -6098,8 +6352,28 @@ RECOMMENDED ACTIONS
   that is not explicit in the artifacts, make it clear that it is your
   recommendation rather than an established outcome of the run.
 
+NARRATIVE COVERAGE CONTRACT
+- REPORT_NARRATIVE_CONTRACT lists evidence-backed topics that are material to
+  this run: data quality characterization, feature governance, model dependency,
+  integration readiness, business impact, and QA caveats when present.
+- Use it as a coverage checklist while preserving your freedom over section
+  order and wording. If a required topic has evidence and is material, cover it
+  explicitly in the narrative. If it is immaterial, say so briefly or omit it
+  only when that omission does not hide a decision-relevant caveat.
+- Do not manufacture conclusions. For each topic, use the source pack named in
+  the contract and separate fact, cautious inference, and recommendation.
+- SENIOR_CONTEXT_MANIFEST is a regression guard for context availability. If it
+  reports missing packs, role mismatches, or non-advisory policies, treat that as
+  a transparency caveat about the report context, not as a model-quality failure.
+
 === FACTS (do not alter values) ===
 $facts_block_json
+
+=== REPORT NARRATIVE CONTRACT ===
+$report_narrative_contract_json
+
+=== SENIOR CONTEXT MANIFEST ===
+$senior_context_manifest_json
 
 === TRANSLATOR EVIDENCE LEDGER (claim grounding source of truth) ===
 $evidence_ledger_json
@@ -6234,6 +6508,8 @@ $execution_results
             "target_language_name": target_language_name,
             "target_language_code": target_language_code,
             "facts_block_json": json.dumps(facts_block, ensure_ascii=False),
+            "report_narrative_contract_json": json.dumps(report_narrative_contract, ensure_ascii=False),
+            "senior_context_manifest_json": json.dumps(senior_context_manifest, ensure_ascii=False),
             "evidence_ledger_json": evidence_ledger_prompt_json,
             "run_narrative_section": run_narrative_section,
             "post_mortem_directive": post_mortem_directive,
@@ -6285,6 +6561,7 @@ $execution_results
                 executive_decision_label=executive_decision_label,
                 facts_block=facts_block,
                 reporting_policy_context=reporting_policy_context if isinstance(reporting_policy_context, dict) else {},
+                report_narrative_contract=report_narrative_contract,
                 evidence_paths=evidence_paths,
                 execution_results=execution_results,
                 abort_info=abort_info if abort_info else None,
