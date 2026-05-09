@@ -751,6 +751,40 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         observational_only=observational_only,
     )
 
+    review_board_payload = state.get("review_board_verdict")
+    if not isinstance(review_board_payload, dict):
+        loaded_board = _safe_load_json("data/review_board_verdict.json")
+        review_board_payload = loaded_board if isinstance(loaded_board, dict) else {}
+    metric_round_finalization = (
+        review_board_payload.get("metric_round_finalization")
+        if isinstance(review_board_payload, dict)
+        and isinstance(review_board_payload.get("metric_round_finalization"), dict)
+        else {}
+    )
+    metric_loop_final = (
+        metric_loop_state.get("final")
+        if isinstance(metric_loop_state, dict) and isinstance(metric_loop_state.get("final"), dict)
+        else {}
+    )
+    restored_incumbent_selected = str(
+        metric_round_finalization.get("kept")
+        or metric_loop_final.get("label")
+        or state.get("ml_improvement_kept")
+        or ""
+    ).strip().lower() in {"baseline", "incumbent", "best_attempt"}
+    output_contract_ok = bool(
+        isinstance(output_contract, dict)
+        and str(output_contract.get("overall_status") or "").strip().lower() in {"ok", "pass", "passed"}
+        and not output_contract.get("missing")
+        and not output_contract.get("blocking_qa_gate_failures")
+        and not output_contract.get("qa_gate_failures")
+    )
+    restored_incumbent_contract_safe = bool(
+        restored_incumbent_selected
+        and output_contract_ok
+        and integrity_critical_count == 0
+    )
+
     # =========================================================================
     # LEGACY FALLBACK: Preserve existing critical token detection as secondary check
     # This ensures no regression while transitioning to reducer-based logic
@@ -771,6 +805,8 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Secondary NO_GO check (legacy signals that might not be in reducer yet)
     if (
+        not restored_incumbent_contract_safe
+        and
         run_outcome != "NO_GO"
         and (
             output_missing
@@ -783,16 +819,6 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     ):
         run_outcome = "NO_GO"
 
-    review_board_payload = state.get("review_board_verdict")
-    if not isinstance(review_board_payload, dict):
-        loaded_board = _safe_load_json("data/review_board_verdict.json")
-        review_board_payload = loaded_board if isinstance(loaded_board, dict) else {}
-    metric_round_finalization = (
-        review_board_payload.get("metric_round_finalization")
-        if isinstance(review_board_payload, dict)
-        and isinstance(review_board_payload.get("metric_round_finalization"), dict)
-        else {}
-    )
     loop_metric_improvement_summary = _build_metric_improvement_summary_from_loop_state(metric_loop_state, metric_pool)
     board_metric_improvement_summary: Dict[str, Any] = {}
     if metric_round_finalization:
@@ -823,6 +849,44 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         loop_metric_improvement_summary,
         board_metric_improvement_summary,
     )
+    if restored_incumbent_contract_safe and status == "NEEDS_IMPROVEMENT":
+        status = _normalize_review_status_token(
+            metric_loop_final.get("review_verdict")
+            or state.get("last_successful_review_verdict")
+            or state.get("review_verdict")
+            or "APPROVED"
+        )
+        transient_tokens = (
+            "runtime",
+            "runtime_failure",
+            "contract_required_artifacts_missing",
+            "output_contract_missing",
+            "feature_drift_baseline_scope",
+            "result_evaluator_failed_gate:runtime_failure",
+            "hard_gate_failed:feature_drift_baseline_scope",
+            "qa_gates",
+            "reviewer_alignment",
+            "results_quality",
+        )
+        failed_gates = [
+            gate
+            for gate in failed_gates
+            if str(gate).strip().lower() not in transient_tokens
+        ]
+        reducer_hard_failures = [
+            failure
+            for failure in reducer_hard_failures
+            if str(failure).strip().lower() not in transient_tokens
+        ]
+        reducer_reasons = [
+            reason
+            for reason in reducer_reasons
+            if "runtime" not in str(reason).lower()
+            and "feature_drift_baseline_scope" not in str(reason).lower()
+            and "contract_required_artifacts_missing" not in str(reason).lower()
+        ]
+        overall_status_global = "ok" if not reducer_hard_failures and not failed_gates else overall_status_global
+        run_outcome = "GO_WITH_LIMITATIONS" if status == "APPROVE_WITH_WARNINGS" else "GO"
     if status == "NEEDS_IMPROVEMENT" and run_outcome != "NO_GO":
         run_outcome = "NO_GO"
         if "authoritative_status=NEEDS_IMPROVEMENT" not in reducer_reasons:

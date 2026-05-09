@@ -439,9 +439,58 @@ def _resolve_explicit_primary_metric(metrics_json: Dict[str, Any], metric_name: 
     return {}
 
 
+def _resolve_validation_scoped_metric(metrics_json: Dict[str, Any], metric_name: str) -> Dict[str, Any]:
+    """Prefer metrics measured on the validation/holdout split over ambiguous aliases.
+
+    Some generated reports expose both `holdout.qwk` and a top-level
+    `primary_metric_value`. The latter is not trustworthy unless its evaluation
+    scope is explicit: model code can accidentally bind it to train metrics. A
+    split-scoped value is stronger evidence for governance and incumbent
+    selection.
+    """
+    if not isinstance(metrics_json, dict):
+        return {}
+    metric_name = str(metric_name or "").strip()
+    if not metric_name:
+        return {}
+
+    preferred_scopes = (
+        "holdout",
+        "validation",
+        "valid",
+        "val",
+        "test",
+        "oof",
+    )
+    for scope in preferred_scopes:
+        scoped = metrics_json.get(scope)
+        if not isinstance(scoped, dict):
+            continue
+        resolved = _resolve_direct_named_metric(scoped, metric_name)
+        if not resolved:
+            continue
+        value = _coerce_float(resolved.get("value"))
+        if value is None:
+            continue
+        matched_key = str(resolved.get("matched_key") or metric_name).strip()
+        return {
+            "metric_name": str(resolved.get("metric_name") or metric_name).strip(),
+            "canonical_name": canonicalize_metric_name(metric_name),
+            "matched_key": f"{scope}.{matched_key}",
+            "value": float(value),
+            "score": 100250,
+            "scope": scope,
+        }
+    return {}
+
+
 def resolve_metric_value(metrics_json: Dict[str, Any], metric_name: str) -> Dict[str, Any]:
     if not isinstance(metrics_json, dict):
         return {}
+
+    validation_scoped = _resolve_validation_scoped_metric(metrics_json, metric_name)
+    if validation_scoped:
+        return validation_scoped
 
     explicit_primary = _resolve_explicit_primary_metric(metrics_json, metric_name)
     if explicit_primary:
