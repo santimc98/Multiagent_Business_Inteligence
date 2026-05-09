@@ -309,14 +309,10 @@ def _collect_metric_artifact_paths(
         metric_like = (
             "metric" in lower_path
             or "cv_" in lower_path
-            or "latency" in lower_path
-            or "benchmark" in lower_path
             or "performance" in lower_path
             or "kpi" in lower_path
             or "metrics" in intent_text
             or "cv_metrics" in intent_text
-            or "latency" in intent_text
-            or "benchmark" in intent_text
             or "performance" in intent_text
             or "kpi" in intent_text
         )
